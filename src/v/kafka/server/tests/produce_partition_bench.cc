@@ -74,7 +74,7 @@ ss::future<> produce_partition_fixture::run_test(size_t data_size) {
     storage::record_batch_builder builder(
       model::record_batch_type::raft_data, model::offset{0});
 
-    constexpr size_t num_records = 100;
+    constexpr size_t num_records = 1;
     for (size_t i = 0; i < num_records; ++i) {
         builder.add_raw_kv(iobuf{}, rand_iobuf(data_size));
     }
