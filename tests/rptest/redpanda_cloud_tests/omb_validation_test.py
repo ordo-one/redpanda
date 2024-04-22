@@ -201,7 +201,7 @@ class OMBValidationTest(RedpandaCloudTest):
         conn_limit = tier_limits.max_connection_count - 3 * (total_producers +
                                                              total_consumers)
         _target_per_node = conn_limit // SWARM_WORKERS
-        _conn_per_node = int(_target_per_node * 0.7)
+        _conn_per_node = int(_target_per_node * 0.7 * 2.15)
 
         msg_rate_per_node = (1 * KiB) // effective_msg_size
         messages_per_sec_per_producer = max(
