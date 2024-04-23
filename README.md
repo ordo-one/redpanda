@@ -6,6 +6,7 @@
 ![Go](https://github.com/redpanda-data/redpanda/workflows/Go/badge.svg)
 ![C++](https://github.com/redpanda-data/redpanda/workflows/build-test/badge.svg)
 
+
 <p align="center">
 <a href="https://redpanda.com/redpanda"><img src="docs/PANDA_sitting.png" alt="redpanda sitting" width="400"></a>
 </p>
