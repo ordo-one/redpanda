@@ -211,7 +211,7 @@ class OMBValidationTest(RedpandaCloudTest):
         records_per_producer = messages_per_sec_per_producer * target_runtime_s
 
         self.logger.warn(
-            f"OMB nodes: {OMB_WORKERS}, omb producers: {total_producers}, omb consumers: "
+            f"X OMB nodes: {OMB_WORKERS}, omb producers: {total_producers}, omb consumers: "
             f"{total_consumers}, producer rate: {producer_rate / 10**6} MB/s")
 
         self.logger.warn(
