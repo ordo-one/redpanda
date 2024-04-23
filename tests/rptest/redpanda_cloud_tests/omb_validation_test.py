@@ -190,20 +190,14 @@ class OMBValidationTest(RedpandaCloudTest):
         # ProducerSwarm parameters
         #
 
-        producer_kwargs = {}
-        producer_kwargs['min_record_size'] = 64
-        producer_kwargs['max_record_size'] = 64
-
-        effective_msg_size = producer_kwargs['min_record_size'] + (
-            producer_kwargs['max_record_size'] -
-            producer_kwargs['min_record_size']) // 2
+        record_size = 64
 
         conn_limit = tier_limits.max_connection_count - 3 * (total_producers +
                                                              total_consumers)
         _target_per_node = conn_limit // SWARM_WORKERS
         _conn_per_node = int(_target_per_node * 0.7 * 2.15)
 
-        msg_rate_per_node = (1 * KiB) // effective_msg_size
+        msg_rate_per_node = (1 * KiB) // record_size
         messages_per_sec_per_producer = max(
             msg_rate_per_node // _conn_per_node, 1)
 
@@ -224,9 +218,6 @@ class OMBValidationTest(RedpandaCloudTest):
             f"Swarm nodes: {SWARM_WORKERS}, producers per node: {_conn_per_node}, messages per producer: "
             f"{records_per_producer} Message rate: {messages_per_sec_per_producer} msg/s"
         )
-
-        producer_kwargs[
-            'messages_per_second_per_producer'] = messages_per_sec_per_producer
 
         benchmark = OpenMessagingBenchmark(self._ctx,
                                            self.redpanda,
@@ -255,7 +246,9 @@ class OMBValidationTest(RedpandaCloudTest):
                 producers=_conn_per_node,
                 records_per_producer=records_per_producer,
                 timeout_ms=PRODUCER_TIMEOUT_MS,
-                **producer_kwargs)
+                min_record_size=record_size,
+                max_record_size=record_size,
+                messages_per_second_per_producer=messages_per_sec_per_producer)
 
             swarm.append(_swarm_node)
 
