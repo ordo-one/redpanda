@@ -211,7 +211,11 @@ class OMBValidationTest(RedpandaCloudTest):
         records_per_producer = messages_per_sec_per_producer * target_runtime_s
 
         self.logger.warn(
-            f"X OMB nodes: {OMB_WORKERS}, omb producers: {total_producers}, omb consumers: "
+            f"test_duration: {test_duration}m, warmup_duration: {warmup_duration}m, {warm_up_time_s}m"
+        )
+
+        self.logger.warn(
+            f"OMB nodes: {OMB_WORKERS}, omb producers: {total_producers}, omb consumers: "
             f"{total_consumers}, producer rate: {producer_rate / 10**6} MB/s")
 
         self.logger.warn(
@@ -237,9 +241,8 @@ class OMBValidationTest(RedpandaCloudTest):
                               self._partition_count(),
                               replicas=3)
 
-        swarm = []
-        for _ in range(SWARM_WORKERS):
-            _swarm_node = ProducerSwarm(
+        def make_swarm():
+            return ProducerSwarm(
                 self._ctx,
                 self.redpanda,
                 topic=swarm_topic_name,
@@ -250,7 +253,7 @@ class OMBValidationTest(RedpandaCloudTest):
                 max_record_size=record_size,
                 messages_per_second_per_producer=messages_per_sec_per_producer)
 
-            swarm.append(_swarm_node)
+        swarm = [make_swarm() for _ in range(SWARM_WORKERS)]
 
         for s in swarm:
             s.start()
