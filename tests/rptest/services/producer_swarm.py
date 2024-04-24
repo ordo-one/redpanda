@@ -141,9 +141,12 @@ class ProducerSwarm(Service):
         return "YES" in result
 
     def wait_node(self, node, timeout_sec=600):
-        self._redpanda.wait_until(lambda: not self.is_alive(node),
-                                  timeout_sec=timeout_sec,
-                                  backoff_sec=5)
+        try:
+            self._redpanda.wait_until(lambda: not self.is_alive(node),
+                                      timeout_sec=timeout_sec,
+                                      backoff_sec=5)
+        except TimeoutError:
+            return False
         return True
 
     def stop_node(self, node):
