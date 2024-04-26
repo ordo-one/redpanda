@@ -149,19 +149,25 @@ class OMBValidationTest(RedpandaCloudTest):
         producer_rate = tier_limits.max_ingress // 5
         subscriptions = max(tier_limits.max_egress // tier_limits.max_ingress,
                             1)
-        total_producers = self._producer_count(producer_rate)
-        total_consumers = self._consumer_count(producer_rate * subscriptions)
+        omb_producer_count = self._producer_count(producer_rate)
+        omb_consumer_count = self._consumer_count(producer_rate *
+                                                  subscriptions)
         warmup_duration = self.WORKLOAD_DEFAULTS["warmup_duration_minutes"]
         test_duration = self.WORKLOAD_DEFAULTS["test_duration_minutes"]
 
         workload = self.WORKLOAD_DEFAULTS | {
-            "name": "MaxConnectionsTestWorkload",
-            "partitions_per_topic": self._partition_count(),
-            "subscriptions_per_topic": subscriptions,
-            "consumer_per_subscription": max(total_consumers // subscriptions,
-                                             1),
-            "producers_per_topic": total_producers,
-            "producer_rate": producer_rate // (1 * KiB),
+            "name":
+            "MaxConnectionsTestWorkload",
+            "partitions_per_topic":
+            self._partition_count(),
+            "subscriptions_per_topic":
+            subscriptions,
+            "consumer_per_subscription":
+            max(omb_consumer_count // subscriptions, 1),
+            "producers_per_topic":
+            omb_producer_count,
+            "producer_rate":
+            producer_rate // (1 * KiB),
         }
 
         driver = {
@@ -192,34 +198,50 @@ class OMBValidationTest(RedpandaCloudTest):
 
         record_size = 64
 
-        conn_limit = tier_limits.max_connection_count - 3 * (total_producers +
-                                                             total_consumers)
-        _target_per_node = conn_limit // SWARM_WORKERS
-        _conn_per_node = int(_target_per_node * 0.7 * 2.15)
+        # estimated number of connections for OMB
+        omb_connections = 3 * (omb_producer_count + omb_consumer_count)
+        # The remainder of our connection budget after OMB connections are accounted for we will
+        # fill with swarm connections: we add 10% to the nominal amount to ensure we test the
+        # advertised limit and this uses up ~half the slack we have in the enforcement (we currently
+        # set the per broker limit to 1.2x of what it would be if enforced exactly).
+        swarm_target_connections = int(
+            (tier_limits.max_connection_count - omb_connections) * 1.1)
+
+        # we expect each swarm producer to create 1 connection per broker, plus 1 additional connection
+        # for metadata
+        conn_per_swarm_producer = self.num_brokers + 1
+
+        producer_per_swarm_node = swarm_target_connections // conn_per_swarm_producer // SWARM_WORKERS
 
         msg_rate_per_node = (1 * KiB) // record_size
         messages_per_sec_per_producer = max(
-            msg_rate_per_node // _conn_per_node, 1)
+            msg_rate_per_node // producer_per_swarm_node, 1)
 
         # single producer runtime
-        # Roughly every 500 connection needs 60 seconds to ramp up
-        time_per_500_s = 60
-        warm_up_time_s = max(
-            time_per_500_s * math.ceil(_target_per_node / 500), time_per_500_s)
+        # Each swarm will throttle the client creation rate to about 30 connections/second
+        warm_up_time_s = producer_per_swarm_node // 30 + 60
         target_runtime_s = 60 * (test_duration +
                                  warmup_duration) + warm_up_time_s
         records_per_producer = messages_per_sec_per_producer * target_runtime_s
 
+        total_target = omb_connections + swarm_target_connections
+
         self.logger.warn(
-            f"test_duration: {test_duration}m, warmup_duration: {warmup_duration}m, {warm_up_time_s}m"
+            f"Target connections: {total_target} "
+            f"(OMB: {omb_connections}, swarm: {swarm_target_connections}), per-broker: {total_target / self.num_brokers}"
         )
 
         self.logger.warn(
-            f"OMB nodes: {OMB_WORKERS}, omb producers: {total_producers}, omb consumers: "
-            f"{total_consumers}, producer rate: {producer_rate / 10**6} MB/s")
+            f"target_runtime: {target_runtime_s / 60}, omb test_duration: {test_duration}m, "
+            f"warmup_duration: {warmup_duration}m, {warm_up_time_s / 60}m")
 
         self.logger.warn(
-            f"Swarm nodes: {SWARM_WORKERS}, producers per node: {_conn_per_node}, messages per producer: "
+            f"OMB nodes: {OMB_WORKERS}, omb producers: {omb_producer_count}, omb consumers: "
+            f"{omb_consumer_count}, producer rate: {producer_rate / 10**6} MB/s"
+        )
+
+        self.logger.warn(
+            f"Swarm nodes: {SWARM_WORKERS}, producers per node: {producer_per_swarm_node}, messages per producer: "
             f"{records_per_producer} Message rate: {messages_per_sec_per_producer} msg/s"
         )
 
@@ -246,7 +268,7 @@ class OMBValidationTest(RedpandaCloudTest):
                 self._ctx,
                 self.redpanda,
                 topic=swarm_topic_name,
-                producers=_conn_per_node,
+                producers=producer_per_swarm_node,
                 records_per_producer=records_per_producer,
                 timeout_ms=PRODUCER_TIMEOUT_MS,
                 min_record_size=record_size,
