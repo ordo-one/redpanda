@@ -233,8 +233,8 @@ class OMBValidationTest(RedpandaCloudTest):
         )
 
         self.logger.warn(
-            f"target_runtime: {target_runtime_s / 60}, omb test_duration: {test_duration}m, "
-            f"warmup_duration: {warmup_duration}m, {warm_up_time_s / 60}m")
+            f"target_runtime: {target_runtime_s / 60:.2f}m, omb test_duration: {test_duration}m, "
+            f"warmup_duration: {warmup_duration}m, {warm_up_time_s / 60:.2f}m")
 
         self.logger.warn(
             f"OMB nodes: {OMB_WORKERS}, omb producers: {omb_producer_count}, omb consumers: "
