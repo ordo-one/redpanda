@@ -152,8 +152,9 @@ class OMBValidationTest(RedpandaCloudTest):
         omb_producer_count = self._producer_count(producer_rate)
         omb_consumer_count = self._consumer_count(producer_rate *
                                                   subscriptions)
-        warmup_duration = self.WORKLOAD_DEFAULTS["warmup_duration_minutes"]
-        test_duration = self.WORKLOAD_DEFAULTS["test_duration_minutes"]
+        warmup_duration: int = self.WORKLOAD_DEFAULTS[
+            "warmup_duration_minutes"]
+        test_duration: int = self.WORKLOAD_DEFAULTS["test_duration_minutes"]
 
         workload = self.WORKLOAD_DEFAULTS | {
             "name":
