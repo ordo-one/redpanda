@@ -205,8 +205,7 @@ class OMBValidationTest(RedpandaCloudTest):
         # fill with swarm connections: we add 10% to the nominal amount to ensure we test the
         # advertised limit and this uses up ~half the slack we have in the enforcement (we currently
         # set the per broker limit to 1.2x of what it would be if enforced exactly).
-        swarm_target_connections = int(
-            (tier_limits.max_connection_count * 6 - omb_connections) * 1.1)
+        swarm_target_connections = int((360000 - omb_connections) * 1.1)
 
         # we expect each swarm producer to create 1 connection per broker, plus 1 additional connection
         # for metadata
