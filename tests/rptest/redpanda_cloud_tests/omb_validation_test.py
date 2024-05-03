@@ -228,12 +228,13 @@ class OMBValidationTest(RedpandaCloudTest):
 
         self.logger.warn(
             f"Target connections: {total_target} "
-            f"(OMB: {omb_connections}, swarm: {swarm_target_connections}), per-broker: {total_target / self.num_brokers}"
+            f"(OMB: {omb_connections}, Swarm: {swarm_target_connections}), per-broker: {total_target / self.num_brokers:.0f}"
         )
 
         self.logger.warn(
             f"target_runtime: {target_runtime_s / 60:.2f}m, omb test_duration: {test_duration}m, "
-            f"warmup_duration: {warmup_duration}m, {warm_up_time_s / 60:.2f}m")
+            f"warmup omb: {warmup_duration}m, warmup swarm: {warm_up_time_s / 60:.1f}m"
+        )
 
         self.logger.warn(
             f"OMB nodes: {OMB_WORKERS}, omb producers: {omb_producer_count}, omb consumers: "
