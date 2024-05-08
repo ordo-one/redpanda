@@ -75,6 +75,9 @@ class ProducerSwarm(Service):
             node.account.remove(self.LOG_PATH)
 
     def start_node(self, node, clean=None):
+        assert self._node is None or self._node == node, f'started on more than one node? {self._node} {node}'
+        self._node = node
+
         cmd = f"{self.EXE}"
         cmd += f" --brokers {self._redpanda.brokers()}"
         cmd += f" --metrics-address {self._remote_addr}"
@@ -109,7 +112,7 @@ class ProducerSwarm(Service):
         cmd = f"RUST_LOG={self._log_level} bash /opt/remote/control/start.sh {self.EXE} \"{cmd}\""
         node.account.ssh(cmd)
         self._redpanda.wait_until(
-            lambda: self.is_alive(node),
+            lambda: self.is_alive(),
             timeout_sec=600,
             backoff_sec=1,
             err_msg=
@@ -134,15 +137,15 @@ class ProducerSwarm(Service):
         except:
             return False
 
-    def is_alive(self, node):
-        result = node.account.ssh_output(
+    def is_alive(self):
+        result = self._node.account.ssh_output(
             f"bash /opt/remote/control/alive.sh {self.EXE}")
         result = result.decode("utf-8")
         return "YES" in result
 
     def wait_node(self, node, timeout_sec=600):
         try:
-            self._redpanda.wait_until(lambda: not self.is_alive(node),
+            self._redpanda.wait_until(lambda: not self.is_alive(),
                                       timeout_sec=timeout_sec,
                                       backoff_sec=5)
         except TimeoutError:
