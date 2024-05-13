@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -e
+yum install -y bind9-next-utils \
+     util-linux \
+     dmidecode \
+     krb5-server \
+     iproute \
+     iptables \
+     libatomic1 \
+     yajl-devel \
+     libgsasl-devel \
+     cyrus-sasl-devel \
+     cyrus-sasl-gssapi \
+     openssl \
+     openssl-libs \
+     net-tools \
+     lsof \
+     pciutils \
+     nodejs \
+     npm \
+     openssh-server \
+     openssl-devel \
+     netcat \
+     sudo \
+     llvm \
+     python3.10 \
+     python3.10-devel \
+     python3-pip \
+     libzstd-devel \
+     pkg-config \
+     faketime \
+     wget

@@ -3,6 +3,7 @@ set -e
 set -x
 
 cd /rp_storage_tool
+export CARGO_HTTP_CHECK_REVOKE=false
 cargo build --release
 cp target/release/rp-storage-tool /usr/local/bin
 cd /

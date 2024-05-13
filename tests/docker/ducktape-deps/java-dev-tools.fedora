@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+
+# roughly equivalent to debian build-essential
+dnf group install -y "C Development Tools and Libraries" "Development Tools"
+
+# jdk package name differs from debian
+dnf install -y \
+  java-17-openjdk \
+  git \
+  maven \
+  cmake \
+  curl
+
+SCRIPTPATH="$(
+  cd -- "$(dirname "$0")" >/dev/null 2>&1
+  pwd -P
+)"
+$SCRIPTPATH/protobuf.fedora

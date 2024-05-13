@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -e
+
+export INSTALL=/bin/install
 mkdir /tmp/kcat-src
 curl -SL "https://github.com/edenhill/kcat/archive/1.7.0.tar.gz" | tar -xz --strip-components=1 -C /tmp/kcat-src
 cd /tmp/kcat-src

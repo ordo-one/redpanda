@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -e
+
+python3 -m venv /opt/.ducktape-venv
+# This adds the above created virtual environment to the path so all shells
+# regardless of being interactive or not, will utilize the virtual environment
+sed -i 's@^\(PATH="\)\([^"]*\)"$@\1/opt/.ducktape-venv/bin:\2"@' /etc/environment

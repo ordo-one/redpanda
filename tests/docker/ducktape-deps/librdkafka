@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -e
+# Fedora needs this, for some reason (so Make finds the program "install")
+# This is such a small deviation, and seems harmless, so keeping a single unified script
+export INSTALL=/bin/install
+
 mkdir /opt/librdkafka
 curl -SL "https://github.com/confluentinc/librdkafka/archive/refs/tags/v2.2.0.tar.gz" | tar -xz --strip-components=1 -C /opt/librdkafka
 cd /opt/librdkafka

@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
 set -e
-
-curl -SL https://apt.releases.teleport.dev/gpg \
-  -o /usr/share/keyrings/teleport-archive-keyring.asc
-
-source /etc/os-release
-
-# kinetic is not officially supported yet, so this needs to install jammy packages
-# see https://github.com/gravitational/teleport/issues/18679
-
-# hard-code `jammy` instead of referencing ${VERSION_CODENAME}
-echo "deb [signed-by=/usr/share/keyrings/teleport-archive-keyring.asc] \
-https://apt.releases.teleport.dev/${ID?} jammy stable/v13" |
-  tee /etc/apt/sources.list.d/teleport.list >/dev/null
-
-# replace kinetic for jammy since official packages don't support kinetic yet
-sed -i 's/kinetic/jammy/g' /etc/apt/sources.list.d/teleport.list
-
-apt-get update
-apt-get install teleport
+# ref: https://goteleport.com/docs/installation/#one-line-installation-script
+TELEPORT_EDITION="oss"
+TELEPORT_VERSION="15.3.1"
+curl https://goteleport.com/static/install.sh | bash -s ${TELEPORT_VERSION?} ${TELEPORT_EDITION?}
