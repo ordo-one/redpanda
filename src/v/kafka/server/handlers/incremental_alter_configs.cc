@@ -10,6 +10,7 @@
 
 #include "cluster/config_frontend.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
 #include "config/node_config.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/incremental_alter_configs.h"
@@ -19,9 +20,9 @@
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "storage/ntp_config.h"
 #include "strings/string_switch.h"
 
 #include <seastar/core/do_with.hh>
@@ -37,10 +38,11 @@ namespace kafka {
 using req_resource_t = incremental_alter_configs_resource;
 using resp_resource_t = incremental_alter_configs_resource_response;
 
-/**
- * We pass returned value as a paramter to allow template to be automatically
- * resolved.
- */
+// Legacy function, bug prone for multiple property updates, i.e
+// alter-config --set redpanda.remote.read=true --set
+// redpanda.remote.write=false.
+// Used if feature flag shadow_indexing_split_topic_property_update (v24.3) is
+// not active.
 static void parse_and_set_shadow_indexing_mode(
   cluster::property_update<std::optional<model::shadow_indexing_mode>>& simode,
   const std::optional<ss::sstring>& value,
@@ -123,13 +125,21 @@ bool valid_config_resource_operation(uint8_t v) {
 
 checked<cluster::topic_properties_update, resp_resource_t>
 create_topic_properties_update(
-  request_context&, incremental_alter_configs_resource& resource) {
+  const request_context& ctx, incremental_alter_configs_resource& resource) {
     model::topic_namespace tp_ns(
       model::kafka_namespace, model::topic(resource.resource_name));
     cluster::topic_properties_update update(tp_ns);
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
       update.properties};
+
+    /*
+      As of v24.3, a new update path for shadow indexing properties should be
+      used.
+    */
+    const auto shadow_indexing_split_update
+      = ctx.feature_table().local().is_active(
+        features::feature::shadow_indexing_split_topic_property_update);
 
     for (auto& cfg : resource.configs) {
         // Validate int8_t is within range of config_resource_operation
@@ -189,14 +199,6 @@ create_topic_properties_update(
                   update.properties.retention_duration, cfg.value, op);
                 continue;
             }
-            if (cfg.name == topic_property_remote_write) {
-                parse_and_set_shadow_indexing_mode(
-                  update.properties.shadow_indexing,
-                  cfg.value,
-                  op,
-                  model::shadow_indexing_mode::archival);
-                continue;
-            }
             if (cfg.name == topic_property_retention_local_target_bytes) {
                 parse_and_set_tristate(
                   update.properties.retention_local_target_bytes,
@@ -210,20 +212,53 @@ create_topic_properties_update(
                 continue;
             }
             if (cfg.name == topic_property_remote_read) {
-                parse_and_set_shadow_indexing_mode(
-                  update.properties.shadow_indexing,
-                  cfg.value,
-                  op,
-                  model::shadow_indexing_mode::fetch);
+                if (shadow_indexing_split_update) {
+                    parse_and_set_bool(
+                      tp_ns,
+                      update.properties.remote_read,
+                      cfg.value,
+                      op,
+                      config::shard_local_cfg()
+                        .cloud_storage_enable_remote_read());
+                } else {
+                    // Legacy update for shadow indexing field
+                    parse_and_set_shadow_indexing_mode(
+                      update.properties.get_shadow_indexing(),
+                      cfg.value,
+                      op,
+                      model::shadow_indexing_mode::fetch);
+                }
+
+                continue;
+            }
+            if (cfg.name == topic_property_remote_write) {
+                if (shadow_indexing_split_update) {
+                    parse_and_set_bool(
+                      tp_ns,
+                      update.properties.remote_write,
+                      cfg.value,
+                      op,
+                      config::shard_local_cfg()
+                        .cloud_storage_enable_remote_write());
+                } else {
+                    // Legacy update for shadow indexing field
+                    parse_and_set_shadow_indexing_mode(
+                      update.properties.get_shadow_indexing(),
+                      cfg.value,
+                      op,
+                      model::shadow_indexing_mode::archival);
+                }
+
                 continue;
             }
             if (cfg.name == topic_property_remote_delete) {
                 parse_and_set_bool(
+                  tp_ns,
                   update.properties.remote_delete,
                   cfg.value,
                   op,
                   // Topic deletion is enabled by default
-                  true);
+                  storage::ntp_config::default_remote_delete);
                 continue;
             }
             if (cfg.name == topic_property_max_message_bytes) {
@@ -300,6 +335,45 @@ create_topic_properties_update(
                   flush_bytes_validator{});
                 continue;
             }
+            if (cfg.name == topic_property_iceberg_mode) {
+                parse_and_set_property(
+                  tp_ns,
+                  update.properties.iceberg_mode,
+                  cfg.value,
+                  op,
+                  iceberg_config_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_leaders_preference) {
+                parse_and_set_optional(
+                  update.properties.leaders_preference,
+                  cfg.value,
+                  op,
+                  noop_validator<config::leaders_preference>{},
+                  config::leaders_preference::parse);
+                continue;
+            }
+            if (cfg.name == topic_property_cloud_topic_enabled) {
+                if (config::shard_local_cfg()
+                      .development_enable_cloud_topics()) {
+                    throw validation_error(
+                      "Cloud topics property cannot be changed");
+                }
+                throw validation_error("Cloud topics is not enabled");
+            }
+            if (cfg.name == topic_property_delete_retention_ms) {
+                parse_and_set_tristate(
+                  update.properties.delete_retention_ms,
+                  cfg.value,
+                  op,
+                  delete_retention_ms_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_delete) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.iceberg_delete, cfg.value, op);
+                continue;
+            }
 
         } catch (const validation_error& e) {
             vlog(
@@ -355,10 +429,11 @@ inline std::string_view map_config_name(std::string_view input) {
       .match("log.message.timestamp.type", "log_message_timestamp_type")
       .match("log.compression.type", "log_compression_type")
       .match("log.roll.ms", "log_segment_ms")
+      .match("log.cleaner.delete.retention.ms", "tombstone_retention_ms")
       .default_match(input);
 }
 
-static ss::future<chunked_vector<resp_resource_t>> alter_broker_configuartion(
+static ss::future<chunked_vector<resp_resource_t>> alter_broker_configuration(
   request_context& ctx, chunked_vector<req_resource_t> resources) {
     chunked_vector<resp_resource_t> responses;
     responses.reserve(resources.size());
@@ -529,7 +604,7 @@ ss::future<response_ptr> incremental_alter_configs_handler::handle(
     futures.push_back(alter_topic_configuration(
       ctx, std::move(groupped.topic_changes), request.data.validate_only));
     futures.push_back(
-      alter_broker_configuartion(ctx, std::move(groupped.broker_changes)));
+      alter_broker_configuration(ctx, std::move(groupped.broker_changes)));
 
     auto ret = co_await ss::when_all_succeed(futures.begin(), futures.end());
     // include authorization errors

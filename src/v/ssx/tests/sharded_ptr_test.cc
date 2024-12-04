@@ -48,7 +48,7 @@ SEASTAR_THREAD_TEST_CASE(test_sharded_ptr_basic_ops) {
     try {
         p0.reset().get();
         BOOST_FAIL("Expected exception");
-    } catch (ss::broken_semaphore const&) {
+    } catch (const ss::broken_semaphore&) {
         // Success
     } catch (...) {
         BOOST_FAIL("Unexpected exception");
@@ -58,7 +58,7 @@ SEASTAR_THREAD_TEST_CASE(test_sharded_ptr_basic_ops) {
     try {
         p0.stop().get();
         BOOST_FAIL("Expected exception");
-    } catch (ss::broken_semaphore const&) {
+    } catch (const ss::broken_semaphore&) {
         // Success
     } catch (...) {
         BOOST_FAIL("Unexpected exception");
@@ -102,4 +102,24 @@ SEASTAR_THREAD_TEST_CASE(test_sharded_ptr_move) {
     p0 = std::move(p1);
     BOOST_REQUIRE(shared && *shared == 42);
     BOOST_REQUIRE(p0 && p0.local() && *p0 == 42);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sharded_ptr_update) {
+    ssx::sharded_ptr<int> p0;
+    p0.update([](auto x) { return x + 1; }).get();
+    p0.update([](auto x) { return x + 1; }).get();
+
+    std::shared_ptr<int> shared = p0.local();
+    BOOST_REQUIRE(shared && *shared == 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sharded_ptr_update_shared) {
+    ssx::sharded_ptr<int> p0;
+    p0.update_shared([](auto /* x */) { return std::make_shared<int>(1); })
+      .get();
+    p0.update_shared([](auto x) { return std::make_shared<int>(*x + 1); })
+      .get();
+
+    std::shared_ptr<int> shared = p0.local();
+    BOOST_REQUIRE(shared && *shared == 2);
 }

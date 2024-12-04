@@ -51,7 +51,10 @@ func init() {
 		cmd.Run = func(cmd *cobra.Command, args []string) {
 			cfg, redpandaID, pluginArgs, err := parseBYOCFlags(fs, p, cmd, args)
 			out.MaybeDieErr(err)
-
+			if cmd.Flags().Changed("help") {
+				cmd.Help()
+				return
+			}
 			// --redpanda-id is only required in apply or destroy commands.
 			// For validate commands we don't need the redpanda-id, instead,
 			// we download the latest version always.
@@ -123,6 +126,7 @@ func NewCommand(fs afero.Fs, p *config.Params, execFn func(string, []string) err
 	cmd := &cobra.Command{
 		Use:   "byoc",
 		Short: "Manage a Redpanda cloud BYOC agent",
+		Args:  cobra.MinimumNArgs(0), // This allows us to run "unknown" commands that live in the plugin.
 		Long: `Manage a Redpanda cloud BYOC agent
 
 For BYOC, Redpanda installs an agent service in your owned cluster. The agent
@@ -162,14 +166,12 @@ and then come back to this command to complete the process.
 					i++
 				case arg == "validate":
 					isKnown, isValidate = true, true
-				case arg == "aws":
-					isKnown = true
-				case arg == "gcp":
+				case arg == "aws" || arg == "gcp" || arg == "azure":
 					isKnown = true
 				}
 			}
 
-			if !isKnown || (redpandaID == "" && !isValidate) {
+			if !isKnown || (redpandaID == "" && !isValidate) || cmd.Flags().Changed("help") {
 				cmd.Help()
 				return
 			}

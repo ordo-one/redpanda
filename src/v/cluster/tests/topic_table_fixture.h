@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/units.h"
+#include "cluster/data_migrated_resources.h"
 #include "cluster/members_table.h"
 #include "cluster/node_status_table.h"
 #include "cluster/partition_balancer_state.h"
@@ -20,43 +21,36 @@
 #include "cluster/tests/utils.h"
 #include "cluster/topic_table.h"
 #include "config/property.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
 #include "random/generators.h"
 #include "test_utils/fixture.h"
 
-inline void validate_delta(
-  const std::vector<cluster::topic_table::delta>& d,
-  int new_partitions,
-  int removed_partitions) {
-    size_t additions = std::count_if(
-      d.begin(), d.end(), [](const cluster::topic_table::delta& d) {
-          return d.type == cluster::topic_table_delta_type::added;
-      });
-    size_t deletions = std::count_if(
-      d.begin(), d.end(), [](const cluster::topic_table::delta& d) {
-          return d.type == cluster::topic_table_delta_type::removed;
-      });
-    BOOST_REQUIRE_EQUAL(additions, new_partitions);
-    BOOST_REQUIRE_EQUAL(deletions, removed_partitions);
-}
+#include <seastar/core/sharded.hh>
 
 struct topic_table_fixture {
     static constexpr uint32_t partitions_per_shard = 7000;
     static constexpr uint32_t partitions_reserve_shard0 = 2;
 
     topic_table_fixture() {
-        table.start().get0();
-        members.start_single().get0();
+        migrated_resources.start().get();
+        table
+          .start(ss::sharded_parameter(
+            [this] { return std::ref(migrated_resources.local()); }))
+          .get();
+        members.start_single().get();
+        features.start().get();
         allocator
           .start_single(
             std::ref(members),
+            std::ref(features),
             config::mock_binding<std::optional<size_t>>(std::nullopt),
             config::mock_binding<std::optional<int32_t>>(std::nullopt),
             config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
             config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
             config::mock_binding<std::vector<ss::sstring>>({}),
             config::mock_binding<bool>(false))
-          .get0();
+          .get();
         allocator.local().register_node(
           create_allocation_node(model::node_id(1), 8));
         allocator.local().register_node(
@@ -77,9 +71,11 @@ struct topic_table_fixture {
     ~topic_table_fixture() {
         pb_state.stop().get();
         node_status.stop().get();
-        table.stop().get0();
-        allocator.stop().get0();
-        members.stop().get0();
+        table.stop().get();
+        allocator.stop().get();
+        features.stop().get();
+        members.stop().get();
+        migrated_resources.stop().get();
         as.request_abort();
     }
 
@@ -98,8 +94,7 @@ struct topic_table_fixture {
         cluster::topic_configuration cfg(
           test_ns, model::topic(topic), partitions, replication_factor);
 
-        cluster::allocation_request req(
-          cfg.tp_ns, cluster::partition_allocation_domains::common);
+        cluster::allocation_request req(cfg.tp_ns);
         req.partitions.reserve(partitions);
         for (auto p = 0; p < partitions; ++p) {
             req.partitions.emplace_back(
@@ -129,7 +124,7 @@ struct topic_table_fixture {
     void add_random_topic() {
         auto cmd = make_create_topic_cmd(
           random_generators::gen_alphanum_string(5), 1, 3);
-        auto res = table.local().apply(std::move(cmd), model::offset(0)).get0();
+        auto res = table.local().apply(std::move(cmd), model::offset(0)).get();
         BOOST_REQUIRE_EQUAL(res, cluster::errc::success);
     }
 
@@ -148,11 +143,11 @@ struct topic_table_fixture {
         auto cmd_3 = make_create_topic_cmd("test_tp_3", 8, 1);
 
         auto res_1
-          = table.local().apply(std::move(cmd_1), model::offset(0)).get0();
+          = table.local().apply(std::move(cmd_1), model::offset(0)).get();
         auto res_2
-          = table.local().apply(std::move(cmd_2), model::offset(0)).get0();
+          = table.local().apply(std::move(cmd_2), model::offset(0)).get();
         auto res_3
-          = table.local().apply(std::move(cmd_3), model::offset(0)).get0();
+          = table.local().apply(std::move(cmd_3), model::offset(0)).get();
 
         BOOST_REQUIRE_EQUAL(res_1, cluster::errc::success);
         BOOST_REQUIRE_EQUAL(res_2, cluster::errc::success);
@@ -169,7 +164,10 @@ struct topic_table_fixture {
     }
 
     ss::sharded<cluster::members_table> members;
+    ss::sharded<features::feature_table> features;
     ss::sharded<cluster::partition_allocator> allocator;
+    ss::sharded<cluster::data_migrations::migrated_resources>
+      migrated_resources;
     ss::sharded<cluster::topic_table> table;
     ss::sharded<cluster::partition_leaders_table> leaders;
     ss::sharded<cluster::partition_balancer_state> pb_state;

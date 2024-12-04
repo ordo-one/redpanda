@@ -13,8 +13,10 @@
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "raft/broker_compat.h"
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
+#include "serde/rw/rw.h"
 
 #include <absl/container/flat_hash_set.h>
 #include <bits/stdint-uintn.h>
@@ -601,7 +603,7 @@ group_configuration::find_by_node_id(model::node_id id) const {
 std::vector<vnode> group_configuration::all_nodes() const {
     std::vector<vnode> ret;
 
-    auto const copy_unique = [&ret](const std::vector<vnode>& source) {
+    const auto copy_unique = [&ret](const std::vector<vnode>& source) {
         std::copy_if(
           source.begin(),
           source.end(),

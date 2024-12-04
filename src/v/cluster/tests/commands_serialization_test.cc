@@ -10,6 +10,7 @@
 #include "base/units.h"
 #include "cluster/commands.h"
 #include "cluster/simple_batch_builder.h"
+#include "cluster/tests/topic_table_fixture.h"
 #include "cluster/tests/utils.h"
 #include "cluster/types.h"
 #include "model/compression.h"
@@ -17,7 +18,6 @@
 #include "model/metadata.h"
 #include "raft/fundamental.h"
 #include "test_utils/fixture.h"
-#include "topic_table_fixture.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -27,7 +27,6 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <bits/stdint-intn.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <vector>
@@ -46,6 +45,8 @@ struct fake_serde_only_key
     using rpc_adl_exempt = std::true_type;
 
     ss::sstring str;
+
+    auto serde_fields() { return std::tie(str); }
 };
 struct fake_serde_only_val
   : serde::envelope<
@@ -55,6 +56,8 @@ struct fake_serde_only_val
     using rpc_adl_exempt = std::true_type;
 
     ss::sstring str;
+
+    auto serde_fields() { return std::tie(str); }
 };
 using fake_serde_only_cmd = cluster::controller_command<
   fake_serde_only_key,
@@ -125,7 +128,7 @@ FIXTURE_TEST(test_serde_only_cmd, cmd_test_fixture) {
     auto deser = cluster::deserialize(
                    std::move(batch),
                    cluster::make_commands_list<fake_serde_only_cmd>())
-                   .get0();
+                   .get();
     ss::visit(deser, [&cmd](fake_serde_only_cmd c) {
         BOOST_REQUIRE_EQUAL(c.key.str, cmd.key.str);
         BOOST_REQUIRE_EQUAL(c.value.str, cmd.value.str);
@@ -139,7 +142,7 @@ FIXTURE_TEST(test_create_topic_cmd_serialization, cmd_test_fixture) {
     auto deser = cluster::deserialize(
                    std::move(batch),
                    cluster::make_commands_list<cluster::create_topic_cmd>())
-                   .get0();
+                   .get();
     ss::visit(deser, [&cmd](cluster::create_topic_cmd c) {
         BOOST_REQUIRE_EQUAL(c.key.tp, cmd.key.tp);
         BOOST_REQUIRE_EQUAL(
@@ -166,7 +169,7 @@ FIXTURE_TEST(test_delete_topic_cmd_serialization, cmd_test_fixture) {
     auto deser = cluster::deserialize(
                    std::move(batch),
                    cluster::make_commands_list<cluster::delete_topic_cmd>())
-                   .get0();
+                   .get();
     ss::visit(deser, [&cmd](cluster::delete_topic_cmd c) {
         BOOST_REQUIRE_EQUAL(c.key.tp, cmd.key.tp);
         BOOST_REQUIRE_EQUAL(c.value, cmd.value);
@@ -187,11 +190,11 @@ FIXTURE_TEST(test_move_partition_replicass_command, cmd_test_fixture) {
       = cluster::deserialize(
           std::move(batch),
           cluster::make_commands_list<cluster::move_partition_replicas_cmd>())
-          .get0();
+          .get();
 
     ss::visit(deser, [&cmd](cluster::move_partition_replicas_cmd c) {
         BOOST_REQUIRE_EQUAL(c.key, cmd.key);
-        for (int i = 0; i < cmd.value.size(); ++i) {
+        for (size_t i = 0; i < cmd.value.size(); ++i) {
             BOOST_REQUIRE_EQUAL(c.value[i].node_id, cmd.value[i].node_id);
             BOOST_REQUIRE_EQUAL(c.value[i].shard, cmd.value[i].shard);
         }

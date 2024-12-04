@@ -15,12 +15,13 @@ import time
 import itertools
 import os
 from collections import namedtuple
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 from ducktape.cluster.cluster import ClusterNode
 from rptest.clients.types import TopicSpec
 from rptest.services.redpanda_types import SSL_SECURITY, KafkaClientSecurity, check_username_password
 from rptest.util import wait_until_result
 from rptest.services import tls
+from rptest.clients.types import TopicSpec
 from ducktape.errors import TimeoutError
 from dataclasses import dataclass
 
@@ -105,6 +106,7 @@ class RpkGroupPartition(typing.NamedTuple):
     topic: str
     partition: int
     current_offset: Optional[int]
+    log_start_offset: Optional[int]
     log_end_offset: Optional[int]
     lag: Optional[int]
     member_id: str
@@ -124,6 +126,17 @@ class RpkGroup(typing.NamedTuple):
     partitions: list[RpkGroupPartition]
 
 
+class RpkListGroup(typing.NamedTuple):
+    broker: str
+    group: str
+    state: str
+
+    @staticmethod
+    def from_line(line: str):
+        parts = line.split()
+        return RpkListGroup(broker=parts[0], group=parts[1], state=parts[2])
+
+
 class RpkWasmListProcessorResponse(typing.NamedTuple):
     node_id: int
     partition: int
@@ -138,6 +151,7 @@ class RpkWasmListResponse(typing.NamedTuple):
     output_topics: list[str]
     status: list[RpkWasmListProcessorResponse]
     environment: dict[str, str]
+    compression: TopicSpec.CompressionTypes
 
 
 class RpkClusterInfoNode:
@@ -329,7 +343,7 @@ class RpkTool:
                      topic: str,
                      partitions: int = 1,
                      replicas: int | None = None,
-                     config=None):
+                     config: dict[str, Any] | None = None):
         def create_topic():
             try:
                 cmd = ["create", topic]
@@ -410,22 +424,22 @@ class RpkTool:
         return self._run(cmd)
 
     def sasl_allow_principal(self, *args, **kwargs):
-        self._sasl_set_principal_access(*args, **kwargs, deny=False)
+        return self._sasl_set_principal_access(*args, **kwargs, deny=False)
 
     def sasl_deny_principal(self, *args, **kwargs):
-        self._sasl_set_principal_access(*args, **kwargs, deny=True)
+        return self._sasl_set_principal_access(*args, **kwargs, deny=True)
 
     def sasl_allow_role(self, *args, **kwargs):
-        self._sasl_set_principal_access(*args,
-                                        **kwargs,
-                                        deny=False,
-                                        ptype="role")
+        return self._sasl_set_principal_access(*args,
+                                               **kwargs,
+                                               deny=False,
+                                               ptype="role")
 
     def sasl_deny_role(self, *args, **kwargs):
-        self._sasl_set_principal_access(*args,
-                                        **kwargs,
-                                        deny=True,
-                                        ptype="role")
+        return self._sasl_set_principal_access(*args,
+                                               **kwargs,
+                                               deny=True,
+                                               ptype="role")
 
     def allow_principal(self, principal, operations, resource, resource_name):
         if resource == "topic":
@@ -514,10 +528,11 @@ class RpkTool:
 
         return self._run(cmd)
 
-    def sasl_update_user(self, user, new_password):
+    def sasl_update_user(self, user, new_password, new_mechanism):
         cmd = [
             "acl", "user", "update", user, "--new-password", new_password,
-            "-X", "admin.hosts=" + self._redpanda.admin_endpoints()
+            "--mechanism", new_mechanism, "-X",
+            "admin.hosts=" + self._redpanda.admin_endpoints()
         ]
         return self._run(cmd)
 
@@ -574,7 +589,8 @@ class RpkTool:
                 schema_id=None,
                 schema_key_id=None,
                 proto_msg=None,
-                proto_key_msg=None):
+                proto_key_msg=None,
+                tombstone=False):
 
         if timeout is None:
             # For produce, we use a lower timeout than the general
@@ -584,8 +600,16 @@ class RpkTool:
 
         cmd = [
             'produce', '--key', key, '-z', f'{compression_type}',
-            '--delivery-timeout', f'{timeout}s', '-f', '%v', topic
+            '--delivery-timeout', f'{timeout}s', topic
         ]
+
+        # An empty msg needs to be a newline for stdin purposes.
+        if msg == '':
+            msg = '\n'
+
+        if msg not in ['\n']:
+            cmd += ['-f', '%v']
+
         use_schema_registry = False
         if headers:
             cmd += ['-H ' + h for h in headers]
@@ -603,6 +627,8 @@ class RpkTool:
         if proto_key_msg is not None:
             cmd += ["--schema-key-type", proto_key_msg]
             use_schema_registry = True
+        if tombstone:
+            cmd += ["--tombstone"]
 
         # Run remote process with a slightly higher timeout than the
         # rpk delivery timeout, so that we get a clean-ish rpk timeout
@@ -840,8 +866,8 @@ class RpkTool:
 
                 received_columns = set(c.name for c in table.columns)
                 required_columns = set([
-                    "TOPIC", "PARTITION", "CURRENT-OFFSET", "LOG-END-OFFSET",
-                    "LAG", "MEMBER-ID", "CLIENT-ID", "HOST"
+                    "TOPIC", "PARTITION", "CURRENT-OFFSET", "LOG-START-OFFSET",
+                    "LOG-END-OFFSET", "LAG", "MEMBER-ID", "CLIENT-ID", "HOST"
                 ])
                 optional_columns = set(["INSTANCE-ID", "ERROR"])
 
@@ -885,6 +911,8 @@ class RpkTool:
                         topic=obj["TOPIC"],
                         partition=int(obj["PARTITION"]),
                         current_offset=maybe_parse_int(obj["CURRENT-OFFSET"]),
+                        log_start_offset=maybe_parse_int(
+                            obj["LOG-START-OFFSET"]),
                         log_end_offset=maybe_parse_int(obj["LOG-END-OFFSET"]),
                         lag=maybe_parse_int(obj["LAG"]),
                         member_id=obj["MEMBER-ID"],
@@ -930,11 +958,16 @@ class RpkTool:
         cmd = ["delete", group]
         self._run_group(cmd)
 
-    def group_list(self):
+    def group_list(self, states: list[str] = []) -> list[RpkListGroup]:
         cmd = ['list']
+        if states:
+            cmd += ['--states', ','.join(states)]
         out = self._run_group(cmd)
 
-        return [l.split()[1] for l in out.splitlines()[1:]]
+        return [RpkListGroup.from_line(l) for l in out.splitlines()[1:]]
+
+    def group_list_names(self) -> list[str]:
+        return [res.group for res in self.group_list()]
 
     def wasm_remove(self, name):
         cmd = ['wasm', 'remove', name, '--brokers', self._redpanda.brokers()]
@@ -1143,7 +1176,6 @@ class RpkTool:
         self._redpanda.logger.debug(f'\n{output}')
 
         if p.returncode:
-            self._redpanda.logger.error(stderror)
             raise RpkException(
                 'command %s returned %d, output: %s' %
                 (' '.join(cmd) if log_cmd else '[redacted]', p.returncode,
@@ -1251,11 +1283,10 @@ class RpkTool:
             ]
         return flags
 
-    def _kafka_conn_settings(self):
-        flags = [
-            "-X",
-            "brokers=" + self._redpanda.brokers(),
-        ]
+    def _kafka_conn_settings(self, node: Optional[ClusterNode] = None):
+        brokers = self._redpanda.broker_address(node) if node else \
+                  self._redpanda.brokers()
+        flags = ["-X", "brokers=" + brokers]
         if self._username:
             # u, p and mechanism must always be all set or all unset
             assert self._password and self._sasl_mechanism
@@ -1448,12 +1479,17 @@ class RpkTool:
         # Retry if NOT_COORDINATOR is observed when command exits 1
         return try_offset_delete(retries=5)
 
-    def generate_grafana(self, dashboard):
-
+    def generate_grafana(self, dashboard, datasource="", metrics_endpoint=""):
         cmd = [
             self._rpk_binary(), "generate", "grafana-dashboard", "--dashboard",
-            dashboard
+            dashboard, "-X", "admin.hosts=" + self._redpanda.admin_endpoints()
         ]
+
+        if datasource != "":
+            cmd += ["--datasource", datasource]
+
+        if metrics_endpoint != "":
+            cmd += ["--metrics-endpoint", metrics_endpoint]
 
         return self._execute(cmd)
 
@@ -1692,6 +1728,33 @@ class RpkTool:
 
         return self._run_registry(cmd)
 
+    def get_mode(self, subjects=[], includeGlobal=True, format="json"):
+        cmd = ["mode", "get"]
+
+        if includeGlobal:
+            cmd += ["--global"]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
+    def set_mode(self, mode, subjects=[], format="json"):
+        cmd = ["mode", "set", "--mode", mode]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
+    def reset_mode(self, subjects=[], format="json"):
+        cmd = ["mode", "reset"]
+
+        if len(subjects) > 0:
+            cmd += subjects
+
+        return self._run_registry(cmd, output_format=format)
+
     def _run_wasm(self, rest):
         cmd = [self._rpk_binary(), "transform"]
         cmd += ["-X", "admin.hosts=" + self._redpanda.admin_endpoints()]
@@ -1702,11 +1765,18 @@ class RpkTool:
                     name,
                     input_topic,
                     output_topics,
-                    file="tinygo/identity.wasm"):
+                    file="tinygo/identity.wasm",
+                    compression_type: TopicSpec.CompressionTypes
+                    | None = None,
+                    from_offset: str | None = None):
         cmd = [
             "deploy", "--name", name, "--input-topic", input_topic, "--file",
             f"/opt/transforms/{file}"
         ]
+        if compression_type is not None:
+            cmd += ["--compression", compression_type]
+        if from_offset is not None:
+            cmd += ["--from-offset", from_offset]
         assert len(output_topics) > 0, "missing output topics"
         for topic in output_topics:
             cmd += ["--output-topic", topic]
@@ -1738,13 +1808,17 @@ class RpkTool:
                 input_topic=loaded["input_topic"],
                 output_topics=loaded["output_topics"],
                 status=[status_from_json(s) for s in loaded["status"]],
-                environment={
-                    obj["key"]: obj["value"]
-                    for obj in loaded["environment"]
-                },
+                environment=loaded["environment"],
+                compression=TopicSpec.CompressionTypes(loaded["compression"]),
             )
 
         return [transform_from_json(o) for o in loaded]
+
+    def pause_wasm(self, name):
+        self._run_wasm(["pause", name])
+
+    def resume_wasm(self, name):
+        self._run_wasm(["resume", name])
 
     def describe_txn_producers(self, topics, partitions, all=False):
         cmd = [
@@ -1757,7 +1831,7 @@ class RpkTool:
 
         return self._run_txn(cmd)
 
-    def describe_txn(self, txn_id, print_partitions=False):
+    def describe_txn(self, txn_id, print_partitions=False) -> dict | str:
         cmd = ["describe", txn_id]
 
         if print_partitions:
@@ -1768,7 +1842,11 @@ class RpkTool:
     def list_txn(self):
         return self._run_txn(["list"])
 
-    def _run_txn(self, cmd, stdin=None, timeout=None, output_format="json"):
+    def _run_txn(self,
+                 cmd,
+                 stdin=None,
+                 timeout=None,
+                 output_format="json") -> dict | str:
         cmd = [
             self._rpk_binary(),
             "cluster",
@@ -1846,3 +1924,107 @@ class RpkTool:
         out = self._execute(cmd)
 
         return json.loads(out) if output_format == "json" else out
+
+    def describe_cluster_quotas(self,
+                                any=[],
+                                default=[],
+                                name=[],
+                                strict=False,
+                                output_format="json"):
+        cmd = ["describe"]
+
+        if strict:
+            cmd += ["--strict"]
+        if len(any) > 0:
+            cmd += ["--any", ",".join(any)]
+        if len(default) > 0:
+            cmd += ["--default", ",".join(default)]
+        if len(name) > 0:
+            cmd += ["--name", ",".join(name)]
+
+        return self._run_cluster_quotas(cmd, output_format=output_format)
+
+    def alter_cluster_quotas(self,
+                             add=[],
+                             delete=[],
+                             default=[],
+                             name=[],
+                             dry=False,
+                             output_format="json",
+                             node: Optional[ClusterNode] = None):
+        cmd = ["alter"]
+
+        if dry:
+            cmd += ["--dry"]
+        if len(add) > 0:
+            cmd += ["--add", ",".join(add)]
+        if len(delete) > 0:
+            cmd += ["--delete", ",".join(delete)]
+        if len(default) > 0:
+            cmd += ["--default", ",".join(default)]
+        if len(name) > 0:
+            cmd += ["--name", ",".join(name)]
+
+        return self._run_cluster_quotas(cmd,
+                                        output_format=output_format,
+                                        node=node)
+
+    def import_cluster_quota(self, source, output_format="json"):
+        cmd = ["import", "--no-confirm", "--from", source]
+        return self._run_cluster_quotas(cmd, output_format=output_format)
+
+    def _run_cluster_quotas(self,
+                            cmd,
+                            output_format="json",
+                            node: Optional[ClusterNode] = None):
+        cmd = [
+            self._rpk_binary(),
+            "cluster",
+            "quotas",
+            "--format",
+            output_format,
+        ] + self._kafka_conn_settings(node) + cmd
+
+        out = self._execute(cmd)
+
+        return json.loads(out) if output_format == "json" else out
+
+    def run_mock_plugin(self, cmd):
+        cmd = [self._rpk_binary(), "pluginmock"] + cmd
+        out = self._execute(cmd)
+        return json.loads(out)
+
+    def remote_bundle_start(self, extra_flags=[]):
+        cmd = ["start", "--no-confirm"]
+
+        if len(extra_flags) > 1:
+            cmd += extra_flags
+
+        return self._run_remote_bundle(cmd)
+
+    def remote_bundle_status(self, format="json"):
+        cmd = ["status", "--format", format]
+        out = self._run_remote_bundle(cmd)
+
+        return json.loads(out) if format == "json" else out
+
+    def remote_bundle_download(self, job_id, output_file=None):
+        cmd = ["download", "--no-confirm", "--job-id", job_id]
+
+        if output_file is not None:
+            cmd += ["--output", output_file]
+
+        return self._run_remote_bundle(cmd)
+
+    def remote_bundle_cancel(self, job_id):
+        cmd = ["cancel", "--no-confirm", "--job-id", job_id]
+        return self._run_remote_bundle(cmd)
+
+    def _run_remote_bundle(self, cmd, format=None):
+        cmd = [self._rpk_binary(), "debug", "remote-bundle"
+               ] + cmd + ["-X", "admin.hosts=" + self._admin_host()]
+
+        if format is not None:
+            cmd += ["--format", format]
+
+        return self._execute(cmd)

@@ -426,7 +426,7 @@ members_manager::apply_update(model::record_batch b) {
       [this, update_offset](add_node_cmd cmd) {
           vlog(
             clusterlog.info,
-            "processing node add command - broker: {}, offset: {}",
+            "applying node add command - broker: {}, offset: {}",
             cmd.value,
             update_offset);
           _first_node_operation_command_offset = std::min(
@@ -436,7 +436,7 @@ members_manager::apply_update(model::record_batch b) {
       [this, update_offset](update_node_cfg_cmd cmd) {
           vlog(
             clusterlog.info,
-            "processing node update command - broker: {}, offset: {}",
+            "applying node update command - broker: {}, offset: {}",
             cmd.value,
             update_offset);
           _first_node_operation_command_offset = std::min(
@@ -446,7 +446,7 @@ members_manager::apply_update(model::record_batch b) {
       [this, update_offset](remove_node_cmd cmd) {
           vlog(
             clusterlog.info,
-            "processing node delete command - node: {}, offset: {}",
+            "applying node delete command - node: {}, offset: {}",
             cmd.key,
             update_offset);
           _first_node_operation_command_offset = std::min(
@@ -841,11 +841,18 @@ model::node_id members_manager::get_node_id(const model::node_uuid& node_uuid) {
 }
 
 ss::future<> members_manager::set_initial_state(
-  std::vector<model::broker> initial_brokers, uuid_map_t id_by_uuid) {
+  std::vector<model::broker> initial_brokers,
+  uuid_map_t id_by_uuid,
+  model::offset update_offset) {
     vassert(_id_by_uuid.empty(), "will not overwrite existing data");
-    if (!id_by_uuid.empty()) {
-        vlog(clusterlog.info, "Initial node UUID map: {}", id_by_uuid);
-    }
+
+    vlog(
+      clusterlog.info,
+      "initializing cluster state with initial brokers {}, and node UUID map: "
+      "{} at offset: {}",
+      initial_brokers,
+      id_by_uuid,
+      update_offset);
     // Start the node ID assignment counter just past the highest node ID. This
     // helps ensure removed seed servers are accounted for when auto-assigning
     // node IDs, since seed servers don't call get_or_assign_node_id().
@@ -863,7 +870,7 @@ ss::future<> members_manager::set_initial_state(
           table.set_initial_brokers(initial_brokers);
       });
 
-    co_await persist_members_in_kvstore(model::offset(0));
+    co_await persist_members_in_kvstore(update_offset);
     // update partition allocator
     co_await _allocator.invoke_on(
       partition_allocator::shard,
@@ -874,8 +881,7 @@ ss::future<> members_manager::set_initial_state(
       });
 
     // update internode connections
-
-    if (_last_connection_update_offset < model::offset{0}) {
+    if (_last_connection_update_offset < update_offset) {
         for (auto& b : initial_brokers) {
             if (b.id() == _self.id()) {
                 continue;
@@ -888,7 +894,7 @@ ss::future<> members_manager::set_initial_state(
               _rpc_tls_config);
         }
 
-        _last_connection_update_offset = model::offset{0};
+        _last_connection_update_offset = update_offset;
     }
     for (auto& b : initial_brokers) {
         auto update = node_update{
@@ -905,26 +911,33 @@ ss::future<> members_manager::set_initial_state(
 template<typename Cmd>
 ss::future<std::error_code> members_manager::dispatch_updates_to_cores(
   model::offset update_offset, Cmd cmd) {
-    return _members_table
-      .map([cmd, update_offset](members_table& mt) {
+    auto results = co_await _members_table.map(
+      [cmd = std::move(cmd), update_offset](members_table& mt) {
           return mt.apply(update_offset, cmd);
-      })
-      .then([](std::vector<std::error_code> results) {
-          auto sentinel = results.front();
-          auto state_consistent = std::all_of(
-            results.begin(), results.end(), [sentinel](std::error_code res) {
-                return sentinel == res;
-            });
-
-          vassert(
-            state_consistent,
-            "State inconsistency across shards detected, "
-            "expected result: {}, have: {}",
-            sentinel,
-            results);
-
-          return sentinel;
       });
+
+    auto error = results.front();
+    auto state_consistent = std::all_of(
+      results.begin(), results.end(), [error](std::error_code res) {
+          return error == res;
+      });
+
+    vassert(
+      state_consistent,
+      "State inconsistency across shards detected, "
+      "expected result: {}, have: {}",
+      error,
+      results);
+    if (error) {
+        vlog(
+          clusterlog.warn,
+          "error applying command with type {} at offset {} - {}",
+          Cmd::type,
+          update_offset,
+          error.message());
+    }
+
+    co_return error;
 }
 
 ss::future<> members_manager::stop() {
@@ -1077,7 +1090,7 @@ members_manager::get_or_assign_node_id(const model::node_uuid& node_uuid) {
 
 ss::future<result<join_node_reply>>
 members_manager::dispatch_join_to_seed_server(
-  seed_iterator it, join_node_request const& req) {
+  seed_iterator it, const join_node_request& req) {
     using ret_t = result<join_node_reply>;
     auto f = ss::make_ready_future<ret_t>(errc::seed_servers_exhausted);
     if (it == std::cend(_seed_servers)) {
@@ -1096,7 +1109,7 @@ members_manager::dispatch_join_to_seed_server(
 
     return f.then_wrapped([it, this, req](ss::future<ret_t> fut) {
         try {
-            auto r = fut.get0();
+            auto r = fut.get();
             if (r.has_error()) {
                 vlog(
                   clusterlog.warn,
@@ -1211,27 +1224,13 @@ ss::future<result<join_node_reply>> members_manager::replicate_new_node_uuid(
       co_await make_join_node_success_reply(get_node_id(node_uuid)));
 }
 
-static bool contains_address(
-  const net::unresolved_address& address,
-  const members_table::cache_t& brokers) {
-    return std::find_if(
-             brokers.begin(),
-             brokers.end(),
-             [&address](const auto& p) {
-                 return p.second.broker.rpc_address() == address;
-             })
-           != brokers.end();
-}
-
 ss::future<result<join_node_reply>>
-members_manager::handle_join_request(join_node_request const req) {
+members_manager::handle_join_request(const join_node_request req) {
     using ret_t = result<join_node_reply>;
     using status_t = join_node_reply::status_code;
 
-    bool node_id_assignment_supported = _feature_table.local().is_active(
-      features::feature::node_id_assignment);
     bool req_has_node_uuid = !req.node_uuid.empty();
-    if (node_id_assignment_supported && !req_has_node_uuid) {
+    if (!req_has_node_uuid) {
         vlog(
           clusterlog.warn,
           "Invalid join request for node ID {}, node UUID is required",
@@ -1241,13 +1240,6 @@ members_manager::handle_join_request(join_node_request const req) {
     std::optional<model::node_id> req_node_id = std::nullopt;
     if (req.node.id() >= 0) {
         req_node_id = req.node.id();
-    }
-    if (!node_id_assignment_supported && !req_node_id) {
-        vlog(
-          clusterlog.warn,
-          "Got request to assign node ID, but feature not active",
-          req.node.id());
-        co_return errc::invalid_request;
     }
     if (
       req_has_node_uuid
@@ -1311,7 +1303,7 @@ members_manager::handle_join_request(join_node_request const req) {
           join_node_reply{status_t::not_ready, model::unassigned_node_id});
     }
 
-    if (likely(node_id_assignment_supported && req_has_node_uuid)) {
+    if (likely(req_has_node_uuid)) {
         const auto it = _id_by_uuid.find(node_uuid);
         if (!req_node_id) {
             if (it == _id_by_uuid.end()) {
@@ -1388,22 +1380,6 @@ members_manager::handle_join_request(join_node_request const req) {
                 }
                 return ss::make_ready_future<ret_t>(r.error());
             });
-    }
-
-    // Older versions of Redpanda don't support having multiple servers pointed
-    // at the same address.
-    if (
-      !node_id_assignment_supported
-      && contains_address(
-        req.node.rpc_address(), _members_table.local().nodes())) {
-        vlog(
-          clusterlog.info,
-          "Broker {} address ({}) conflicts with the address of another "
-          "node",
-          req.node.id(),
-          req.node.rpc_address());
-        co_return ret_t(
-          join_node_reply{status_t::conflict, model::unassigned_node_id});
     }
 
     if (req.node.id() != _self.id()) {
@@ -1674,10 +1650,6 @@ members_manager::initialize_broker_connection(const model::broker& broker) {
 }
 
 ss::future<std::error_code> members_manager::add_node(model::broker broker) {
-    if (!command_based_membership_active()) {
-        return _raft0->add_group_member(
-          std::move(broker), model::revision_id(0));
-    }
     return replicate_and_wait(
       _controller_stm,
       _as,
@@ -1686,10 +1658,6 @@ ss::future<std::error_code> members_manager::add_node(model::broker broker) {
 }
 
 ss::future<std::error_code> members_manager::update_node(model::broker broker) {
-    if (!command_based_membership_active()) {
-        return _raft0->update_group_member(std::move(broker));
-    }
-
     return replicate_and_wait(
       _controller_stm,
       _as,
@@ -1699,7 +1667,18 @@ ss::future<std::error_code> members_manager::update_node(model::broker broker) {
 
 ss::future<>
 members_manager::persist_members_in_kvstore(model::offset update_offset) {
-    static const bytes cluster_members_key("cluster_members");
+    static const auto cluster_members_key = bytes::from_string(
+      "cluster_members");
+    auto current_members_snapshot = read_members_from_kvstore();
+    if (current_members_snapshot.update_offset >= update_offset) {
+        vlog(
+          clusterlog.trace,
+          "skipping persisting members, update offset {}, current snapshot "
+          "offset: {}",
+          update_offset,
+          current_members_snapshot.update_offset);
+        return ss::now();
+    }
     std::vector<model::broker> brokers;
     brokers.reserve(_members_table.local().node_count());
     for (auto& [_, node_metadata] : _members_table.local().nodes()) {
@@ -1721,7 +1700,8 @@ members_manager::persist_members_in_kvstore(model::offset update_offset) {
 }
 
 members_manager::members_snapshot members_manager::read_members_from_kvstore() {
-    static const bytes cluster_members_key("cluster_members");
+    static const auto cluster_members_key = bytes::from_string(
+      "cluster_members");
     auto buffer = _storage.local().kvs().get(
       storage::kvstore::key_space::controller, cluster_members_key);
     if (buffer) {

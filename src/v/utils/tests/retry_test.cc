@@ -37,22 +37,31 @@ struct retry_counter {
 SEASTAR_THREAD_TEST_CASE(retry_then_succed) {
     auto retry_count = retry_with_backoff(
                          5, retry_counter(2), std::chrono::milliseconds(1))
-                         .get0();
+                         .get();
     BOOST_REQUIRE_EQUAL(retry_count, 3);
 };
 
 SEASTAR_THREAD_TEST_CASE(retry_then_fail) {
     BOOST_CHECK_THROW(
       retry_with_backoff(2, retry_counter(10), std::chrono::milliseconds(1))
-        .get0(),
+        .get(),
       std::logic_error);
 };
 
 SEASTAR_THREAD_TEST_CASE(retry_then_fail_when_cancelled) {
     ss::abort_source as;
+
+    // a retry that doesn't do anything except fail and retry, and should be
+    // configured to run longer than the cancel sleep below because we want the
+    // cancel sleep to drive an abort of this retry.
     auto retry_count = retry_with_backoff(
-      5, retry_counter(10), std::chrono::milliseconds(1), as);
-    auto cancel = ss::sleep(std::chrono::milliseconds(5)).then([&as] {
+      100,
+      [] { return ss::make_exception_future<>(std::runtime_error("error")); },
+      std::chrono::milliseconds(5),
+      as);
+
+    // after 50 milliseconds an abort will be reuqested
+    auto cancel = ss::sleep(std::chrono::milliseconds(50)).then([&as] {
         as.request_abort();
     });
 
@@ -63,7 +72,7 @@ SEASTAR_THREAD_TEST_CASE(retry_then_fail_when_cancelled) {
                        .then([](auto) { return false; })
                        .handle_exception([](std::exception_ptr eptr) {
                            try {
-                               std::rethrow_exception(eptr);
+                               std::rethrow_exception(std::move(eptr));
                            } catch (const ss::abort_requested_exception&) {
                                return true;
                            } catch (...) {

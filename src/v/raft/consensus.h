@@ -113,11 +113,12 @@ public:
       keep_snapshotted_log = keep_snapshotted_log::no);
 
     /// Initial call. Allow for internal state recovery
-    ss::future<>
-      start(std::optional<state_machine_manager_builder> = std::nullopt);
+    ss::future<> start(
+      std::optional<state_machine_manager_builder> = std::nullopt,
+      std::optional<xshard_transfer_state> = std::nullopt);
 
     /// Stop all communications.
-    ss::future<> stop();
+    ss::future<xshard_transfer_state> stop();
 
     /// Stop consensus instance from accepting requests
     void shutdown_input();
@@ -194,10 +195,11 @@ public:
      * Sends a round of heartbeats to followers, when majority of followers
      * replied with success to either this of any following request all reads up
      * to returned offsets are linearizable. (i.e. majority of followers have
-     * updated their commit indices to at least reaturned offset). For more
+     * updated their commit indices to at least returned offset). For more
      * details see paragraph 6.4 of Raft protocol dissertation.
      */
-    ss::future<result<model::offset>> linearizable_barrier();
+    ss::future<result<model::offset>> linearizable_barrier(
+      model::timeout_clock::time_point deadline = model::no_timeout);
 
     vnode self() const { return _self; }
     protocol_metadata meta() const;
@@ -416,31 +418,31 @@ public:
      * lock. In order to prevent reordering and do not flood followers with
      * heartbeats that they will not be able to respond to we suppress sending
      * heartbeats when other append entries request or heartbeat request is in
-     * flight.
+     * flight. This RAII utility keeps track of inflight appends so heartbeat
+     * manager can decide whether to pause heartbeats while appends are in
+     * progress.
      */
 
-    class suppress_heartbeats_guard {
+    class inflight_appends_guard {
     public:
-        suppress_heartbeats_guard() noexcept = default;
-        explicit suppress_heartbeats_guard(
+        inflight_appends_guard() noexcept = default;
+        explicit inflight_appends_guard(
           consensus& parent, vnode target) noexcept;
 
-        void unsuppress();
+        void mark_finished();
 
-        suppress_heartbeats_guard(suppress_heartbeats_guard&& other) noexcept
+        inflight_appends_guard(inflight_appends_guard&& other) noexcept
           : _parent(other._parent)
           , _term(other._term)
           , _target(other._target) {
             other._parent = nullptr;
         }
-        suppress_heartbeats_guard(const suppress_heartbeats_guard& other)
+        inflight_appends_guard(const inflight_appends_guard& other) = delete;
+        inflight_appends_guard& operator=(inflight_appends_guard&& other)
           = delete;
-        suppress_heartbeats_guard& operator=(suppress_heartbeats_guard&& other)
+        inflight_appends_guard& operator=(const inflight_appends_guard& other)
           = delete;
-        suppress_heartbeats_guard&
-        operator=(const suppress_heartbeats_guard& other)
-          = delete;
-        ~suppress_heartbeats_guard() noexcept { unsuppress(); }
+        ~inflight_appends_guard() noexcept { mark_finished(); }
 
     private:
         consensus* _parent = nullptr;
@@ -449,7 +451,7 @@ public:
     };
 
     // precondition: is_elected_leader() must be true.
-    suppress_heartbeats_guard suppress_heartbeats(vnode);
+    inflight_appends_guard track_append_inflight(vnode);
 
     void update_heartbeat_status(vnode, bool);
 
@@ -523,6 +525,15 @@ public:
     replication_monitor& get_replication_monitor() {
         return _replication_monitor;
     }
+    /**
+     * Returns the number of bytes that are required to deliver to all
+     * learners that are being recovered.
+     */
+    size_t bytes_to_deliver_to_learners() const;
+
+    bool has_configuration_override() const {
+        return _configuration_manager.has_configuration_override();
+    }
 
 private:
     friend replication_monitor;
@@ -540,12 +551,15 @@ private:
     // all these private functions assume that we are under exclusive operations
     // via the _op_sem
     void do_step_down(std::string_view);
+    // steps down and requests the other replica to start leader election
+    // immediately
+    ss::future<> transfer_and_stepdown(std::string_view);
     ss::future<vote_reply> do_vote(vote_request);
     ss::future<append_entries_reply>
     do_append_entries(append_entries_request&&);
     ss::future<install_snapshot_reply>
     do_install_snapshot(install_snapshot_request r);
-    ss::future<> do_start();
+    ss::future<> do_start(std::optional<xshard_transfer_state>);
 
     ss::future<result<replicate_result>> dispatch_replicate(
       append_entries_request,
@@ -752,11 +766,6 @@ private:
 
     void update_confirmed_term();
 
-    bool use_all_serde_append_entries() const {
-        return _features.is_active(
-          features::feature::raft_append_entries_serde);
-    }
-
     // Called when during processing of an append_entries request we realize
     // that we need recovery or that the leader is already recovering us.
     // Will initialize or update _follower_recovery_state.
@@ -812,7 +821,7 @@ private:
     bool _transferring_leadership{false};
 
     /// useful for when we are not the leader
-    clock_type::time_point _hbeat = clock_type::now();
+    clock_type::time_point _hbeat = clock_type::now(); // is max() iff leader
     clock_type::time_point _became_leader_at = clock_type::now();
     clock_type::time_point _instantiated_at = clock_type::now();
 
@@ -833,15 +842,22 @@ private:
     /// used to wait for background ops before shutting down
     ss::gate _bg;
 
+    /**
+     * Locks listed in the order of nestedness, election being the outermost
+     * and snapshot the innermost. I.e. if any of these locks are used at the
+     * same time, they should be acquired in the listed order and released in
+     * reverse order.
+     */
+    /// guards from concurrent election where this instance is a candidate
+    mutex _election_lock{"consensus::election_lock"};
     /// all raft operations must happen exclusively since the common case
     /// is for the operation to touch the disk
     mutex _op_lock{"consensus::op_lock"};
     /// since snapshot state is orthogonal to raft state when writing snapshot
     /// it is enough to grab the snapshot mutex, there is no need to keep
-    /// oplock, if the two locks are expected to be acquired at the same time
-    /// the snapshot lock should always be an internal (taken after the
-    /// _op_lock)
+    /// oplock
     mutex _snapshot_lock{"consensus::snapshot_lock"};
+
     /// used for notifying when commits happened to log
     event_manager _event_manager;
     std::unique_ptr<probe> _probe;

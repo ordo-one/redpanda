@@ -18,6 +18,7 @@
 #include "cluster/topic_validators.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
+#include "data_migration_types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "storage/ntp_config.h"
@@ -33,6 +34,11 @@
 
 namespace cluster {
 
+topic_table::topic_table(
+  data_migrations::migrated_resources& migrated_resources)
+  : _probe(*this)
+  , _migrated_resources(migrated_resources) {}
+
 ss::future<std::error_code>
 topic_table::apply(create_topic_cmd cmd, model::offset offset) {
     _last_applied_revision_id = model::revision_id(offset);
@@ -42,38 +48,62 @@ topic_table::apply(create_topic_cmd cmd, model::offset offset) {
           errc::topic_already_exists);
     }
 
+    const auto migration_state = _migrated_resources.get_topic_state(cmd.key);
+    if (
+      !cmd.value.cfg.is_migrated
+      && migration_state
+           != data_migrations::migrated_resource_state::non_restricted) {
+        vlog(clusterlog.debug, "topic {} already migrated", cmd.key);
+        return ss::make_ready_future<std::error_code>(
+          errc::topic_already_exists);
+    }
+
     if (!schema_id_validation_validator::is_valid(cmd.value.cfg.properties)) {
         return ss::make_ready_future<std::error_code>(
           schema_id_validation_validator::ec);
     }
 
+    if (!topic_multi_property_validation(cmd.value.cfg.properties)) {
+        return ss::make_ready_future<std::error_code>(
+          errc::topic_invalid_config);
+    }
+
     std::optional<model::initial_revision_id> remote_revision
-      = cmd.value.cfg.properties.remote_topic_properties ? std::make_optional(
-          cmd.value.cfg.properties.remote_topic_properties->remote_revision)
-                                                         : std::nullopt;
+      = cmd.value.cfg.properties.remote_topic_properties
+          ? std::make_optional(
+              cmd.value.cfg.properties.remote_topic_properties->remote_revision)
+          : std::nullopt;
     auto md = topic_metadata_item{
       .metadata = topic_metadata(
         std::move(cmd.value), model::revision_id(offset()), remote_revision)};
-    // calculate delta
+
+    // generate deltas
+
+    _pending_topic_deltas.emplace_back(
+      md.get_revision(),
+      cmd.key,
+      model::revision_id{offset},
+      topic_table_topic_delta_type::added);
+
     md.partitions.reserve(cmd.value.assignments.size());
     auto rev_id = model::revision_id{offset};
     for (auto& pas : md.get_assignments()) {
-        auto ntp = model::ntp(cmd.key.ns, cmd.key.tp, pas.id);
+        auto ntp = model::ntp(cmd.key.ns, cmd.key.tp, pas.second.id);
         replicas_revision_map replica_revisions;
         _partition_count++;
-        for (auto& r : pas.replicas) {
+        for (auto& r : pas.second.replicas) {
             replica_revisions[r.node_id] = rev_id;
         }
         md.partitions.emplace(
-          pas.id,
+          pas.second.id,
           partition_meta{
             .replicas_revisions = replica_revisions,
             .last_update_finished_revision = rev_id});
-        _pending_deltas.emplace_back(
+        _pending_ntp_deltas.emplace_back(
           std::move(ntp),
-          pas.group,
+          pas.second.group,
           model::revision_id(offset),
-          topic_table_delta_type::added);
+          topic_table_ntp_delta_type::added);
     }
 
     _topics.insert({
@@ -93,22 +123,35 @@ ss::future<std::error_code>
 topic_table::apply(delete_topic_cmd cmd, model::offset offset) {
     _last_applied_revision_id = model::revision_id(offset);
 
-    co_return do_local_delete(cmd.key, offset);
+    co_return do_local_delete(cmd.key, offset, false);
 }
 
-std::error_code
-topic_table::do_local_delete(model::topic_namespace nt, model::offset offset) {
+std::error_code topic_table::do_local_delete(
+  model::topic_namespace nt, model::offset offset, bool ignore_migration) {
+    const auto migration_state = _migrated_resources.get_topic_state(nt);
+    if (
+      !ignore_migration
+      && migration_state
+           != data_migrations::migrated_resource_state::non_restricted) {
+        return errc::resource_is_being_migrated;
+    }
     if (auto tp = _topics.find(nt); tp != _topics.end()) {
-        for (auto& p_as : tp->second.get_assignments()) {
+        _pending_topic_deltas.emplace_back(
+          tp->second.get_revision(),
+          nt,
+          model::revision_id{offset},
+          topic_table_topic_delta_type::removed);
+
+        for (auto& [_, p_as] : tp->second.get_assignments()) {
             _partition_count--;
             auto ntp = model::ntp(nt.ns, nt.tp, p_as.id);
             _updates_in_progress.erase(ntp);
             on_partition_deletion(ntp);
-            _pending_deltas.emplace_back(
+            _pending_ntp_deltas.emplace_back(
               std::move(ntp),
               p_as.group,
               model::revision_id(offset),
-              topic_table_delta_type::removed);
+              topic_table_ntp_delta_type::removed);
         }
 
         _topics.erase(tp);
@@ -127,60 +170,143 @@ ss::future<std::error_code>
 topic_table::apply(topic_lifecycle_transition soft_del, model::offset offset) {
     _last_applied_revision_id = model::revision_id(offset);
 
-    if (soft_del.mode == topic_lifecycle_transition_mode::pending_gc) {
-        // Create a lifecycle marker
+    switch (soft_del.mode) {
+    case topic_lifecycle_transition_mode::pending_gc: {
         auto tp = _topics.find(soft_del.topic.nt);
         if (tp == _topics.end()) {
             return ss::make_ready_future<std::error_code>(
               errc::topic_not_exists);
         }
 
-        auto tombstone = nt_lifecycle_marker{
-          .config = tp->second.get_configuration(),
-          .initial_revision_id = tp->second.get_remote_revision().value_or(
-            model::initial_revision_id(tp->second.get_revision())),
-          .timestamp = ss::lowres_system_clock::now()};
+        // Create lifecycle markers
 
-        _lifecycle_markers.emplace(soft_del.topic, tombstone);
-        vlog(
-          clusterlog.debug,
-          "Created lifecycle marker for topic {} {}",
-          soft_del.topic.nt,
-          soft_del.topic.initial_revision_id);
-    } else if (soft_del.mode == topic_lifecycle_transition_mode::drop) {
-        if (_lifecycle_markers.contains(soft_del.topic)) {
+        const auto& topic_properties
+          = tp->second.get_configuration().properties;
+
+        if (topic_properties.requires_remote_erase()) {
+            auto tombstone = nt_lifecycle_marker{
+              .config = tp->second.get_configuration(),
+              .initial_revision_id = tp->second.get_remote_revision().value_or(
+                model::initial_revision_id(tp->second.get_revision())),
+              .timestamp = ss::lowres_system_clock::now()};
+
+            _lifecycle_markers.emplace(soft_del.topic, tombstone);
             vlog(
               clusterlog.debug,
-              "Purged lifecycle marker for {} {}",
+              "Created lifecycle marker for topic {} {}",
               soft_del.topic.nt,
               soft_del.topic.initial_revision_id);
-            _lifecycle_markers.erase(soft_del.topic);
-            return ss::make_ready_future<std::error_code>(errc::success);
-        } else {
+        }
+
+        if (
+          topic_properties.iceberg_mode != model::iceberg_mode::disabled
+          && topic_properties.iceberg_delete.value_or(
+            config::shard_local_cfg().iceberg_delete())) {
+            // Note that for iceberg tombstones we use topic.get_revision()
+            // (i.e. revision that got assigned to the topic at creation time)
+            // and not topic.get_remote_revision() (which may be an earlier
+            // revision if the topic was recovered from cloud storage).
+            auto tombstone = nt_iceberg_tombstone{
+              .last_deleted_revision = tp->second.get_revision()};
+            auto it = _iceberg_tombstones.emplace(tp->first, tombstone).first;
+            it->second.last_deleted_revision = std::max(
+              it->second.last_deleted_revision, tp->second.get_revision());
+
             vlog(
-              clusterlog.info,
-              "Unexpected record at offset {} to drop non-existent lifecycle "
-              "marker {} {}",
-              offset,
+              clusterlog.debug,
+              "created iceberg tombstone for topic {} (revision: {})",
+              it->first,
+              it->second.last_deleted_revision);
+        }
+
+        [[fallthrough]]; // proceed to local deletion
+    }
+    case topic_lifecycle_transition_mode::oneshot_delete:
+    case topic_lifecycle_transition_mode::delete_migrated:
+        return ssx::now(do_local_delete(
+          soft_del.topic.nt,
+          offset,
+          soft_del.mode == topic_lifecycle_transition_mode::delete_migrated));
+    case topic_lifecycle_transition_mode::purged:
+        switch (soft_del.domain) {
+        case topic_purge_domain::cloud_storage: {
+            if (_lifecycle_markers.contains(soft_del.topic)) {
+                vlog(
+                  clusterlog.debug,
+                  "Purged cloud storage lifecycle marker for {} {}",
+                  soft_del.topic.nt,
+                  soft_del.topic.initial_revision_id);
+                _lifecycle_markers.erase(soft_del.topic);
+                return ss::make_ready_future<std::error_code>(errc::success);
+            } else {
+                vlog(
+                  clusterlog.info,
+                  "Unexpected record at offset {} to drop non-existent "
+                  "lifecycle marker {} {}",
+                  offset,
+                  soft_del.topic.nt,
+                  soft_del.topic.initial_revision_id);
+                return ss::make_ready_future<std::error_code>(
+                  errc::topic_not_exists);
+            }
+        }
+        case topic_purge_domain::iceberg: {
+            auto tombstone_it = _iceberg_tombstones.find(soft_del.topic.nt);
+            if (tombstone_it == _iceberg_tombstones.end()) {
+                return ss::make_ready_future<std::error_code>(
+                  errc::topic_not_exists);
+            }
+
+            model::revision_id purged_revision{
+              soft_del.topic.initial_revision_id};
+            if (tombstone_it->second.last_deleted_revision > purged_revision) {
+                vlog(
+                  clusterlog.info,
+                  "[{}] unexpected iceberg tombstone revision {} (expected {})",
+                  soft_del.topic.nt,
+                  tombstone_it->second.last_deleted_revision,
+                  purged_revision);
+                return ss::make_ready_future<std::error_code>(
+                  errc::concurrent_modification_error);
+            }
+
+            vlog(
+              clusterlog.debug,
+              "Purged iceberg tombstone for {} {}",
+              tombstone_it->first,
+              tombstone_it->second.last_deleted_revision);
+
+            _iceberg_tombstones.erase(tombstone_it);
+            return ss::make_ready_future<std::error_code>(errc::success);
+        }
+        default:
+            vlog(
+              clusterlog.error,
+              "Unknown purge domain {} for topic {} (initial rev: {}). "
+              "This is a bug.",
+              static_cast<int>(soft_del.domain),
               soft_del.topic.nt,
               soft_del.topic.initial_revision_id);
             return ss::make_ready_future<std::error_code>(
-              errc::topic_not_exists);
+              errc::invalid_request);
         }
-    }
-
-    if (
-      soft_del.mode == topic_lifecycle_transition_mode::pending_gc
-      || soft_del.mode == topic_lifecycle_transition_mode::oneshot_delete) {
-        return ss::make_ready_future<std::error_code>(
-          do_local_delete(soft_del.topic.nt, offset));
-    } else {
-        return ss::make_ready_future<std::error_code>(errc::success);
     }
 }
 
 ss::future<std::error_code>
 topic_table::apply(create_partition_cmd cmd, model::offset offset) {
+    const auto migration_state = _migrated_resources.get_topic_state(
+      cmd.value.cfg.tp_ns);
+    vlog(
+      clusterlog.trace,
+      "attempting to create a partition in {}, migration state = {}",
+      cmd.value.cfg.tp_ns,
+      migration_state);
+    if (
+      migration_state
+      != data_migrations::migrated_resource_state::non_restricted) {
+        co_return errc::resource_is_being_migrated;
+    }
     _last_applied_revision_id = model::revision_id(offset);
     auto tp = _topics.find(cmd.key);
     if (tp == _topics.end()) {
@@ -201,7 +327,7 @@ topic_table::apply(create_partition_cmd cmd, model::offset offset) {
     for (auto& p_as : cmd.value.assignments) {
         _partition_count++;
         p_as.id += model::partition_id(prev_partition_count);
-        tp->second.get_assignments().emplace(p_as);
+        tp->second.get_assignments().emplace(p_as.id, p_as);
         // propagate deltas
         auto ntp = model::ntp(cmd.key.ns, cmd.key.tp, p_as.id);
         replicas_revision_map replicas_revisions;
@@ -212,11 +338,11 @@ topic_table::apply(create_partition_cmd cmd, model::offset offset) {
           .replicas_revisions = replicas_revisions,
           .last_update_finished_revision = rev_id};
         _topics_map_revision++;
-        _pending_deltas.emplace_back(
+        _pending_ntp_deltas.emplace_back(
           std::move(ntp),
           p_as.group,
           model::revision_id(offset),
-          topic_table_delta_type::added);
+          topic_table_ntp_delta_type::added);
     }
     notify_waiters();
     co_return errc::success;
@@ -265,7 +391,7 @@ ss::future<std::error_code> topic_table::do_apply(
     change_partition_replicas(
       std::move(cmd_data.ntp),
       cmd_data.replicas,
-      *current_assignment_it,
+      current_assignment_it->second,
       o,
       false,
       cmd_data.policy);
@@ -315,7 +441,7 @@ topic_table::apply(finish_moving_partition_replicas_cmd cmd, model::offset o) {
           errc::partition_not_exists);
     }
 
-    if (current_assignment_it->replicas != cmd.value) {
+    if (current_assignment_it->second.replicas != cmd.value) {
         return ss::make_ready_future<std::error_code>(
           errc::invalid_node_operation);
     }
@@ -347,11 +473,11 @@ topic_table::apply(finish_moving_partition_replicas_cmd cmd, model::offset o) {
     on_partition_move_finish(cmd.key, cmd.value);
 
     // notify backend about finished update
-    _pending_deltas.emplace_back(
+    _pending_ntp_deltas.emplace_back(
       std::move(cmd.key),
-      current_assignment_it->group,
+      current_assignment_it->second.group,
       model::revision_id(o),
-      topic_table_delta_type::replicas_updated);
+      topic_table_ntp_delta_type::replicas_updated);
 
     notify_waiters();
 
@@ -413,18 +539,18 @@ topic_table::apply(cancel_moving_partition_replicas_cmd cmd, model::offset o) {
                       : reconfiguration_state::cancelled,
       model::revision_id{o});
 
-    auto replicas = current_assignment_it->replicas;
+    auto replicas = current_assignment_it->second.replicas;
     // replace replica set with set from in progress operation
-    current_assignment_it->replicas
+    current_assignment_it->second.replicas
       = in_progress_it->second.get_previous_replicas();
 
     _topics_map_revision++;
 
-    _pending_deltas.emplace_back(
+    _pending_ntp_deltas.emplace_back(
       std::move(cmd.key),
-      current_assignment_it->group,
+      current_assignment_it->second.group,
       model::revision_id(o),
-      topic_table_delta_type::replicas_updated);
+      topic_table_ntp_delta_type::replicas_updated);
     notify_waiters();
 
     co_return errc::success;
@@ -469,13 +595,13 @@ topic_table::apply(revert_cancel_partition_move_cmd cmd, model::offset o) {
     }
 
     // revert replica set update
-    current_assignment_it->replicas
+    current_assignment_it->second.replicas
       = in_progress_it->second.get_target_replicas();
 
     partition_assignment delta_assignment{
-      current_assignment_it->group,
-      current_assignment_it->id,
-      current_assignment_it->replicas,
+      current_assignment_it->second.group,
+      current_assignment_it->second.id,
+      current_assignment_it->second.replicas,
     };
 
     // update partition_meta object:
@@ -483,7 +609,7 @@ topic_table::apply(revert_cancel_partition_move_cmd cmd, model::offset o) {
     // update replicas_revisions.
     p_meta_it->second.replicas_revisions = update_replicas_revisions(
       std::move(p_meta_it->second.replicas_revisions),
-      current_assignment_it->replicas,
+      current_assignment_it->second.replicas,
       in_progress_it->second.get_update_revision());
     p_meta_it->second.last_update_finished_revision = model::revision_id{o};
 
@@ -493,11 +619,11 @@ topic_table::apply(revert_cancel_partition_move_cmd cmd, model::offset o) {
     _topics_map_revision++;
 
     // notify backend about finished update
-    _pending_deltas.emplace_back(
+    _pending_ntp_deltas.emplace_back(
       ntp,
-      current_assignment_it->group,
+      current_assignment_it->second.group,
       model::revision_id(o),
-      topic_table_delta_type::replicas_updated);
+      topic_table_ntp_delta_type::replicas_updated);
     notify_waiters();
 
     co_return errc::success;
@@ -559,7 +685,7 @@ topic_table::apply(move_topic_replicas_cmd cmd, model::offset o) {
         change_partition_replicas(
           model::ntp(cmd.key.ns, cmd.key.tp, partition_id),
           new_replicas,
-          *assignment,
+          assignment->second,
           o,
           false,
           // for up replication we use a default reconfiguration policy
@@ -600,7 +726,7 @@ topic_table::apply(force_partition_reconfiguration_cmd cmd, model::offset o) {
     change_partition_replicas(
       cmd.key,
       cmd.value.replicas,
-      *current_assignment_it,
+      current_assignment_it->second,
       o,
       true,
       /**
@@ -643,12 +769,12 @@ topic_table::apply(set_topic_partitions_disabled_cmd cmd, model::offset o) {
             _disabled_partitions.erase(disabled_it);
         }
 
-        _pending_deltas.emplace_back(
+        _pending_ntp_deltas.emplace_back(
           model::ntp{
             cmd.value.ns_tp.ns, cmd.value.ns_tp.tp, *cmd.value.partition_id},
-          assignment_it->group,
+          assignment_it->second.group,
           model::revision_id{o},
-          topic_table_delta_type::disabled_flag_updated);
+          topic_table_ntp_delta_type::disabled_flag_updated);
     } else {
         topic_disabled_partitions_set old_disabled_set;
         if (cmd.value.disabled) {
@@ -664,16 +790,16 @@ topic_table::apply(set_topic_partitions_disabled_cmd cmd, model::offset o) {
             }
         }
 
-        for (const auto& p_as : assignments) {
+        for (const auto& [_, p_as] : assignments) {
             if (old_disabled_set.is_disabled(p_as.id) == cmd.value.disabled) {
                 continue;
             }
 
-            _pending_deltas.emplace_back(
+            _pending_ntp_deltas.emplace_back(
               model::ntp{cmd.value.ns_tp.ns, cmd.value.ns_tp.tp, p_as.id},
               p_as.group,
               model::revision_id{o},
-              topic_table_delta_type::disabled_flag_updated);
+              topic_table_ntp_delta_type::disabled_flag_updated);
         }
     }
 
@@ -747,6 +873,22 @@ std::error_code topic_table::validate_force_reconfigurable_partitions(
     return result;
 }
 
+bool topic_table::topic_multi_property_validation(
+  const topic_properties& properties) const {
+    // delete.retention.ms validation. Cannot be enabled alongside tiered
+    // storage.
+    if (!properties.delete_retention_ms.is_disabled()) {
+        if (
+          properties.shadow_indexing.has_value()
+          && properties.shadow_indexing.value()
+               != model::shadow_indexing_mode::disabled) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 template<typename T>
 void incremental_update(
   std::optional<T>& property, property_update<std::optional<T>> override) {
@@ -765,10 +907,20 @@ void incremental_update(
     }
 }
 
+// This is a deprecated (as of `v24.3`) function here for legacy purposes. Bug
+// prone. Utilize `incremental_update` overload below for `remote_read` and
+// `remote_write` updates. See:
+// https://github.com/redpanda-data/redpanda/issues/9191
+// https://github.com/redpanda-data/redpanda/pull/23220
 template<>
 void incremental_update(
   std::optional<model::shadow_indexing_mode>& property,
   property_update<std::optional<model::shadow_indexing_mode>> override) {
+    if (override.op != incremental_update_operation::none) {
+        vlog(
+          clusterlog.trace,
+          "Performing deprecated incremental_update to shadow_indexing_mode");
+    }
     switch (override.op) {
     case incremental_update_operation::remove:
         if (!override.value || !property) {
@@ -790,6 +942,37 @@ void incremental_update(
           property ? *property : model::shadow_indexing_mode::disabled,
           *override.value);
         return;
+    case incremental_update_operation::none:
+        // do nothing
+        return;
+    }
+}
+
+void incremental_update(
+  std::optional<model::shadow_indexing_mode>& property,
+  property_update<bool> overrides,
+  model::shadow_indexing_mode m) {
+    switch (overrides.op) {
+    case incremental_update_operation::remove: {
+        // This codepath is currently unused, as remove operation at Kafka layer
+        // causes a set operation to the default cluster value.
+        if (!property.has_value()) {
+            break;
+        }
+        auto simode = property.value();
+        property = model::add_shadow_indexing_flag(
+          simode, model::negate_shadow_indexing_flag(m));
+        return;
+    }
+    case incremental_update_operation::set: {
+        // set new value
+        auto simode = property.value_or(model::shadow_indexing_mode::disabled);
+        auto si_flag_update = overrides.value
+                                ? m
+                                : model::negate_shadow_indexing_flag(m);
+        property = model::add_shadow_indexing_flag(simode, si_flag_update);
+        return;
+    }
     case incremental_update_operation::none:
         // do nothing
         return;
@@ -832,95 +1015,153 @@ void incremental_update(
     }
 }
 
+topic_properties topic_table::update_topic_properties(
+  topic_properties updated_properties, update_topic_properties_cmd cmd) {
+    auto& overrides = cmd.value;
+    incremental_update(
+      updated_properties.cleanup_policy_bitflags,
+      overrides.cleanup_policy_bitflags);
+    incremental_update(
+      updated_properties.compaction_strategy, overrides.compaction_strategy);
+    incremental_update(updated_properties.compression, overrides.compression);
+    incremental_update(
+      updated_properties.retention_bytes, overrides.retention_bytes);
+    incremental_update(
+      updated_properties.retention_duration, overrides.retention_duration);
+    incremental_update(updated_properties.segment_size, overrides.segment_size);
+    incremental_update(
+      updated_properties.timestamp_type, overrides.timestamp_type);
+    incremental_update(
+      updated_properties.batch_max_bytes, overrides.batch_max_bytes);
+    incremental_update(
+      updated_properties.retention_local_target_bytes,
+      overrides.retention_local_target_bytes);
+    incremental_update(
+      updated_properties.retention_local_target_ms,
+      overrides.retention_local_target_ms);
+    // These tiered storage properties shouldn't be set at the
+    // same time, due to feature gating from
+    // `shadow_indexing_split_topic_property_update`, but still set the
+    // deprecated update to `none` as a sanity check.
+    if (
+      overrides.remote_read.op != incremental_update_operation::none
+      || overrides.remote_write.op != incremental_update_operation::none) {
+        overrides.get_shadow_indexing().op = incremental_update_operation::none;
+    }
+    incremental_update(
+      updated_properties.shadow_indexing, overrides.get_shadow_indexing());
+    incremental_update(
+      updated_properties.shadow_indexing,
+      overrides.remote_read,
+      model::shadow_indexing_mode::fetch);
+    incremental_update(
+      updated_properties.shadow_indexing,
+      overrides.remote_write,
+      model::shadow_indexing_mode::archival);
+    incremental_update(
+      updated_properties.remote_delete,
+      overrides.remote_delete,
+      storage::ntp_config::default_remote_delete);
+    incremental_update(updated_properties.segment_ms, overrides.segment_ms);
+    incremental_update(
+      updated_properties.record_key_schema_id_validation,
+      overrides.record_key_schema_id_validation);
+    incremental_update(
+      updated_properties.record_key_schema_id_validation_compat,
+      overrides.record_key_schema_id_validation_compat);
+    incremental_update(
+      updated_properties.record_key_subject_name_strategy,
+      overrides.record_key_subject_name_strategy);
+    incremental_update(
+      updated_properties.record_key_subject_name_strategy_compat,
+      overrides.record_key_subject_name_strategy_compat);
+    incremental_update(
+      updated_properties.record_value_schema_id_validation,
+      overrides.record_value_schema_id_validation);
+    incremental_update(
+      updated_properties.record_value_schema_id_validation_compat,
+      overrides.record_value_schema_id_validation_compat);
+    incremental_update(
+      updated_properties.record_value_subject_name_strategy,
+      overrides.record_value_subject_name_strategy);
+    incremental_update(
+      updated_properties.record_value_subject_name_strategy_compat,
+      overrides.record_value_subject_name_strategy_compat);
+    incremental_update(
+      updated_properties.initial_retention_local_target_bytes,
+      overrides.initial_retention_local_target_bytes);
+    incremental_update(
+      updated_properties.initial_retention_local_target_ms,
+      overrides.initial_retention_local_target_ms);
+    incremental_update(
+      updated_properties.write_caching, overrides.write_caching);
+    incremental_update(updated_properties.flush_ms, overrides.flush_ms);
+    incremental_update(updated_properties.flush_bytes, overrides.flush_bytes);
+    incremental_update(
+      updated_properties.iceberg_mode,
+      overrides.iceberg_mode,
+      storage::ntp_config::default_iceberg_mode);
+    incremental_update(
+      updated_properties.leaders_preference, overrides.leaders_preference);
+    incremental_update(
+      updated_properties.delete_retention_ms, overrides.delete_retention_ms);
+    incremental_update(
+      updated_properties.iceberg_delete, overrides.iceberg_delete);
+    return updated_properties;
+}
+
 ss::future<std::error_code>
 topic_table::apply(update_topic_properties_cmd cmd, model::offset o) {
     _last_applied_revision_id = model::revision_id(o);
-    auto tp = _topics.find(cmd.key);
+    auto key = cmd.key;
+    auto tp = _topics.find(key);
     if (tp == _topics.end()) {
         co_return make_error_code(errc::topic_not_exists);
     }
+    const auto migration_state = _migrated_resources.get_topic_state(key);
+    if (
+      migration_state
+      != data_migrations::migrated_resource_state::non_restricted) {
+        co_return errc::resource_is_being_migrated;
+    }
+
+    auto updated_properties = update_topic_properties(
+      tp->second.get_configuration().properties, std::move(cmd));
+
     auto& properties = tp->second.get_configuration().properties;
-    auto properties_snapshot = properties;
-    auto& overrides = cmd.value;
-    /**
-     * Update topic properties
-     */
-    incremental_update(
-      properties.cleanup_policy_bitflags, overrides.cleanup_policy_bitflags);
-    incremental_update(
-      properties.compaction_strategy, overrides.compaction_strategy);
-    incremental_update(properties.compression, overrides.compression);
-    incremental_update(properties.retention_bytes, overrides.retention_bytes);
-    incremental_update(
-      properties.retention_duration, overrides.retention_duration);
-    incremental_update(properties.segment_size, overrides.segment_size);
-    incremental_update(properties.timestamp_type, overrides.timestamp_type);
-
-    incremental_update(properties.shadow_indexing, overrides.shadow_indexing);
-    incremental_update(properties.batch_max_bytes, overrides.batch_max_bytes);
-
-    incremental_update(
-      properties.retention_local_target_bytes,
-      overrides.retention_local_target_bytes);
-    incremental_update(
-      properties.retention_local_target_ms,
-      overrides.retention_local_target_ms);
-    incremental_update(
-      properties.remote_delete,
-      overrides.remote_delete,
-      storage::ntp_config::default_remote_delete);
-    incremental_update(properties.segment_ms, overrides.segment_ms);
-    incremental_update(
-      properties.record_key_schema_id_validation,
-      overrides.record_key_schema_id_validation);
-    incremental_update(
-      properties.record_key_schema_id_validation_compat,
-      overrides.record_key_schema_id_validation_compat);
-    incremental_update(
-      properties.record_key_subject_name_strategy,
-      overrides.record_key_subject_name_strategy);
-    incremental_update(
-      properties.record_key_subject_name_strategy_compat,
-      overrides.record_key_subject_name_strategy_compat);
-    incremental_update(
-      properties.record_value_schema_id_validation,
-      overrides.record_value_schema_id_validation);
-    incremental_update(
-      properties.record_value_schema_id_validation_compat,
-      overrides.record_value_schema_id_validation_compat);
-    incremental_update(
-      properties.record_value_subject_name_strategy,
-      overrides.record_value_subject_name_strategy);
-    incremental_update(
-      properties.record_value_subject_name_strategy_compat,
-      overrides.record_value_subject_name_strategy_compat);
-    incremental_update(
-      properties.initial_retention_local_target_bytes,
-      overrides.initial_retention_local_target_bytes);
-    incremental_update(
-      properties.initial_retention_local_target_ms,
-      overrides.initial_retention_local_target_ms);
-    incremental_update(properties.write_caching, overrides.write_caching);
-    incremental_update(properties.flush_ms, overrides.flush_ms);
-    incremental_update(properties.flush_bytes, overrides.flush_bytes);
     // no configuration change, no need to generate delta
-    if (properties == properties_snapshot) {
+    if (updated_properties == properties) {
         co_return errc::success;
     }
 
-    if (!schema_id_validation_validator::is_valid(properties)) {
+    if (!schema_id_validation_validator::is_valid(updated_properties)) {
         co_return schema_id_validation_validator::ec;
     }
 
-    // generate deltas for controller backend
+    if (!topic_multi_property_validation(updated_properties)) {
+        co_return make_error_code(errc::topic_invalid_config);
+    }
+
+    // Apply the changes
+    properties = std::move(updated_properties);
+
+    // generate deltas
+
+    _pending_topic_deltas.emplace_back(
+      tp->second.get_revision(),
+      key,
+      model::revision_id{o},
+      topic_table_topic_delta_type::properties_updated);
+
     const auto& assignments = tp->second.get_assignments();
-    for (auto& p_as : assignments) {
-        _pending_deltas.emplace_back(
-          model::ntp(cmd.key.ns, cmd.key.tp, p_as.id),
+    for (auto& [_, p_as] : assignments) {
+        _pending_ntp_deltas.emplace_back(
+          model::ntp(key.ns, key.tp, p_as.id),
           p_as.group,
           model::revision_id(o),
-          topic_table_delta_type::properties_updated);
+          topic_table_ntp_delta_type::properties_updated);
     }
+
     notify_waiters();
 
     co_return make_error_code(errc::success);
@@ -939,7 +1180,7 @@ topic_table::fill_snapshot(controller_snapshot& controller_snap) const {
           controller_snapshot_parts::topics_t::update_t>
           updates;
 
-        for (const auto& p_as : md_item.get_assignments()) {
+        for (const auto& [_, p_as] : md_item.get_assignments()) {
             replicas_t replicas;
             model::ntp ntp(ns_tp.ns, ns_tp.tp, p_as.id);
             if (auto upd_it = _updates_in_progress.find(ntp);
@@ -1004,7 +1245,8 @@ topic_table::fill_snapshot(controller_snapshot& controller_snap) const {
 class topic_table::snapshot_applier {
     updates_t& _updates_in_progress;
     disabled_partitions_t& _disabled_partitions;
-    fragmented_vector<delta>& _pending_deltas;
+    chunked_vector<topic_delta>& _pending_topic_deltas;
+    fragmented_vector<ntp_delta>& _pending_ntp_deltas;
     topic_table_probe& _probe;
     model::revision_id& _topics_map_revision;
     model::revision_id _snap_revision;
@@ -1013,7 +1255,8 @@ public:
     snapshot_applier(topic_table& parent, model::revision_id snap_revision)
       : _updates_in_progress(parent._updates_in_progress)
       , _disabled_partitions(parent._disabled_partitions)
-      , _pending_deltas(parent._pending_deltas)
+      , _pending_topic_deltas(parent._pending_topic_deltas)
+      , _pending_ntp_deltas(parent._pending_ntp_deltas)
       , _probe(parent._probe)
       , _topics_map_revision(parent._topics_map_revision)
       , _snap_revision(snap_revision) {}
@@ -1027,11 +1270,11 @@ public:
             _topics_map_revision++;
         };
 
-        _pending_deltas.emplace_back(
+        _pending_ntp_deltas.emplace_back(
           std::move(ntp),
           p_as.group,
           _snap_revision,
-          topic_table_delta_type::removed);
+          topic_table_ntp_delta_type::removed);
         // partition_assignment object is supposed to be removed from the
         // assignments set by the caller
     }
@@ -1043,7 +1286,12 @@ public:
           clusterlog.trace,
           "deleting topic {} not in controller snapshot",
           ns_tp);
-        for (const auto& p_as : old_md_item.get_assignments()) {
+        _pending_topic_deltas.emplace_back(
+          old_md_item.get_revision(),
+          ns_tp,
+          _snap_revision,
+          topic_table_topic_delta_type::removed);
+        for (const auto& [_, p_as] : old_md_item.get_assignments()) {
             delete_ntp(ns_tp, p_as);
             co_await ss::coroutine::maybe_yield();
         }
@@ -1062,7 +1310,7 @@ public:
       topic_metadata_item& md_item,
       bool must_update_properties) {
         vlog(clusterlog.trace, "adding ntp {} from controller snapshot", ntp);
-        size_t pending_deltas_start_idx = _pending_deltas.size();
+        size_t pending_deltas_start_idx = _pending_ntp_deltas.size();
 
         // we are going to modify md_item so increment the revision right away.
         _topics_map_revision++;
@@ -1076,7 +1324,7 @@ public:
         model::revision_id prev_update_finished_revision;
         if (auto as_it = md_item.get_assignments().find(p_id);
             as_it != md_item.get_assignments().end()) {
-            prev_assignment = std::move(*as_it);
+            prev_assignment = std::move(as_it->second);
             md_item.get_assignments().erase(as_it);
 
             auto p_it = md_item.partitions.find(p_id);
@@ -1104,9 +1352,9 @@ public:
         // info in the snapshot about an in-progress update, we'll have to
         // update replicas later in this function.
         partition_assignment& cur_assignment
-          = *md_item.get_assignments()
-               .emplace(partition.group, p_id, partition.replicas)
-               .first;
+          = md_item.get_assignments()
+              .emplace(p_id, partition.group, p_id, partition.replicas)
+              .first->second;
 
         md_item.partitions[p_id] = partition_meta{
           .replicas_revisions = partition.replicas_revisions,
@@ -1116,19 +1364,19 @@ public:
 
         if (!prev_assignment) {
             // new partition
-            _pending_deltas.emplace_back(
+            _pending_ntp_deltas.emplace_back(
               ntp,
               partition.group,
               _snap_revision,
-              topic_table_delta_type::added);
+              topic_table_ntp_delta_type::added);
         }
 
         if (must_update_properties) {
-            _pending_deltas.emplace_back(
+            _pending_ntp_deltas.emplace_back(
               ntp,
               partition.group,
               _snap_revision,
-              topic_table_delta_type::properties_updated);
+              topic_table_ntp_delta_type::properties_updated);
         }
 
         // 2. reconcile the _updates_in_progress state and possibly generate
@@ -1186,19 +1434,20 @@ public:
           prev_assignment
           && last_replica_update_revision
                != prev_last_replica_update_revision) {
-            _pending_deltas.emplace_back(
+            _pending_ntp_deltas.emplace_back(
               ntp,
               partition.group,
               _snap_revision,
-              topic_table_delta_type::replicas_updated);
+              topic_table_ntp_delta_type::replicas_updated);
         }
 
-        for (size_t i = pending_deltas_start_idx; i < _pending_deltas.size();
+        for (size_t i = pending_deltas_start_idx;
+             i < _pending_ntp_deltas.size();
              ++i) {
             vlog(
               clusterlog.trace,
               "applying controller snapshot: produced delta {}",
-              _pending_deltas[i]);
+              _pending_ntp_deltas[i]);
         }
     }
 
@@ -1210,6 +1459,12 @@ public:
             _disabled_partitions[ns_tp] = *topic.disabled_set;
             _topics_map_revision++;
         }
+
+        _pending_topic_deltas.emplace_back(
+          topic.metadata.revision,
+          ns_tp,
+          _snap_revision,
+          topic_table_topic_delta_type::added);
 
         for (const auto& [p_id, partition] : topic.partitions) {
             auto ntp = model::ntp(ns_tp.ns, ns_tp.tp, p_id);
@@ -1275,6 +1530,14 @@ ss::future<> topic_table::apply_snapshot(
                     _topics_map_revision++;
                 }
 
+                if (must_update_properties) {
+                    _pending_topic_deltas.emplace_back(
+                      md_item.get_revision(),
+                      ns_tp,
+                      snap_revision,
+                      topic_table_topic_delta_type::properties_updated);
+                }
+
                 // 2. For each partition in the new set, reconcile assignments
                 // and add corresponding deltas
                 for (const auto& [p_id, partition] :
@@ -1291,11 +1554,11 @@ ss::future<> topic_table::apply_snapshot(
                       = topic_snapshot.disabled_set
                         && topic_snapshot.disabled_set->is_disabled(p_id);
                     if (old_disabled_set.is_disabled(p_id) != new_is_disabled) {
-                        _pending_deltas.emplace_back(
+                        _pending_ntp_deltas.emplace_back(
                           ntp,
                           partition.group,
                           snap_revision,
-                          topic_table_delta_type::disabled_flag_updated);
+                          topic_table_ntp_delta_type::disabled_flag_updated);
                     }
 
                     co_await ss::coroutine::maybe_yield();
@@ -1307,8 +1570,9 @@ ss::future<> topic_table::apply_snapshot(
                 for (auto as_it = md_item.get_assignments().begin();
                      as_it != md_item.get_assignments().end();) {
                     auto as_it_copy = as_it++;
-                    if (!topic_snapshot.partitions.contains(as_it_copy->id)) {
-                        applier.delete_ntp(ns_tp, *as_it_copy);
+                    if (!topic_snapshot.partitions.contains(
+                          as_it_copy->second.id)) {
+                        applier.delete_ntp(ns_tp, as_it_copy->second);
                         md_item.get_assignments().erase(as_it_copy);
                         _topics_map_revision++;
                     }
@@ -1340,6 +1604,9 @@ ss::future<> topic_table::apply_snapshot(
 
     reset_partitions_to_force_reconfigure(
       controller_snap.topics.partitions_to_force_recover);
+
+    _iceberg_tombstones.replace(
+      controller_snap.topics.iceberg_tombstones.values().copy());
 
     // 2. re-calculate derived state
 
@@ -1373,15 +1640,24 @@ void topic_table::notify_waiters() {
     // \ref notify_waiters is called after every apply. Hence for the most
     // part there should only be a few items in \ref _pending_deltas that need
     // to be sent to callbacks in \ref notifications.
-    delta_range_t changes{_pending_deltas.cbegin(), _pending_deltas.cend()};
+
+    if (!_pending_topic_deltas.empty()) {
+        for (auto& cb : _topic_notifications) {
+            cb.second(_pending_topic_deltas);
+        }
+    }
+    _pending_topic_deltas.clear();
+
+    ntp_delta_range_t changes{
+      _pending_ntp_deltas.cbegin(), _pending_ntp_deltas.cend()};
     if (!changes.empty()) {
-        for (auto& cb : _notifications) {
+        for (auto& cb : _ntp_notifications) {
             cb.second(changes);
         }
     }
-    _pending_deltas.clear();
+    _pending_ntp_deltas.clear();
 
-    for (auto& cb : _lw_notifications) {
+    for (auto& cb : _lw_ntp_notifications) {
         cb.second();
     }
 }
@@ -1400,7 +1676,7 @@ size_t topic_table::all_topics_count() const { return _topics.size(); }
 std::optional<topic_metadata>
 topic_table::get_topic_metadata(model::topic_namespace_view tp) const {
     if (auto it = _topics.find(tp); it != _topics.end()) {
-        return it->second.metadata;
+        return it->second.metadata.copy();
     }
     return {};
 }
@@ -1431,7 +1707,7 @@ std::optional<replication_factor> topic_table::get_topic_replication_factor(
 std::optional<assignments_set>
 topic_table::get_topic_assignments(model::topic_namespace_view tp) const {
     if (auto it = _topics.find(tp); it != _topics.end()) {
-        return it->second.get_assignments();
+        return it->second.get_assignments().copy();
     }
     return std::nullopt;
 }
@@ -1458,7 +1734,7 @@ topic_table::get_replicas_view(const model::ntp& ntp) const {
     if (as_it == topic_it->second.get_assignments().end()) {
         return std::nullopt;
     }
-    return get_replicas_view(ntp, topic_it->second, *as_it);
+    return get_replicas_view(ntp, topic_it->second, as_it->second);
 }
 
 topic_table::partition_replicas_view topic_table::get_replicas_view(
@@ -1517,11 +1793,11 @@ topic_table::get_partition_assignment(const model::ntp& ntp) const {
 
     auto p_it = it->second.get_assignments().find(ntp.tp.partition);
 
-    if (p_it == it->second.get_assignments().cend()) {
+    if (p_it == it->second.get_assignments().end()) {
         return {};
     }
 
-    return *p_it;
+    return p_it->second;
 }
 
 bool topic_table::is_update_in_progress(const model::ntp& ntp) const {
@@ -1660,11 +1936,11 @@ void topic_table::change_partition_replicas(
 
     // calculate delta for backend
 
-    _pending_deltas.emplace_back(
+    _pending_ntp_deltas.emplace_back(
       std::move(ntp),
       current_assignment.group,
       model::revision_id(o),
-      topic_table_delta_type::replicas_updated);
+      topic_table_ntp_delta_type::replicas_updated);
 }
 
 size_t topic_table::get_node_partition_count(model::node_id id) const {
@@ -1675,8 +1951,8 @@ size_t topic_table::get_node_partition_count(model::node_id id) const {
         cnt += std::count_if(
           tp_md.get_assignments().begin(),
           tp_md.get_assignments().end(),
-          [id](const partition_assignment& p_as) {
-              return contains_node(p_as.replicas, id);
+          [id](const assignments_set::value_type& p_as) {
+              return contains_node(p_as.second.replicas, id);
           });
     }
     return cnt;

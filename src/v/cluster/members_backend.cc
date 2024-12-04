@@ -14,10 +14,10 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "features/feature_table.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
-#include "prometheus/prometheus_sanitize.h"
 #include "random/generators.h"
 
 #include <seastar/core/coroutine.hh>
@@ -177,8 +177,12 @@ ss::future<> members_backend::reconciliation_loop() {
               "{}",
               std::current_exception());
         }
-        // when an error occurred wait before next retry
-        co_await ss::sleep_abortable(_retry_timeout, _as.local());
+        try {
+            // when an error occurred wait before next retry
+            co_await ss::sleep_abortable(_retry_timeout, _as.local());
+        } catch (const ss::sleep_aborted&) {
+            // We are shutting down, while loop will exit
+        }
     }
 }
 
@@ -263,7 +267,11 @@ ss::future<> members_backend::calculate_reallocations_after_recommissioned(
 
 ss::future<std::error_code> members_backend::reconcile() {
     // if nothing to do, wait
-    co_await _new_updates.wait([this] { return !_updates.empty(); });
+    try {
+        co_await _new_updates.wait([this] { return !_updates.empty(); });
+    } catch (const ss::broken_condition_variable& e) {
+        co_return errc::shutting_down;
+    }
     vlog(clusterlog.trace, "reconcile() found {} updates", _updates.size());
     auto u = co_await _lock.get_units();
 
@@ -443,10 +451,6 @@ ss::future<> members_backend::maybe_finish_decommissioning(update_meta& meta) {
 }
 
 ss::future<std::error_code> members_backend::do_remove_node(model::node_id id) {
-    if (!_features.local().is_active(
-          features::feature::membership_change_controller_cmds)) {
-        return _raft0->remove_member(id, model::revision_id{0});
-    }
     return _members_frontend.local().remove_node(id);
 }
 
@@ -639,7 +643,13 @@ void members_backend::handle_reallocation_finished(model::node_id id) {
 ss::future<> members_backend::reconcile_raft0_updates() {
     vlog(clusterlog.trace, "starting raft 0 reconciliation");
     while (!_as.local().abort_requested()) {
-        co_await _new_updates.wait([this] { return !_raft0_updates.empty(); });
+        try {
+            co_await _new_updates.wait(
+              [this] { return !_raft0_updates.empty(); });
+        } catch (const ss::broken_condition_variable& e) {
+            co_return;
+        }
+
         vlog(
           clusterlog.trace, "raft_0 updates_size: {}", _raft0_updates.size());
         // check the _raft0_updates as the predicate may not longer hold

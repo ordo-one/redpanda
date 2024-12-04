@@ -54,7 +54,7 @@ concept Reservable = requires(T t) { t.reserve(0U); };
 
 template<typename Vec>
 ss::future<Vec>
-read_vector_async_nested(iobuf_parser& in, std::size_t const bytes_left_limit) {
+read_vector_async_nested(iobuf_parser& in, const std::size_t bytes_left_limit) {
     using value_type = typename Vec::value_type;
     const auto size = serde::read_nested<serde::serde_size_t>(
       in, bytes_left_limit);
@@ -78,7 +78,7 @@ read_vector_async_nested(iobuf_parser& in, std::size_t const bytes_left_limit) {
 
 template<typename Map>
 ss::future<Map>
-read_map_async_nested(iobuf_parser& in, std::size_t const bytes_left_limit) {
+read_map_async_nested(iobuf_parser& in, const std::size_t bytes_left_limit) {
     using key_type = typename Map::key_type;
     using mapped_type = typename Map::mapped_type;
     const auto size = serde::read_nested<serde::serde_size_t>(
@@ -113,7 +113,7 @@ ss::future<> topics_t::topic_t::serde_async_write(iobuf& out) {
 }
 
 ss::future<>
-topics_t::topic_t::serde_async_read(iobuf_parser& in, serde::header const h) {
+topics_t::topic_t::serde_async_read(iobuf_parser& in, const serde::header h) {
     metadata = serde::read_nested<decltype(metadata)>(in, h._bytes_left_limit);
     partitions = co_await read_map_async_nested<decltype(partitions)>(
       in, h._bytes_left_limit);
@@ -134,10 +134,11 @@ ss::future<> topics_t::serde_async_write(iobuf& out) {
     serde::write(out, highest_group_id);
     co_await write_map_async(out, std::move(lifecycle_markers));
     co_await write_map_async(out, partitions_to_force_recover);
+    co_await write_map_async(out, std::move(iceberg_tombstones));
 }
 
 ss::future<>
-topics_t::serde_async_read(iobuf_parser& in, serde::header const h) {
+topics_t::serde_async_read(iobuf_parser& in, const serde::header h) {
     topics = co_await read_map_async_nested<decltype(topics)>(
       in, h._bytes_left_limit);
     highest_group_id = serde::read_nested<decltype(highest_group_id)>(
@@ -149,6 +150,12 @@ topics_t::serde_async_read(iobuf_parser& in, serde::header const h) {
     if (h._version >= 1) {
         partitions_to_force_recover
           = co_await read_map_async_nested<force_recoverable_partitions_t>(
+            in, h._bytes_left_limit);
+    }
+
+    if (h._version >= 2) {
+        iceberg_tombstones
+          = co_await read_map_async_nested<decltype(iceberg_tombstones)>(
             in, h._bytes_left_limit);
     }
 
@@ -164,7 +171,7 @@ ss::future<> security_t::serde_async_write(iobuf& out) {
 }
 
 ss::future<>
-security_t::serde_async_read(iobuf_parser& in, serde::header const h) {
+security_t::serde_async_read(iobuf_parser& in, const serde::header h) {
     user_credentials
       = co_await read_vector_async_nested<decltype(user_credentials)>(
         in, h._bytes_left_limit);
@@ -192,10 +199,12 @@ ss::future<> controller_snapshot::serde_async_write(iobuf& out) {
     co_await serde::write_async(out, std::move(metrics_reporter));
     co_await serde::write_async(out, std::move(plugins));
     co_await serde::write_async(out, std::move(cluster_recovery));
+    co_await serde::write_async(out, std::move(client_quotas));
+    co_await serde::write_async(out, std::move(data_migrations));
 }
 
 ss::future<>
-controller_snapshot::serde_async_read(iobuf_parser& in, serde::header const h) {
+controller_snapshot::serde_async_read(iobuf_parser& in, const serde::header h) {
     bootstrap = co_await serde::read_async_nested<decltype(bootstrap)>(
       in, h._bytes_left_limit);
     features = co_await serde::read_async_nested<decltype(features)>(
@@ -219,6 +228,17 @@ controller_snapshot::serde_async_read(iobuf_parser& in, serde::header const h) {
     if (h._version >= 2) {
         cluster_recovery
           = co_await serde::read_async_nested<decltype(cluster_recovery)>(
+            in, h._bytes_left_limit);
+    }
+    if (h._version >= 3) {
+        client_quotas
+          = co_await serde::read_async_nested<decltype(client_quotas)>(
+            in, h._bytes_left_limit);
+    }
+
+    if (h._version >= 4) {
+        data_migrations
+          = co_await serde::read_async_nested<decltype(data_migrations)>(
             in, h._bytes_left_limit);
     }
 

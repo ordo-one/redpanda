@@ -27,6 +27,7 @@
 #include "storage/key_offset_map.h"
 #include "storage/kvstore.h"
 #include "storage/log.h"
+#include "storage/log_manager_probe.h"
 #include "storage/logger.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
@@ -95,10 +96,10 @@ log_config::log_config(
   with_cache with,
   std::optional<file_sanitize_config> file_cfg) noexcept
   : log_config(
-    std::move(directory),
-    segment_size,
-    compaction_priority,
-    std::move(file_cfg)) {
+      std::move(directory),
+      segment_size,
+      compaction_priority,
+      std::move(file_cfg)) {
     cache = with;
 }
 
@@ -143,13 +144,16 @@ log_manager::log_manager(
   , _feature_table(feature_table)
   , _jitter(_config.compaction_interval())
   , _trigger_gc_jitter(0s, 5s)
-  , _batch_cache(_config.reclaim_opts) {
+  , _batch_cache(_config.reclaim_opts)
+  , _probe(std::make_unique<log_manager_probe>()) {
     _config.compaction_interval.watch([this]() {
         _jitter = simple_time_jitter<ss::lowres_clock>{
           _config.compaction_interval()};
         _housekeeping_sem.signal();
     });
 }
+
+log_manager::~log_manager() = default;
 
 ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
     auto clean_segment = co_await log->close();
@@ -171,6 +175,7 @@ ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
 }
 
 ss::future<> log_manager::start() {
+    _probe->setup_metrics();
     if (unlikely(config::shard_local_cfg()
                    .log_disable_housekeeping_for_tests.value())) {
         co_return;
@@ -189,12 +194,14 @@ ss::future<> log_manager::stop() {
           return clean_close(entry.second->handle);
       });
     co_await _batch_cache.stop();
-    co_await ssx::async_clear(_logs)();
+    co_await ssx::async_clear(_logs);
     if (_compaction_hash_key_map) {
         // Clear memory used for the compaction hash map, if any.
         co_await _compaction_hash_key_map->initialize(0);
         _compaction_hash_key_map.reset();
     }
+
+    _probe->clear_metrics();
 }
 
 /**
@@ -275,10 +282,12 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
           collection_threshold,
           _config.retention_bytes(),
           current_log.handle->stm_manager()->max_collectible_offset(),
+          current_log.handle->config().tombstone_retention_ms(),
           _config.compaction_priority,
           _abort_source,
           std::move(ntp_sanitizer_cfg),
           _compaction_hash_key_map.get()));
+        _probe->housekeeping_log_processed();
 
         // bail out of compaction early in order to get back to gc
         if (_gc_triggered) {
@@ -358,6 +367,7 @@ ss::future<> log_manager::housekeeping_loop() {
             // it is expected that callers set the flag whenever they want the
             // next round of housekeeping to priortize gc.
             _gc_triggered = false;
+            _probe->urgent_gc_run();
 
             /*
              * build a schedule of partitions to gc ordered by amount of
@@ -433,8 +443,12 @@ ss::future<> log_manager::housekeeping_loop() {
 
         try {
             co_await housekeeping_scan(lowest_ts_to_retain());
-        } catch (const std::exception& e) {
-            vlog(stlog.info, "Error processing housekeeping(): {}", e);
+        } catch (...) {
+            auto eptr = std::current_exception();
+            if (ssx::is_shutdown_exception(eptr)) {
+                std::rethrow_exception(eptr);
+            }
+            vlog(stlog.warn, "Error processing housekeeping(): {}", eptr);
         }
 
         co_await ss::coroutine::switch_to(prev_sg);
@@ -452,6 +466,7 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
   ss::io_priority_class pc,
   size_t read_buf_size,
   unsigned read_ahead,
+  size_t segment_size_hint,
   record_version_type version) {
     auto gate_holder = _gate.hold();
 
@@ -468,7 +483,8 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
       create_cache(ntp.cache_enabled()),
       _resources,
       _feature_table,
-      std::move(ntp_sanitizer_cfg));
+      std::move(ntp_sanitizer_cfg),
+      segment_size_hint);
 }
 
 std::optional<batch_cache_index>
@@ -569,7 +585,7 @@ ss::future<ss::shared_ptr<log>> log_manager::do_manage(
     auto [it, success] = _logs.emplace(
       l->config().ntp(), std::make_unique<log_housekeeping_meta>(l));
     _logs_list.push_back(*it->second);
-    _resources.update_partition_count(_logs.size());
+    update_log_count();
     vassert(success, "Could not keep track of:{} - concurrency issue", l);
     co_return l;
 }
@@ -578,10 +594,10 @@ ss::future<> log_manager::shutdown(model::ntp ntp) {
     vlog(stlog.debug, "Asked to shutdown: {}", ntp);
     auto gate = _gate.hold();
     auto handle = _logs.extract(ntp);
-    if (handle.empty()) {
+    if (!handle) {
         co_return;
     }
-    co_await clean_close(handle.mapped()->handle);
+    co_await clean_close(handle.value().second->handle);
     vlog(stlog.debug, "Shutdown: {}", ntp);
 }
 
@@ -589,12 +605,12 @@ ss::future<> log_manager::remove(model::ntp ntp) {
     vlog(stlog.info, "Asked to remove: {}", ntp);
     auto g = _gate.hold();
     auto handle = _logs.extract(ntp);
-    _resources.update_partition_count(_logs.size());
-    if (handle.empty()) {
+    update_log_count();
+    if (!handle) {
         co_return;
     }
     // 'ss::shared_ptr<>' make a copy
-    auto lg = handle.mapped()->handle;
+    auto lg = handle.value().second->handle;
     vlog(stlog.info, "Removing: {}", lg);
     // NOTE: it is ok to *not* externally synchronize the log here
     // because remove, takes a write lock on each individual segments
@@ -656,8 +672,8 @@ ss::future<> remove_orphan_partition_files(
               vlog(stlog.info, "Cleaning up ntp directory {} ", ntp_directory);
               return ss::recursive_remove_directory(ntp_directory)
                 .handle_exception_type([ntp_directory](
-                                         std::filesystem::
-                                           filesystem_error const& err) {
+                                         const std::filesystem::
+                                           filesystem_error& err) {
                     vlog(
                       stlog.error,
                       "Exception while cleaning orphan files for {} Error: {}",
@@ -713,7 +729,7 @@ ss::future<> log_manager::remove_orphan_files(
                       topic_directory.string());
                 })
                 .handle_exception_type(
-                  [](std::filesystem::filesystem_error const& err) {
+                  [](const std::filesystem::filesystem_error& err) {
                       auto lvl = err.code()
                                      == std::errc::no_such_file_or_directory
                                    ? ss::log_level::trace
@@ -726,7 +742,7 @@ ss::future<> log_manager::remove_orphan_files(
                   });
           })
           .handle_exception_type(
-            [](std::filesystem::filesystem_error const& err) {
+            [](const std::filesystem::filesystem_error& err) {
                 vlog(
                   stlog.error, "Exception while cleaning orphan files {}", err);
             });
@@ -870,6 +886,13 @@ gc_config log_manager::default_gc_config() const {
           model::timestamp::now().value() - _config.log_retention()->count());
     }
     return {collection_threshold, _config.retention_bytes()};
+}
+
+void log_manager::update_log_count() {
+    auto count = _logs.size();
+
+    _resources.update_partition_count(count);
+    _probe->set_log_count(count);
 }
 
 } // namespace storage

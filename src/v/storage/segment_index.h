@@ -64,8 +64,8 @@ struct time_based_retention_cfg {
     bool use_broker_time;
     bool use_escape_hatch_for_timestamps_in_the_future;
 
-    static auto make(features::feature_table const& ft)
-      -> time_based_retention_cfg {
+    static auto
+    make(const features::feature_table& ft) -> time_based_retention_cfg {
         return {
           .use_broker_time = ft.is_active(
             features::feature::broker_time_based_retention),
@@ -113,12 +113,7 @@ struct time_based_retention_cfg {
 class segment_index {
 public:
     /// brief hydrated entry
-    struct entry {
-        model::offset offset;
-        model::timestamp timestamp;
-        size_t filepos;
-        friend std::ostream& operator<<(std::ostream&, const entry&);
-    };
+    using entry = index_state::entry;
 
     // 32KB - a well known number as a sweet spot for fetching data from disk
     static constexpr size_t default_data_buffer_step = 4096 * 8;
@@ -129,7 +124,9 @@ public:
       size_t step,
       ss::sharded<features::feature_table>& feature_table,
       std::optional<ntp_sanitizer_config> sanitizer_config,
-      std::optional<model::timestamp> broker_timestamp = std::nullopt);
+      std::optional<model::timestamp> broker_timestamp = std::nullopt,
+      std::optional<model::timestamp> clean_compact_timestamp = std::nullopt,
+      bool may_have_tombstone_records = true);
 
     ~segment_index() noexcept = default;
     segment_index(segment_index&&) noexcept = default;
@@ -194,6 +191,39 @@ public:
     model::timestamp retention_timestamp(time_based_retention_cfg cfg) const {
         return cfg.compute_retention_ms(
           _state.broker_timestamp, _state.max_timestamp, _retention_timestamp);
+    }
+
+    // Check if compacted timestamp has a value.
+    bool has_clean_compact_timestamp() const {
+        return _state.clean_compact_timestamp.has_value();
+    }
+
+    // Set the compacted timestamp, if it doesn't already have a value.
+    // Returns a boolean indicating whether the clean compact timestamp was set
+    // or not.
+    bool maybe_set_clean_compact_timestamp(model::timestamp t) {
+        if (!_state.clean_compact_timestamp.has_value()) {
+            _state.clean_compact_timestamp = t;
+            _needs_persistence = true;
+            return true;
+        }
+        return false;
+    }
+
+    // Get the compacted timestamp.
+    std::optional<model::timestamp> clean_compact_timestamp() const {
+        return _state.clean_compact_timestamp;
+    }
+
+    void set_may_have_tombstone_records(bool b) {
+        if (_state.may_have_tombstone_records != b) {
+            _needs_persistence = true;
+        }
+        _state.may_have_tombstone_records = b;
+    }
+
+    bool may_have_tombstone_records() const {
+        return _state.may_have_tombstone_records;
     }
 
     ss::future<bool> materialize_index();
@@ -273,7 +303,7 @@ operator<<(std::ostream&, const std::optional<segment_index::entry>&);
 template<>
 struct fmt::formatter<storage::time_based_retention_cfg>
   : public fmt::formatter<std::string_view> {
-    auto format(storage::time_based_retention_cfg const& cfg, auto& ctx) const {
+    auto format(const storage::time_based_retention_cfg& cfg, auto& ctx) const {
         auto str = ssx::sformat(
           "[.use_broker_time={}, "
           ".use_escape_hatch_for_timestamps_in_the_future={}]",

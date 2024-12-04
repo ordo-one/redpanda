@@ -9,10 +9,10 @@
 
 #include "raft/recovery_stm.h"
 
+#include "base/outcome_future_utils.h"
 #include "bytes/iostream.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
-#include "outcome_future_utils.h"
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
@@ -20,6 +20,7 @@
 #include "raft/raftgen_service.h"
 #include "ssx/sformat.h"
 #include "storage/snapshot.h"
+#include "utils/human.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
@@ -152,12 +153,14 @@ ss::future<> recovery_stm::do_recover(ss::io_priority_class iopc) {
     }
     // acquire read memory:
     auto read_memory_units = co_await _memory_quota.acquire_read_memory();
-    auto reader = co_await read_range_for_recovery(
+    auto tuple = co_await read_range_for_recovery(
       follower_next_offset, iopc, is_learner, read_memory_units.count());
     // no batches for recovery, do nothing
-    if (!reader) {
+    if (!tuple) {
         co_return;
     }
+    auto reader = std::move(std::get<0>(*tuple));
+    auto range_size = std::get<1>(*tuple);
 
     if (is_recovery_finished()) {
         _stop_requested = true;
@@ -169,7 +172,8 @@ ss::future<> recovery_stm::do_recover(ss::io_priority_class iopc) {
         _recovered_bytes_since_flush = 0;
     }
 
-    co_await replicate(std::move(*reader), flush, std::move(read_memory_units));
+    co_await replicate(
+      std::move(reader), flush, std::move(read_memory_units), range_size);
 }
 
 flush_after_append
@@ -208,6 +212,11 @@ recovery_stm::should_flush(model::offset follower_committed_match_index) const {
     return flush_after_append(is_last || should_checkpoint_flush);
 }
 
+bool recovery_stm::is_snapshot_at_offset_supported() const {
+    return !_ptr->stm_manager().has_value()
+           || _ptr->stm_manager()->supports_snapshot_at_offset();
+}
+
 recovery_stm::required_snapshot_type recovery_stm::get_required_snapshot_type(
   const follower_index_metadata& follower_metadata) const {
     /**
@@ -216,8 +225,10 @@ recovery_stm::required_snapshot_type recovery_stm::get_required_snapshot_type(
      * use greater than (not greater than or equal) while the other branch is
      * comparing next index with last included snapshot offset
      */
+
     if (
-      follower_metadata.is_learner && _ptr->get_learner_start_offset()
+      is_snapshot_at_offset_supported() && follower_metadata.is_learner
+      && _ptr->get_learner_start_offset()
       && follower_metadata.next_index < *_ptr->get_learner_start_offset()) {
         // current snapshot moved beyond configured learner start offset, we can
         // use current snapshot instead creating a new on demand one
@@ -231,7 +242,7 @@ recovery_stm::required_snapshot_type recovery_stm::get_required_snapshot_type(
     return required_snapshot_type::none;
 }
 
-ss::future<std::optional<model::record_batch_reader>>
+ss::future<std::optional<std::tuple<model::record_batch_reader, size_t>>>
 recovery_stm::read_range_for_recovery(
   model::offset start_offset,
   ss::io_priority_class iopc,
@@ -301,8 +312,10 @@ recovery_stm::read_range_for_recovery(
               });
         }
 
-        co_return model::make_foreign_fragmented_memory_record_batch_reader(
-          std::move(gap_filled_batches));
+        co_return std::make_tuple(
+          model::make_foreign_fragmented_memory_record_batch_reader(
+            std::move(gap_filled_batches)),
+          size);
     } catch (const ss::timed_out_error& e) {
         vlog(
           _ctxlog.error,
@@ -364,7 +377,7 @@ ss::future<> recovery_stm::send_install_snapshot_request() {
               = _inflight_snapshot_last_included_index;
         }
         vlog(_ctxlog.trace, "sending install_snapshot request: {}", req);
-        auto hb_guard = _ptr->suppress_heartbeats(_node_id);
+        auto append_guard = _ptr->track_append_inflight(_node_id);
         return _ptr->_client_protocol
           .install_snapshot(
             _node_id.id(),
@@ -375,7 +388,7 @@ ss::future<> recovery_stm::send_install_snapshot_request() {
                 _ptr->validate_reply_target_node(
                   "install_snapshot", reply, _node_id.id()));
           })
-          .finally([hb_guard = std::move(hb_guard)] {});
+          .finally([append_guard = std::move(append_guard)] {});
     });
 }
 ss::future<iobuf> recovery_stm::read_snapshot_chunk() {
@@ -454,9 +467,14 @@ ss::future<> recovery_stm::install_snapshot(required_snapshot_type s_type) {
 ss::future<>
 recovery_stm::take_on_demand_snapshot(model::offset last_included_offset) {
     vlog(
-      _ctxlog.debug,
-      "creating on demand snapshot with last included offset: {}",
-      last_included_offset);
+      _ctxlog.info,
+      "creating on demand snapshot with last included offset: {}, current "
+      "leader start offset: {}. Total partition size on leader {}, expected to "
+      "transfer to learner: {}",
+      last_included_offset,
+      _ptr->start_offset(),
+      human::bytes(_ptr->log()->size_bytes()),
+      human::bytes(_ptr->log()->size_bytes_after_offset(last_included_offset)));
 
     _inflight_snapshot_last_included_index = last_included_offset;
     // if there is no stm_manager available for the raft group use empty
@@ -464,8 +482,9 @@ recovery_stm::take_on_demand_snapshot(model::offset last_included_offset) {
     iobuf snapshot_data;
 
     if (_ptr->stm_manager()) {
-        snapshot_data = co_await _ptr->stm_manager()->take_snapshot(
-          last_included_offset);
+        snapshot_data = (co_await _ptr->stm_manager()->take_snapshot(
+                           last_included_offset))
+                          .data;
     }
     auto cfg = _ptr->_configuration_manager.get(last_included_offset);
     const auto term = _ptr->log()->get_term(last_included_offset);
@@ -508,7 +527,8 @@ recovery_stm::take_on_demand_snapshot(model::offset last_included_offset) {
 ss::future<> recovery_stm::replicate(
   model::record_batch_reader&& reader,
   flush_after_append flush,
-  ssx::semaphore_units mem_units) {
+  ssx::semaphore_units mem_units,
+  size_t range_size) {
     // collect metadata for append entries request
     // last persisted offset is last_offset of batch before the first one in the
     // reader
@@ -548,6 +568,7 @@ ss::future<> recovery_stm::replicate(
         .last_visible_index = last_visible_idx,
         .dirty_offset = lstats.dirty_offset},
       std::move(reader),
+      range_size,
       flush);
     auto meta = get_follower_meta();
 
@@ -576,12 +597,12 @@ ss::future<> recovery_stm::replicate(
     _ptr->update_node_append_timestamp(_node_id);
 
     auto seq = _ptr->next_follower_sequence(_node_id);
-    auto hb_guard = _ptr->suppress_heartbeats(_node_id);
+    auto append_guard = _ptr->track_append_inflight(_node_id);
 
     std::vector<ssx::semaphore_units> units;
     units.push_back(std::move(mem_units));
     return dispatch_append_entries(std::move(r), std::move(units))
-      .finally([hb_guard = std::move(hb_guard)] {})
+      .finally([append_guard = std::move(append_guard)] {})
       .then([this, seq, dirty_offset = lstats.dirty_offset](auto r) {
           if (!r) {
               vlog(
@@ -642,11 +663,7 @@ ss::future<result<append_entries_reply>> recovery_stm::dispatch_append_entries(
       ss::make_lw_shared<std::vector<ssx::semaphore_units>>(std::move(units)));
 
     return _ptr->_client_protocol
-      .append_entries(
-        _node_id.id(),
-        std::move(r),
-        std::move(opts),
-        _ptr->use_all_serde_append_entries())
+      .append_entries(_node_id.id(), std::move(r), std::move(opts))
       .then([this](result<append_entries_reply> reply) {
           return _ptr->validate_reply_target_node(
             "append_entries_recovery", reply, _node_id.id());

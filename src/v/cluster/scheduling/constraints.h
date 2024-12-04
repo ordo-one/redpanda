@@ -22,7 +22,7 @@ namespace cluster {
 
 class allocation_state;
 
-static constexpr std::string_view rack_label = "rack";
+inline constexpr std::string_view rack_label = "rack";
 
 hard_constraint not_fully_allocated();
 hard_constraint is_active();
@@ -50,10 +50,8 @@ hard_constraint disk_not_overflowed_by_partition(
 /*
  * Scores nodes based on partition count after all moves have been finished
  * returning `0` for fully allocated nodes and `max_capacity` for empty nodes.
- * If partition_allocation_domain != common, takes into account only counts
- * in this domain.
  */
-soft_constraint max_final_capacity(partition_allocation_domain);
+soft_constraint max_final_capacity();
 
 /*
  * constraint scores nodes on free disk space
@@ -94,7 +92,7 @@ distinct_labels_preferred(const char* label_name, Mapper&& mapper) {
             std::optional<T> prev_label;
 
             for (auto& r : partition.replicas()) {
-                auto const l = _mapper(r.node_id);
+                const auto l = _mapper(r.node_id);
                 if (!l) {
                     continue;
                 }

@@ -12,6 +12,7 @@
 #include "model/metadata.h"
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
+#include "raft/broker_compat.h"
 #include "raft/consensus_utils.h"
 #include "raft/group_configuration.h"
 #include "random/generators.h"
@@ -20,7 +21,6 @@
 
 #include <seastar/testing/thread_test_case.hh>
 
-#include <bits/stdint-uintn.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <iterator>
@@ -173,7 +173,7 @@ SEASTAR_THREAD_TEST_CASE(test_config_extracting_reader) {
           BOOST_REQUIRE_EQUAL(configurations[1].offset, offsets[1]);
           BOOST_REQUIRE_EQUAL(configurations[1].cfg, cfg_2);
       })
-      .get0();
+      .get();
 }
 
 /**

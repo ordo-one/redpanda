@@ -49,10 +49,10 @@ FIXTURE_TEST(register_node, partition_allocator_fixture) {
     register_node(0, 32);
     register_node(1, 64);
     register_node(2, 12);
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(0)));
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(1)));
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(2)));
-    BOOST_REQUIRE_EQUAL(allocator.state().available_nodes(), 3);
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(0)));
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(1)));
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(2)));
+    BOOST_REQUIRE_EQUAL(allocator().state().available_nodes(), 3);
 }
 
 model::broker create_broker(
@@ -72,52 +72,93 @@ FIXTURE_TEST(unregister_node, partition_allocator_fixture) {
     register_node(1, 64);
     register_node(2, 12);
 
-    allocator.update_allocation_nodes(
+    allocator().update_allocation_nodes(
       std::vector<model::broker>{create_broker(0, 32), create_broker(2, 12)});
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(0)));
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(0)));
     // allocator MUST still contain the node. it has to be marked as removed
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(1)));
-    BOOST_REQUIRE(allocator.state()
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(1)));
+    BOOST_REQUIRE(allocator()
+                    .state()
                     .allocation_nodes()
                     .find(model::node_id(1))
                     ->second->is_removed());
-    BOOST_REQUIRE(allocator.contains_node(model::node_id(2)));
-    BOOST_REQUIRE_EQUAL(allocator.state().available_nodes(), 2);
+    BOOST_REQUIRE(allocator().contains_node(model::node_id(2)));
+    BOOST_REQUIRE_EQUAL(allocator().state().available_nodes(), 2);
 }
 
 FIXTURE_TEST(allocation_over_core_capacity, partition_allocator_fixture) {
     const auto partition_count
       = partition_allocator_fixture::partitions_per_shard + 1;
     register_node(0, 1);
-    auto result
-      = allocator.allocate(make_allocation_request(partition_count, 1)).get();
-    BOOST_REQUIRE(result.has_error());
-    BOOST_REQUIRE_EQUAL(
-      result.assume_error(),
-      cluster::make_error_code(
-        cluster::errc::topic_invalid_partitions_core_limit));
+
+    {
+        auto result = allocator()
+                        .allocate(make_allocation_request(partition_count, 1))
+                        .get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_core_limit));
+    }
+
+    {
+        auto result = allocator()
+                        .allocate(
+                          make_simple_allocation_request(partition_count, 1))
+                        .get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_core_limit));
+    }
 }
 
 FIXTURE_TEST(
   allocation_over_memory_capacity, partition_allocator_memory_limited_fixture) {
     register_node(0, 1);
-    auto result = allocator.allocate(make_allocation_request(1, 1)).get();
-    BOOST_REQUIRE(result.has_error());
-    BOOST_REQUIRE_EQUAL(
-      result.assume_error(),
-      cluster::make_error_code(
-        cluster::errc::topic_invalid_partitions_memory_limit));
+
+    {
+        auto result = allocator().allocate(make_allocation_request(1, 1)).get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_memory_limit));
+    }
+    {
+        auto result
+          = allocator().allocate(make_simple_allocation_request(1, 1)).get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_memory_limit));
+    }
 }
 
 FIXTURE_TEST(
   allocation_over_fds_capacity, partition_allocator_fd_limited_fixture) {
     register_node(0, 1);
-    auto result = allocator.allocate(make_allocation_request(1, 1)).get();
-    BOOST_REQUIRE(result.has_error());
-    BOOST_REQUIRE_EQUAL(
-      result.assume_error(),
-      cluster::make_error_code(
-        cluster::errc::topic_invalid_partitions_fd_limit));
+
+    {
+        auto result = allocator().allocate(make_allocation_request(1, 1)).get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_fd_limit));
+    }
+    {
+        auto result
+          = allocator().allocate(make_simple_allocation_request(1, 1)).get();
+        BOOST_REQUIRE(result.has_error());
+        BOOST_REQUIRE_EQUAL(
+          result.assume_error(),
+          cluster::make_error_code(
+            cluster::errc::topic_invalid_partitions_fd_limit));
+    }
 }
 
 FIXTURE_TEST(allocation_over_capacity, partition_allocator_fixture) {
@@ -126,21 +167,21 @@ FIXTURE_TEST(allocation_over_capacity, partition_allocator_fixture) {
     register_node(2, 6);
 
     saturate_all_machines();
-    auto gr = allocator.state().last_group_id();
+    auto gr = allocator().state().last_group_id();
     BOOST_REQUIRE(
-      allocator.allocate(make_allocation_request(1, 1)).get().has_error());
+      allocator().allocate(make_allocation_request(1, 1)).get().has_error());
     // group id hasn't changed
-    BOOST_REQUIRE_EQUAL(allocator.state().last_group_id(), gr);
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id(), gr);
 
     // Make the topic internal and retry, should work.
     kafka_internal_topics.update({tn.tp()});
-    BOOST_REQUIRE(allocator.allocate(make_allocation_request(1, 1)).get());
-    BOOST_REQUIRE_GT(allocator.state().last_group_id(), gr);
+    BOOST_REQUIRE(allocator().allocate(make_allocation_request(1, 1)).get());
+    BOOST_REQUIRE_GT(allocator().state().last_group_id(), gr);
 
     // Undo the configuration, should fail again.
     kafka_internal_topics.update({});
     BOOST_REQUIRE(
-      allocator.allocate(make_allocation_request(1, 1)).get().has_error());
+      allocator().allocate(make_allocation_request(1, 1)).get().has_error());
 
     auto int_1 = model::topic_namespace{
       model::ns{"redpanda"}, model::topic{"controller"}};
@@ -148,9 +189,9 @@ FIXTURE_TEST(allocation_over_capacity, partition_allocator_fixture) {
       model::ns{"kafka_internal"}, model::topic{"controller"}};
     // Internal namespaces should work too.
     BOOST_REQUIRE(
-      allocator.allocate(make_allocation_request(int_1, 1, 1)).get());
+      allocator().allocate(make_allocation_request(int_1, 1, 1)).get());
     BOOST_REQUIRE(
-      allocator.allocate(make_allocation_request(int_2, 1, 1)).get());
+      allocator().allocate(make_allocation_request(int_2, 1, 1)).get());
 }
 
 FIXTURE_TEST(max_allocation, partition_allocator_fixture) {
@@ -162,16 +203,16 @@ FIXTURE_TEST(max_allocation, partition_allocator_fixture) {
 
     auto req = make_allocation_request(max_capacity() / 3, 3);
 
-    auto units = allocator.allocate(std::move(req)).get().value();
+    auto units = allocator().allocate(std::move(req)).get().value();
 
     BOOST_REQUIRE_EQUAL(units->get_assignments().size(), 1998);
     BOOST_REQUIRE_EQUAL(allocated_nodes_count(units->get_assignments()), 5994);
-    BOOST_REQUIRE_EQUAL(allocator.state().last_group_id()(), 1998);
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), 1998);
     validate_replica_set_diversity(units->get_assignments());
 
     // make sure there is no room left after
     auto single_partition_req = make_allocation_request(1, 1);
-    auto result = allocator.allocate(std::move(single_partition_req)).get();
+    auto result = allocator().allocate(std::move(single_partition_req)).get();
     BOOST_REQUIRE(result.has_error());
 }
 
@@ -181,7 +222,7 @@ FIXTURE_TEST(unsatisfyable_diversity_assignment, partition_allocator_fixture) {
     register_node(2, 6);
 
     auto req = make_allocation_request(1, 5);
-    auto allocs = allocator.allocate(std::move(req)).get();
+    auto allocs = allocator().allocate(std::move(req)).get();
     BOOST_TEST_REQUIRE(allocs.has_error());
     BOOST_REQUIRE_EQUAL(
       cluster::errc(allocs.error().value()),
@@ -190,7 +231,7 @@ FIXTURE_TEST(unsatisfyable_diversity_assignment, partition_allocator_fixture) {
     // ensure rollback happened
     BOOST_REQUIRE(all_nodes_empty());
 
-    BOOST_REQUIRE_EQUAL(allocator.state().last_group_id()(), 0);
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), 0);
 }
 
 FIXTURE_TEST(diverse_replica_sets, partition_allocator_fixture) {
@@ -212,7 +253,7 @@ FIXTURE_TEST(diverse_replica_sets, partition_allocator_fixture) {
     absl::flat_hash_set<std::vector<model::broker_shard>> seen_replicas;
     for (int i = 0; i < 1000; i++) {
         auto req = make_allocation_request(1, r);
-        auto result = allocator.allocate(std::move(req)).get();
+        auto result = allocator().allocate(std::move(req)).get();
         BOOST_REQUIRE(result);
         auto assignments = result.value()->copy_assignments();
         BOOST_REQUIRE(assignments.size() == 1);
@@ -231,7 +272,7 @@ FIXTURE_TEST(partial_assignment, partition_allocator_fixture) {
     register_node(2, 2);
     auto max_partitions_in_cluster = max_capacity() / 3;
 
-    auto units_1 = allocator
+    auto units_1 = allocator()
                      .allocate(make_allocation_request(
                        max_partitions_in_cluster - 1, 3))
                      .get()
@@ -242,12 +283,12 @@ FIXTURE_TEST(partial_assignment, partition_allocator_fixture) {
     // allocate 2 partitions - one should fail, returning null & deallocating
 
     auto req_2 = make_allocation_request(2, 3);
-    auto units_2 = allocator.allocate(std::move(req_2)).get();
+    auto units_2 = allocator().allocate(std::move(req_2)).get();
     BOOST_REQUIRE(units_2.has_error());
 
     BOOST_REQUIRE_EQUAL(3, max_capacity());
     BOOST_REQUIRE_EQUAL(
-      allocator.state().last_group_id()(), max_partitions_in_cluster - 1);
+      allocator().state().last_group_id()(), max_partitions_in_cluster - 1);
 }
 FIXTURE_TEST(max_deallocation, partition_allocator_fixture) {
     register_node(0, 3);
@@ -257,16 +298,17 @@ FIXTURE_TEST(max_deallocation, partition_allocator_fixture) {
     const auto max = max_capacity();
 
     {
-        auto allocs = allocator.allocate(make_allocation_request(max / 3, 3))
+        auto allocs = allocator()
+                        .allocate(make_allocation_request(max / 3, 3))
                         .get()
                         .value();
 
         BOOST_REQUIRE_EQUAL(allocs->get_assignments().size() * 3, max);
 
-        BOOST_REQUIRE_EQUAL(allocator.state().last_group_id()(), max / 3);
+        BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), max / 3);
     }
 
-    BOOST_REQUIRE_EQUAL(allocator.state().last_group_id()(), max / 3);
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), max / 3);
     BOOST_REQUIRE_EQUAL(max_capacity(), max);
 }
 
@@ -290,28 +332,30 @@ FIXTURE_TEST(recovery_test, partition_allocator_fixture) {
     };
     // 100 topics with 12 partitions each replicated on 3 nodes each
     auto replicas = create_replicas(100, 12);
-    allocator.add_allocations(
-      replicas, cluster::partition_allocation_domains::common);
+    allocator().add_allocations(replicas);
     // each node in the cluster holds one replica for each partition,
     // so it has to have topics * partitions shards allocated
     cluster::allocation_node::allocation_capacity allocated_shards{100 * 12};
     // Remaining capacity on node 0
     BOOST_REQUIRE_EQUAL(
-      allocator.state()
+      allocator()
+        .state()
         .allocation_nodes()
         .find(model::node_id(0))
         ->second->allocated_partitions(),
       allocated_shards);
     // Remaining capacity on node 1
     BOOST_REQUIRE_EQUAL(
-      allocator.state()
+      allocator()
+        .state()
         .allocation_nodes()
         .find(model::node_id(1))
         ->second->allocated_partitions(),
       allocated_shards);
     // Remaining capacity on node 2
     BOOST_REQUIRE_EQUAL(
-      allocator.state()
+      allocator()
+        .state()
         .allocation_nodes()
         .find(model::node_id(2))
         ->second->allocated_partitions(),
@@ -326,7 +370,7 @@ FIXTURE_TEST(allocation_units_test, partition_allocator_fixture) {
 
     {
         auto allocs
-          = allocator.allocate(make_allocation_request(10, 3)).get().value();
+          = allocator().allocate(make_allocation_request(10, 3)).get().value();
         BOOST_REQUIRE_EQUAL(allocs->get_assignments().size(), 10);
         BOOST_REQUIRE_EQUAL(
           allocated_nodes_count(allocs->get_assignments()), 3 * 10);
@@ -335,16 +379,37 @@ FIXTURE_TEST(allocation_units_test, partition_allocator_fixture) {
     BOOST_REQUIRE(all_nodes_empty());
 
     // we do not decrement the highest raft group
-    BOOST_REQUIRE_EQUAL(allocator.state().last_group_id()(), 10);
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), 10);
+}
+FIXTURE_TEST(allocation_units_test_raw_req, partition_allocator_fixture) {
+    register_node(1, 10);
+    register_node(2, 11);
+    register_node(3, 12);
+    // just fill up the cluster partially
+
+    {
+        auto allocs = allocator()
+                        .allocate(make_simple_allocation_request(10, 3))
+                        .get()
+                        .value();
+        BOOST_REQUIRE_EQUAL(allocs->get_assignments().size(), 10);
+        BOOST_REQUIRE_EQUAL(
+          allocated_nodes_count(allocs->get_assignments()), 3 * 10);
+    }
+
+    BOOST_REQUIRE(all_nodes_empty());
+
+    // we do not decrement the highest raft group
+    BOOST_REQUIRE_EQUAL(allocator().state().last_group_id()(), 10);
 }
 FIXTURE_TEST(decommission_node, partition_allocator_fixture) {
     register_node(0, 32);
     register_node(1, 64);
     register_node(2, 12);
-    allocator.decommission_node(model::node_id(1));
+    allocator().decommission_node(model::node_id(1));
 
     // only two of machines are available as one of them is decommissioned
-    BOOST_REQUIRE_EQUAL(allocator.state().available_nodes(), 2);
+    BOOST_REQUIRE_EQUAL(allocator().state().available_nodes(), 2);
 }
 
 cluster::hard_constraint make_throwing_hard_evaluator() {
@@ -415,14 +480,12 @@ FIXTURE_TEST(allocator_exception_safety_test, partition_allocator_fixture) {
         req.partitions.front().constraints.hard_constraints.push_back(
           ss::make_lw_shared<cluster::hard_constraint>(random_evaluator()));
         try {
-            auto res = allocator.allocate(std::move(req)).get();
+            auto res = allocator().allocate(std::move(req)).get();
             if (res) {
                 capacity--;
                 for (auto& as : res.value()->get_assignments()) {
-                    allocator.add_allocations_for_new_partition(
-                      as.replicas,
-                      as.group,
-                      cluster::partition_allocation_domains::common);
+                    allocator().add_allocations_for_new_partition(
+                      as.replicas, as.group);
                 }
             }
 
@@ -441,20 +504,18 @@ FIXTURE_TEST(updating_nodes_properties, partition_allocator_fixture) {
     for (int i = 0; i < 50; ++i) {
         // try to allocate single partition
         auto req = make_allocation_request(1, 1);
-        auto res = allocator.allocate(std::move(req)).get();
+        auto res = allocator().allocate(std::move(req)).get();
         if (res) {
             for (auto& as : res.value()->get_assignments()) {
-                allocator.add_allocations_for_new_partition(
-                  as.replicas,
-                  as.group,
-                  cluster::partition_allocation_domains::common);
+                allocator().add_allocations_for_new_partition(
+                  as.replicas, as.group);
             }
         }
     }
-    auto it = allocator.state().allocation_nodes().find(model::node_id(1));
+    auto it = allocator().state().allocation_nodes().find(model::node_id(1));
     auto allocated = it->second->allocated_partitions();
     auto new_rack = model::rack_id{"rack_A"};
-    allocator.update_allocation_nodes(std::vector<model::broker>{
+    allocator().update_allocation_nodes(std::vector<model::broker>{
       create_broker(0, 2),
       create_broker(1, 10, new_rack),
       create_broker(2, 7)});
@@ -471,14 +532,13 @@ FIXTURE_TEST(change_replication_factor, partition_allocator_fixture) {
     register_node(0, 4);
     register_node(1, 4);
     auto req = make_allocation_request(2, 1);
-    auto res = allocator.allocate(std::move(req)).get();
+    auto res = allocator().allocate(std::move(req)).get();
 
     BOOST_CHECK_EQUAL(res.has_value(), true);
     const auto& orig_assignments = res.value()->get_assignments();
 
     auto make_reallocate_req = [&] {
-        cluster::allocation_request req(
-          tn, cluster::partition_allocation_domains::common);
+        cluster::allocation_request req(tn);
         for (const auto& assignment : orig_assignments) {
             req.partitions.push_back(
               cluster::partition_constraints(assignment, 3));
@@ -487,14 +547,14 @@ FIXTURE_TEST(change_replication_factor, partition_allocator_fixture) {
     };
 
     // try to allocate 3 replicas on 2 nodes - should fail
-    auto expected_failure = allocator.allocate(make_reallocate_req()).get();
+    auto expected_failure = allocator().allocate(make_reallocate_req()).get();
 
     BOOST_CHECK_EQUAL(expected_failure.has_error(), true);
 
     // add new node and allocate again
     register_node(2, 4);
 
-    auto expected_success = allocator.allocate(make_reallocate_req()).get();
+    auto expected_success = allocator().allocate(make_reallocate_req()).get();
 
     BOOST_CHECK_EQUAL(expected_success.has_value(), true);
     BOOST_REQUIRE_EQUAL(
@@ -527,7 +587,7 @@ FIXTURE_TEST(rack_aware_assignment_1, partition_allocator_fixture) {
     }
 
     auto units
-      = allocator.allocate(make_allocation_request(1, 3)).get().value();
+      = allocator().allocate(make_allocation_request(1, 3)).get().value();
 
     BOOST_REQUIRE(!units->get_assignments().empty());
     auto group = units->get_assignments().front();
@@ -559,7 +619,7 @@ FIXTURE_TEST(rack_aware_assignment_2, partition_allocator_fixture) {
     }
 
     auto units
-      = allocator.allocate(make_allocation_request(1, 3)).get().value();
+      = allocator().allocate(make_allocation_request(1, 3)).get().value();
 
     BOOST_REQUIRE(!units->get_assignments().empty());
     auto group = units->get_assignments().front();
@@ -579,82 +639,13 @@ FIXTURE_TEST(rack_aware_assignment_2, partition_allocator_fixture) {
     BOOST_REQUIRE(racks.contains("rack-b"));
 }
 
-FIXTURE_TEST(even_distribution_pri_allocation, partition_allocator_fixture) {
-    // allocate some regular partitions in the cluster but leave space
-    register_node(0, 2);
-    register_node(1, 2);
-    register_node(2, 2);
-    auto req_reg = make_allocation_request(max_capacity() / 4, 3);
-    auto units_reg = allocator.allocate(std::move(req_reg)).get().value();
-    // add empty nodes
-    register_node(3, 2);
-    register_node(4, 2);
-
-    // do several rounds of priority allocation
-    std::list<cluster::allocation_units::pointer> units;
-    for (int i = 0; i != 21; ++i) {
-        auto req = make_allocation_request(11 + i * 3, 1);
-        // there is only one priority allocation domain yet
-        static constexpr auto prio_domain
-          = cluster::partition_allocation_domains::consumer_offsets;
-        req.domain = prio_domain;
-        units.push_back(
-          std::move(allocator.allocate(std::move(req)).get().value()));
-
-        // invariant: number of partitions allocated in the priority domain
-        // across all nodes must be even, i.e. must not vary by more than one
-        // partition
-        const auto priority_part_capacity_minmax = std::minmax_element(
-          allocator.state().allocation_nodes().cbegin(),
-          allocator.state().allocation_nodes().cend(),
-          [](const auto& lhs, const auto& rhs) {
-              return lhs.second->domain_partition_capacity(prio_domain)
-                     < rhs.second->domain_partition_capacity(prio_domain);
-          });
-        BOOST_CHECK_LE(
-          priority_part_capacity_minmax.second->second
-              ->domain_partition_capacity(prio_domain)
-            - priority_part_capacity_minmax.first->second
-                ->domain_partition_capacity(prio_domain),
-          cluster::allocation_node::allocation_capacity(1));
-
-        // invariant: sum(max_capacity()-domain_partition_capacity(d)) for d in
-        // all_domains == max_capacity()-partition_capacity()
-        // as long as node is not overallocated
-        BOOST_CHECK(std::all_of(
-          allocator.state().allocation_nodes().cbegin(),
-          allocator.state().allocation_nodes().cend(),
-          [](const auto& allocation_nodes_v) {
-              const cluster::allocation_node& n = *allocation_nodes_v.second;
-              return n.domain_partition_capacity(
-                       cluster::partition_allocation_domains::consumer_offsets)
-                       + n.domain_partition_capacity(
-                         cluster::partition_allocation_domains::common)
-                       - n.max_capacity()
-                     == n.partition_capacity();
-          }));
-
-        // occassionaly deallocate prior allocations
-        if (i % 2 == 0) {
-            units.pop_front();
-            // after deallocation, partitions in the priority domain are not
-            // necessarily allocated evenly any more. However the next iteration
-            // of the test would fill the irregularities because there will be
-            // more partitions allocated (re: i*3) than what has been
-            // deallocated
-        }
-    }
-}
-
 void check_allocated_counts(
   const cluster::partition_allocator& allocator,
-  const std::vector<size_t>& expected,
-  cluster::partition_allocation_domain domain
-  = cluster::partition_allocation_domains::common) {
+  const std::vector<size_t>& expected) {
     std::vector<size_t> counts;
     for (const auto& [id, node] : allocator.state().allocation_nodes()) {
-        BOOST_REQUIRE(id() == counts.size());
-        counts.push_back(node->domain_allocated_partitions(domain));
+        BOOST_REQUIRE(id() == static_cast<int>(counts.size()));
+        counts.push_back(node->allocated_partitions());
     }
     logger.debug("allocated counts: {}, expected: {}", counts, expected);
     BOOST_CHECK_EQUAL(counts, expected);
@@ -662,13 +653,11 @@ void check_allocated_counts(
 
 void check_final_counts(
   const cluster::partition_allocator& allocator,
-  const std::vector<size_t>& expected,
-  cluster::partition_allocation_domain domain
-  = cluster::partition_allocation_domains::common) {
+  const std::vector<size_t>& expected) {
     std::vector<size_t> counts;
     for (const auto& [id, node] : allocator.state().allocation_nodes()) {
-        BOOST_REQUIRE(id() == counts.size());
-        counts.push_back(node->domain_final_partitions(domain));
+        BOOST_REQUIRE(id() == static_cast<int>(counts.size()));
+        counts.push_back(node->final_partitions());
     }
     logger.debug("final counts: {}, expected: {}", counts, expected);
     BOOST_CHECK_EQUAL(counts, expected);
@@ -691,29 +680,28 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
     register_node(2, 1);
 
     // allocate a partition with 3 replicas on 3 nodes
-    auto domain = cluster::partition_allocation_domains::common;
     auto req = make_allocation_request(1, 3);
-    auto res = allocator.allocate(std::move(req)).get();
+    auto res = allocator().allocate(std::move(req)).get();
     auto original_replicas = res.value()->get_assignments().front().replicas;
 
     // add another node to move replicas to and from
     register_node(3, 1);
 
-    check_allocated_counts(allocator, {1, 1, 1, 0});
-    check_final_counts(allocator, {1, 1, 1, 0});
+    check_allocated_counts(allocator(), {1, 1, 1, 0});
+    check_final_counts(allocator(), {1, 1, 1, 0});
 
     {
         auto partition_id = res.value()->get_assignments().front().id;
         auto ntp = model::ntp{tn.ns, tn.tp, partition_id};
         cluster::allocated_partition reallocated
-          = allocator.make_allocated_partition(
-            std::move(ntp), original_replicas, domain);
+          = allocator().make_allocated_partition(
+            std::move(ntp), original_replicas);
 
         cluster::allocation_constraints not_on_old_nodes;
         not_on_old_nodes.add(cluster::distinct_from(original_replicas));
 
         // move to node 3
-        auto moved = allocator.reallocate_replica(
+        auto moved = allocator().reallocate_replica(
           reallocated, model::node_id{0}, not_on_old_nodes);
         BOOST_REQUIRE(moved.has_value());
         BOOST_REQUIRE_EQUAL(moved.value().current().node_id, model::node_id{3});
@@ -721,11 +709,11 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(
           reallocated.replicas().at(2).node_id, model::node_id{3});
 
-        check_allocated_counts(allocator, {1, 1, 1, 1});
-        check_final_counts(allocator, {0, 1, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1});
+        check_final_counts(allocator(), {0, 1, 1, 1});
 
         // there is no replica on node 0 any more
-        auto moved2 = allocator.reallocate_replica(
+        auto moved2 = allocator().reallocate_replica(
           reallocated, model::node_id{0}, not_on_old_nodes);
         BOOST_REQUIRE(moved2.has_error());
         BOOST_REQUIRE_EQUAL(
@@ -733,17 +721,17 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
 
         // node 3 already has a replica so the replica on node 1 has nowhere to
         // move
-        auto moved3 = allocator.reallocate_replica(
+        auto moved3 = allocator().reallocate_replica(
           reallocated, model::node_id{1}, not_on_old_nodes);
         BOOST_REQUIRE(moved3.has_error());
         BOOST_REQUIRE_EQUAL(
           moved3.error(), cluster::errc::no_eligible_allocation_nodes);
 
-        check_allocated_counts(allocator, {1, 1, 1, 1});
-        check_final_counts(allocator, {0, 1, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1});
+        check_final_counts(allocator(), {0, 1, 1, 1});
 
         // replicas can move to the same place
-        auto moved4 = allocator.reallocate_replica(
+        auto moved4 = allocator().reallocate_replica(
           reallocated, model::node_id{3}, not_on_old_nodes);
         BOOST_REQUIRE(moved4.has_value());
         BOOST_REQUIRE_EQUAL(
@@ -751,15 +739,15 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(
           reallocated.replicas().at(2).node_id, model::node_id{3});
 
-        check_allocated_counts(allocator, {1, 1, 1, 1});
-        check_final_counts(allocator, {0, 1, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1});
+        check_final_counts(allocator(), {0, 1, 1, 1});
 
         std::vector node_0(
           {model::broker_shard{.node_id = model::node_id{0}, .shard = 0}});
         cluster::allocation_constraints not_on_node0;
         not_on_node0.add(cluster::distinct_from(node_0));
 
-        auto moved5 = allocator.reallocate_replica(
+        auto moved5 = allocator().reallocate_replica(
           reallocated, model::node_id{2}, not_on_node0);
         BOOST_REQUIRE(moved5.has_value());
         BOOST_REQUIRE_EQUAL(
@@ -767,15 +755,15 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(
           reallocated.replicas().at(2).node_id, model::node_id{2});
 
-        check_allocated_counts(allocator, {1, 1, 1, 1});
-        check_final_counts(allocator, {0, 1, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1});
+        check_final_counts(allocator(), {0, 1, 1, 1});
 
         std::vector new_replicas(reallocated.replicas());
         cluster::allocation_constraints not_on_new_nodes;
         not_on_new_nodes.add(cluster::distinct_from(new_replicas));
 
         // move reallocated replica back to node 0
-        auto moved6 = allocator.reallocate_replica(
+        auto moved6 = allocator().reallocate_replica(
           reallocated, model::node_id{3}, not_on_new_nodes);
         BOOST_REQUIRE(moved6.has_value());
         BOOST_REQUIRE_EQUAL(
@@ -784,11 +772,11 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(
           reallocated.replicas().at(2).node_id, model::node_id{0});
 
-        check_allocated_counts(allocator, {1, 1, 1, 0});
-        check_final_counts(allocator, {1, 1, 1, 0});
+        check_allocated_counts(allocator(), {1, 1, 1, 0});
+        check_final_counts(allocator(), {1, 1, 1, 0});
 
         // do another move so that we have something to revert
-        auto moved7 = allocator.reallocate_replica(
+        auto moved7 = allocator().reallocate_replica(
           reallocated, model::node_id{1}, not_on_old_nodes);
         BOOST_REQUIRE(moved7.has_value());
         BOOST_REQUIRE_EQUAL(
@@ -797,12 +785,12 @@ FIXTURE_TEST(incrementally_reallocate_replicas, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(
           reallocated.replicas().at(2).node_id, model::node_id{3});
 
-        check_allocated_counts(allocator, {1, 1, 1, 1});
-        check_final_counts(allocator, {1, 0, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1});
+        check_final_counts(allocator(), {1, 0, 1, 1});
     }
 
-    check_allocated_counts(allocator, {1, 1, 1, 0});
-    check_final_counts(allocator, {1, 1, 1, 0});
+    check_allocated_counts(allocator(), {1, 1, 1, 0});
+    check_final_counts(allocator(), {1, 1, 1, 0});
 }
 
 FIXTURE_TEST(reallocate_partition_with_move, partition_allocator_fixture) {
@@ -812,7 +800,7 @@ FIXTURE_TEST(reallocate_partition_with_move, partition_allocator_fixture) {
 
     // allocate a partition with 3 replicas on 3 nodes
     auto req = make_allocation_request(1, 3);
-    auto res = allocator.allocate(std::move(req)).get();
+    auto res = allocator().allocate(std::move(req)).get();
     auto original_assignment = res.value()->get_assignments().front();
     model::ntp ntp(tn.ns, tn.tp, original_assignment.id);
 
@@ -820,14 +808,14 @@ FIXTURE_TEST(reallocate_partition_with_move, partition_allocator_fixture) {
     register_node(3, 1);
     register_node(4, 1);
 
-    check_allocated_counts(allocator, {1, 1, 1, 0, 0});
-    check_final_counts(allocator, {1, 1, 1, 0, 0});
+    check_allocated_counts(allocator(), {1, 1, 1, 0, 0});
+    check_final_counts(allocator(), {1, 1, 1, 0, 0});
 
     cluster::allocation_constraints not_on_old_nodes;
     not_on_old_nodes.add(cluster::distinct_from(original_assignment.replicas));
 
     {
-        auto res = allocator.reallocate_partition(
+        auto res = allocator().reallocate_partition(
           ntp,
           original_assignment.replicas,
           {model::node_id{0}, model::node_id{1}},
@@ -844,12 +832,12 @@ FIXTURE_TEST(reallocate_partition_with_move, partition_allocator_fixture) {
         BOOST_REQUIRE(!replicas_set.contains(model::node_id{0}));
         BOOST_REQUIRE(!replicas_set.contains(model::node_id{1}));
 
-        check_allocated_counts(allocator, {1, 1, 1, 1, 1});
-        check_final_counts(allocator, {0, 0, 1, 1, 1});
+        check_allocated_counts(allocator(), {1, 1, 1, 1, 1});
+        check_final_counts(allocator(), {0, 0, 1, 1, 1});
     }
 
     {
-        auto res = allocator.reallocate_partition(
+        auto res = allocator().reallocate_partition(
           ntp,
           original_assignment.replicas,
           {model::node_id{0}, model::node_id{1}, model::node_id{2}},
@@ -861,7 +849,7 @@ FIXTURE_TEST(reallocate_partition_with_move, partition_allocator_fixture) {
     }
 
     {
-        auto res = allocator.reallocate_partition(
+        auto res = allocator().reallocate_partition(
           ntp,
           original_assignment.replicas,
           {model::node_id{3}},
@@ -889,7 +877,7 @@ FIXTURE_TEST(
 
     cluster::allocation_units::pointer partition_1;
     {
-        auto res = allocator.allocate(make_allocation_request(1, 4)).get();
+        auto res = allocator().allocate(make_allocation_request(1, 4)).get();
         BOOST_REQUIRE(res);
         partition_1 = std::move(res.value());
     }
@@ -901,7 +889,7 @@ FIXTURE_TEST(
     {
         auto req = make_allocation_request(1, 3);
         req.partitions.front().constraints.add(cluster::distinct_from(node_3));
-        auto res = allocator.allocate(std::move(req)).get();
+        auto res = allocator().allocate(std::move(req)).get();
         BOOST_REQUIRE(res);
         partition_2 = std::move(res.value());
     }
@@ -912,18 +900,15 @@ FIXTURE_TEST(
         replica2shard.emplace(bs.node_id, bs.shard);
     }
 
-    check_allocated_counts(allocator, {2, 2, 2, 1});
-    check_final_counts(allocator, {2, 2, 2, 1});
+    check_allocated_counts(allocator(), {2, 2, 2, 1});
+    check_final_counts(allocator(), {2, 2, 2, 1});
 
     auto id = partition_2->get_assignments().front().id;
     auto ntp = model::ntp{tn.ns, tn.tp, id};
     cluster::allocated_partition reallocated
-      = allocator.make_allocated_partition(
-        std::move(ntp),
-        original_replicas,
-        cluster::partition_allocation_domains::common);
+      = allocator().make_allocated_partition(std::move(ntp), original_replicas);
 
-    auto moved = allocator.reallocate_replica(
+    auto moved = allocator().reallocate_replica(
       reallocated, model::node_id{0}, not_on_0);
     BOOST_REQUIRE(moved);
     BOOST_REQUIRE_EQUAL(moved.value().current().node_id, model::node_id{3});
@@ -934,11 +919,11 @@ FIXTURE_TEST(
     // more attractive. But replicas on nodes 0, 1, and 2 should still end up on
     // shard 2
     partition_1.reset();
-    check_allocated_counts(allocator, {1, 1, 1, 1});
-    check_final_counts(allocator, {0, 1, 1, 1});
+    check_allocated_counts(allocator(), {1, 1, 1, 1});
+    check_final_counts(allocator(), {0, 1, 1, 1});
 
     // Reallocate replica on node 1 to itself.
-    moved = allocator.reallocate_replica(
+    moved = allocator().reallocate_replica(
       reallocated, model::node_id{1}, not_on_0);
     BOOST_REQUIRE(moved);
     BOOST_REQUIRE_EQUAL(moved.value().current().node_id, model::node_id{1});
@@ -947,7 +932,7 @@ FIXTURE_TEST(
       replica2shard.at(moved.value().current().node_id));
 
     // Reallocate replica on node 3 to itself.
-    moved = allocator.reallocate_replica(
+    moved = allocator().reallocate_replica(
       reallocated, model::node_id{3}, not_on_0);
     BOOST_REQUIRE(moved);
     BOOST_REQUIRE_EQUAL(moved.value().current().node_id, model::node_id{3});
@@ -958,7 +943,7 @@ FIXTURE_TEST(
       replica2shard.at(moved.value().current().node_id));
 
     // Reallocate replica on node 3 back to the original node 0.
-    moved = allocator.reallocate_replica(
+    moved = allocator().reallocate_replica(
       reallocated, model::node_id{3}, not_on_3);
     BOOST_REQUIRE(moved);
     BOOST_REQUIRE_EQUAL(moved.value().current().node_id, model::node_id{0});
@@ -1003,9 +988,8 @@ FIXTURE_TEST(revert_allocation_step, partition_allocator_fixture) {
     register_node(2, 1);
 
     // allocate a partition with 3 replicas on 3 nodes
-    auto domain = cluster::partition_allocation_domains::common;
     auto req = make_allocation_request(1, 3);
-    auto res = allocator.allocate(std::move(req)).get();
+    auto res = allocator().allocate(std::move(req)).get();
     auto original_replicas = res.value()->get_assignments().front().replicas;
 
     // add a couple more nodes
@@ -1018,16 +1002,16 @@ FIXTURE_TEST(revert_allocation_step, partition_allocator_fixture) {
         auto partition_id = res.value()->get_assignments().front().id;
         auto ntp = model::ntp{tn.ns, tn.tp, partition_id};
         cluster::allocated_partition reallocated
-          = allocator.make_allocated_partition(
-            std::move(ntp), original_replicas, domain);
-        auto step1 = allocator.reallocate_replica(
+          = allocator().make_allocated_partition(
+            std::move(ntp), original_replicas);
+        auto step1 = allocator().reallocate_replica(
           reallocated, n(0), on_node(n(3)));
         BOOST_REQUIRE(step1);
         BOOST_REQUIRE_EQUAL(step1.value().current().node_id, n(3));
         BOOST_REQUIRE(step1.value().previous());
         BOOST_REQUIRE_EQUAL(step1.value().previous()->node_id, n(0));
 
-        auto step2 = allocator.reallocate_replica(
+        auto step2 = allocator().reallocate_replica(
           reallocated, n(3), on_node(n(4)));
         BOOST_REQUIRE(step2);
 
@@ -1038,8 +1022,8 @@ FIXTURE_TEST(revert_allocation_step, partition_allocator_fixture) {
         BOOST_REQUIRE_EQUAL(ec, cluster::errc::success);
         BOOST_REQUIRE_EQUAL(
           to_node_ids(reallocated.replicas()), std::vector({n(1), n(2), n(3)}));
-        check_allocated_counts(allocator, {1, 1, 1, 1, 0});
-        check_final_counts(allocator, {0, 1, 1, 1, 0});
+        check_allocated_counts(allocator(), {1, 1, 1, 1, 0});
+        check_final_counts(allocator(), {0, 1, 1, 1, 0});
     }
 }
 
@@ -1048,10 +1032,10 @@ FIXTURE_TEST(topic_aware_reallocate_partition, partition_allocator_fixture) {
 
     cluster::allocation_units::pointer topic1;
     {
-        auto res = allocator.allocate(make_allocation_request(10, 1)).get();
+        auto res = allocator().allocate(make_allocation_request(10, 1)).get();
         topic1 = std::move(res.value());
     }
-    check_allocated_counts(allocator, {10});
+    check_allocated_counts(allocator(), {10});
 
     register_node(1, 4);
     register_node(2, 4);
@@ -1059,11 +1043,11 @@ FIXTURE_TEST(topic_aware_reallocate_partition, partition_allocator_fixture) {
 
     cluster::allocation_units::pointer topic2;
     {
-        auto res = allocator.allocate(make_allocation_request(3, 1)).get();
+        auto res = allocator().allocate(make_allocation_request(3, 1)).get();
         topic2 = std::move(res.value());
     }
     // 1-replica partitions of topic2 should end up on empty nodes
-    check_allocated_counts(allocator, {10, 1, 1, 1});
+    check_allocated_counts(allocator(), {10, 1, 1, 1});
 
     cluster::node2count_t topic2_counts;
     for (const auto& p_as : topic2->get_assignments()) {
@@ -1080,7 +1064,7 @@ FIXTURE_TEST(topic_aware_reallocate_partition, partition_allocator_fixture) {
     cluster::allocation_constraints constraints;
     constraints.add(cluster::distinct_from(p0_replicas));
 
-    auto reallocated = allocator.reallocate_partition(
+    auto reallocated = allocator().reallocate_partition(
       model::ntp(tn.ns, tn.tp, model::partition_id(0)),
       {original},
       {original.node_id},

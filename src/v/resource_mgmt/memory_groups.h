@@ -43,7 +43,8 @@ public:
     system_memory_groups(
       size_t total_available_memory,
       compaction_memory_reservation compaction,
-      bool wasm_enabled);
+      bool wasm_enabled,
+      bool datalake_enabled);
 
     size_t kafka_total_memory() const;
 
@@ -76,6 +77,8 @@ public:
         return _compaction_reserved_memory;
     }
 
+    size_t datalake_max_memory() const;
+
 private:
     /**
      * Total memory for a core after the user's Wasm and compaction
@@ -92,6 +95,7 @@ private:
     size_t _compaction_reserved_memory;
     size_t _total_system_memory;
     bool _wasm_enabled;
+    bool _datalake_enabled;
 };
 
 /**

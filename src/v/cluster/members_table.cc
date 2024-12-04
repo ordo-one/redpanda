@@ -17,7 +17,10 @@
 #include "cluster/types.h"
 #include "model/metadata.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
+#include <ranges>
 #include <vector>
 
 namespace cluster {
@@ -79,12 +82,12 @@ members_table::get_removed_node_metadata_ref(model::node_id id) const {
 }
 
 std::error_code members_table::apply(model::offset o, add_node_cmd cmd) {
+    vlog(clusterlog.info, "applying node add command for: {}", cmd.value);
     _version = model::revision_id(o);
     auto it = _nodes.find(cmd.value.id());
     if (it != _nodes.end()) {
         return errc::invalid_node_operation;
     }
-    vlog(clusterlog.info, "adding node {}", cmd.value);
     _nodes.emplace(cmd.value.id(), node_metadata{.broker = cmd.value});
 
     _waiters.notify(cmd.value.id());
@@ -94,7 +97,20 @@ std::error_code members_table::apply(model::offset o, add_node_cmd cmd) {
 }
 
 void members_table::set_initial_brokers(std::vector<model::broker> brokers) {
-    vassert(!_nodes.empty(), "can not initialize not empty members table");
+    /**
+     * With the new Redpanda clusters the set_initial brokers will be the first
+     * method updating the members table content. In previous versions where the
+     * configuration changes were driven by the controller Raft configuration
+     * the members table may already have some nodes when the set command is
+     * applied.
+     */
+    if (!_nodes.empty()) {
+        vlog(
+          clusterlog.info,
+          "resetting initial nodes from raft configuration: {}",
+          fmt::join(_nodes | std::views::values, ", "));
+        _nodes.clear();
+    }
     vlog(clusterlog.info, "setting initial nodes {}", brokers);
     for (auto& b : brokers) {
         const auto id = b.id();
@@ -105,12 +121,15 @@ void members_table::set_initial_brokers(std::vector<model::broker> brokers) {
 }
 
 std::error_code members_table::apply(model::offset o, update_node_cfg_cmd cmd) {
+    vlog(
+      clusterlog.info,
+      "applying update node config command for: {}",
+      cmd.value);
     _version = model::revision_id(o);
     auto it = _nodes.find(cmd.value.id());
     if (it == _nodes.end()) {
         return errc::node_does_not_exists;
     }
-    vlog(clusterlog.info, "updating node configuration {}", cmd.value);
     it->second.broker = std::move(cmd.value);
 
     notify_member_updated(cmd.value.id(), model::membership_state::active);
@@ -118,6 +137,7 @@ std::error_code members_table::apply(model::offset o, update_node_cfg_cmd cmd) {
 }
 
 std::error_code members_table::apply(model::offset o, remove_node_cmd cmd) {
+    vlog(clusterlog.info, "applying remove node command for: {}", cmd.key);
     _version = model::revision_id(o);
     auto it = _nodes.find(cmd.key);
     if (it == _nodes.end()) {
@@ -129,7 +149,6 @@ std::error_code members_table::apply(model::offset o, remove_node_cmd cmd) {
         return errc::invalid_node_operation;
     }
 
-    vlog(clusterlog.info, "removing node {}", cmd.key);
     auto handle = _nodes.extract(it);
 
     handle.mapped().state.set_membership_state(
@@ -143,6 +162,8 @@ std::error_code members_table::apply(model::offset o, remove_node_cmd cmd) {
 std::error_code
 members_table::apply(model::offset version, decommission_node_cmd cmd) {
     _version = model::revision_id(version());
+    vlog(
+      clusterlog.info, "applying decommission node command for: {}", cmd.key);
 
     if (auto it = _nodes.find(cmd.key); it != _nodes.end()) {
         auto& [id, metadata] = *it;
@@ -151,11 +172,6 @@ members_table::apply(model::offset version, decommission_node_cmd cmd) {
           != model::membership_state::active) {
             return errc::invalid_node_operation;
         }
-        vlog(
-          clusterlog.info,
-          "changing node {} membership state to: {}",
-          id,
-          model::membership_state::draining);
         metadata.state.set_membership_state(model::membership_state::draining);
         notify_member_updated(cmd.key, model::membership_state::draining);
         return errc::success;
@@ -166,6 +182,8 @@ members_table::apply(model::offset version, decommission_node_cmd cmd) {
 std::error_code
 members_table::apply(model::offset version, recommission_node_cmd cmd) {
     _version = model::revision_id(version());
+    vlog(
+      clusterlog.info, "applying recommission node command for: {}", cmd.key);
 
     if (auto it = _nodes.find(cmd.key); it != _nodes.end()) {
         auto& [id, metadata] = *it;
@@ -174,11 +192,6 @@ members_table::apply(model::offset version, recommission_node_cmd cmd) {
           != model::membership_state::draining) {
             return errc::invalid_node_operation;
         }
-        vlog(
-          clusterlog.info,
-          "changing node {} membership state to: {}",
-          id,
-          model::membership_state::active);
         metadata.state.set_membership_state(model::membership_state::active);
         notify_member_updated(cmd.key, model::membership_state::active);
         return errc::success;
@@ -189,6 +202,12 @@ members_table::apply(model::offset version, recommission_node_cmd cmd) {
 std::error_code
 members_table::apply(model::offset version, maintenance_mode_cmd cmd) {
     _version = model::revision_id(version());
+    vlog(
+      clusterlog.info,
+      "applying maintenance mode command for: {} with enable maintenance "
+      "mode: {}",
+      cmd.key,
+      cmd.value);
 
     const auto target = _nodes.find(cmd.key);
     if (target == _nodes.end()) {
@@ -207,7 +226,6 @@ members_table::apply(model::offset version, maintenance_mode_cmd cmd) {
             return errc::success;
         }
 
-        vlog(clusterlog.info, "marking node {} not in maintenance state", id);
         metadata.state.set_maintenance_state(
           model::maintenance_state::inactive);
         notify_maintenance_state_change(id, model::maintenance_state::inactive);
@@ -275,13 +293,18 @@ void members_table::fill_snapshot(controller_snapshot& controller_snap) {
           controller_snapshot_parts::members_t::node_t{
             .broker = md.broker, .state = md.state});
     }
+    snap.version = _version;
 }
 
 void members_table::apply_snapshot(
   model::offset snap_offset, const controller_snapshot& controller_snap) {
-    _version = model::revision_id(snap_offset);
-
     const auto& snap = controller_snap.members;
+
+    // if version is present in snapshot use it, otherwise fallback to old
+    // behavior
+    _version = snap.version != model::revision_id{}
+                 ? snap.version
+                 : model::revision_id(snap_offset);
 
     // update the list of brokers
 
@@ -289,6 +312,11 @@ void members_table::apply_snapshot(
     std::swap(old_nodes, _nodes);
 
     for (const auto& [id, node] : snap.nodes) {
+        vlog(
+          clusterlog.trace,
+          "adding node {} with state {} from snapshot",
+          node.broker,
+          node.state);
         _nodes.emplace(id, node_metadata{node.broker, node.state});
         _waiters.notify(id);
         notify_member_updated(id, node.state.get_membership_state());
@@ -297,6 +325,7 @@ void members_table::apply_snapshot(
     _removed_nodes.clear();
 
     for (const auto& [id, node] : snap.removed_nodes) {
+        vlog(clusterlog.trace, "removed node {} from snapshot", node.broker);
         _removed_nodes.emplace(id, node_metadata{node.broker, node.state});
         notify_member_updated(id, model::membership_state::removed);
     }

@@ -5,40 +5,35 @@
 [![Twitter](https://img.shields.io/twitter/follow/redpandadata.svg?style=social&label=Follow)](https://twitter.com/intent/follow?screen_name=redpandadata)
 ![Go](https://github.com/redpanda-data/redpanda/workflows/Go/badge.svg)
 ![C++](https://github.com/redpanda-data/redpanda/workflows/build-test/badge.svg)
-
+[![Redpanda University](https://img.shields.io/badge/Redpanda%20University-black)](https://university.redpanda.com/)
 <p align="center">
 <a href="https://redpanda.com/redpanda"><img src="docs/PANDA_sitting.png" alt="redpanda sitting" width="400"></a>
 </p>
 
-Redpanda is a streaming data platform for developers. Kafka® API-compatible. ZooKeeper® free. JVM free. We built it from the ground up to eliminate complexity common to Apache Kafka, improve performance by up to 10x, and make the storage architecture safer, and more resilient. The simpler devex lets you focus on your code (instead of fighting Kafka) and develop new use cases that were never before possible. The business benefits from a significantly lower total cost and faster time to market. A new platform that scales with you from the smallest projects to petabytes of data distributed across the globe!
+Redpanda is the most complete, Apache Kafka®-compatible streaming data platform, designed from the ground up to be lighter, faster, and simpler to operate. Free from ZooKeeper™ and JVMs, it prioritizes an end-to-end developer experience with a huge ecosystem of connectors, configurable tiered storage, and more.
 
-# Community
+# Table of Contents
+- [Get started](#get-started)
+  - [Prebuilt packages](#prebuilt-packages)
+    - [Debian/Ubuntu](#debianubuntu)
+    - [Fedora/RedHat/Amazon Linux](#fedoraredhatamazon-linux)
+    - [macOS](#macos)
+    - [Other Linux environments](#other-linux-environments)
+  - [Build manually](#build-manually)
+  - [Release candidate builds](#release-candidate-builds)
+    - [RC releases on Debian/Ubuntu](#rc-releases-on-debianubuntu)
+    - [RC releases on Fedora/RedHat/Amazon Linux](#rc-releases-on-fedoraredhatamazon-linux)
+    - [RC releases on Docker](#rc-releases-on-docker)
+- [Community](#community)
+- [Resources](#resources)
 
-[Slack](https://redpanda.com/slack) is the main way the community interacts with one another in real-time :)
+# Get started
 
-[Github Discussion](https://github.com/redpanda-data/redpanda/discussions) is preferred for longer, async, thoughtful discussions
+## Prebuilt packages
 
-[GitHub Issues](https://github.com/redpanda-data/redpanda/issues) is reserved only for actual issues. Please use the mailing list for discussions.
+Redpanda Data recommends using the following free, prebuilt stable releases.
 
-[Code of conduct](./CODE_OF_CONDUCT.md) code of conduct for the community
-
-[Contributing docs](./CONTRIBUTING.md)
-
-# Getting Started
-
-## Prebuilt Packages
-
-We recommend using our free & prebuilt stable releases below.
-
-### On MacOS
-
-Simply download our `rpk` [binary here](https://github.com/redpanda-data/redpanda/releases). We require Docker on MacOS
-
-```
-brew install redpanda-data/tap/redpanda && rpk container start
-```
-
-### On Debian/Ubuntu
+### Debian/Ubuntu
 
 ```
 curl -1sLf \
@@ -48,7 +43,7 @@ curl -1sLf \
 sudo apt-get install redpanda
 ```
 
-### On Fedora/RedHat/Amazon Linux
+### Fedora/RedHat/Amazon Linux
 
 ```
 curl -1sLf \
@@ -58,7 +53,15 @@ curl -1sLf \
 sudo yum install redpanda
 ```
 
-### On Other Linux
+### macOS
+
+Download the `rpk` [binary here](https://github.com/redpanda-data/redpanda/releases). Docker is required on MacOS.
+
+```
+brew install redpanda-data/tap/redpanda && rpk container start
+```
+
+### Other Linux environments
 
 To install from a `.tar.gz` archive, download the file and extract it into `/opt/redpanda`.
 
@@ -66,54 +69,47 @@ For amd64:
 
 ```
 curl -LO \
-  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-amd64/versions/23.3.6/redpanda-23.3.6-amd64.tar.gz
+  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-amd64/versions/23.3.6/redpanda-24.2.7-amd64.tar.gz
 ```
 
 For arm64:
 
 ```
 curl -LO \
-  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-arm64/versions/23.3.6/redpanda-23.3.6-arm64.tar.gz
+  https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/raw/names/redpanda-arm64/versions/23.3.6/redpanda-24.2.7-arm64.tar.gz
 ```
 
-Replace `23.3.6` with the appropriate version you are trying to download.
-
-## GitHub Actions
-
-
-```yaml
-    - name: start redpanda
-      uses: redpanda-data/github-action@v0.1.3
-      with:
-        version: "latest"
-```
-
-Now you should be able to connect to `redpanda` (kafka-api) running at `localhost:9092`
-
+Replace `24.2.7` with the version you want to download. See [Release Notes](https://github.com/redpanda-data/redpanda/releases).
 
 ## Build Manually
 
-We provide a very simple build system that uses your system libraries. We recommend
-users leverage our pre-built stable releases which are vetted, tested, and reproducible with exact
-versions of the entire transitive dependency graph, including exact compilers
-all built from source. The only thing we do not build yet is the Linux Kernel, but soon!
+Redpanda Data uses [Bazel](https://bazel.build/) as the build system. Bazel automatically manages most of the toolchains and third-party dependencies.
 
-Currently `clang 16` is required. We test the open-source build nightly using Fedora 38.
+We rely on [bazelisk](https://github.com/bazelbuild/bazelisk) to get the right
+version of bazel needed for the build. You can for example install it as follows
+and add it to your $PATH (or use one of the other suggested ways from their
+repo).
 
-```bash
-sudo ./install-dependencies.sh
-cmake --preset release
-cmake --build --preset release
+```
+wget -O ~/bin/bazel https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 && chmod +x ~/bin/bazel
 ```
 
-For quicker dev setup, we provide a [docker image](tools/docker/README.md) with the toolchain installed.
+There are a few system libraries and preinstalled tools our build assumes are
+available locally. To bootstrap and build redpanda along with all its tests.
 
-# Release candidate builds
+```bash
+sudo ./bazel/install-deps.sh
+bazel build --config=release //...
+```
 
-We create a release candidate (RC) build when we get close to a new release and publish these to make new features available for testing.
+For more build configurations, see `.bazelrc`.
+
+## Release candidate builds
+
+Redpanda Data creates a release candidate (RC) build when we get close to a new release, and we publish it to make new features available for testing.
 RC builds are not recommended for production use.
 
-## RC releases on Debian/Ubuntu
+### RC releases on Debian/Ubuntu
 
 ```bash
 curl -1sLf \
@@ -123,7 +119,7 @@ curl -1sLf \
 sudo apt-get install redpanda
 ```
 
-## RC releases on Fedora/RedHat/Amazon Linux
+### RC releases on Fedora/RedHat/Amazon Linux
 
 ```bash
 curl -1sLf \
@@ -133,10 +129,34 @@ curl -1sLf \
 sudo yum install redpanda
 ```
 
-## RC releases on Docker
+### RC releases on Docker
 
-This is an example with the `v23.1.1-rc1` version prior to the 23.1.1 release.
+Example with `v23.1.1-rc1`:
 
 ```bash
 docker pull docker.redpanda.com/redpandadata/redpanda-unstable:v23.1.1-rc1
 ```
+
+# Community
+
+[Slack](https://redpanda.com/slack): This is the primary way the community interacts in real time. :)
+
+[Github Discussions](https://github.com/redpanda-data/redpanda/discussions): This is for longer, async, thoughtful discussions.
+
+[GitHub Issues](https://github.com/redpanda-data/redpanda/issues): This is reserved only for actual issues. Please use the mailing list for discussions.
+
+[Code of Conduct](./CODE_OF_CONDUCT.md)
+
+[Contribute to the Code](./CONTRIBUTING.md)
+
+# Resources
+
+[Redpanda Documentation](https://docs.redpanda.com/home/)
+
+[Redpanda Blog](https://www.redpanda.com/blog)
+
+[Upcoming Redpanda Events](https://www.redpanda.com/events)
+
+[Redpanda Support](https://support.redpanda.com/)
+
+[Redpanda University](https://university.redpanda.com/)

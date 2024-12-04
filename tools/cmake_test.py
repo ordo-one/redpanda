@@ -29,7 +29,10 @@ formatter = logging.Formatter(fmt_string)
 for h in logging.getLogger().handlers:
     h.setFormatter(formatter)
 
-COMMON_TEST_ARGS = ["--blocked-reactor-notify-ms 2000000"]
+COMMON_TEST_ARGS = [
+    "--blocked-reactor-notify-ms 2000000",
+    "--abort-on-seastar-bad-alloc",
+]
 
 
 def find_vbuild_path_from_binary(binary_path, num_subdirs=1):
@@ -149,7 +152,7 @@ class BacktraceCapture(threading.Thread):
             return ci_location
 
         # Workstation: find our build directory by searching back from binary
-        vbuild = find_vbuild_path_from_binary(self.binary, 3)
+        vbuild = find_vbuild_path_from_binary(self.binary, 5)
         if vbuild:
             location = os.path.join(
                 vbuild,
@@ -295,7 +298,7 @@ class TestRunner():
         env["BOOST_TEST_CATCH_SYSTEM_ERRORS"] = "no"
         env["BOOST_TEST_REPORT_LEVEL"] = "no"
         env["BOOST_LOGGER"] = "HRF,test_suite"
-        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1:report_error_type=1"
         env["ASAN_OPTIONS"] = "disable_coredump=0:abort_on_error=1"
 
         # FIXME: workaround for https://app.clubhouse.io/vectorized/story/897
@@ -338,10 +341,15 @@ class TestRunner():
         src_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                "..")
         lsan_suppressions = os.path.join(src_dir, "lsan_suppressions.txt")
+        ubsan_suppressions = os.path.join(src_dir, "ubsan_suppressions.txt")
         assert os.path.isfile(
             lsan_suppressions
         ), f"cannot find lsan suppressions at {lsan_suppressions}"
+        assert os.path.isfile(
+            ubsan_suppressions
+        ), f"cannot find ubsan suppressions at {ubsan_suppressions}"
         env["LSAN_OPTIONS"] = f"suppressions={lsan_suppressions}"
+        env["UBSAN_OPTIONS"] += f":suppressions={ubsan_suppressions}"
 
         # We only capture stderr because that's where backtraces go
         # FIXME: avoid usage of the unsafe shell=True if possible, or sanitized the cmd input

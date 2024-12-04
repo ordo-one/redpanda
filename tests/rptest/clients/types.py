@@ -39,6 +39,8 @@ class TopicSpec:
     PROPERTY_WRITE_CACHING = "write.caching"
     PROPERTY_FLUSH_MS = "flush.ms"
     PROPERTY_FLUSH_BYTES = "flush.bytes"
+    PROPERTY_ICEBERG_MODE = "redpanda.iceberg.mode"
+    PROPERTY_DELETE_RETENTION_MS = "delete.retention.ms"
 
     class CompressionTypes(str, Enum):
         """
@@ -95,7 +97,7 @@ class TopicSpec:
             name: str | None = None,
             partition_count: int = 1,
             replication_factor: int = 3,
-            cleanup_policy: str = CLEANUP_DELETE,
+            cleanup_policy: str | None = CLEANUP_DELETE,
             compression_type: CompressionTypes = COMPRESSION_PRODUCER,
             message_timestamp_type: TIMESTAMP_TYPE = TIMESTAMP_CREATE_TIME,
             segment_bytes: int | None = None,
@@ -120,7 +122,8 @@ class TopicSpec:
         | None = None,
             initial_retention_local_target_bytes: int | None = None,
             initial_retention_local_target_ms: int | None = None,
-            virtual_cluster_id: str | None = None):
+            virtual_cluster_id: str | None = None,
+            delete_retention_ms: int | None = None):
         self.name = name or f"topic-{self._random_topic_suffix()}"
         self.partition_count = partition_count
         self.replication_factor = replication_factor
@@ -146,6 +149,7 @@ class TopicSpec:
         self.initial_retention_local_target_bytes = initial_retention_local_target_bytes
         self.initial_retention_local_target_ms = initial_retention_local_target_ms
         self.virtual_cluster_id = virtual_cluster_id
+        self.delete_retention_ms = delete_retention_ms
 
     def __str__(self):
         return self.name

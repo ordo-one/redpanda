@@ -10,6 +10,7 @@
  */
 
 #include "cluster/commands.h"
+#include "cluster/data_migrated_resources.h"
 #include "cluster/fwd.h"
 #include "cluster/plugin_frontend.h"
 #include "cluster/topic_table.h"
@@ -54,7 +55,7 @@ struct transform_config {
 
 ss::sstring make_string(size_t size) {
     ss::sstring str;
-    for (int i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; ++i) {
         str.append("a", 1);
     }
     return str;
@@ -62,7 +63,7 @@ ss::sstring make_string(size_t size) {
 
 absl::flat_hash_map<ss::sstring, ss::sstring> make_env_map(size_t size) {
     absl::flat_hash_map<ss::sstring, ss::sstring> env;
-    for (int i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; ++i) {
         env.insert({ss::format("var_{}", i), "bar"});
     }
     return env;
@@ -74,7 +75,8 @@ public:
     model::transform_id _latest_id{0};
 
     plugin_table _plugin_table;
-    topic_table _topic_table;
+    data_migrations::migrated_resources _migrated_resources;
+    topic_table _topic_table{_migrated_resources};
     plugin_frontend::validator _validator{
       &_topic_table,
       &_plugin_table,

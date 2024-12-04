@@ -12,6 +12,8 @@ package partitions
 import (
 	"fmt"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -38,19 +40,20 @@ nodes are gone and irrecoverable; this may result in data loss.
 You can perform a dry run and verify the partitions that will be recovered by 
 using the '--dry' flag.
 `,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			f := p.Formatter
 			if f.Kind != "text" && f.Kind != "help" && !dry {
 				out.Die("Format type %q is only valid for dry runs (--dry)", f.Kind)
 			}
-			if h, ok := f.Help([]adminapi.MajorityLostPartitions{}); ok {
+			if h, ok := f.Help([]rpadmin.MajorityLostPartitions{}); ok {
 				out.Exit(h)
 			}
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			plan, err := cl.MajorityLostPartitions(cmd.Context(), nodes)
@@ -88,7 +91,7 @@ using the '--dry' flag.
 	return cmd
 }
 
-func printPlan(f config.OutFormatter, plan []adminapi.MajorityLostPartitions) error {
+func printPlan(f config.OutFormatter, plan []rpadmin.MajorityLostPartitions) error {
 	if isText, _, s, err := f.Format(plan); !isText {
 		if err != nil {
 			return fmt.Errorf("unable to print in the required format %q: %v", f.Kind, err)

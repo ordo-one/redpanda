@@ -11,7 +11,9 @@
 
 #pragma once
 #include "base/seastarx.h"
+#include "bytes/bytes.h"
 #include "bytes/iobuf.h"
+#include "container/chunked_hash_map.h"
 #include "metrics/metrics.h"
 #include "storage/fwd.h"
 #include "storage/ntp_config.h"
@@ -25,8 +27,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace storage {
 
@@ -91,6 +91,8 @@ struct kvstore_config {
 
 class kvstore {
 public:
+    using map_t = chunked_hash_map<bytes, iobuf>;
+
     enum class key_space : int8_t {
         testing = 0,
         consensus = 1,
@@ -99,11 +101,14 @@ public:
         offset_translator = 4,
         usage = 5,
         stms = 6,
+        shard_placement = 7,
+        debug_bundle = 8,
         /* your sub-system here */
     };
 
     explicit kvstore(
       kvstore_config kv_conf,
+      ss::shard_id shard,
       storage_resources&,
       ss::sharded<features::feature_table>& feature_table);
     ~kvstore() noexcept;
@@ -114,6 +119,12 @@ public:
     std::optional<iobuf> get(key_space ks, bytes_view key);
     ss::future<> put(key_space ks, bytes key, iobuf value);
     ss::future<> remove(key_space ks, bytes key);
+
+    /// Iterate over all key-value pairs in a keyspace.
+    /// NOTE: this will stall all updates, so use with a lot of caution.
+    ss::future<> for_each(
+      key_space ks,
+      ss::noncopyable_function<void(bytes_view, const iobuf&)> visitor);
 
     bool empty() const {
         vassert(_started, "kvstore has not been started");
@@ -164,12 +175,12 @@ private:
     // Protect _db and _next_offset across asynchronous mutations.
     mutex _db_mut{"kvstore::db_mut"};
     model::offset _next_offset;
-    absl::btree_map<bytes, iobuf, bytes_type_cmp> _db;
+    map_t _db;
     std::optional<ntp_sanitizer_config> _ntp_sanitizer_config;
 
     ss::future<> put(key_space ks, bytes key, std::optional<iobuf> value);
     void apply_op(
-      bytes key, std::optional<iobuf> value, ssx::semaphore_units const&);
+      bytes key, std::optional<iobuf> value, const ssx::semaphore_units&);
     ss::future<> flush_and_apply_ops();
     ss::future<> roll();
     ss::future<> save_snapshot();

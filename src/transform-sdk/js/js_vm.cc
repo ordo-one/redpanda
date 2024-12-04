@@ -19,11 +19,13 @@
 #include <sys/types.h>
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <format>
 #include <print>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -125,16 +127,40 @@ value value::array_buffer(JSContext* ctx, std::span<uint8_t> data) {
         ctx, data.data(), data.size(), func, opaque, /*is_shared=*/0)};
 }
 
+std::expected<value, exception>
+value::array_buffer_copy(JSContext* ctx, std::span<uint8_t> data) {
+    value val{ctx, JS_NewArrayBufferCopy(ctx, data.data(), data.size())};
+    if (val.is_exception()) {
+        return std::unexpected(exception::current(ctx));
+    }
+    return val;
+}
+
 value value::uint8_array(JSContext* ctx, std::span<uint8_t> data) {
     void* opaque = nullptr;
     // NOLINTNEXTLINE(*easily-swappable-parameters)
     JSFreeArrayBufferDataFunc* func = [](JSRuntime*, void* opaque, void* ptr) {
         // Nothing to do
     };
+
     return {
       ctx,
       JS_NewUint8Array(
         ctx, data.data(), data.size(), func, opaque, /*is_shared=*/0)};
+}
+
+// see quickjs source for detailed buffer ownership semantics
+// https://github.com/quickjs-ng/quickjs/blob/da5b95dcaf372dcc206019e171a0b08983683bf5/quickjs.c#L49379-L49436
+// TL;DR - With copying enabled, the array constructor registers a baked-in
+// free_func to be called by the object destructor. The copy of data is made
+// and mangaged internally to the quickjs runtime.
+std::expected<value, exception>
+value::uint8_array_copy(JSContext* ctx, std::span<uint8_t> data) {
+    value val{ctx, JS_NewUint8ArrayCopy(ctx, data.data(), data.size())};
+    if (val.is_exception()) {
+        return std::unexpected(exception::current(ctx));
+    }
+    return val;
 }
 
 void value::detach_buffer() {
@@ -181,6 +207,7 @@ value value::current_exception(JSContext* ctx) {
 }
 bool value::is_number() const { return JS_IsNumber(_underlying) != 0; }
 bool value::is_exception() const { return JS_IsException(_underlying) != 0; }
+bool value::is_error() const { return JS_IsError(_ctx, _underlying) != 0; }
 bool value::is_function() const {
     return JS_IsFunction(_ctx, _underlying) != 0;
 }
@@ -202,6 +229,11 @@ double value::as_number() const {
         return JS_VALUE_GET_FLOAT64(_underlying);
     }
     return JS_VALUE_GET_INT(_underlying);
+}
+
+int32_t value::as_integer() const {
+    auto num = as_number();
+    return static_cast<int32_t>(std::lround(num));
 }
 
 std::expected<value, exception> value::call(std::span<value> values) {
@@ -274,6 +306,7 @@ size_t value::array_length() const {
     return JS_VALUE_GET_INT(prop.raw());
 }
 
+// NOLINTNEXTLINE(*-no-recursion)
 std::string value::debug_string() const {
     if (is_null()) {
         return "null";
@@ -283,12 +316,18 @@ std::string value::debug_string() const {
     }
     size_t size = 0;
     const char* str = JS_ToCStringLen(_ctx, &size, _underlying);
+    std::string result;
     if (str != nullptr) {
-        auto result = std::string(str, size);
+        result = std::string(str, size);
         JS_FreeCString(_ctx, str);
-        return result;
+    } else {
+        result = "[exception]";
     }
-    return "[exception]";
+    if (is_exception() || is_error()) {
+        auto stack = get_property("stack");
+        result += std::format("\n Stack: \n{}", stack.debug_string());
+    }
+    return result;
 }
 
 bool operator==(const value& lhs, const value& rhs) {
@@ -394,6 +433,43 @@ private:
     FILE* _info_stream;
     FILE* _err_stream;
 };
+
+std::unordered_map<std::string, std::string> map_from_environ() {
+    std::unordered_map<std::string, std::string> env{};
+    for (char** envp = environ; *envp != nullptr;
+         std::advance(envp, std::ptrdiff_t{1})) {
+        // environ entries are expected to be null terminated
+        const std::string entry{*envp};
+        if (entry.empty()) {
+            continue;
+        }
+        auto delim = entry.find_first_of('=');
+        if (delim == std::string_view::npos) {
+            continue;
+        }
+        auto key = entry.substr(0, delim);
+        auto val = delim + 1 < entry.size() ? entry.substr(delim + 1) : "";
+        env.emplace(std::move(key), std::move(val));
+    }
+    env.try_emplace("NODE_ENV", "production");
+    return env;
+}
+
+std::expected<qjs::value, qjs::exception> env(JSContext* ctx) {
+    auto native_env = map_from_environ();
+    auto js_env = value::object(ctx);
+    for (const auto& [k, v] : native_env) {
+        auto val = value::string(ctx, v);
+        if (!val.has_value()) {
+            return std::unexpected(val.error());
+        }
+        if (auto res = js_env.set_property(k, val.value()); !res.has_value()) {
+            return std::unexpected(res.error());
+        }
+    }
+    return js_env;
+}
+
 } // namespace
 
 std::expected<std::monostate, exception> runtime::create_builtins() {
@@ -406,10 +482,29 @@ std::expected<std::monostate, exception> runtime::create_builtins() {
     console_builder.method<&console::warn>("error");
     auto factory = console_builder.build();
     auto global_this = value::global(_ctx.get());
-    return global_this.set_property(
+    auto result = global_this.set_property(
       "console",
       factory.create(std::make_unique<console>(
         console::config{.info = stdout, .warn = stderr})));
+
+    if (!result.has_value()) {
+        return result;
+    }
+
+    auto process = qjs::value::object(_ctx.get());
+    auto env_obj = env(_ctx.get());
+    if (!env_obj.has_value()) {
+        return std::unexpected(env_obj.error());
+    }
+    result = process.set_property("env", env_obj.value());
+    if (!result.has_value()) {
+        return result;
+    }
+    result = global_this.set_property("process", process);
+    if (!result.has_value()) {
+        return result;
+    }
+    return global_this.set_property("self", value::global(_ctx.get()));
 }
 
 std::expected<compiled_bytecode, exception>
@@ -504,11 +599,17 @@ module_builder::add_function(std::string name, native_function func) {
     return *this;
 }
 
+module_builder&
+module_builder::add_object(std::string name, object_builder obj) {
+    _objects.emplace(std::move(name), std::move(obj));
+    return *this;
+}
+
 std::expected<std::monostate, exception> module_builder::build(JSContext* ctx) {
     auto* ctx_state = static_cast<runtime::context_state*>(
       JS_GetContextOpaque(ctx));
     std::vector<JSCFunctionListEntry> entries;
-    entries.reserve(_exports.size());
+    entries.reserve(_exports.size() + _objects.size());
     for (auto& [name, func] : _exports) {
         auto my_magic = static_cast<int16_t>(ctx_state->named_functions.size());
         runtime::named_native_function& function
@@ -551,6 +652,29 @@ std::expected<std::monostate, exception> module_builder::build(JSContext* ctx) {
                 }}}}});
     }
 
+    for (auto& [name, builder] : _objects) {
+        auto obj_data = builder.build(ctx);
+        if (!obj_data.has_value()) {
+            return std::unexpected(obj_data.error());
+        }
+        const auto& obj = ctx_state->named_objects.emplace_back(
+          std::make_unique<std::string>(name), std::move(obj_data).value());
+        // TODO(oren): any properties? configurable, etc?
+        constexpr int prop_flags = 0;
+        entries.push_back(JSCFunctionListEntry{
+          .name = obj.name->c_str(),
+          .prop_flags = prop_flags,
+          .def_type = JS_DEF_OBJECT,
+          .magic = 0 /* not used  */,
+          .u = {
+            .prop_list = {
+              .tab = obj.data.properties.data(),
+              .len = static_cast<int32_t>(obj.data.properties.size()),
+            }
+          },
+        });
+    }
+
     JSModuleDef* mod = JS_NewCModule(
       ctx, _name.c_str() /*copied*/, [](JSContext* ctx, JSModuleDef* mod) {
           auto* ctx_state = static_cast<runtime::context_state*>(
@@ -570,6 +694,82 @@ std::expected<std::monostate, exception> module_builder::build(JSContext* ctx) {
       ctx, mod, entries.data(), static_cast<int>(entries.size()));
     ctx_state->module_functions.emplace(mod, std::move(entries));
     return {};
+}
+
+object_builder& object_builder::add_string(std::string key, std::string value) {
+    return add_native_value(std::move(key), std::move(value));
+}
+object_builder& object_builder::add_i32(std::string key, int32_t value) {
+    return add_native_value(std::move(key), value);
+}
+object_builder& object_builder::add_i64(std::string key, int64_t value) {
+    return add_native_value(std::move(key), value);
+}
+object_builder& object_builder::add_f64(std::string key, double value) {
+    return add_native_value(std::move(key), value);
+}
+
+object_builder& object_builder::add_native_value(
+  std::string key, object_builder::native_value value) {
+    _properties.emplace(std::move(key), std::move(value));
+    return *this;
+}
+
+std::expected<object_export_data, exception>
+object_builder::build(JSContext* ctx) {
+    std::vector<std::unique_ptr<std::string>> pnames;
+    pnames.reserve(_properties.size());
+    std::vector<JSCFunctionListEntry> props;
+    props.reserve(_properties.size());
+    std::vector<std::unique_ptr<std::string>> strs;
+    for (const auto& [pname, pval] : _properties) {
+        pnames.push_back(std::make_unique<std::string>(pname));
+        if (const auto* arg = std::get_if<std::string>(&pval)) {
+            strs.push_back(std::make_unique<std::string>(*arg));
+            props.push_back(JSCFunctionListEntry{
+              .name = pnames.back()->c_str(),
+              .prop_flags = 0,
+              .def_type = JS_DEF_PROP_STRING,
+              .magic = 0, /* not used */
+              .u = {.str = strs.back()->c_str()},
+            });
+        } else if (const auto* arg = std::get_if<int32_t>(&pval)) {
+            props.push_back(JSCFunctionListEntry{
+              .name = pnames.back()->c_str(),
+              .prop_flags = 0,
+              .def_type = JS_DEF_PROP_INT32,
+              .magic = 0, /* not used */
+              .u = {.i32 = static_cast<int32_t>(*arg)},
+            });
+        } else if (const auto* arg = std::get_if<int64_t>(&pval)) {
+            props.push_back(JSCFunctionListEntry{
+              .name = pnames.back()->c_str(),
+              .prop_flags = 0,
+              .def_type = JS_DEF_PROP_INT64,
+              .magic = 0, /* not used */
+              .u = {.i64 = static_cast<int64_t>(*arg)},
+            });
+        } else if (const auto* arg = std::get_if<double>(&pval)) {
+            props.push_back(JSCFunctionListEntry{
+              .name = pnames.back()->c_str(),
+              .prop_flags = 0,
+              .def_type = JS_DEF_PROP_DOUBLE,
+              .magic = 0, /* not used */
+              .u = {.f64 = static_cast<double>(*arg)},
+            });
+        } else {
+            return std::unexpected(qjs::exception::make(
+              ctx,
+              std::format(
+                "object builder failed - bad type for '{}'", *pnames.back())));
+        }
+    }
+
+    return object_export_data{
+      .property_names = std::move(pnames),
+      .str_values = std::move(strs),
+      .properties = std::move(props),
+    };
 }
 
 cstring::cstring(JSContext* context, const char* ptr, size_t size)

@@ -48,7 +48,7 @@ Allow write permissions to user buzz to transactional ID "txn":
 `,
 
 		Args: cobra.ExactArgs(0),
-		Run: func(cmd *cobra.Command, _ []string) {
+		Run: func(_ *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
@@ -69,6 +69,10 @@ Allow write permissions to user buzz to transactional ID "txn":
 			tw := out.NewTable(headersWithError...)
 			defer tw.Flush()
 			for _, c := range results {
+				errMsg := kafka.ErrMessage(c.Err)
+				if c.ErrMessage != "" {
+					errMsg = fmt.Sprintf("%v: %v", errMsg, c.ErrMessage)
+				}
 				tw.PrintStructFields(aclWithMessage{
 					c.Principal,
 					c.Host,
@@ -77,7 +81,7 @@ Allow write permissions to user buzz to transactional ID "txn":
 					c.Pattern,
 					c.Operation,
 					c.Permission,
-					kafka.ErrMessage(c.Err),
+					errMsg,
 				})
 			}
 		},

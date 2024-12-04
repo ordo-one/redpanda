@@ -51,7 +51,7 @@ The --dry option will validate whether the requested configuration change is
 valid, but does not apply it.
 `,
 		Args: cobra.MinimumNArgs(1),
-		Run: func(cmd *cobra.Command, topics []string) {
+		Run: func(_ *cobra.Command, topics []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
@@ -76,6 +76,8 @@ valid, but does not apply it.
 			// at the same time, so we issue first the set request for write,
 			// then the rest of the requests.
 			// See https://github.com/redpanda-data/redpanda/issues/9191
+			// TODO: Remove this once v24.2 is EOL.
+			// See https://github.com/redpanda-data/redpanda/pull/23545.
 			_, isRRR := setKVs["redpanda.remote.read"]
 			wv, isRRW := setKVs["redpanda.remote.write"]
 			rrwErrors := make(map[string]int16)

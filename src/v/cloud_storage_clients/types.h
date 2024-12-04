@@ -11,6 +11,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "config/types.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
@@ -33,6 +34,9 @@ enum class error_outcome {
     fail,
     /// Missing key API error (only suitable for downloads and deletions)
     key_not_found,
+    /// Currently used for directory deletion errors in ABS, typically treated
+    /// as regular failure outcomes.
+    operation_not_supported
 };
 
 struct error_outcome_category final : public std::error_category {
@@ -48,6 +52,8 @@ struct error_outcome_category final : public std::error_category {
             return "Non retriable error";
         case error_outcome::key_not_found:
             return "Key not found error";
+        case error_outcome::operation_not_supported:
+            return "Operation not supported error";
         default:
             return "Undefined error_outcome encountered";
         }
@@ -72,6 +78,19 @@ inline std::ostream& operator<<(std::ostream& os, const s3_url_style& us) {
     case s3_url_style::path:
         return os << "path";
     }
+}
+
+inline std::optional<s3_url_style>
+from_config(std::optional<config::s3_url_style> us) {
+    if (us.has_value()) {
+        switch (us.value()) {
+        case config::s3_url_style::virtual_host:
+            return s3_url_style::virtual_host;
+        case config::s3_url_style::path:
+            return s3_url_style::path;
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace cloud_storage_clients

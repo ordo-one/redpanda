@@ -12,7 +12,6 @@
 #include "raft/heartbeats.h"
 
 #include "raft/types.h"
-#include "serde/serde.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -57,7 +56,7 @@ ss::future<> heartbeat_request_v2::serde_async_write(iobuf& out) {
 }
 
 ss::future<> heartbeat_request_v2::serde_async_read(
-  iobuf_parser& in, serde::header const hdr) {
+  iobuf_parser& in, const serde::header hdr) {
     using serde::read_async_nested;
     using serde::read_nested;
     _source_node = serde::read_nested<model::node_id>(
@@ -118,7 +117,7 @@ ss::future<> heartbeat_reply_v2::serde_async_write(iobuf& out) {
 }
 
 ss::future<> heartbeat_reply_v2::serde_async_read(
-  iobuf_parser& in, serde::header const hdr) {
+  iobuf_parser& in, const serde::header hdr) {
     using serde::read_async_nested;
     using serde::read_nested;
     _source_node = read_nested<model::node_id>(in, hdr._bytes_left_limit);

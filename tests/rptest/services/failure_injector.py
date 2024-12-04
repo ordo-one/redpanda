@@ -9,6 +9,7 @@
 
 import random
 import signal
+import time
 import threading
 from ducktape.utils.util import wait_until
 from ducktape.errors import TimeoutError
@@ -63,13 +64,15 @@ class FailureSpec:
 class FailureInjectorBase:
     def __init__(self, redpanda):
         self.redpanda = redpanda
-        self._in_flight = set()
+        self._in_flight = {}
 
     def __enter__(self):
         return self
 
     def __exit__(self, type, value, traceback):
         self._heal_all()
+        self._continue_all()
+        self._undo_all()
 
     def inject_failure(self, spec):
         if spec in self._in_flight:
@@ -96,21 +99,45 @@ class FailureInjectorBase:
                 else:
 
                     def cleanup():
-                        if spec in self._in_flight:
-                            self._stop_func(spec.type)(spec.node)
-                            self._in_flight.remove(spec)
-                        else:
+                        try:
+                            self.redpanda.logger.debug(
+                                f"Timed cleanup started, _in_flight={self._in_flight}"
+                            )
+                            run_time = self._in_flight.pop(spec)
+                            self.redpanda.logger.debug(
+                                f"Timed cleanup dequeued, spec={spec}, would be run time={run_time}, _in_flight={self._in_flight}"
+                            )
+                        except KeyError:
                             # The stop timers may outlive the test, handle case
                             # where they run after we already had a heal_all call.
                             self.redpanda.logger.warn(
                                 f"Skipping failure stop action, already cleaned up?"
                             )
+                        else:
+                            self._stop_func(spec.type)(spec.node)
+                            self.redpanda.logger.debug(
+                                f"Timed cleanup complete spec={spec}, _in_flight={self._in_flight}"
+                            )
 
                     stop_timer = threading.Timer(function=cleanup,
                                                  args=[],
                                                  interval=spec.length)
-                    self._in_flight.add(spec)
+                    self._in_flight[spec] = self.now() + spec.length
+                    self.redpanda.logger.debug(
+                        f"Timed cleanup scheduled spec={spec}, run_time={self._in_flight[spec]}, _in_flight={self._in_flight}"
+                    )
                     stop_timer.start()
+
+    def cnt_in_flight(self):
+        return len(self._in_flight)
+
+    def time_till_next_recovery(self):
+        return min(run_time
+                   for spec, run_time in self._in_flight.items()) - self.now()
+
+    @classmethod
+    def now(cls):
+        return time.clock_gettime(time.CLOCK_THREAD_CPUTIME_ID)
 
     def _start_func(self, tp):
         if tp == FailureSpec.FAILURE_KILL:
@@ -130,9 +157,9 @@ class FailureInjectorBase:
         elif tp == FailureSpec.FAILURE_NETEM_PACKET_DUPLICATE:
             return self._netem_duplicate
 
-    def _stop_func(self, tp):
+    def _stop_func(self, tp, wait=False):
         if tp == FailureSpec.FAILURE_KILL or tp == FailureSpec.FAILURE_TERMINATE:
-            return self._start
+            return self._start_and_wait if wait else self._start
         elif tp == FailureSpec.FAILURE_SUSPEND:
             return self._continue
         elif tp == FailureSpec.FAILURE_ISOLATE:
@@ -155,6 +182,12 @@ class FailureInjectorBase:
     def _heal_all(self):
         pass
 
+    def _continue_all(self):
+        pass
+
+    def _undo_all(self):
+        pass
+
     def _suspend(self, node):
         pass
 
@@ -165,6 +198,9 @@ class FailureInjectorBase:
         pass
 
     def _start(self, node):
+        pass
+
+    def _start_and_wait(self, node):
         pass
 
     def _netem(self, node, op):
@@ -246,7 +282,46 @@ class FailureInjector(FailureInjectorBase):
                     # Cleanups can fail, e.g. rule does not exist
                     self.redpanda.logger.warn(f"_heal_all: {e}")
 
-        self._in_flight.clear()
+        self.redpanda.logger.debug(
+            f"before _heal_all _in_flight={self._in_flight}")
+        self._in_flight = {
+            spec: run_time
+            for spec, run_time in self._in_flight.items()
+            if spec.type != FailureSpec.FAILURE_ISOLATE
+        }
+        self.redpanda.logger.debug(
+            f"after _heal_all _in_flight={self._in_flight}")
+
+    def _continue_all(self):
+        self.redpanda.logger.info(f"continuing execution on all nodes")
+        for n in self.redpanda.nodes:
+            if self.redpanda.check_node(n):
+                self._continue(n)
+        self.redpanda.logger.debug(
+            f"before _continue_all _in_flight={self._in_flight}")
+        self._in_flight = {
+            spec: run_time
+            for spec, run_time in self._in_flight.items()
+            if spec.type != FailureSpec.FAILURE_SUSPEND
+        }
+        self.redpanda.logger.debug(
+            f"after _continue_all _in_flight={self._in_flight}")
+
+    def _undo_all(self):
+        self.redpanda.logger.info(f"running scheduled undos earlier")
+        self.redpanda.logger.debug(
+            f"before _undo_all _in_flight={self._in_flight}")
+        while self._in_flight:
+            try:
+                spec, run_time = self._in_flight.popitem()
+                self.redpanda.logger.debug(
+                    f"_undo_all popped spec={spec}, planned run time={run_time} _in_flight={self._in_flight}"
+                )
+            except KeyError:
+                pass  # timer just emptied the set: GIL off???
+            else:
+                self.redpanda.logger.debug(f"_undo_all stopping spec={spec}")
+                self._stop_func(spec.type, wait=True)(spec.node)
 
     def _suspend(self, node):
         self.redpanda.logger.info(
@@ -279,6 +354,10 @@ class FailureInjector(FailureInjectorBase):
             self.redpanda.logger.info(
                 f"skipping starting redpanda on {node.account.hostname}, already running with pid: {[pid]}"
             )
+
+    def _start_and_wait(self, node):
+        self._start(node)
+        time.sleep(1)  # should be sufficient for the node to start responding
 
     def _netem(self, node, op):
         self.redpanda.logger.info(

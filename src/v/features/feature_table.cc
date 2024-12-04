@@ -11,54 +11,37 @@
 
 #include "feature_table.h"
 
-#include "cluster/types.h"
-#include "config/node_config.h"
+#include "cluster/feature_update_action.h"
+#include "cluster/version.h"
+#include "config/configuration.h"
 #include "features/logger.h"
-#include "version.h"
+#include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
+#include "model/timestamp.h"
+#include "security/license.h"
+#include "version/version.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/shard_id.hh>
+
+#include <chrono>
+#include <memory>
+#include <optional>
 
 // The feature table is closely related to cluster and uses many types from it
 using namespace cluster;
+using namespace std::chrono_literals;
 
 namespace features {
 
 std::string_view to_string_view(feature f) {
     switch (f) {
-    case feature::serde_raft_0:
-        return "serde_raft_0";
-    case feature::license:
-        return "license";
-    case feature::raft_improved_configuration:
-        return "raft_improved_configuration";
-    case feature::transaction_ga:
-        return "transaction_ga";
-    case feature::raftless_node_status:
-        return "raftless_node_status";
-    case feature::rpc_v2_by_default:
-        return "rpc_v2_by_default";
     case feature::cloud_retention:
         return "cloud_retention";
-    case feature::node_id_assignment:
-        return "node_id_assignment";
-    case feature::replication_factor_change:
-        return "replication_factor_change";
-    case feature::ephemeral_secrets:
-        return "ephemeral_secrets";
-    case feature::seeds_driven_bootstrap_capable:
-        return "seeds_driven_bootstrap_capable";
-    case feature::tm_stm_cache:
-        return "tm_stm_cache";
-    case feature::kafka_gssapi:
-        return "kafka_gssapi";
-    case feature::partition_move_revert_cancel:
-        return "partition_move_cancel_revert";
     case feature::node_isolation:
         return "node_isolation";
     case feature::group_offset_retention:
         return "group_offset_retention";
-    case feature::rpc_transport_unknown_errc:
-        return "rpc_transport_unknown_errc";
     case feature::membership_change_controller_cmds:
         return "membership_change_controller_cmds";
     case feature::controller_snapshots:
@@ -67,12 +50,8 @@ std::string_view to_string_view(feature f) {
         return "cloud_storage_manifest_format_v2";
     case feature::force_partition_reconfiguration:
         return "force_partition_reconfiguration";
-    case feature::raft_append_entries_serde:
-        return "raft_append_entries_serde";
     case feature::delete_records:
         return "delete_records";
-    case feature::lightweight_heartbeats:
-        return "lightweight_heartbeats";
     case feature::raft_coordinated_recovery:
         return "raft_coordinated_recovery";
     case feature::cloud_storage_scrubbing:
@@ -101,6 +80,24 @@ std::string_view to_string_view(feature f) {
         return "role_based_access_control";
     case feature::cluster_topic_manifest_format_v2:
         return "cluster_topic_manifest_format_v2";
+    case feature::node_local_core_assignment:
+        return "node_local_core_assignment";
+    case feature::unified_tx_state:
+        return "unified_tx_state";
+    case feature::data_migrations:
+        return "data_migrations";
+    case feature::group_tx_fence_dedicated_batch_type:
+        return "group_tx_fence_dedicated_batch_type";
+    case feature::transforms_specify_offset:
+        return "transforms_specify_offset";
+    case feature::remote_labels:
+        return "remote_labels";
+    case feature::partition_properties_stm:
+        return "partition_properties_stm";
+    case feature::shadow_indexing_split_topic_property_update:
+        return "shadow_indexing_split_topic_property_update";
+    case feature::datalake_iceberg:
+        return "datalake_iceberg";
 
     /*
      * testing features
@@ -137,35 +134,63 @@ std::string_view to_string_view(feature_state::state s) {
 
 // The version that this redpanda node will report: increment this
 // on protocol changes to raft0 structures, like adding new services.
-//
-// For your convenience, a rough guide to the history of how logical
-// versions mapped to redpanda release versions:
-//  22.1.1 -> 3  (22.1.5 was version 4)
-//  22.2.1 -> 5  (22.2.6 later proceeds to version 6)
-//  22.3.1 -> 7  (22.3.6 later proceeds to verison 8)
-//  23.1.1 -> 9
-//  23.2.1 -> 10
-//  23.3.1 -> 11
-//  24.1.1 -> 12
-//  24.2.1 -> 13
-//
-// Although some previous stable branches have included feature version
-// bumps, this is _not_ the intended usage, as stable branches are
-// meant to be safely downgradable within the branch, and new features
-// imply that new data formats may be written.
-static constexpr cluster_version latest_version = cluster_version{13};
+constexpr cluster_version latest_version = to_cluster_version(
+  release_version::MAX);
 
-// The earliest version we can upgrade from.  This is the version that
-// a freshly initialized node will start at: e.g. a 23.1 Redpanda joining
-// a cluster of 22.3.6 peers would do this:
-// - Start up blank, initialize feature table to version 7
-// - Send join request advertising version range 7-9
-// - 22.3.x peer accepts join request because version range 7-9 includes its
-//   active version (7).
-// - The new 23.1 node advances feature table to version 8 when it joins and
-//   sees controller log replay.
-// - Eventually once all nodes are 23.1, all nodes advance active version to 9
-static constexpr cluster_version earliest_version = cluster_version{7};
+// The earliest version we can upgrade from. This is the version that
+// a freshly initialized node will start at. All features up to this cluster
+// version will automatically be enabled when Redpanda starts.
+constexpr cluster_version earliest_version = to_cluster_version(
+  release_version::v24_1_1);
+
+static_assert(
+  latest_version - earliest_version == 3L,
+  "Consider upgrading the earliest_version in lockstep whenever you increment "
+  "the latest_version");
+
+namespace {
+bool is_major_version_release(cluster::cluster_version version) {
+    if (
+      version < to_cluster_version(release_version::MIN)
+      || version > to_cluster_version(release_version::MAX)) {
+        // Unknown versions default to being a major version release
+        return true;
+    }
+    switch (static_cast<release_version>(version())) {
+    case release_version::v22_1_1:
+        return true;
+    case release_version::v22_1_5:
+        return false;
+    case release_version::v22_2_1:
+        return true;
+    case release_version::v22_2_6:
+        return false;
+    case release_version::v22_3_1:
+        return true;
+    case release_version::v22_3_6:
+        return false;
+    case release_version::v23_1_1:
+    case release_version::v23_2_1:
+    case release_version::v23_3_1:
+    case release_version::v24_1_1:
+    case release_version::v24_2_1:
+    case release_version::v24_3_1:
+    case release_version::v25_1_1:
+        return true;
+    }
+    __builtin_unreachable();
+}
+} // namespace
+
+bool is_major_version_upgrade(
+  cluster::cluster_version from, cluster::cluster_version to) {
+    for (cluster::cluster_version i = from + 1L; i <= to; ++i) {
+        if (is_major_version_release(i)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Extra features that will be wired into the feature table if a special
 // environment variable is set
@@ -194,6 +219,84 @@ static std::array test_extra_schema{
     feature_spec::available_policy::new_clusters_only,
     feature_spec::prepare_policy::always},
 };
+
+class feature_table::probe {
+public:
+    explicit probe(const feature_table& parent)
+      : _parent(parent) {}
+
+    probe(const probe&) = delete;
+    probe& operator=(const probe&) = delete;
+    probe(probe&&) = delete;
+    probe& operator=(probe&&) = delete;
+    ~probe() noexcept = default;
+
+    void setup_metrics() {
+        if (ss::this_shard_id() != 0) {
+            return;
+        }
+
+        if (!config::shard_local_cfg().disable_metrics()) {
+            setup_metrics_for(_metrics);
+        }
+
+        if (!config::shard_local_cfg().disable_public_metrics()) {
+            setup_metrics_for(_public_metrics);
+        }
+    }
+
+    void setup_metrics_for(metrics::metric_groups_base& metrics) {
+        namespace sm = ss::metrics;
+
+        static_assert(
+          !std::is_move_constructible_v<feature_table>
+            && !std::is_move_assignable_v<feature_table>
+            && !std::is_copy_constructible_v<feature_table>
+            && !std::is_copy_assignable_v<feature_table>,
+          "The probe captures a reference to this");
+
+        metrics.add_group(
+          prometheus_sanitize::metrics_name("cluster:features"),
+          {
+            sm::make_gauge(
+              "enterprise_license_expiry_sec",
+              [&ft = _parent]() {
+                  return calculate_expiry_metric(ft.get_license());
+              },
+              sm::description("Number of seconds remaining until the "
+                              "Enterprise license expires"))
+              .aggregate({sm::shard_label}),
+          });
+    }
+
+    const feature_table& _parent;
+    metrics::internal_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
+};
+
+namespace {
+
+security::license
+make_builtin_trial_license(security::license::clock::time_point start_time) {
+    auto expiry_time = start_time + std::chrono::days{30};
+    auto expiry = std::chrono::duration_cast<std::chrono::seconds>(
+      expiry_time.time_since_epoch());
+
+    if (std::getenv("__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE") != nullptr) {
+        // For testing, use an expired trial license
+        expiry = 0s;
+    }
+
+    return security::license{
+      .format_version = 0,
+      .type = security::license_type::free_trial,
+      .organization = "Redpanda Built-In Evaluation Period",
+      .expiry = expiry,
+      .checksum = "",
+    };
+}
+
+} // namespace
 
 feature_table::feature_table() {
     // Intentionally undocumented environment variable, only for use
@@ -227,9 +330,15 @@ feature_table::feature_table() {
             }
         }
     }
+
+    _probe = std::make_unique<probe>(*this);
+    _probe->setup_metrics();
 }
 
+feature_table::~feature_table() noexcept = default;
+
 ss::future<> feature_table::stop() {
+    _probe.reset();
     _as.request_abort();
 
     // Don't trust callers to have fired their abort source in the right
@@ -514,7 +623,7 @@ feature_table::await_feature_then(feature f, std::function<void(void)> fn) {
     try {
         co_await await_feature(f);
         fn();
-    } catch (ss::abort_requested_exception&) {
+    } catch (const ss::abort_requested_exception&) {
         // Shutting down
     } catch (...) {
         // Should never happen, abort is the only exception that await_feature
@@ -578,10 +687,54 @@ void feature_table::set_license(security::license license) {
     _license = std::move(license);
 }
 
-void feature_table::revoke_license() { _license = std::nullopt; }
+void feature_table::set_builtin_trial_license(
+  model::timestamp cluster_creation_timestamp) {
+    _builtin_trial_license = make_builtin_trial_license(
+      model::to_time_point(cluster_creation_timestamp));
+    _builtin_trial_license_initialized = true;
+
+    if (ss::this_shard_id() == 0) {
+        vlog(
+          featureslog.debug,
+          "Initialized builtin trial license expirying at "
+          "{}",
+          _builtin_trial_license->expiry);
+    }
+}
+
+void feature_table::revoke_license() {
+    _license = std::nullopt;
+    _builtin_trial_license = std::nullopt;
+}
 
 const std::optional<security::license>& feature_table::get_license() const {
+    static const std::optional<security::license> no_license = std::nullopt;
+    if (_license) {
+        return _license;
+    } else if (
+      _builtin_trial_license && !_builtin_trial_license->is_expired()) {
+        // Don't not show the evaluation period license after it expired
+        return _builtin_trial_license;
+    } else {
+        return no_license;
+    }
+}
+
+const std::optional<security::license>&
+feature_table::get_configured_license() const {
     return _license;
+}
+
+bool feature_table::should_sanction() const {
+    if (_license) {
+        return _license->is_expired();
+    } else if (_builtin_trial_license) {
+        return _builtin_trial_license->is_expired();
+    }
+
+    // While we are yet to initialize _builtin_trial_license on cluster
+    // creation, be permissive
+    return _builtin_trial_license_initialized;
 }
 
 void feature_table::testing_activate_all() {
@@ -690,6 +843,18 @@ void feature_table::assert_compatible_version(bool override) {
             }
         }
     }
+}
+
+long long feature_table::calculate_expiry_metric(
+  const std::optional<security::license>& license,
+  security::license::clock::time_point now) {
+    if (!license) {
+        return -1;
+    }
+
+    auto rem = license->expiration() - now;
+    auto rem_capped = std::max(rem.zero(), rem);
+    return rem_capped / 1s;
 }
 
 } // namespace features

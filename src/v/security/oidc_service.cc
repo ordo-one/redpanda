@@ -9,10 +9,12 @@
  */
 #include "security/oidc_service.h"
 
+#include "config/configuration.h"
+#include "config/tls_config.h"
 #include "http/client.h"
 #include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
 #include "net/tls_certificate_probe.h"
-#include "prometheus/prometheus_sanitize.h"
 #include "security/exceptions.h"
 #include "security/jwt.h"
 #include "security/logger.h"
@@ -189,7 +191,7 @@ struct service::impl {
         return _gate.close();
     }
 
-    probe& get_probe_for(parsed_url const& url) {
+    probe& get_probe_for(const parsed_url& url) {
         auto& p = _probes[url.host];
         if (!p) {
             p = std::make_unique<probe>();
@@ -217,10 +219,10 @@ struct service::impl {
     ss::future<> update() {
         auto enabled = absl::c_any_of(
                          _sasl_mechanisms(),
-                         [](auto const& m) { return m == "OAUTHBEARER"; })
+                         [](const auto& m) { return m == "OAUTHBEARER"; })
                        || absl::c_any_of(
                          _http_authentication(),
-                         [](auto const& m) { return m == "OIDC"; });
+                         [](const auto& m) { return m == "OIDC"; });
         if (!enabled) {
             co_return;
         }
@@ -340,6 +342,8 @@ struct service::impl {
             if (!_creds) {
                 ss::tls::credentials_builder builder;
                 builder.set_client_auth(ss::tls::client_auth::NONE);
+                builder.set_minimum_tls_version(config::from_config(
+                  config::shard_local_cfg().tls_min_version()));
                 co_await builder.set_system_trust();
                 _creds = co_await net::build_reloadable_credentials_with_probe<
                   ss::tls::certificate_credentials>(
@@ -415,13 +419,13 @@ service::service(
   config::binding<ss::sstring> mapping,
   config::binding<std::chrono::seconds> keys_refresh_interval)
   : _impl{std::make_unique<impl>(
-    std::move(sasl_mechanisms),
-    std::move(http_authentication),
-    std::move(discovery_url),
-    std::move(token_audience),
-    std::move(clock_skew_tolerance),
-    std::move(mapping),
-    std::move(keys_refresh_interval))} {}
+      std::move(sasl_mechanisms),
+      std::move(http_authentication),
+      std::move(discovery_url),
+      std::move(token_audience),
+      std::move(clock_skew_tolerance),
+      std::move(mapping),
+      std::move(keys_refresh_interval))} {}
 
 service::~service() noexcept = default;
 
@@ -440,9 +444,9 @@ std::chrono::seconds service::clock_skew_tolerance() const {
     return _impl->_clock_skew_tolerance();
 }
 
-verifier const& service::get_verifier() const { return _impl->_verifier; }
+const verifier& service::get_verifier() const { return _impl->_verifier; }
 
-principal_mapping_rule const& service::get_principal_mapping_rule() const {
+const principal_mapping_rule& service::get_principal_mapping_rule() const {
     return _impl->_rule;
 }
 

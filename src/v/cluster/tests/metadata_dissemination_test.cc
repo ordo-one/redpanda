@@ -48,7 +48,7 @@ wait_for_leaders_updates(int id, cluster::metadata_cache& cache) {
         if (tp_md->get_assignments().size() != 3) {
             return false;
         }
-        for (auto& p_md : tp_md->get_assignments()) {
+        for (auto& [_, p_md] : tp_md->get_assignments()) {
             auto leader_id = cache.get_leader_id(tn, p_md.id);
             test_logger.info(
               "waiting for leaders on node {}, partition {}, leader_id: {}",
@@ -61,7 +61,7 @@ wait_for_leaders_updates(int id, cluster::metadata_cache& cache) {
             leaders.push_back(*leader_id);
         }
         return true;
-    }).get0();
+    }).get();
     return leaders;
 }
 
@@ -80,7 +80,7 @@ FIXTURE_TEST(
 
     tests::cooperative_spin_wait_with_timeout(timeout, [&cache_1, &cache_2] {
         return cache_1.node_count() == 3 && cache_2.node_count() == 3;
-    }).get0();
+    }).get();
 
     // Make sure we have 3 working nodes
     BOOST_REQUIRE_EQUAL(cache_0.node_count(), 3);
@@ -95,7 +95,7 @@ FIXTURE_TEST(
       .create_topics(
         cluster::without_custom_assignments(std::move(topics)),
         model::no_timeout)
-      .get0();
+      .get();
 
     auto leaders_0 = wait_for_leaders_updates(0, cache_0);
     auto leaders_1 = wait_for_leaders_updates(1, cache_1);
@@ -116,7 +116,7 @@ FIXTURE_TEST(test_metadata_dissemination_joining_node, cluster_test_fixture) {
 
     tests::cooperative_spin_wait_with_timeout(timeout, [&cache_1] {
         return cache_1.node_count() == 2;
-    }).get0();
+    }).get();
     // Make sure we have 2 working nodes
     BOOST_REQUIRE_EQUAL(cache_0.node_count(), 2);
     BOOST_REQUIRE_EQUAL(cache_1.node_count(), 2);
@@ -129,7 +129,7 @@ FIXTURE_TEST(test_metadata_dissemination_joining_node, cluster_test_fixture) {
       .create_topics(
         cluster::without_custom_assignments(std::move(topics)),
         model::no_timeout)
-      .get0();
+      .get();
 
     // Add new now to the cluster
     create_node_application(model::node_id{2});
@@ -137,7 +137,7 @@ FIXTURE_TEST(test_metadata_dissemination_joining_node, cluster_test_fixture) {
     // Wait for node to join the cluster
     tests::cooperative_spin_wait_with_timeout(timeout, [&cache_1, &cache_2] {
         return cache_1.node_count() == 3 && cache_2.node_count() == 3;
-    }).get0();
+    }).get();
 
     auto leaders_0 = wait_for_leaders_updates(0, cache_0);
     auto leaders_1 = wait_for_leaders_updates(1, cache_1);

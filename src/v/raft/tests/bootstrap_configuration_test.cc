@@ -35,22 +35,22 @@ struct bootstrap_fixture : raft::simple_record_fixture {
     using raft::simple_record_fixture::active_nodes;
     bootstrap_fixture()
       : _storage(
-        []() {
-            return storage::kvstore_config(
-              1_MiB,
-              config::mock_binding(10ms),
-              "test.dir",
-              storage::make_sanitized_file_config());
-        },
-        []() {
-            return storage::log_config(
-              "test.dir",
-              1_GiB,
-              ss::default_priority_class(),
-              storage::with_cache::no,
-              storage::make_sanitized_file_config());
-        },
-        _feature_table) {
+          []() {
+              return storage::kvstore_config(
+                1_MiB,
+                config::mock_binding(10ms),
+                "test.dir",
+                storage::make_sanitized_file_config());
+          },
+          []() {
+              return storage::log_config(
+                "test.dir",
+                1_GiB,
+                ss::default_priority_class(),
+                storage::with_cache::no,
+                storage::make_sanitized_file_config());
+          },
+          _feature_table) {
         _feature_table.start().get();
         _feature_table
           .invoke_on_all(
@@ -60,7 +60,7 @@ struct bootstrap_fixture : raft::simple_record_fixture {
         // ignore the get_log()
         (void)_storage.log_mgr()
           .manage(storage::ntp_config(_ntp, "test.dir"))
-          .get0();
+          .get();
     }
 
     std::vector<storage::append_result> write_n(const std::size_t n) {
@@ -72,11 +72,11 @@ struct bootstrap_fixture : raft::simple_record_fixture {
         res.push_back(
           datas(n)
             .for_each_ref(get_log()->make_appender(cfg), cfg.timeout)
-            .get0());
+            .get());
         res.push_back(
           configs(n, raft::group_configuration::v_6)
             .for_each_ref(get_log()->make_appender(cfg), cfg.timeout)
-            .get0());
+            .get());
         get_log()->flush().get();
         return res;
     }
@@ -102,7 +102,7 @@ FIXTURE_TEST(write_configs, bootstrap_fixture) {
     }
     auto cfg = raft::details::read_bootstrap_state(
                  get_log(), model::offset(0), _as)
-                 .get0();
+                 .get();
     info(
       "data batches:{}, config batches: {}, data batches:{}, config batches:{}",
       replies[0],
@@ -121,28 +121,28 @@ FIXTURE_TEST(mixed_config_versions, bootstrap_fixture) {
 
     datas(20)
       .for_each_ref(get_log()->make_appender(append_cfg), append_cfg.timeout)
-      .get0();
+      .get();
     configs(3, raft::group_configuration::v_4)
       .for_each_ref(get_log()->make_appender(append_cfg), append_cfg.timeout)
-      .get0();
+      .get();
     configs(2, raft::group_configuration::v_5)
       .for_each_ref(get_log()->make_appender(append_cfg), append_cfg.timeout)
-      .get0();
+      .get();
     configs(5, raft::group_configuration::v_6)
       .for_each_ref(get_log()->make_appender(append_cfg), append_cfg.timeout)
-      .get0();
+      .get();
     get_log()->flush().get();
 
     auto state = raft::details::read_bootstrap_state(
                    get_log(), model::offset(0), _as)
-                   .get0();
+                   .get();
 
     // 20 data batches
     BOOST_REQUIRE_EQUAL(state.data_batches_seen(), 20);
     // 10 configuration batches
     BOOST_REQUIRE_EQUAL(state.config_batches_seen(), 10);
 
-    for (auto i = 0; i < state.configurations().size(); ++i) {
+    for (size_t i = 0; i < state.configurations().size(); ++i) {
         auto& current_cfg = state.configurations()[i];
         info("i: {}, cfg_version: {}", i, current_cfg.cfg.version());
         if (i < 3) {
@@ -161,7 +161,7 @@ FIXTURE_TEST(mixed_config_versions, bootstrap_fixture) {
 FIXTURE_TEST(empty_log, bootstrap_fixture) {
     auto cfg = raft::details::read_bootstrap_state(
                  get_log(), model::offset(0), _as)
-                 .get0();
+                 .get();
 
     BOOST_REQUIRE_EQUAL(cfg.data_batches_seen(), 0);
     BOOST_REQUIRE_EQUAL(cfg.config_batches_seen(), 0);

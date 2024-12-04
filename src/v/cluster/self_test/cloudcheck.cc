@@ -14,6 +14,7 @@
 #include "base/vlog.h"
 #include "cloud_storage/types.h"
 #include "cluster/logger.h"
+#include "cluster/self_test/metrics.h"
 #include "config/configuration.h"
 #include "random/generators.h"
 #include "utils/uuid.h"
@@ -43,7 +44,11 @@ cloudcheck::run(cloudcheck_opts opts) {
     if (_gate.is_closed()) {
         vlog(clusterlog.debug, "cloudcheck - gate already closed");
         auto result = self_test_result{
-          .name = _opts.name, .warning = "cloudcheck - gate already closed"};
+          .name = _opts.name,
+          .test_type = "cloud",
+          .start_time = time_since_epoch(ss::lowres_system_clock::now()),
+          .end_time = time_since_epoch(ss::lowres_system_clock::now()),
+          .warning = "cloudcheck - gate already closed"};
         co_return std::vector<self_test_result>{result};
     }
     auto g = _gate.hold();
@@ -59,7 +64,11 @@ cloudcheck::run(cloudcheck_opts opts) {
           clusterlog.warn,
           "Cloud storage is not enabled, exiting cloud storage self-test.");
         auto result = self_test_result{
-          .name = _opts.name, .warning = "Cloud storage is not enabled."};
+          .name = _opts.name,
+          .test_type = "cloud",
+          .start_time = time_since_epoch(ss::lowres_system_clock::now()),
+          .end_time = time_since_epoch(ss::lowres_system_clock::now()),
+          .warning = "Cloud storage is not enabled."};
         co_return std::vector<self_test_result>{result};
     }
 
@@ -70,15 +79,27 @@ cloudcheck::run(cloudcheck_opts opts) {
           "self-test.");
         auto result = self_test_result{
           .name = _opts.name,
+          .test_type = "cloud",
+          .start_time = time_since_epoch(ss::lowres_system_clock::now()),
+          .end_time = time_since_epoch(ss::lowres_system_clock::now()),
           .warning = "cloud_storage_api is not initialized."};
         co_return std::vector<self_test_result>{result};
     }
 
-    _remote_read_enabled = cfg.cloud_storage_enable_remote_read();
-    _remote_write_enabled = cfg.cloud_storage_enable_remote_write();
-
     co_return co_await ss::with_scheduling_group(
       _opts.sg, [this]() mutable { return run_benchmarks(); });
+}
+
+template<typename Test, typename... Args, typename R>
+R cloudcheck::do_run_test(Test test, Args&&... args) {
+    const auto start = ss::lowres_system_clock::now();
+    auto result = co_await std::invoke(
+      test, *this, std::forward<Args>(args)...);
+    const auto end = ss::lowres_system_clock::now();
+    result.test_result.start_time = time_since_epoch(start);
+    result.test_result.end_time = time_since_epoch(end);
+    result.test_result.duration = end - start;
+    co_return result;
 }
 
 ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
@@ -95,13 +116,12 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
     const auto self_test_key = cloud_storage_clients::object_key{
       self_test_prefix / uuid};
 
-    const std::optional<iobuf> payload = (_remote_write_enabled)
-                                           ? make_random_payload()
-                                           : std::optional<iobuf>{};
+    const iobuf payload = make_random_payload();
 
     // Test Put
-    auto upload_test_result = co_await verify_upload(
-      bucket, self_test_key, payload);
+    auto verify_test_result = co_await do_run_test(
+      &cloudcheck::verify_upload, bucket, self_test_key, payload);
+    auto upload_test_result = verify_test_result.test_result;
     const bool is_uploaded
       = (!upload_test_result.warning && !upload_test_result.error);
 
@@ -113,7 +133,8 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
     const std::optional<cloud_storage_clients::object_key> list_prefix
       = (is_uploaded) ? self_test_prefix
                       : std::optional<cloud_storage_clients::object_key>{};
-    auto list_test_result_pair = co_await verify_list(bucket, list_prefix);
+    auto list_test_result_pair = co_await do_run_test(
+      &cloudcheck::verify_list, bucket, list_prefix, num_default_objects);
     auto& [object_list, list_test_result] = list_test_result_pair;
     if (is_uploaded && object_list) {
         // Check that uploaded object exists in object_list contents.
@@ -134,7 +155,7 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
     results.push_back(std::move(list_test_result));
 
     // Test Get
-    // If the payloaded was uploaded, this attempts to get the written
+    // If the payload was uploaded, this attempts to get the written
     // object. If it wasn't, it will attempt to get the smallest object from the
     // object list, if at least one exists.
     auto get_min_object_key =
@@ -160,12 +181,12 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
 
     const std::optional<cloud_storage_clients::object_key> download_key
       = (is_uploaded) ? self_test_key : get_min_object_key();
-    auto download_test_result_pair = co_await verify_download(
-      bucket, download_key);
+    auto download_test_result_pair = co_await do_run_test(
+      &cloudcheck::verify_download, bucket, download_key);
     auto& [downloaded_object, download_test_result] = download_test_result_pair;
     if (is_uploaded && downloaded_object) {
         auto& downloaded_buf = downloaded_object.value();
-        if (downloaded_buf != payload.value()) {
+        if (downloaded_buf != payload) {
             download_test_result.error
               = "Downloaded object differs from uploaded payload.";
         }
@@ -174,16 +195,19 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
     results.push_back(std::move(download_test_result));
 
     // Test Head
-    auto head_test_result = co_await verify_head(bucket, download_key);
-    results.push_back(std::move(head_test_result));
+    auto head_test_result = co_await do_run_test(
+      &cloudcheck::verify_head, bucket, download_key);
+    results.push_back(std::move(head_test_result.test_result));
 
     // Test Delete
-    auto delete_test_result = co_await verify_delete(bucket, self_test_key);
-    results.push_back(std::move(delete_test_result));
+    auto delete_test_result = co_await do_run_test(
+      &cloudcheck::verify_delete, bucket, self_test_key);
+    results.push_back(std::move(delete_test_result.test_result));
 
     // Test Deletes
-    auto deletes_test_result = co_await verify_deletes(bucket);
-    results.push_back(std::move(deletes_test_result));
+    auto deletes_test_result = co_await do_run_test(
+      &cloudcheck::verify_deletes, bucket, num_default_objects);
+    results.push_back(std::move(deletes_test_result.test_result));
 
     co_return results;
 }
@@ -200,10 +224,8 @@ cloud_storage::upload_request cloudcheck::make_upload_request(
   const cloud_storage_clients::object_key& key,
   iobuf payload,
   retry_chain_node& rtc) {
-    cloud_storage::transfer_details transfer_details{
-      .bucket = bucket, .key = key, .parent_rtc = rtc};
     cloud_storage::upload_request upload_request(
-      std::move(transfer_details),
+      {.bucket = bucket, .key = key, .parent_rtc = rtc},
       cloud_storage::upload_type::object,
       std::move(payload));
     return upload_request;
@@ -214,37 +236,29 @@ cloud_storage::download_request cloudcheck::make_download_request(
   const cloud_storage_clients::object_key& key,
   iobuf& payload,
   retry_chain_node& rtc) {
-    cloud_storage::transfer_details transfer_details{
-      .bucket = bucket, .key = key, .parent_rtc = rtc};
     cloud_storage::download_request download_request(
-      std::move(transfer_details),
+      {.bucket = bucket, .key = key, .parent_rtc = rtc},
       cloud_storage::download_type::object,
       std::ref(payload));
     return download_request;
 }
 
-ss::future<self_test_result> cloudcheck::verify_upload(
+ss::future<cloudcheck::verify_upload_result> cloudcheck::verify_upload(
   cloud_storage_clients::bucket_name bucket,
   cloud_storage_clients::object_key key,
-  const std::optional<iobuf>& payload) {
+  const iobuf& payload) {
     auto result = self_test_result{
-      .name = _opts.name, .info = "Put", .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "Put", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
         co_return result;
     }
 
-    if (!_remote_write_enabled) {
-        result.error = "Remote write is not enabled for this cluster.";
-        co_return result;
-    }
-
-    const auto start = ss::lowres_clock::now();
     try {
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
         cloud_storage::upload_request upload_request = make_upload_request(
-          bucket, key, payload.value().copy(), rtc);
+          bucket, key, payload.copy(), rtc);
         const cloud_storage::upload_result upload_result
           = co_await _cloud_storage_api.local().upload_object(
             std::move(upload_request));
@@ -264,33 +278,22 @@ ss::future<self_test_result> cloudcheck::verify_upload(
         result.error = e.what();
     }
 
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
-
     co_return result;
 }
 
-ss::future<std::pair<cloud_storage::remote::list_result, self_test_result>>
-cloudcheck::verify_list(
+ss::future<cloudcheck::verify_list_result> cloudcheck::verify_list(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> prefix,
   size_t max_keys) {
     auto result = self_test_result{
-      .name = _opts.name, .info = "List", .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "List", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return std::make_pair(
-          cloud_storage_clients::error_outcome::fail, result);
+        co_return verify_list_result{
+          cloud_storage_clients::error_outcome::fail, result};
     }
 
-    if (!_remote_read_enabled) {
-        result.error = "Remote read is not enabled for this cluster.";
-        co_return std::make_pair(
-          cloud_storage_clients::error_outcome::fail, result);
-    }
-
-    const auto start = ss::lowres_clock::now();
     try {
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
         const cloud_storage::remote::list_result object_list
@@ -301,31 +304,23 @@ cloudcheck::verify_list(
             result.error = "Failed to list objects in cloud storage.";
         }
 
-        co_return std::make_pair(std::move(object_list), std::move(result));
+        co_return verify_list_result{std::move(object_list), std::move(result)};
     } catch (const std::exception& e) {
         result.error = e.what();
     }
 
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
-
-    co_return std::make_pair(
-      cloud_storage_clients::error_outcome::fail, std::move(result));
+    co_return verify_list_result{
+      cloud_storage_clients::error_outcome::fail, std::move(result)};
 }
 
-ss::future<self_test_result> cloudcheck::verify_head(
+ss::future<cloudcheck::verify_head_result> cloudcheck::verify_head(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> key) {
     auto result = self_test_result{
-      .name = _opts.name, .info = "Head", .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "Head", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
-    }
-
-    if (!_remote_read_enabled) {
-        result.error = "Remote read is not enabled for this cluster.";
         co_return result;
     }
 
@@ -335,7 +330,6 @@ ss::future<self_test_result> cloudcheck::verify_head(
         co_return result;
     }
 
-    const auto start = ss::lowres_clock::now();
     try {
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
         const cloud_storage::download_result head_result
@@ -361,38 +355,28 @@ ss::future<self_test_result> cloudcheck::verify_head(
         result.error = e.what();
     }
 
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
-
     co_return result;
 }
 
-ss::future<std::pair<std::optional<iobuf>, self_test_result>>
-cloudcheck::verify_download(
+ss::future<cloudcheck::verify_download_result> cloudcheck::verify_download(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> key) {
     auto result = self_test_result{
-      .name = _opts.name, .info = "Get", .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "Get", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return std::make_pair(std::nullopt, result);
-    }
-
-    if (!_remote_read_enabled) {
-        result.error = "Remote read is not enabled for this cluster.";
-        co_return std::make_pair(std::nullopt, result);
+        co_return verify_download_result{std::nullopt, result};
     }
 
     if (!key) {
         result.warning = "Could not download from cloud storage (no file was "
                          "found in the bucket).";
-        co_return std::make_pair(std::nullopt, result);
+        co_return verify_download_result{std::nullopt, result};
     }
 
     std::optional<iobuf> result_payload = std::nullopt;
 
-    const auto start = ss::lowres_clock::now();
     try {
         iobuf download_payload;
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
@@ -420,29 +404,21 @@ cloudcheck::verify_download(
         result.error = e.what();
     }
 
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
-
-    co_return std::make_pair(std::move(result_payload), std::move(result));
+    co_return verify_download_result{
+      std::move(result_payload), std::move(result)};
 }
 
-ss::future<self_test_result> cloudcheck::verify_delete(
+ss::future<cloudcheck::verify_delete_result> cloudcheck::verify_delete(
   cloud_storage_clients::bucket_name bucket,
   cloud_storage_clients::object_key key) {
     auto result = self_test_result{
-      .name = _opts.name, .info = "Delete", .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "Delete", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
         co_return result;
     }
 
-    if (!_remote_write_enabled) {
-        result.error = "Remote write is not enabled for this cluster.";
-        co_return result;
-    }
-
-    const auto start = ss::lowres_clock::now();
     try {
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
         const cloud_storage::upload_result delete_result
@@ -463,26 +439,16 @@ ss::future<self_test_result> cloudcheck::verify_delete(
         result.error = e.what();
     }
 
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
-
     co_return result;
 }
 
-ss::future<self_test_result> cloudcheck::verify_deletes(
+ss::future<cloudcheck::verify_deletes_result> cloudcheck::verify_deletes(
   cloud_storage_clients::bucket_name bucket, size_t num_objects) {
     auto result = self_test_result{
-      .name = _opts.name,
-      .info = "Plural Delete",
-      .test_type = "cloud_storage"};
+      .name = _opts.name, .info = "Plural Delete", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
-    }
-
-    if (!_remote_write_enabled) {
-        result.error = "Remote write is not enabled for this cluster.";
         co_return result;
     }
 
@@ -495,7 +461,6 @@ ss::future<self_test_result> cloudcheck::verify_deletes(
         co_await verify_upload(bucket, key, make_random_payload());
     }
 
-    const auto start = ss::lowres_clock::now();
     try {
         auto rtc = retry_chain_node(_opts.timeout, _opts.backoff, &_rtc);
         const cloud_storage::upload_result delete_result
@@ -516,9 +481,6 @@ ss::future<self_test_result> cloudcheck::verify_deletes(
     } catch (const std::exception& e) {
         result.error = e.what();
     }
-
-    const auto end = ss::lowres_clock::now();
-    result.duration = end - start;
 
     co_return result;
 }

@@ -128,6 +128,23 @@ rpk will talk to a localhost:9092 cluster until you swap to a different profile.
 				return
 			}
 
+			// Below here, the current profile is pointed to a
+			// local container cluster or a self hosted cluster.
+			// We want to create or swap to the cloud profile,
+			// unless the user used --no-profile.
+			if noProfile {
+				// The current profile is seemingly pointing to a container cluster.
+				if p.Name == common.ContainerProfileName {
+					fmt.Printf("You are talking to a localhost 'rpk container' cluster (rpk profile name: %q)\n", p.Name)
+					fmt.Println("To talk to a cloud cluster, use 'rpk cloud cluster select'.")
+					return
+				}
+				// The current profile is a self hosted cluster.
+				fmt.Printf("You are talking to a self hosted cluster (rpk profile name: %q)\n", p.Name)
+				fmt.Println("To talk to a cloud cluster, use 'rpk cloud cluster select'.")
+				return
+			}
+
 			// The current profile was auth'd to the current organization.
 			// We tell the status of what org the user is talking to.
 			if p.FromCloud {
@@ -138,25 +155,8 @@ rpk will talk to a localhost:9092 cluster until you swap to a different profile.
 				return
 			}
 
-			// Below here, the current profile is pointed to a
-			// local container cluster or a self hosted cluster.
-			// We want to create or swap to the cloud profile,
-			// unless the user used --no-profile.
-			if noProfile {
-				// The current profile is seemingly pointing to a container cluster.
-				if p.Name == common.ContainerProfileName {
-					fmt.Printf("You are talking to a localhost 'rpk container' cluster (rpk profile name: %q)", p.Name)
-					fmt.Println("To talk to a cloud cluster, use 'rpk cloud cluster select'.")
-					return
-				}
-				// The current profile is a self hosted cluster.
-				fmt.Printf("You are talking to a self hosted cluster (rpk profile name: %q)\n", p.Name)
-				fmt.Println("To talk to a cloud cluster, use 'rpk cloud cluster select'.")
-				return
-			}
-
 			if p.Name == common.ContainerProfileName {
-				fmt.Printf("You are talking to a localhost 'rpk container' cluster (rpk profile name: %q)", p.Name)
+				fmt.Printf("You are talking to a localhost 'rpk container' cluster (rpk profile name: %q)\n", p.Name)
 			} else {
 				fmt.Printf("You are talking to a self hosted cluster (rpk profile name: %q)\n", p.Name)
 			}

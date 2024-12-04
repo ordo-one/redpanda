@@ -25,10 +25,13 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug/common"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	k8score "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -70,8 +73,6 @@ func executeK8SBundle(ctx context.Context, bp bundleParams) error {
 		saveDataDirStructure(ps, bp.y),
 		saveDiskUsage(ctx, ps, bp.y),
 		saveInterrupts(ps),
-		saveK8SLogs(ctx, ps, bp.namespace, bp.logsSince, bp.logsLimitBytes, bp.labelSelector),
-		saveK8SResources(ctx, ps, bp.namespace, bp.labelSelector),
 		saveKafkaMetadata(ctx, ps, bp.cl),
 		saveKernelSymbols(ps),
 		saveMdstat(ps),
@@ -79,18 +80,43 @@ func executeK8SBundle(ctx context.Context, bp bundleParams) error {
 		saveNTPDrift(ps),
 		saveResourceUsageData(ps, bp.y),
 		saveSlabInfo(ps),
+		saveUname(ctx, ps),
 	}
 
-	adminAddresses, err := adminAddressesFromK8S(ctx, bp.namespace)
-	if err != nil {
-		zap.L().Sugar().Debugf("unable to get admin API addresses from the k8s API: %v", err)
+	// We use the K8S to discover the cluster's admin API addresses and collect
+	// logs and k8s resources. First we check if we have enough permissions
+	// before kicking the steps.
+	var adminAddresses []string
+	if err := checkK8sPermissions(ctx, bp.namespace); err != nil {
+		errs = multierror.Append(
+			errs,
+			fmt.Errorf("skipping log collection and Kubernetes resource collection (such as Pods and Services) in the namespace %q. To enable this, grant additional permissions to your Service Account. For more information, visit https://docs.redpanda.com/current/manage/kubernetes/troubleshooting/k-diagnostics-bundle/", err),
+		)
+	} else {
+		steps = append(steps, []step{
+			saveK8SResources(ctx, ps, bp.namespace, bp.labelSelector),
+			saveK8SLogs(ctx, ps, bp.namespace, bp.logsSince, bp.logsLimitBytes, bp.labelSelector),
+		}...)
+
+		adminAddresses, err = adminAddressesFromK8S(ctx, bp.namespace)
+		if err != nil {
+			zap.L().Sugar().Debugf("unable to get admin API addresses from the k8s API: %v", err)
+		}
 	}
 	if len(adminAddresses) == 0 {
-		adminAddresses = []string{fmt.Sprintf("127.0.0.1:%v", config.DefaultAdminPort)}
+		if len(bp.p.AdminAPI.Addresses) > 0 {
+			zap.L().Sugar().Debugf("using admin API addresses from profile: %v", bp.p.AdminAPI.Addresses)
+			adminAddresses = bp.p.AdminAPI.Addresses
+		} else {
+			defaultAddress := fmt.Sprintf("127.0.0.1:%v", config.DefaultAdminPort)
+			zap.L().Sugar().Debugf("profile empty, using %v for the Admin API address", defaultAddress)
+			adminAddresses = []string{defaultAddress}
+		}
 	}
 	steps = append(steps, []step{
 		saveClusterAdminAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.partitions),
-		saveSingleAdminAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.metricsInterval, bp.cpuProfilerWait),
+		saveSingleAdminAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.cpuProfilerWait),
+		saveMetricsAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.metricsInterval, bp.metricsSampleCount),
 	}...)
 
 	for _, s := range steps {
@@ -136,6 +162,41 @@ func k8sPodList(ctx context.Context, namespace string, labelSelector map[string]
 		return nil, nil, fmt.Errorf("unable to get pods in the %q namespace: %v", namespace, err)
 	}
 	return clientset, pods, nil
+}
+
+// checkK8sPermissions will check for the minimal service account permissions
+// needed to perform the k8s-API-related steps in the debug bundle collection
+// process.
+func checkK8sPermissions(ctx context.Context, namespace string) error {
+	cl, err := k8sClientset()
+	if err != nil {
+		return fmt.Errorf("unable to create kubernetes client: %v", err)
+	}
+
+	// These are the minimal permissions needed for the k8s bundle to function.
+	perMap := map[string]string{
+		"services": "list",
+		"pods":     "list",
+	}
+	for resource, verb := range perMap {
+		sar := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace: namespace,
+					Verb:      verb,
+					Resource:  resource,
+				},
+			},
+		}
+		response, err := cl.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to check service account permissions: %v", err)
+		}
+		if !response.Status.Allowed {
+			return fmt.Errorf("permission denied to %s %s", verb, resource)
+		}
+	}
+	return nil
 }
 
 // adminAddressesFromK8S returns the admin API host:port list by querying the
@@ -216,7 +277,7 @@ func saveClusterAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, 
 				TLS:       p.AdminAPI.TLS,
 			},
 		}
-		cl, err := adminapi.NewClient(fs, p)
+		cl, err := adminapi.NewClient(ctx, fs, p)
 		if err != nil {
 			return fmt.Errorf("unable to initialize admin client: %v", err)
 		}
@@ -224,6 +285,7 @@ func saveClusterAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, 
 		var grp multierror.Group
 		reqFuncs := []func() error{
 			func() error { return requestAndSave(ctx, ps, "admin/brokers.json", cl.Brokers) },
+			func() error { return requestAndSave(ctx, ps, "admin/broker_uuids.json", cl.GetBrokerUuids) },
 			func() error { return requestAndSave(ctx, ps, "admin/health_overview.json", cl.GetHealthOverview) },
 			func() error { return requestAndSave(ctx, ps, "admin/license.json", cl.GetLicenseInfo) },
 			func() error { return requestAndSave(ctx, ps, "admin/reconfigurations.json", cl.Reconfigurations) },
@@ -240,17 +302,17 @@ func saveClusterAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, 
 			},
 			func() error {
 				// Need to wrap this function because cl.Config receives an additional 'includeDefaults' param.
-				f := func(ctx context.Context) (adminapi.Config, error) {
+				f := func(ctx context.Context) (rpadmin.Config, error) {
 					return cl.Config(ctx, true)
 				}
 				return requestAndSave(ctx, ps, "admin/cluster_config.json", f)
 			}, func() error {
-				f := func(ctx context.Context) (adminapi.ConfigStatusResponse, error) {
+				f := func(ctx context.Context) (rpadmin.ConfigStatusResponse, error) {
 					return cl.ClusterConfigStatus(ctx, true)
 				}
 				return requestAndSave(ctx, ps, "admin/cluster_config_status.json", f)
 			}, func() error {
-				f := func(ctx context.Context) ([]adminapi.ClusterPartition, error) {
+				f := func(ctx context.Context) ([]rpadmin.ClusterPartition, error) {
 					return cl.AllClusterPartitions(ctx, true, false) // include defaults, and include disabled.
 				}
 				return requestAndSave(ctx, ps, "admin/cluster_partitions.json", f)
@@ -270,7 +332,7 @@ func saveClusterAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, 
 
 // saveSingleAdminAPICalls saves per-node admin API requests in the 'admin/'
 // directory of the bundle zip.
-func saveSingleAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, metricsInterval, profilerWait time.Duration) step {
+func saveSingleAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, profilerWait time.Duration) step {
 	return func() error {
 		var rerrs *multierror.Error
 		var funcs []func() error
@@ -285,13 +347,13 @@ func saveSingleAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p
 					TLS:       p.AdminAPI.TLS,
 				},
 			}
-			cl, err := adminapi.NewClient(fs, p, adminapi.ClientTimeout(profilerWait+2*time.Second))
+			cl, err := adminapi.NewClient(ctx, fs, p, rpadmin.ClientTimeout(profilerWait+2*time.Second))
 			if err != nil {
 				rerrs = multierror.Append(rerrs, fmt.Errorf("unable to initialize admin client for %q: %v", a, err))
 				continue
 			}
 
-			aName := sanitizeName(a)
+			aName := common.SanitizeName(a)
 			r := []func() error{
 				func() error {
 					return requestAndSave(ctx, ps, fmt.Sprintf("admin/node_config_%v.json", aName), cl.RawNodeConfig)
@@ -326,32 +388,70 @@ func saveSingleAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("admin/cpu_profile_%v.json", aName), f)
 				},
-				func() error {
-					err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t0_metrics.txt", aName), cl.PrometheusMetrics)
-					if err != nil {
-						return err
-					}
-					select {
-					case <-time.After(metricsInterval):
-						return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t1_metrics.txt", aName), cl.PrometheusMetrics)
-					case <-ctx.Done():
-						return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t1_metrics.txt", aName), cl.PrometheusMetrics)
-					}
-				},
-				func() error {
-					err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t0_public_metrics.txt", aName), cl.PublicMetrics)
-					if err != nil {
-						return err
-					}
-					select {
-					case <-time.After(metricsInterval):
-						return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t1_public_metrics.txt", aName), cl.PublicMetrics)
-					case <-ctx.Done():
-						return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t1_public_metrics.txt", aName), cl.PublicMetrics)
-					}
-				},
 			}
 			funcs = append(funcs, r...)
+		}
+
+		var grp multierror.Group
+		for _, f := range funcs {
+			grp.Go(f)
+		}
+		errs := grp.Wait()
+		if errs != nil {
+			rerrs = multierror.Append(rerrs, errs)
+		}
+		return rerrs.ErrorOrNil()
+	}
+}
+
+func saveMetricsAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, metricsInterval time.Duration, metricsSampleCount int) step {
+	return func() error {
+		var rerrs *multierror.Error
+		var funcs []func() error
+		for _, a := range adminAddresses {
+			a := a
+			p = &config.RpkProfile{
+				KafkaAPI: config.RpkKafkaAPI{
+					SASL: p.KafkaAPI.SASL,
+				},
+				AdminAPI: config.RpkAdminAPI{
+					Addresses: []string{a},
+					TLS:       p.AdminAPI.TLS,
+				},
+			}
+			cl, err := adminapi.NewClient(ctx, fs, p)
+			if err != nil {
+				rerrs = multierror.Append(rerrs, fmt.Errorf("unable to initialize admin client for %q: %v", a, err))
+				continue
+			}
+
+			endpoints := map[string]func(context.Context) ([]byte, error){"metrics": cl.PrometheusMetrics, "public_metrics": cl.PublicMetrics}
+			aName := common.SanitizeName(a)
+			for endpointName, endpoint := range endpoints {
+				endpointPoller := func() error {
+					err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t0_%s.txt", aName, endpointName), endpoint)
+					if err != nil {
+						return err
+					}
+					ticker := time.NewTicker(metricsInterval)
+					defer ticker.Stop()
+
+					for count := range metricsSampleCount - 1 {
+						select {
+						case <-ticker.C:
+							err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t%d_%s.txt", aName, count+1, endpointName), endpoint)
+							if err != nil {
+								return err
+							}
+						case <-ctx.Done():
+							return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t%d_%s.txt", aName, count+1, endpointName), endpoint)
+						}
+					}
+					return nil // Required by Golang in case metricsSampleCount == 0 - we already guard for this when arg parsing
+				}
+
+				funcs = append(funcs, endpointPoller)
+			}
 		}
 
 		var grp multierror.Group
@@ -372,7 +472,7 @@ func saveK8SResources(ctx context.Context, ps *stepParams, namespace string, lab
 	return func() error {
 		clientset, pods, err := k8sPodList(ctx, namespace, labelSelector)
 		if err != nil {
-			return err
+			return fmt.Errorf("unable to save k8s resources: unable to list k8s pods: %v", err)
 		}
 		// This is a safeguard, so we don't end up saving empty request for
 		// namespace who don't have any pods.
@@ -414,7 +514,7 @@ func saveK8SLogs(ctx context.Context, ps *stepParams, namespace, since string, l
 	return func() error {
 		clientset, pods, err := k8sPodList(ctx, namespace, labelSelector)
 		if err != nil {
-			return err
+			return fmt.Errorf("unable to save logs: unable to list k8s pods: %v", err)
 		}
 		podsInterface := clientset.CoreV1().Pods(namespace)
 
@@ -538,50 +638,38 @@ func parseJournalTime(str string, now time.Time) (time.Time, error) {
 	}
 }
 
-// sanitizeName replace any of the following characters with "-": "<", ">", ":",
-// `"`, "/", "|", "?", "*". This is to avoid having forbidden names in Windows
-// environments.
-func sanitizeName(name string) string {
-	forbidden := []string{"<", ">", ":", `"`, "/", `\`, "|", "?", "*"}
-	r := name
-	for _, s := range forbidden {
-		r = strings.Replace(r, s, "-", -1)
-	}
-	return r
-}
-
-func saveExtraFuncs(ctx context.Context, ps *stepParams, cl *adminapi.AdminAPI, partitionFilters []topicPartitionFilter) (funcs []func() error) {
+func saveExtraFuncs(ctx context.Context, ps *stepParams, cl *rpadmin.AdminAPI, partitionFilters []topicPartitionFilter) (funcs []func() error) {
 	for _, tpf := range partitionFilters {
 		tpf := tpf
 		for _, p := range tpf.partitionsID {
 			p := p
 			funcs = append(funcs, []func() error{
 				func() error {
-					f := func(ctx context.Context) (adminapi.Partition, error) {
+					f := func(ctx context.Context) (rpadmin.Partition, error) {
 						return cl.GetPartition(ctx, tpf.namespace, tpf.topic, p)
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/info_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)
 				},
 				func() error {
-					f := func(ctx context.Context) (adminapi.DebugPartition, error) {
+					f := func(ctx context.Context) (rpadmin.DebugPartition, error) {
 						return cl.DebugPartition(ctx, tpf.namespace, tpf.topic, p)
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/debug_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)
 				},
 				func() error {
-					f := func(ctx context.Context) (adminapi.CloudStorageStatus, error) {
+					f := func(ctx context.Context) (rpadmin.CloudStorageStatus, error) {
 						return cl.CloudStorageStatus(ctx, tpf.topic, strconv.Itoa(p))
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_status_%v_%v.json", tpf.topic, p), f)
 				},
 				func() error {
-					f := func(ctx context.Context) (adminapi.CloudStorageManifest, error) {
+					f := func(ctx context.Context) (rpadmin.CloudStorageManifest, error) {
 						return cl.CloudStorageManifest(ctx, tpf.topic, p)
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_manifest_%v_%v.json", tpf.topic, p), f)
 				},
 				func() error {
-					f := func(ctx context.Context) (adminapi.CloudStorageAnomalies, error) {
+					f := func(ctx context.Context) (rpadmin.CloudStorageAnomalies, error) {
 						return cl.CloudStorageAnomalies(ctx, tpf.namespace, tpf.topic, p)
 					}
 					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_anomalies_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)

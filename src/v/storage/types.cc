@@ -114,7 +114,7 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
       "remote_delete: {}, segment_ms: {}, "
       "initial_retention_local_target_bytes: {}, "
       "initial_retention_local_target_ms: {}, write_caching: {}, flush_ms: {}, "
-      "flush_bytes: {}}}",
+      "flush_bytes: {} iceberg_mode: {} }}",
       v.compaction_strategy,
       v.cleanup_policy_bitflags,
       v.segment_size,
@@ -129,7 +129,14 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
       v.initial_retention_local_target_ms,
       v.write_caching,
       v.flush_ms,
-      v.flush_bytes);
+      v.flush_bytes,
+      v.iceberg_mode);
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        fmt::print(o, ", cloud_topic_enabled: {}", v.cloud_topic_enabled);
+    }
+
+    o << "}";
 
     return o;
 }
@@ -139,21 +146,23 @@ std::ostream& operator<<(std::ostream& o, const ntp_config& v) {
         fmt::print(
           o,
           "{{ntp: {}, base_dir: {}, overrides: {}, revision: {}, "
-          "initial_revision: {}}}",
+          "topic_revision: {}, remote_revision: {}}}",
           v.ntp(),
           v.base_directory(),
           v.get_overrides(),
           v.get_revision(),
-          v.get_initial_revision());
+          v.get_topic_revision(),
+          v.get_remote_revision());
     } else {
         fmt::print(
           o,
           "{{ntp: {}, base_dir: {}, overrides: nullptr, revision: {}, "
-          "initial_revision: {}}}",
+          "topic_revision: {}, remote_revision: {}}}",
           v.ntp(),
           v.base_directory(),
           v.get_revision(),
-          v.get_initial_revision());
+          v.get_topic_revision(),
+          v.get_remote_revision());
     }
     return o;
 }
@@ -197,9 +206,11 @@ std::ostream& operator<<(std::ostream& o, const compaction_config& c) {
     fmt::print(
       o,
       "{{max_collectible_offset:{}, "
-      "should_sanitize:{}}}",
+      "should_sanitize:{}, "
+      "tombstone_retention_ms:{}}}",
       c.max_collectible_offset,
-      c.sanitizer_config);
+      c.sanitizer_config,
+      c.tombstone_retention_ms);
     return o;
 }
 

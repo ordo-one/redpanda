@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/docker/go-units"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -29,8 +31,8 @@ func newPartitionMovementsStatusCommand(fs afero.Fs, p *config.Params) *cobra.Co
 		all              bool
 		human            bool
 		partitions       []string
-		response         []adminapi.ReconfigurationsResponse
-		filteredResponse []adminapi.ReconfigurationsResponse
+		response         []rpadmin.ReconfigurationsResponse
+		filteredResponse []rpadmin.ReconfigurationsResponse
 	)
 	cmd := &cobra.Command{
 		Use:   "move-status",
@@ -46,7 +48,7 @@ func newPartitionMovementsStatusCommand(fs afero.Fs, p *config.Params) *cobra.Co
 				out.Die("specify at least one topic when --partition is used, exiting.")
 			}
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			response, err = cl.Reconfigurations(cmd.Context())
@@ -84,7 +86,7 @@ func newPartitionMovementsStatusCommand(fs afero.Fs, p *config.Params) *cobra.Co
 				return strconv.Itoa(size)
 			}
 
-			f := func(rr *adminapi.ReconfigurationsResponse) interface{} {
+			f := func(rr *rpadmin.ReconfigurationsResponse) interface{} {
 				var (
 					newReplica []int
 					oldReplica []int

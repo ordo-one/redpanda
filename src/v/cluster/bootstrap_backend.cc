@@ -158,7 +158,7 @@ bootstrap_backend::apply(bootstrap_cluster_cmd cmd, model::offset offset) {
 
     // Apply initial node UUID to ID map
     co_await _members_manager.local().set_initial_state(
-      cmd.value.initial_nodes, cmd.value.node_ids_by_uuid);
+      cmd.value.initial_nodes, cmd.value.node_ids_by_uuid, offset);
 
     // Apply cluster version to feature table: this activates features without
     // waiting for feature_manager to come up.
@@ -234,7 +234,9 @@ ss::future<> bootstrap_backend::apply_cluster_uuid(model::cluster_uuid uuid) {
           storage.set_cluster_uuid(new_cluster_uuid);
       });
     co_await _storage.local().kvs().put(
-      cluster_uuid_key_space, cluster_uuid_key, serde::to_iobuf(uuid));
+      cluster_uuid_key_space,
+      bytes::from_string(cluster_uuid_key),
+      serde::to_iobuf(uuid));
     _cluster_uuid_applied = uuid;
     vlog(clusterlog.debug, "Cluster UUID initialized {}", uuid);
 }

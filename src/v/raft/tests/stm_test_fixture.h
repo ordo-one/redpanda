@@ -8,6 +8,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#pragma once
+
 #include "bytes/iostream.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -18,11 +20,11 @@
 #include "raft/group_configuration.h"
 #include "raft/state_machine_manager.h"
 #include "raft/tests/raft_fixture.h"
+#include "raft/tests/raft_fixture_retry_policy.h"
 #include "raft/tests/raft_group_fixture.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "serde/envelope.h"
-#include "serde/serde.h"
 #include "storage/record_batch_builder.h"
 #include "storage/types.h"
 #include "test_utils/async.h"
@@ -68,10 +70,12 @@ struct value_entry
 /**
  * Simple kv-store state machine
  */
-struct simple_kv : public raft::state_machine_base {
+template<typename BaseT = state_machine_base>
+struct simple_kv_base : public BaseT {
     using state_t = absl::flat_hash_map<ss::sstring, value_entry>;
     static constexpr std::string_view name = "simple_kv";
-    explicit simple_kv(raft_node_instance& rn)
+
+    explicit simple_kv_base(raft_node_instance& rn)
       : raft_node(rn) {}
 
     static void apply_to_state(
@@ -96,9 +100,10 @@ struct simple_kv : public raft::state_machine_base {
         });
     }
     ss::future<> start() override { return ss::now(); }
-    ss::future<> stop() override { co_await raft::state_machine_base::stop(); };
+    ss::future<> stop() override { co_await BaseT::stop(); };
 
-    ss::future<> apply(const model::record_batch& batch) override {
+    ss::future<> apply(
+      const model::record_batch& batch, const ssx::semaphore_units&) override {
         apply_to_state(batch, state);
         co_return;
     }
@@ -110,6 +115,14 @@ struct simple_kv : public raft::state_machine_base {
 
     size_t get_local_state_size() const final { return 0; }
     ss::future<> remove_local_state() final { co_return; }
+
+    state_t state;
+    raft_node_instance& raft_node;
+};
+class simple_kv : public simple_kv_base<state_machine_base> {
+public:
+    explicit simple_kv(raft_node_instance& rn)
+      : simple_kv_base<>(rn) {}
 
     ss::future<iobuf>
     take_snapshot(model::offset last_included_offset) override {
@@ -134,14 +147,11 @@ struct simple_kv : public raft::state_machine_base {
           batches.begin(),
           batches.end(),
           [&inc_state](const model::record_batch& b) {
-              return simple_kv::apply_to_state(b, inc_state);
+              return simple_kv_base::apply_to_state(b, inc_state);
           });
 
         co_return serde::to_iobuf(std::move(inc_state));
     };
-
-    state_t state;
-    raft_node_instance& raft_node;
 };
 using wait_for_each_batch = ss::bool_class<struct wait_for_each_tag>;
 
@@ -163,25 +173,28 @@ struct state_machine_fixture : raft_fixture {
             builder.add_raw_kv(serde::to_iobuf(k), serde::to_iobuf(v));
         }
 
-        co_return co_await with_leader(
-          5s,
+        co_return co_await retry_with_leader(
+          10s + model::timeout_clock::now(),
           [b = std::move(builder).build()](
             raft_node_instance& leader_node) mutable {
               return leader_node.raft()->replicate(
-                model::make_memory_record_batch_reader(std::move(b)),
+                model::make_memory_record_batch_reader(b.share()),
                 raft::replicate_options(raft::consistency_level::quorum_ack));
           });
     }
 
     ss::future<absl::flat_hash_map<ss::sstring, value_entry>>
     build_random_state(
-      int op_cnt, wait_for_each_batch wait_for_each = wait_for_each_batch::no) {
+      int op_cnt,
+      wait_for_each_batch wait_for_each = wait_for_each_batch::no,
+      size_t max_batch_size = 50) {
         absl::flat_hash_map<ss::sstring, value_entry> state;
 
         for (int i = 0; i < op_cnt;) {
-            const auto batch_sz = random_generators::get_int(1, 50);
+            const auto batch_sz = random_generators::get_int<size_t>(
+              1, max_batch_size);
             std::vector<std::pair<ss::sstring, std::optional<ss::sstring>>> ops;
-            for (auto n = 0; n < batch_sz; ++n) {
+            for (size_t n = 0; n < batch_sz; ++n) {
                 auto k = random_generators::gen_alphanum_string(10);
                 auto v = random_generators::gen_alphanum_string(10);
 
@@ -212,10 +225,17 @@ struct state_machine_fixture : raft_fixture {
             i += batch_sz;
 
             auto result = co_await replicate(std::move(ops));
-            vlog(
-              logger().debug,
-              "replication result: [last_offset: {}]",
-              result.value().last_offset);
+            if (result.has_value()) {
+                vlog(
+                  logger().debug,
+                  "replication result: [last_offset: {}]",
+                  result.value().last_offset);
+            } else {
+                auto error = result.error();
+                vlog(logger().warn, "replication failure: {}", error);
+                throw std::runtime_error(
+                  fmt::format("replication failure {}", error));
+            }
 
             if (wait_for_each) {
                 co_await wait_for_apply();

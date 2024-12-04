@@ -14,7 +14,7 @@
 #include "base/vlog.h"
 #include "config/configuration.h"
 #include "metrics/metrics.h"
-#include "prometheus/prometheus_sanitize.h"
+#include "metrics/prometheus_sanitize.h"
 #include "ssx/abort_source.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
@@ -29,6 +29,8 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/later.hh>
+
+#include <exception>
 
 namespace net {
 
@@ -87,6 +89,8 @@ void server::start() {
             if (cfg.listen_backlog.has_value()) {
                 lo.listen_backlog = cfg.listen_backlog.value();
             }
+            lo.so_rcvbuf = cfg.tcp_recv_buf;
+            lo.so_sndbuf = cfg.tcp_send_buf;
 
             if (!endpoint.credentials) {
                 ss = ss::engine().listen(endpoint.addr, lo);
@@ -113,9 +117,9 @@ void server::start() {
 bool is_gate_closed_exception(std::exception_ptr e) {
     try {
         if (e) {
-            rethrow_exception(e);
+            std::rethrow_exception(e);
         }
-    } catch (ss::gate_closed_exception&) {
+    } catch (const ss::gate_closed_exception&) {
         return true;
     } catch (...) {
         return false;
@@ -218,28 +222,13 @@ ss::future<ss::stop_iteration> server::accept_finish(
           ar.remote_address.addr());
         if (!cq_units.live()) {
             // Connection limit hit, drop this connection.
-            _probe->connection_rejected();
+            _probe->connection_rejected_open_limit();
             vlog(
-              _log.info,
-              "Connection limit reached, rejecting {}",
-              ar.remote_address.addr());
+              _log.warn,
+              "Open connection limit reached, rejecting {}",
+              ar.remote_address);
             co_return ss::stop_iteration::no;
         }
-    }
-
-    // Apply socket buffer size settings
-    if (cfg.tcp_recv_buf.has_value()) {
-        // Explicitly store in an int to decouple the
-        // config type from the set_sockopt type.
-        int recv_buf = cfg.tcp_recv_buf.value();
-        ar.connection.set_sockopt(
-          SOL_SOCKET, SO_RCVBUF, &recv_buf, sizeof(recv_buf));
-    }
-
-    if (cfg.tcp_send_buf.has_value()) {
-        int send_buf = cfg.tcp_send_buf.value();
-        ar.connection.set_sockopt(
-          SOL_SOCKET, SO_SNDBUF, &send_buf, sizeof(send_buf));
     }
 
     if (_connection_rates) {
@@ -248,10 +237,10 @@ ss::future<ss::stop_iteration> server::accept_finish(
         } catch (const std::exception& e) {
             vlog(
               _log.trace,
-              "Timeout while waiting free token for connection rate. "
-              "addr:{}",
+              "Connection rate limit reached and no token available after "
+              "wait, rejecting {}",
               ar.remote_address);
-            _probe->timeout_waiting_rate_limit();
+            _probe->connection_rejected_rate_limit();
             co_return ss::stop_iteration::no;
         }
     }

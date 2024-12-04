@@ -456,6 +456,7 @@ class MissingPartition(BaseCase):
 
     def generate_baseline(self):
         """Produce enough data to trigger uploads to S3/minio"""
+        self.original_cluster_uuid = self._redpanda._admin.get_cluster_uuid()
         for topic in self.topics:
             producer = self._rpk_producer_maker(topic=topic.name,
                                                 msg_count=10000,
@@ -486,7 +487,8 @@ class MissingPartition(BaseCase):
           max([seg_meta['delta_offset_end'] for _, seg_meta in manifest_1['segments'].items()])
 
         manifest_0_path = view.gen_manifest_path(
-            ntp_0.to_ntpr(manifest_0['revision']))
+            ntp_0.to_ntpr(manifest_0['revision']),
+            remote_label=self.original_cluster_uuid)
         self._delete(manifest_0_path)
         self.logger.info(
             f"manifest {manifest_0_path} is removed, partition-1 last offset is {self._part1_offset}"
@@ -1209,6 +1211,7 @@ class TopicRecoveryTest(RedpandaTest):
         self._started = True
 
         self.rpk = RpkTool(self.redpanda)
+        self.admin = Admin(self.redpanda)
 
     def rpk_producer_maker(self,
                            topic: str,
@@ -1329,12 +1332,13 @@ class TopicRecoveryTest(RedpandaTest):
             self.redpanda.remove_local_data(node)
 
     @staticmethod
-    def _normalize_lw_seg_key(key: str, lw_seg_meta: dict) -> str:
-        """adds archiver_term to key, to match the actual object key in cloud storage"""
-        if not key.endswith(".log"):
-            # key already has archiver term set in the name
-            return key
-        return f"{key}.{lw_seg_meta['archiver_term']}" if "archiver_term" in lw_seg_meta else key
+    def _cloud_segment_key(lw_seg_meta: dict) -> str:
+        """calculates the segment key in cloud storage from segment meta"""
+        assert lw_seg_meta.get("sname_format") == 3
+        sm = lw_seg_meta
+        return (
+            f"{sm['base_offset']}-{sm['committed_offset']}-{sm['size_bytes']}"
+            f"-{sm['segment_term']}-v1.log.{sm['archiver_term']}")
 
     def _collect_replaced_segments(self, replaced: dict[NTPR, dict[str, dict]],
                                    manifest_key: str):
@@ -1349,7 +1353,7 @@ class TopicRecoveryTest(RedpandaTest):
         assert manifest is not None, f"failed to load manifest from path {manifest_key}"
         if replaced_segments := manifest.get('replaced'):
             replaced[parse_s3_manifest_path(manifest_key)] = {
-                TopicRecoveryTest._normalize_lw_seg_key(k, v): v
+                TopicRecoveryTest._cloud_segment_key(v): v
                 for k, v in replaced_segments.items()
             }
 
@@ -1419,8 +1423,7 @@ class TopicRecoveryTest(RedpandaTest):
                         tmp_size += size
                 size_on_disk = max(tmp_size, size_on_disk)
 
-            size_in_cloud = sum(obj.content_length for obj in segments
-                                if obj.content_length > EMPTY_SEGMENT_SIZE)
+            size_in_cloud = sum(obj.content_length for obj in segments)
             self.logger.debug(
                 f'segments in cloud: {pprint.pformat(segments, indent=2)}, '
                 f'size in cloud: {size_in_cloud}')
@@ -1465,22 +1468,42 @@ class TopicRecoveryTest(RedpandaTest):
         expected_num_leaders = sum(
             [t.partition_count for t in recovered_topics])
 
+        def all_replicas_in_sync(topic, *, partition, num_replicas):
+            partition_state = self.admin.get_partition_state(
+                "kafka", topic, partition)
+            if len(partition_state["replicas"]) != num_replicas:
+                return False
+            hwms = [
+                replica["high_watermark"]
+                for replica in partition_state["replicas"]
+            ]
+            return all([hwm == hwms[0] for hwm in hwms])
+
         def verify():
             num_leaders = 0
-            try:
-                for topic in recovered_topics:
-                    topic_state = self.rpk.describe_topic(topic.name)
-                    # Describe topics only works after leader election succeded.
-                    # We can use it to wait until the recovery is completed.
-                    for partition in topic_state:
-                        self.logger.info(f"partition: {partition}")
-                        if partition.leader in partition.replicas:
-                            num_leaders += 1
-            except:
-                return False
+            for topic in recovered_topics:
+                topic_state = self.rpk.describe_topic(topic.name)
+                # Describe topics only works after leader election succeded.
+                # We can use it to wait until the recovery is completed.
+                for partition in topic_state:
+                    self.logger.info(f"partition: {partition}")
+                    if partition.leader in partition.replicas:
+                        num_leaders += 1
+
+                        # If we have a leader, we can check if all replicas are in sync
+                        if not all_replicas_in_sync(topic.name,
+                                                    partition=partition.id,
+                                                    num_replicas=len(
+                                                        partition.replicas)):
+                            self.logger.debug(
+                                "partition replicas are not in sync yet")
+                            return False
             return num_leaders == expected_num_leaders
 
-        wait_until(verify, timeout_sec=timeout.total_seconds(), backoff_sec=1)
+        wait_until(verify,
+                   timeout_sec=timeout.total_seconds(),
+                   backoff_sec=1,
+                   retry_on_exc=True)
 
     def do_run(self, test_case: BaseCase, upload_delay_sec=60):
         """Template method invoked by all tests."""
@@ -1554,7 +1577,7 @@ class TopicRecoveryTest(RedpandaTest):
              log_allow_list=MISSING_DATA_ERRORS + TRANSIENT_ERRORS)
     @matrix(cloud_storage_type=get_cloud_storage_type())
     def test_no_data(self, cloud_storage_type):
-        """If we're trying to recovery a topic which didn't have any data
+        """If we're trying to recover a topic which didn't have any data
         in old cluster the empty topic should be created. We should be able
         to produce to the topic."""
         test_case = NoDataCase(self.redpanda, self.cloud_storage_client,
@@ -1762,7 +1785,7 @@ class TopicRecoveryTest(RedpandaTest):
                                        num_topics=5,
                                        num_partitions_per_topic=20,
                                        check_mode=check_mode)
-        self.do_run(test_case)
+        self.do_run(test_case, upload_delay_sec=120)
 
     @cluster(num_nodes=4,
              log_allow_list=TRANSIENT_ERRORS +

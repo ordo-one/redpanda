@@ -9,6 +9,7 @@ please keep this up to date with every new library use.
 | :----------     | :------------                      |
 | abseil          | Apache License 2                   |
 | ada             | Apache License 2 / MIT             |
+| arrow           | Apache License 2 / MIT / Boost / BSD 2 & 3 clause / ZPL / LLVM / <https://github.com/apache/arrow/blob/main/LICENSE.txt> |
 | avro            | Apache License 2                   |
 | base64          | BSD 2                              |
 | boost libraries | Boost Software License Version 1.0 |
@@ -16,13 +17,11 @@ please keep this up to date with every new library use.
 | CRoaring        | Apache License 2                   |
 | clang           | Apache License 2                   |
 | crc32c          | BSD 3                              |
-| cryptopp        | Public Domain                      |
 | DPDK            | BSD                                |
 | fmt             | BSD                                |
-| gmp             | LGPL v3                            |
-| gnutls          | LGPL v2.1                          |
 | HdrHistogram    | BSD 2                              |
 | hwloc           | BSD                                |
+| jsoncons        | Boost Software License Version 1.0 |
 | krb5            | MIT                                |
 | libcxx          | Apache License 2                   |
 | libcxxabi       | Apache License 2                   |
@@ -30,7 +29,6 @@ please keep this up to date with every new library use.
 | libpciaccess    | MIT                                |
 | lksctp-tools    | LGPL v2.1                          |
 | lz4             | BSD 2                              |
-| nettle          | LGPL v3                            |
 | OpenSSL v3      | Apache License 2                   |
 | protobuf        | Apache License 2                   |
 | rapidjson       | MIT                                |

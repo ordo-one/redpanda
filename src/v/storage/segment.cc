@@ -38,6 +38,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
 
+#include <exception>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -224,6 +225,9 @@ ss::future<> segment::do_close() {
     // after appender flushes to make sure we make things visible
     // only after appender flush
     f = f.then([this] { return _idx.flush(); });
+    if (_cache) {
+        f = f.then([this] { return _cache->clear_async(); });
+    }
     return f;
 }
 
@@ -358,7 +362,7 @@ ss::future<> remove_compacted_index(const segment_full_path& reader_path) {
     return ss::remove_file(path.string())
       .handle_exception([path](const std::exception_ptr& e) {
           try {
-              rethrow_exception(e);
+              std::rethrow_exception(e);
           } catch (const std::filesystem::filesystem_error& e) {
               if (e.code() == std::errc::no_such_file_or_directory) {
                   // Do not log: ENOENT on removal is success
@@ -504,24 +508,28 @@ ss::future<> segment::compaction_index_batch(const model::record_batch& b) {
 ss::future<append_result> segment::do_append(const model::record_batch& b) {
     check_segment_not_closed("append()");
     vassert(
-      b.base_offset() <= b.last_offset(),
-      "Empty batch written to {}. Batch header: {}",
-      path(),
-      b.header());
-    vassert(
-      b.base_offset() >= _tracker.get_base_offset(),
-      "Invalid state. Attempted to append a batch with base_offset:{}, but "
-      "would invalidate our initial state base offset of:{}. Actual batch "
-      "header:{}, self:{}",
-      b.base_offset(),
-      _tracker.get_base_offset(),
-      b.header(),
-      *this);
-    vassert(
       b.header().ctx.owner_shard,
       "Shard not set when writing to: {} - header: {}",
       *this,
       b.header());
+    if (unlikely(b.base_offset() > b.last_offset())) {
+        return ss::make_exception_future<append_result>(
+          std::runtime_error(fmt::format(
+            "Empty batch written to {}. Batch header: {}",
+            path(),
+            b.header())));
+    }
+    if (unlikely(b.base_offset() < _tracker.get_base_offset())) {
+        return ss::make_exception_future<
+          append_result>(std::runtime_error(fmt::format(
+          "Invalid state. Attempted to append a batch with base_offset:{}, but "
+          "would invalidate our initial state base offset of:{}. Actual batch "
+          "header:{}, self:{}",
+          b.base_offset(),
+          _tracker.get_base_offset(),
+          b.header(),
+          *this)));
+    }
     if (unlikely(b.compressed() && !b.header().attrs.is_valid_compression())) {
         return ss::make_exception_future<
           append_result>(std::runtime_error(fmt::format(
@@ -600,7 +608,7 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
               }
               return ss::make_exception_future<append_result>(append_err);
           }
-          auto ret = append_fut.get0();
+          auto ret = append_fut.get();
           auto index_err = std::move(index_fut).get_exception();
           vlog(
             stlog.error,
@@ -740,7 +748,7 @@ auto with_segment(ss::lw_shared_ptr<segment> s, Func&& f) {
     return f(s).then_wrapped([s](
                                ss::future<ss::lw_shared_ptr<segment>> new_seg) {
         try {
-            auto ptr = new_seg.get0();
+            auto ptr = new_seg.get();
             return ss::make_ready_future<ss::lw_shared_ptr<segment>>(ptr);
         } catch (...) {
             return s->close()
@@ -801,7 +809,8 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
   std::optional<batch_cache_index> batch_cache,
   storage_resources& resources,
   ss::sharded<features::feature_table>& feature_table,
-  std::optional<ntp_sanitizer_config> ntp_sanitizer_config) {
+  std::optional<ntp_sanitizer_config> ntp_sanitizer_config,
+  size_t segment_size_hint) {
     auto path = segment_full_path(ntpc, base_offset, term, version);
     vlog(stlog.info, "Creating new segment {}", path);
     return open_segment(
@@ -812,16 +821,25 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
              resources,
              feature_table,
              ntp_sanitizer_config)
-      .then([path, &ntpc, pc, &resources, ntp_sanitizer_config](
-              ss::lw_shared_ptr<segment> seg) mutable {
+      .then([path,
+             &ntpc,
+             pc,
+             segment_size_hint,
+             &resources,
+             ntp_sanitizer_config](ss::lw_shared_ptr<segment> seg) mutable {
           return with_segment(
             std::move(seg),
-            [path, &ntpc, pc, &resources, ntp_sanitizer_config](
+            [path,
+             &ntpc,
+             pc,
+             segment_size_hint,
+             &resources,
+             ntp_sanitizer_config](
               const ss::lw_shared_ptr<segment>& seg) mutable {
                 return internal::make_segment_appender(
                          path,
                          internal::number_of_chunks_from_config(ntpc),
-                         internal::segment_size_from_config(ntpc),
+                         segment_size_hint,
                          pc,
                          resources,
                          std::move(ntp_sanitizer_config))
@@ -890,7 +908,7 @@ bool segment::may_have_compactible_records() const {
         // that there were no data records, so err on the side of caution.
         return true;
     }
-    return num_compactible_records.value() > 1;
+    return num_compactible_records.value() > 0;
 }
 
 } // namespace storage

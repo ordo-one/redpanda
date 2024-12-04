@@ -87,6 +87,18 @@ class MirrorMakerService(EndToEndTest):
         self.topic.partition_count = 1000 if self.redpanda.dedicated_nodes else 10
         self.source_client.create_topic(self.topic)
 
+        def topic_present():
+            td = self.source_client.describe_topic(self.topic.name)
+            return len(td.partitions) == self.topic.partition_count
+
+        wait_until(
+            topic_present,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg=
+            f"Error waiting for topic {self.topic} to be present and ready",
+            retry_on_exc=True)
+
     def start_workload(self):
 
         self.consumer = VerifiableConsumer(
@@ -191,7 +203,7 @@ class TestMirrorMakerService(MirrorMakerService):
 
         src_rpk = RpkTool(self.source_broker)
 
-        groups = src_rpk.group_list()
+        groups = src_rpk.group_list_names()
         consumer_group = ""
         for g in groups:
             if g.startswith("kgo-verifier"):
@@ -208,8 +220,8 @@ class TestMirrorMakerService(MirrorMakerService):
         wait_until(group_state_is_valid, 30)
 
         source_group = src_rpk.group_describe(consumer_group)
-        consumer.stop()
         consumer.wait()
+        consumer.stop()
         self.logger.info(f"source topics: {list(src_rpk.list_topics())}")
         target_rpk = RpkTool(self.redpanda)
         self.logger.info(f"target topics: {list(target_rpk.list_topics())}")

@@ -11,24 +11,25 @@
 
 #pragma once
 #include "base/oncore.h"
-#include "cloud_storage_clients/types.h"
+#include "base/type_traits.h"
 #include "config/base_property.h"
 #include "config/rjson_serialization.h"
 #include "container/intrusive_list_helpers.h"
+#include "features/enterprise_feature_messages.h"
 #include "json/stringbuffer.h"
 #include "json/writer.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
-#include "pandaproxy/schema_registry/subject_name_strategy.h"
-#include "reflection/type_traits.h"
 #include "utils/to_string.h"
 
 #include <seastar/util/noncopyable_function.hh>
 
-#include <boost/intrusive/list.hpp>
-
+#include <algorithm>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <optional>
+#include <variant>
+#include <vector>
 
 namespace config {
 
@@ -72,6 +73,7 @@ public:
 template<class T>
 class property : public base_property {
 public:
+    using value_type = T;
     using validator =
       typename ss::noncopyable_function<std::optional<ss::sstring>(const T&)>;
 
@@ -80,9 +82,9 @@ public:
       std::string_view name,
       std::string_view desc,
       base_property::metadata meta = {},
-      T def = T{},
+      value_type def = value_type{},
       property::validator validator = property::noop_validator,
-      std::optional<legacy_default<T>> ld = std::nullopt)
+      std::optional<legacy_default<value_type>> ld = std::nullopt)
       : base_property(conf, name, desc, meta)
       , _value(def)
       , _default(std::move(def))
@@ -90,12 +92,12 @@ public:
       , _validator(std::move(validator)) {}
 
     /**
-     * Properties aren't moved in normal used on the per-shard
+     * Properties aren't moved in normal use on the per-shard
      * cluster configuration objects.  This method exists for
      * use in unit tests of things like kafka client that carry
      * around a config_store as a member.
      */
-    property(property<T>&& rhs)
+    property(property<value_type>&& rhs)
       : base_property(rhs)
       , _value(std::move(rhs._value))
       , _default(std::move(rhs._default))
@@ -112,11 +114,11 @@ public:
         }
     }
 
-    const T& value() { return _value; }
+    const value_type& value() { return _value; }
 
-    const T& value() const { return _value; }
+    const value_type& value() const { return _value; }
 
-    const T& default_value() const { return _default; }
+    const value_type& default_value() const { return _default; }
 
     std::string_view type_name() const override;
 
@@ -130,11 +132,15 @@ public:
 
     bool is_default() const override { return _value == _default; }
 
-    const T& operator()() { return value(); }
+    bool is_hidden() const override {
+        return get_visibility() == visibility::deprecated;
+    }
 
-    const T& operator()() const { return value(); }
+    const value_type& operator()() { return value(); }
 
-    operator T() const { return value(); } // NOLINT
+    const value_type& operator()() const { return value(); }
+
+    operator value_type() const { return value(); } // NOLINT
 
     void print(std::ostream& o) const override {
         o << name() << ":";
@@ -159,22 +165,22 @@ public:
     }
 
     void set_value(std::any v) override {
-        update_value(std::any_cast<T>(std::move(v)));
+        update_value(std::any_cast<value_type>(std::move(v)));
     }
 
     template<typename U>
-    requires std::constructible_from<T, U>
+    requires std::constructible_from<value_type, U>
     void set_value(U&& v) {
         // needs to go through virtual inheritance chain, since this class is
         // not final
-        set_value(std::make_any<T>(std::forward<U>(v)));
+        set_value(std::make_any<value_type>(std::forward<U>(v)));
     }
 
     bool set_value(YAML::Node n) override {
         return update_value(std::move(n.as<T>()));
     }
 
-    std::optional<validation_error> validate(T const& v) const {
+    std::optional<validation_error> validate(const value_type& v) const {
         if (auto err = _validator(v); err) {
             return std::make_optional<validation_error>(name().data(), *err);
         }
@@ -182,8 +188,18 @@ public:
     }
 
     std::optional<validation_error> validate(YAML::Node n) const override {
-        auto v = std::move(n.as<T>());
+        auto v = std::move(n.as<value_type>());
         return validate(v);
+    }
+
+    std::optional<validation_error>
+    check_restricted(YAML::Node) const override {
+        // Config properties are unrestricted by default
+        return std::nullopt;
+    }
+
+    bool check_restricted(const T& value) const {
+        return do_check_restricted(value);
     }
 
     void reset() override {
@@ -192,7 +208,7 @@ public:
     }
 
     base_property& operator=(const base_property& pr) override {
-        auto v = dynamic_cast<const property<T>&>(pr)._value;
+        auto v = dynamic_cast<const property<value_type>&>(pr)._value;
         update_value(std::move(v));
         return *this;
     }
@@ -202,13 +218,14 @@ public:
      * value of the property as well as the ability to watch for
      * changes to the property.
      */
-    binding<T> bind() {
+    binding<value_type> bind() {
         assert_live_settable();
         return {*this};
     }
 
     template<typename U>
-    auto bind(std::function<U(const T&)> conv) -> conversion_binding<U, T> {
+    auto bind(std::function<U(const value_type&)> conv)
+      -> conversion_binding<U, value_type> {
         assert_live_settable();
         return {*this, std::move(conv)};
     }
@@ -217,7 +234,7 @@ public:
         if (_meta.example.has_value()) {
             return _meta.example;
         } else {
-            if constexpr (std::is_same_v<T, bool>) {
+            if constexpr (std::is_same_v<value_type, bool>) {
                 // Provide an example that is the opposite of the default
                 // (i.e. an example of how to _change_ the setting)
                 return _default ? "false" : "true";
@@ -247,7 +264,7 @@ public:
     };
 
 protected:
-    void notify_watchers(const T& new_value) {
+    void notify_watchers(const value_type& new_value) {
         std::exception_ptr ex;
         for (auto& binding : _bindings) {
             try {
@@ -264,11 +281,11 @@ protected:
         }
 
         if (ex) {
-            rethrow_exception(ex);
+            std::rethrow_exception(ex);
         }
     }
 
-    bool update_value(T&& new_value) {
+    bool update_value(value_type&& new_value) {
         if (new_value != _value) {
             // Update the main value first, in case one of the binding updates
             // throws.
@@ -281,19 +298,25 @@ protected:
         }
     }
 
-    T _value;
-    T _default;
+    value_type _value;
+    value_type _default;
 
     // An alternative default that applies if the cluster's original logical
     // version is <= the defined version
-    const std::optional<legacy_default<T>> _legacy_default;
+    const std::optional<legacy_default<value_type>> _legacy_default;
 
 private:
+    virtual bool do_check_restricted(const T&) const {
+        // Config properties are unrestricted by default
+        return false;
+    }
+
     validator _validator;
 
-    friend class binding_base<T>;
-    friend class mock_property<T>;
-    intrusive_list<binding_base<T>, &binding_base<T>::_hook> _bindings;
+    friend class binding_base<value_type>;
+    friend class mock_property<value_type>;
+    intrusive_list<binding_base<value_type>, &binding_base<value_type>::_hook>
+      _bindings;
 };
 
 template<class T>
@@ -463,7 +486,7 @@ public:
     template<typename U>
     friend inline binding<U> mock_binding(U&&);
     template<typename U>
-    friend inline binding<U> mock_binding(U const&);
+    friend inline binding<U> mock_binding(const U&);
 };
 
 /**
@@ -481,7 +504,7 @@ inline binding<T> mock_binding(T&& value) {
 }
 
 template<typename T>
-inline binding<T> mock_binding(T const& value) {
+inline binding<T> mock_binding(const T& value) {
     return binding<T>(T(value));
 }
 /**
@@ -629,24 +652,15 @@ consteval std::string_view property_type_name() {
     } else if constexpr (std::
                            is_same_v<type, model::cloud_credentials_source>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           cloud_storage_clients::s3_url_style>) {
+    } else if constexpr (std::is_same_v<type, s3_url_style>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::cloud_storage_backend>) {
-        return "string";
-    } else if constexpr (std::is_same_v<type, model::leader_balancer_mode>) {
         return "string";
     } else if constexpr (std::is_same_v<type, std::filesystem::path>) {
         return "string";
     } else if constexpr (std::is_same_v<
                            type,
                            model::cloud_storage_chunk_eviction_strategy>) {
-        return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           pandaproxy::schema_registry::
-                             subject_name_strategy>) {
         return "string";
     } else if constexpr (std::is_same_v<
                            type,
@@ -660,9 +674,21 @@ consteval std::string_view property_type_name() {
     } else if constexpr (std::
                            is_same_v<type, model::recovery_validation_mode>) {
         return "recovery_validation_mode";
+    } else if constexpr (std::is_same_v<type, config::fips_mode_flag>) {
+        return "string";
+    } else if constexpr (std::is_same_v<type, config::tls_version>) {
+        return "string";
+    } else if constexpr (std::is_same_v<type, model::node_uuid>) {
+        return "string";
+    } else if constexpr (std::is_same_v<type, config::node_id_override>) {
+        return "node_id_override";
+    } else if constexpr (std::is_same_v<type, config::leaders_preference>) {
+        return "leaders_preference";
+    } else if constexpr (std::is_same_v<type, config::datalake_catalog_type>) {
+        return "string";
     } else {
         static_assert(
-          utils::unsupported_type<T>::value, "Type name not defined");
+          base::unsupported_type<T>::value, "Type name not defined");
     }
 }
 
@@ -834,22 +860,20 @@ public:
       T def,
       std::vector<T> values)
       : property<T>(
-        conf,
-        name,
-        desc,
-        meta,
-        def,
-        [this](T new_value) -> std::optional<ss::sstring> {
-            auto found = std::find_if(
-              _values.begin(), _values.end(), [&new_value](T const& v) {
-                  return v == new_value;
-              });
-            if (found == _values.end()) {
-                return help_text();
-            } else {
-                return std::nullopt;
-            }
-        })
+          conf,
+          name,
+          desc,
+          meta,
+          def,
+          [this](T new_value) -> std::optional<ss::sstring> {
+              auto found = std::ranges::find_if(
+                _values, [&new_value](const T& v) { return v == new_value; });
+              if (found == _values.end()) {
+                  return help_text();
+              } else {
+                  return std::nullopt;
+              }
+          })
       , _values(values) {}
 
     std::optional<validation_error>
@@ -933,6 +957,175 @@ private:
             return property::update_value(value);
         }
     }
+};
+
+template<typename T>
+class hidden_when_default_property : public property<T> {
+public:
+    hidden_when_default_property(
+      config_store& conf,
+      std::string_view name,
+      std::string_view desc,
+      base_property::metadata meta,
+      T def,
+      property<T>::validator validator = property<T>::noop_validator)
+      : property<T>(conf, name, desc, meta, def, std::move(validator)) {}
+
+    bool is_hidden() const override {
+        return this->value() == this->default_value();
+    }
+};
+namespace detail {
+
+template<typename P>
+concept Property = requires() {
+    std::derived_from<P, base_property>;
+    typename P::value_type;
+};
+
+template<typename T>
+concept Array = detail::is_array<T>() && !reflection::is_std_optional<T>;
+
+} // namespace detail
+
+/**
+ * config::enterprise is a wrapper template logically comprising
+ *   - a config::property<T>
+ *   - a predicate check_restricted(T)
+ *
+ * The intended usage of this class is to attach metadata to a
+ * config property, allowing clients of the config subsystem to
+ * determine whether some config setting should be restricted to
+ * enterprise licensed clusters.
+ *
+ * Note that config::enterprise does not do any _enforcement_ of
+ * that restriction - it only provides the interface for clients
+ * to determine whether some value satisfies the predicate.
+ * Checking the license and/or applying any corrective action is
+ * left entirely to the API consumer.
+ *
+ */
+template<detail::Property P>
+class enterprise : public P {
+    template<typename T, typename = void>
+    struct value_type {
+        using type = T;
+    };
+    template<detail::Array T>
+    struct value_type<T, std::void_t<typename T::value_type>> {
+        using type = T::value_type;
+    };
+    template<reflection::is_std_optional T>
+    struct value_type<T, std::void_t<typename T::value_type>> {
+        using type = T::value_type;
+    };
+
+    // The value type of the wrapped property. Could be a container, or
+    // an optional, primitive type, aggregate, etc.
+    using T = typename P::value_type;
+
+    /**
+     * val_t is the unwrapped value type of the property
+     *   - If T is an array, val_t is the element type
+     *   - If T is an optional, val_t is the value type
+     *   - otherwise val_t is T
+     *
+     * This allows us to express restrictions on array-properties by describing
+     * which potential values for _elements_ of the array are 'restricted'
+     * without enumerating all possible values for the array itself.
+     *
+     * e.g. given an array A<T>, where T={w, x, y, z}, we can say that T::x is
+     * 'restricted' such that
+     *   - A = [x]  is restricted
+     *   - A = [z, y, x] is restricted
+     *   - A = [z, x, y] is restricted
+     *   - A = [y, z] is NOT restricted
+     *
+     */
+    using val_t = typename value_type<T>::type;
+    using val_container_t = std::vector<val_t>;
+    using restrict_check_t = std::function<bool(const val_t&)>;
+    using restrict_variant_t
+      = std::variant<val_t, val_container_t, restrict_check_t>;
+
+public:
+    /**
+     * Construct an enterprise property.
+     *
+     * Largely a pass-through to the wrapped property's constructor, with the
+     * addition of a variant parameter describing restricted values, which may
+     * take the type
+     *   - val_t: that value is restricted
+     *   - vector<val_t>: each element is restricted
+     *   - std::function<bool(val_t)>: predicate for whether some val_t is
+     *     restricted
+     *
+     * NOTE: Value restrictions must never conflict with a config's default
+     * value. This condition is enforced by an assertion in the constructor.
+     *
+     */
+    template<typename... Args>
+    enterprise(
+      config_store& conf, restrict_variant_t restricted, Args&&... args)
+      : P(conf, std::forward<Args>(args)...)
+      , _restriction(std::move(restricted)) {
+        assert_no_default_conflict();
+    }
+
+    // Needed because the following override shadows the rest of the overloads
+    using P::check_restricted;
+
+    /**
+     * Decodes the given YAML node into the underlying property's value_type and
+     * checks whether that value should be restricted to enterprise clusters
+     * based on the unwrapped value restrictions described at construction.
+     */
+    std::optional<validation_error> check_restricted(YAML::Node n) const final {
+        auto v = std::move(n.as<T>());
+        if (do_check_restricted(v)) {
+            return std::make_optional<validation_error>(
+              P::name().data(),
+              features::enterprise_error_message::cluster_property(
+                P::name().data(), v));
+        }
+        return std::nullopt;
+    }
+
+private:
+    bool do_check_restricted(const T& setting) const final {
+        // depending on how the restriction was defined, construct an applicable
+        // check function for bare instances of the underlying value type
+        auto restriction_check = [this](const val_t& v) -> bool {
+            return ss::visit(
+              _restriction,
+              [&v](const val_t& val) { return v == val; },
+              [&v](const val_container_t& vals) {
+                  return std::ranges::find(vals, v) != std::ranges::end(vals);
+              },
+              [&v](const restrict_check_t& check) { return check(v); });
+        };
+
+        if constexpr (detail::Array<T>) {
+            return std::ranges::any_of(setting, restriction_check);
+        }
+
+        if constexpr (reflection::is_std_optional<T>) {
+            return setting.has_value() && restriction_check(setting.value());
+        }
+
+        if constexpr (std::is_same_v<T, val_t>) {
+            return restriction_check(setting);
+        }
+    }
+
+    void assert_no_default_conflict() const {
+        vassert(
+          !do_check_restricted(this->default_value()),
+          "Enterprise properties must not restrict the default value of the "
+          "underlying property!");
+    }
+
+    restrict_variant_t _restriction;
 };
 
 }; // namespace config

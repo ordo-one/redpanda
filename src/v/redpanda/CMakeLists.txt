@@ -14,7 +14,9 @@ set(swags
   usage
   shadow_indexing
   transform 
-  recovery)
+  recovery 
+  migration
+  debug_bundle)
 
 set(swag_files)
 foreach(swag ${swags})
@@ -31,7 +33,7 @@ endforeach()
 v_cc_library(
   NAME clientutil
   SRCS
-    cluster_config_schema_util.cc
+    admin/cluster_config_schema_util.cc
     ${cluster_config_swagger_files}
   DEPS
     v::config
@@ -41,7 +43,7 @@ v_cc_library(
   NAME application
   SRCS
     ${swag_files}
-    cluster_config_schema_util.cc
+    admin/cluster_config_schema_util.cc
     admin/server.cc
     admin/debug.cc
     admin/transform.cc
@@ -52,13 +54,20 @@ v_cc_library(
     admin/usage.cc
     admin/kafka.cc
     admin/util.cc
+    admin/migrations.cc
+    admin/topics.cc
+    admin/data_migration_utils.cc
+    admin/debug_bundle.cc
     cli_parser.cc
     application.cc
-    monitor_unsafe_log_flag.cc
+    monitor_unsafe.cc
   DEPS
     Seastar::seastar
     v::crypto
     v::cluster
+    v::datalake_coordinator
+    v::datalake_manager
+    v::debug_bundle
     v::kafka_recovery
     v::finjector
     v::kafka
@@ -72,6 +81,8 @@ v_cc_library(
     v::transform
     v::version 
     v::wasm
+    v::cloud_topics_app
+    v::cloud_topics_dl_stm
   )
 
 add_subdirectory(tests)

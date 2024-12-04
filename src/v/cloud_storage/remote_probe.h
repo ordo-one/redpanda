@@ -11,6 +11,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "cloud_io/io_resources.h"
 #include "cloud_storage/types.h"
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
@@ -32,7 +33,8 @@ public:
     explicit remote_probe(
       remote_metrics_disabled disabled,
       remote_metrics_disabled public_disabled,
-      materialized_resources&);
+      materialized_resources&,
+      const cloud_io::io_resources&);
     remote_probe(const remote_probe&) = delete;
     remote_probe& operator=(const remote_probe&) = delete;
     remote_probe(remote_probe&&) = delete;
@@ -115,6 +117,24 @@ public:
     /// Get manifest download
     uint64_t get_txrange_manifest_downloads() const {
         return _cnt_tx_manifest_downloads;
+    }
+
+    /// Register manifest (re)upload
+    void topic_mount_manifest_upload() { _cnt_topic_mount_manifest_uploads++; }
+
+    /// Get manifest (re)upload
+    uint64_t get_topic_mount_manifest_uploads() const {
+        return _cnt_topic_mount_manifest_uploads;
+    }
+
+    /// Register manifest download
+    void topic_mount_manifest_download() {
+        _cnt_topic_mount_manifest_downloads++;
+    }
+
+    /// Get manifest download
+    uint64_t get_topic_mount_manifest_downloads() const {
+        return _cnt_topic_mount_manifest_downloads;
     }
 
     /// Register backof invocation during manifest upload
@@ -295,6 +315,10 @@ private:
     uint64_t _cnt_spillover_manifest_uploads{0};
     /// Number of spillover manifest downloads
     uint64_t _cnt_spillover_manifest_downloads{0};
+    /// Number of topic_mount manifest uploads
+    uint64_t _cnt_topic_mount_manifest_uploads{0};
+    /// Number of topic_mount manifest downloads
+    uint64_t _cnt_topic_mount_manifest_downloads{0};
 
     hist_t _client_acquisition_latency;
     hist_t _segment_download_latency;

@@ -63,7 +63,10 @@ public:
       = ss::bool_class<struct audit_event_permitted_tag>;
 
     audit_log_manager(
-      cluster::controller* controller, kafka::client::configuration&);
+      model::node_id self,
+      cluster::controller* controller,
+      kafka::client::configuration&,
+      ss::sharded<cluster::metadata_cache>*);
 
     audit_log_manager(const audit_log_manager&) = delete;
     audit_log_manager& operator=(const audit_log_manager&) = delete;
@@ -225,6 +228,12 @@ private:
       const security::acl_principal&,
       const model::topic&) const;
 
+    /**
+     * Compute an output partition for some audit record batch by per-shard
+     * round-robin, biased toward partitions with a locally hosted leader.
+     */
+    model::partition_id compute_partition_id();
+
     ss::future<> drain();
     ss::future<> pause();
     ss::future<> resume();
@@ -274,7 +283,7 @@ private:
         return true;
     }
 
-    audit_probe& probe() { return *_probe; }
+    audit_probe& probe() { return _probe; }
 
     template<security::audit::returns_auditable_resource_vector Func>
     auto restrict_topics(Func&& func) const noexcept {
@@ -392,14 +401,20 @@ private:
     underlying_t _queue;
     ssx::semaphore _active_drain{1, "audit-drain"};
 
+    // Probe is mutable so it can be modified in const methods when they need to
+    // report auditing failures
+    mutable audit_probe _probe;
+
     /// Single instance contains a kafka::client::client instance.
     friend class audit_sink;
     std::unique_ptr<audit_sink> _sink;
 
     /// Other references
+    model::node_id _self;
     cluster::controller* _controller;
     kafka::client::configuration& _config;
-    std::unique_ptr<audit_probe> _probe;
+
+    ss::sharded<cluster::metadata_cache>* _metadata_cache;
 };
 
 } // namespace security::audit

@@ -16,6 +16,7 @@
 #include "model/tests/randoms.h"
 #include "random/generators.h"
 #include "test_utils/randoms.h"
+#include "utils/tristate.h"
 
 namespace compat {
 
@@ -617,6 +618,7 @@ struct instance_generator<cluster::topic_properties> {
           tests::random_optional([] { return tests::random_bool(); }),
           tests::random_optional(
             [] { return tests::random_named_string<ss::sstring>(); }),
+          model::random_topic_namespace(),
           instance_generator<cluster::remote_topic_properties>::random(),
           tests::random_optional(
             [] { return random_generators::get_int<uint32_t>(1024 * 1024); }),
@@ -648,7 +650,12 @@ struct instance_generator<cluster::topic_properties> {
           }),
           tests::random_optional([] { return tests::random_duration_ms(); }),
           tests::random_optional(
-            [] { return random_generators::get_int<size_t>(); })};
+            [] { return random_generators::get_int<size_t>(); }),
+          model::iceberg_mode::disabled,
+          std::nullopt,
+          false,
+          tristate<std::chrono::milliseconds>{disable_tristate},
+          std::nullopt};
     }
 
     static std::vector<cluster::topic_properties> limits() { return {}; }
@@ -661,6 +668,7 @@ struct instance_generator<cluster::topic_configuration> {
         tc.tp_ns = model::random_topic_namespace();
         tc.partition_count = random_generators::get_int<int32_t>();
         tc.replication_factor = random_generators::get_int<int16_t>();
+        tc.is_migrated = tests::random_bool();
         tc.properties = instance_generator<cluster::topic_properties>::random();
         return tc;
     }
@@ -670,11 +678,13 @@ struct instance_generator<cluster::topic_configuration> {
           {model::ns(""),
            model::topic(""),
            std::numeric_limits<int32_t>::max(),
-           std::numeric_limits<int16_t>::max()},
+           std::numeric_limits<int16_t>::max(),
+           std::numeric_limits<bool>::max()},
           {model::ns(""),
            model::topic(""),
            std::numeric_limits<int32_t>::min(),
-           std::numeric_limits<int16_t>::min()}};
+           std::numeric_limits<int16_t>::min(),
+           std::numeric_limits<bool>::min()}};
     }
 };
 
@@ -727,11 +737,11 @@ auto random_property_update(Func f) {
     return tests::random_bool()
              ? cluster::property_update<T>()
              : cluster::property_update<T>(
-               f(),
-               random_generators::random_choice(
-                 {cluster::incremental_update_operation::none,
-                  cluster::incremental_update_operation::set,
-                  cluster::incremental_update_operation::remove}));
+                 f(),
+                 random_generators::random_choice(
+                   {cluster::incremental_update_operation::none,
+                    cluster::incremental_update_operation::set,
+                    cluster::incremental_update_operation::remove}));
 }
 
 template<>
@@ -753,52 +763,52 @@ struct instance_generator<cluster::incremental_topic_custom_updates> {
 template<>
 struct instance_generator<cluster::incremental_topic_updates> {
     static cluster::incremental_topic_updates random() {
-        return {
-          .compression = random_property_update([] {
-              return tests::random_optional([] {
-                  return instance_generator<model::compression>::random();
-              });
-          }),
-          .cleanup_policy_bitflags = random_property_update([] {
-              return tests::random_optional([] {
-                  return instance_generator<
-                    model::cleanup_policy_bitflags>::random();
-              });
-          }),
-          .compaction_strategy = random_property_update([] {
-              return tests::random_optional([] {
-                  return instance_generator<
-                    model::compaction_strategy>::random();
-              });
-          }),
-          .timestamp_type = random_property_update([] {
-              return tests::random_optional([] {
-                  return instance_generator<model::timestamp_type>::random();
-              });
-          }),
-          .segment_size = random_property_update([] {
-              return tests::random_optional(
-                [] { return random_generators::get_int<size_t>(); });
-          }),
-          .retention_bytes = random_property_update([] {
-              return tests::random_tristate(
-                [] { return random_generators::get_int<size_t>(); });
-          }),
-          .retention_duration = random_property_update([] {
-              return tests::random_tristate(
-                [] { return tests::random_duration_ms(); });
-          }),
-          .shadow_indexing = random_property_update([] {
-              return tests::random_optional([] {
-                  return instance_generator<
-                    model::shadow_indexing_mode>::random();
-              });
-          }),
-          .remote_delete = random_property_update([] {
-              // Enable ADL roundtrip, which always decodes as false
-              // for legacy topics
-              return false;
-          })};
+        cluster::incremental_topic_updates updates;
+        updates.compression = random_property_update([] {
+            return tests::random_optional(
+              [] { return instance_generator<model::compression>::random(); });
+        });
+        updates.cleanup_policy_bitflags = random_property_update([] {
+            return tests::random_optional([] {
+                return instance_generator<
+                  model::cleanup_policy_bitflags>::random();
+            });
+        });
+        updates.compaction_strategy = random_property_update([] {
+            return tests::random_optional([] {
+                return instance_generator<model::compaction_strategy>::random();
+            });
+        });
+        updates.timestamp_type = random_property_update([] {
+            return tests::random_optional([] {
+                return instance_generator<model::timestamp_type>::random();
+            });
+        });
+        updates.segment_size = random_property_update([] {
+            return tests::random_optional(
+              [] { return random_generators::get_int<size_t>(); });
+        });
+        updates.retention_bytes = random_property_update([] {
+            return tests::random_tristate(
+              [] { return random_generators::get_int<size_t>(); });
+        });
+        updates.retention_duration = random_property_update([] {
+            return tests::random_tristate(
+              [] { return tests::random_duration_ms(); });
+        });
+        updates.get_shadow_indexing() = random_property_update([] {
+            return tests::random_optional([] {
+                return instance_generator<
+                  model::shadow_indexing_mode>::random();
+            });
+        });
+        updates.remote_delete = random_property_update([] {
+            // Enable ADL roundtrip, which always decodes as false
+            // for legacy topics
+            return false;
+        });
+
+        return updates;
     }
 
     static std::vector<cluster::incremental_topic_updates> limits() {

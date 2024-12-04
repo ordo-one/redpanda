@@ -198,7 +198,7 @@ func CreateFlow(
 		var err error
 		o, err = createCloudProfile(ctx, yAuthVir, cfg, fromCloud)
 		if err != nil {
-			if err == ErrNoCloudClusters {
+			if errors.Is(err, ErrNoCloudClusters) {
 				fmt.Println("Your cloud account has no clusters available to select, avoiding creating a cloud profile.")
 				return nil
 			}
@@ -259,6 +259,7 @@ func CreateFlow(
 		p = &config.RpkProfile{
 			KafkaAPI: nodeCfg.KafkaAPI,
 			AdminAPI: nodeCfg.AdminAPI,
+			SR:       nodeCfg.SR,
 		}
 	}
 	if err := doSet(p, set); err != nil {
@@ -497,6 +498,13 @@ func fromCloudCluster(yAuth *config.RpkCloudAuth, rg *controlplanev1beta2.Resour
 			isMTLS = mtls.Enabled
 		}
 	}
+	if c.SchemaRegistry != nil {
+		p.SR.Addresses = []string{c.SchemaRegistry.Url}
+		p.SR.TLS = new(config.TLS)
+		if mtls := c.SchemaRegistry.Mtls; !isMTLS && mtls != nil {
+			isMTLS = mtls.Enabled
+		}
+	}
 	return CloudClusterOutputs{
 		Profile:           p,
 		ResourceGroupName: rg.Name,
@@ -520,6 +528,10 @@ func fromVirtualCluster(yAuth *config.RpkCloudAuth, rg *controlplanev1beta2.Reso
 		},
 		AdminAPI: config.RpkAdminAPI{
 			Addresses: []string{vc.Status.Listeners.ConsoleURL},
+			TLS:       new(config.TLS),
+		},
+		SR: config.RpkSchemaRegistryAPI{
+			Addresses: vc.Status.Listeners.SchemaRegistryURL,
 			TLS:       new(config.TLS),
 		},
 		CloudCluster: config.RpkCloudCluster{

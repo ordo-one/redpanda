@@ -15,6 +15,10 @@
 #include "base/vlog.h"
 #include "container/fragmented_vector.h"
 #include "model/fundamental.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/vector.h"
 #include "storage/logger.h"
 
 #include <iterator>
@@ -332,7 +336,7 @@ struct persisted_batch {
     int32_t length;
 
     friend inline void read_nested(
-      iobuf_parser& in, persisted_batch& b, size_t const bytes_left_limit) {
+      iobuf_parser& in, persisted_batch& b, const size_t bytes_left_limit) {
         serde::read_nested(in, b.base_offset, bytes_left_limit);
         serde::read_nested(in, b.length, bytes_left_limit);
     }
@@ -350,6 +354,7 @@ struct persisted_batches_map
       serde::compat_version<0>> {
     int64_t start_delta = 0;
     chunked_vector<persisted_batch> batches;
+    auto serde_fields() { return std::tie(start_delta, batches); }
 };
 
 } // namespace

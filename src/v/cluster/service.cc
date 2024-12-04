@@ -10,6 +10,8 @@
 #include "cluster/service.h"
 
 #include "base/vlog.h"
+#include "cluster/client_quota_frontend.h"
+#include "cluster/client_quota_serde.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller.h"
 #include "cluster/controller_api.h"
@@ -58,7 +60,8 @@ service::service(
   ss::sharded<health_monitor_frontend>& hm_frontend,
   ss::sharded<rpc::connection_cache>& conn_cache,
   ss::sharded<partition_manager>& partition_manager,
-  ss::sharded<node_status_backend>& node_status_backend)
+  ss::sharded<node_status_backend>& node_status_backend,
+  ss::sharded<client_quota::frontend>& quotas_frontend)
   : controller_service(sg, ssg)
   , _controller(controller)
   , _topics_frontend(tf)
@@ -75,7 +78,8 @@ service::service(
   , _conn_cache(conn_cache)
   , _partition_manager(partition_manager)
   , _plugin_frontend(pf)
-  , _node_status_backend(node_status_backend) {}
+  , _node_status_backend(node_status_backend)
+  , _quotas_frontend(quotas_frontend) {}
 
 ss::future<join_node_reply>
 service::join_node(join_node_request req, rpc::streaming_context&) {
@@ -155,7 +159,9 @@ service::purged_topic(purged_topic_request r, rpc::streaming_context&) {
              get_scheduling_group(),
              [this, r = std::move(r)]() mutable {
                  return _topics_frontend.local().do_purged_topic(
-                   std::move(r.topic), model::timeout_clock::now() + r.timeout);
+                   std::move(r.topic),
+                   r.domain,
+                   model::timeout_clock::now() + r.timeout);
              })
       .then(
         [](topic_result res) { return purged_topic_reply(std::move(res)); });
@@ -510,7 +516,21 @@ ss::future<get_cluster_health_reply> service::get_cluster_health_report(
 }
 
 ss::future<get_node_health_reply>
-service::do_collect_node_health_report(get_node_health_request) {
+service::do_collect_node_health_report(get_node_health_request req) {
+    // validate if the receiving node is the one that that the request is
+    // addressed to
+    if (
+      req.get_target_node_id() != get_node_health_request::node_id_not_set
+      && req.get_target_node_id() != _controller->self()) {
+        vlog(
+          clusterlog.debug,
+          "Received a get_node_health request addressed to different node. "
+          "Requested node id: {}, current node id: {}",
+          req.get_target_node_id(),
+          _controller->self());
+        co_return get_node_health_reply{.error = errc::invalid_target_node_id};
+    }
+
     auto res = co_await _hm_frontend.local().get_current_node_health();
     if (res.has_error()) {
         co_return get_node_health_reply{
@@ -518,7 +538,7 @@ service::do_collect_node_health_report(get_node_health_request) {
     }
     co_return get_node_health_reply{
       .error = errc::success,
-      .report = std::move(res.value()),
+      .report = node_health_report_serde{*res.value()},
     };
 }
 
@@ -814,6 +834,23 @@ service::delete_topics(delete_topics_request req, rpc::streaming_context&) {
       std::move(topics), model::timeout_clock::now() + timeout);
 
     co_return delete_topics_reply{.results = std::move(result)};
+}
+
+ss::future<set_partition_shard_reply> service::set_partition_shard(
+  set_partition_shard_request req, rpc::streaming_context&) {
+    co_await ss::coroutine::switch_to(get_scheduling_group());
+    auto ec = co_await _topics_frontend.local().set_local_partition_shard(
+      req.ntp, req.shard);
+    co_return set_partition_shard_reply{.ec = ec};
+}
+
+ss::future<client_quota::alter_quotas_response> service::alter_client_quotas(
+  client_quota::alter_quotas_request req, rpc::streaming_context&) {
+    co_await ss::coroutine::switch_to(get_scheduling_group());
+    auto deadline = model::timeout_clock::now() + req.timeout;
+    auto ec = co_await _quotas_frontend.local().alter_quotas(
+      std::move(req.cmd_data), deadline);
+    co_return client_quota::alter_quotas_response{.ec = ec};
 }
 
 } // namespace cluster

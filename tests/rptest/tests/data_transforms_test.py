@@ -9,6 +9,7 @@
 
 import typing
 import time
+import math
 import random
 import string
 import json
@@ -23,6 +24,7 @@ from rptest.clients.rpk import RpkException, RpkTool
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import MetricSamples, MetricsEndpoint
 from ducktape.utils.util import wait_until
+from ducktape.errors import TimeoutError
 from rptest.services.transform_verifier_service import TransformVerifierProduceConfig, TransformVerifierProduceStatus, TransformVerifierService, TransformVerifierConsumeConfig, TransformVerifierConsumeStatus
 from rptest.services.admin import Admin, CommittedWasmOffset
 
@@ -58,7 +60,11 @@ class BaseDataTransformsTest(RedpandaTest):
                      input_topic: TopicSpec,
                      output_topic: TopicSpec | list[TopicSpec],
                      file="tinygo/identity.wasm",
-                     wait_running=True):
+                     compression_type: TopicSpec.CompressionTypes
+                     | None = None,
+                     wait_running: bool = True,
+                     retry_on_exc: bool = True,
+                     from_offset: str | None = None):
         """
         Deploy a wasm transform and wait for all processors to be running.
         """
@@ -69,7 +75,9 @@ class BaseDataTransformsTest(RedpandaTest):
             self._rpk.deploy_wasm(name,
                                   input_topic.name,
                                   [o.name for o in output_topic],
-                                  file=file)
+                                  file=file,
+                                  compression_type=compression_type,
+                                  from_offset=from_offset)
             return True
 
         wait_until(
@@ -77,7 +85,7 @@ class BaseDataTransformsTest(RedpandaTest):
             timeout_sec=30,
             backoff_sec=5,
             err_msg=f"unable to deploy wasm transform {name}",
-            retry_on_exc=True,
+            retry_on_exc=retry_on_exc,
         )
 
         if not wait_running:
@@ -316,6 +324,237 @@ class DataTransformsTest(BaseDataTransformsTest):
             err_msg=f"all offsets where not removed",
             retry_on_exc=True,
         )
+
+    @cluster(num_nodes=3)
+    @matrix(use_rpk=[False, True])
+    def test_patch(self, use_rpk):
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+        self._deploy_wasm(name="identity-xform",
+                          input_topic=input_topic,
+                          output_topic=output_topic,
+                          wait_running=True)
+
+        def all_partitions_status(stat: str):
+            report = self._rpk.list_wasm()
+            return all(s.status == stat for s in report[0].status)
+
+        def env_is(env: dict[str, str]):
+            report = self._rpk.list_wasm()
+            return report[0].environment == env
+
+        if use_rpk:
+            self._rpk.pause_wasm("identity-xform")
+        else:
+            rsp = self._admin.transforms_patch_meta("identity-xform",
+                                                    pause=True)
+            assert rsp.status_code == 200, f"/meta request failed, status: {rsp.status_code}"
+
+        wait_until(lambda: all_partitions_status("inactive"),
+                   timeout_sec=30,
+                   backoff_sec=1,
+                   err_msg=f"some partitions didn't become inactive",
+                   retry_on_exc=True)
+
+        with expect_exception(TimeoutError, lambda _: True):
+            wait_until(lambda: all_partitions_status("running"),
+                       timeout_sec=15,
+                       backoff_sec=1,
+                       retry_on_exc=True)
+
+        if use_rpk:
+            self._rpk.resume_wasm("identity-xform")
+            wait_until(lambda: all_partitions_status("running"),
+                       timeout_sec=30,
+                       backoff_sec=1,
+                       err_msg=f"some partitions didn't become active",
+                       retry_on_exc=True)
+        else:  # NOTE: patching ENV is not yet implemented in rpk
+            env1 = {
+                "FOO": "bar",
+                "BAZ": "quux",
+            }
+            env2 = {"FOO": "bells"}
+
+            rsp = self._admin.transforms_patch_meta("identity-xform",
+                                                    pause=False,
+                                                    env=env1)
+            assert rsp.status_code == 200, f"/meta request failed, status: {rsp.status_code}"
+
+            wait_until(
+                lambda: all_partitions_status("running") and env_is(env1),
+                timeout_sec=30,
+                backoff_sec=1,
+                err_msg=f"some partitions didn't come back",
+                retry_on_exc=True)
+
+            rsp = self._admin.transforms_patch_meta("identity-xform", env=env2)
+
+            wait_until(
+                lambda: all_partitions_status("running") and env_is(env2),
+                timeout_sec=30,
+                backoff_sec=1,
+                err_msg="some partitions didn't take the env update",
+                retry_on_exc=True)
+
+            rsp = self._admin.transforms_patch_meta("identity-xform", env={})
+
+            wait_until(lambda: all_partitions_status("running") and env_is({}),
+                       timeout_sec=30,
+                       backoff_sec=1,
+                       err_msg="some partitions did not clear their envs",
+                       retry_on_exc=True)
+
+    @cluster(num_nodes=4)
+    def test_consume_from_end(self):
+        """
+        Test that by default transforms read from the end of the topic if no records
+        are produced between deploy time and transform start time.
+        """
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+        producer_status = self._produce_input_topic(topic=self.topics[0])
+        self._deploy_wasm(name="identity-xform",
+                          input_topic=input_topic,
+                          output_topic=output_topic,
+                          wait_running=True)
+
+        with expect_exception(TimeoutError, lambda _: True):
+            consumer_status = self._consume_output_topic(
+                topic=self.topics[1], status=producer_status)
+
+    @cluster(num_nodes=4)
+    @matrix(compression_type=[
+        TopicSpec.CompressionTypes.GZIP,
+        TopicSpec.CompressionTypes.LZ4,
+        TopicSpec.CompressionTypes.NONE,
+        TopicSpec.CompressionTypes.SNAPPY,
+        TopicSpec.CompressionTypes.ZSTD,
+        TopicSpec.CompressionTypes.PRODUCER,  # broker will reject this
+    ])
+    def test_compression(self, compression_type: TopicSpec.CompressionTypes):
+        INVALID_MODES: list[TopicSpec.CompressionTypes] = [
+            TopicSpec.CompressionTypes.PRODUCER,
+        ]
+        transform_name = "identity-xform"
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+
+        valid = compression_type not in INVALID_MODES
+
+        def deploy():
+            self._deploy_wasm(name=transform_name,
+                              input_topic=input_topic,
+                              output_topic=output_topic,
+                              compression_type=compression_type,
+                              wait_running=True,
+                              retry_on_exc=valid)
+
+        if not valid:
+            with expect_exception(
+                    RpkException,
+                    lambda e: "invalid JSON request body" in str(e)):
+                deploy()
+            # just go ahead and deploy with no compression and let the test finish
+            compression_type = TopicSpec.CompressionTypes.NONE
+            deploy()
+        else:
+            deploy()
+
+        def compression_set(compression_type: TopicSpec.CompressionTypes):
+            report = self._rpk.list_wasm()
+            return report[0].compression == compression_type
+
+        wait_until(lambda: compression_set(compression_type),
+                   timeout_sec=30,
+                   backoff_sec=1,
+                   err_msg="compression did not update",
+                   retry_on_exc=False)
+
+        producer_status = self._produce_input_topic(topic=self.topics[0])
+        consumer_status = self._consume_output_topic(topic=self.topics[1],
+                                                     status=producer_status)
+        self.logger.info(f"{consumer_status}")
+        assert consumer_status.invalid_records == 0, f"transform verification failed with invalid records: {consumer_status}"
+
+    @cluster(num_nodes=4)
+    @matrix(offset=[
+        "+0",
+        "-1",
+        f"@{int(time.time() * 1000)}",
+        "+9223372036854775807",  # int64_max - should clamp to start at latest
+    ])
+    def test_consume_from_offset(self, offset):
+        '''
+        Verify that offset-delta based and timestamp based consumption works as expected.
+        That is, records produced prior to deployment should still be accessible given an
+        appropriate offset config.
+        '''
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+        producer_status = self._produce_input_topic(topic=self.topics[0])
+        self._deploy_wasm(name="identity-xform",
+                          input_topic=input_topic,
+                          output_topic=output_topic,
+                          from_offset=offset,
+                          wait_running=True)
+        consumer_status = self._consume_output_topic(topic=self.topics[1],
+                                                     status=producer_status)
+
+        self.logger.info(f"{consumer_status}")
+        assert consumer_status.invalid_records == 0, f"transform verification failed with invalid records: {consumer_status}"
+
+    @cluster(num_nodes=4)
+    @matrix(offset=[
+        None,  # No offest -> read from the end of the topic
+        "@33276193569000",  # June 3024
+        "-0",  # '0 from end' should commit 'latest'
+    ])
+    def test_consume_off_end(self, offset):
+        '''
+        Verify that consuming off the end of the input topic works as expected.
+        That is, confirm that records produced _prior_ to deployment do not reach the transform.
+        '''
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+        producer_status = self._produce_input_topic(topic=self.topics[0])
+        self._deploy_wasm(name="identity-xform",
+                          input_topic=input_topic,
+                          output_topic=output_topic,
+                          from_offset=offset,
+                          wait_running=True)
+
+        with expect_exception(TimeoutError, lambda _: True):
+            _ = self._consume_output_topic(topic=self.topics[1],
+                                           status=producer_status)
+
+    @cluster(num_nodes=3)
+    @matrix(offset=[
+        "@9223372036854775807",  # int64_max (out of range for millis)
+        "+NaN",  # lexical cast error (literal NaN)
+        "-9223372036854775808",  # lexical cast error (int64 overflow)
+        f"@{time.time() * 1000}",  # lexical cast error (float value)
+        "@-10",  # illegal negative value
+        "--10",  # illegal negative value
+        "+-10",  # illegal negative value
+    ])
+    def test_consume_junk_off(self, offset):
+        '''
+        Tests for junk data. Deployment should fail cleanly in the admin API or rpk.
+        '''
+        input_topic = self.topics[0]
+        output_topic = self.topics[1]
+
+        with expect_exception(
+                RpkException,
+                lambda e: print(e) or "bad offset" in str(e).lower(
+                )):  # rpk returns 'bad offset', RP Admin returns 'Bad offset'.
+            self._deploy_wasm(name="identity-xform",
+                              input_topic=input_topic,
+                              output_topic=output_topic,
+                              from_offset=offset,
+                              wait_running=False,
+                              retry_on_exc=False)
 
 
 class DataTransformsChainingTest(BaseDataTransformsTest):
@@ -927,36 +1166,70 @@ class DataTransformsLoggingMetricsTest(BaseDataTransformsLoggingTest):
     def test_manager_metrics_values(self):
         self.logger.debug("Set flush interval to 1h so buffers fill up")
         self.redpanda.set_cluster_config(
-            {'data_transforms_logging_flush_interval_ms': 60 * 60 * 1000})
+            {
+                'data_transforms_logging_flush_interval_ms': 60 * 60 * 1000,
+                'data_transforms_logging_buffer_capacity_bytes': 100 * 1024
+            },
+            expect_restart=True)
+
+        cfg = self._admin.get_cluster_config()
+
+        buf_capacity_B = cfg.get(
+            'data_transforms_logging_buffer_capacity_bytes', 0)
+        assert buf_capacity_B > 0, "Expected non-zero log buffer capacity"
+
+        max_log_line_B = cfg.get('data_transforms_logging_line_max_bytes', 0)
+        assert max_log_line_B > 0, "Expected non-zero max log line"
+
+        self.logger.warn(
+            f"Buffer capacity: {buf_capacity_B}B, Max log line: {max_log_line_B}B"
+        )
+
+        input_topic = TopicSpec()
+        self._rpk.create_topic(input_topic.name, input_topic.partition_count,
+                               input_topic.replication_factor)
 
         it, ot = self.setup_identity_xform(
-            self.topics[0],
+            input_topic,
             self.topics[1],
             name=f"logger-xform",
         )
 
-        N_PER_TP = 32
-        for _ in range(0, N_PER_TP):
+        def get_buffer_usage() -> list[float]:
+            all_nodes_usage: list[float] = []
+            for node in self.redpanda.nodes:
+                samples = self.unpack_samples(
+                    self.get_metrics_from_node(
+                        node,
+                        ["log_manager_buffer_usage"],
+                        endpoint=MetricsEndpoint.METRICS,
+                    ))
+
+                for s in samples['log_manager_buffer_usage']:
+                    all_nodes_usage.append(s['value'])
+            self.logger.debug(f"MAX: {max(all_nodes_usage)}")
+            return all_nodes_usage
+
+        N_PER_TP = int(math.ceil(buf_capacity_B / max_log_line_B))
+        k = self.random_ascii_string(128, 128)
+
+        self.logger.debug("Produce enough data to fill the buffers twice over")
+        for _ in range(0, N_PER_TP * 2):
             self._rpk.produce(
                 it.name,
-                self.random_ascii_string(128, 128),
-                self.random_ascii_string(128, 128),
+                k,
+                self.random_ascii_string(max_log_line_B, max_log_line_B),
             )
 
-        self._rpk.consume(ot.name, n=1, offset=N_PER_TP - 1)
+        self.logger.debug(
+            "This should trigger a flush, preventing us from getting close to 100% usage"
+        )
 
-        all_nodes_usage = []
-        for node in self.redpanda.nodes:
-            samples = self.unpack_samples(
-                self.get_metrics_from_node(
-                    node,
-                    ["log_manager_buffer_usage"],
-                    endpoint=MetricsEndpoint.METRICS,
-                ))
+        with expect_exception(TimeoutError, lambda _: True):
+            wait_until(lambda: any(bu > 1.0 for bu in get_buffer_usage()),
+                       timeout_sec=10,
+                       backoff_sec=1,
+                       err_msg=f"buffers never filled up!")
 
-            for s in samples['log_manager_buffer_usage']:
-                all_nodes_usage.append(s['value'])
-
-        assert any(
-            bu > 0.0 for bu in all_nodes_usage
-        ), f"Expected some non-zero buffer usage, got {all_nodes_usage}"
+        self.logger.debug(
+            f"Final buffer usage: {json.dumps(get_buffer_usage(), indent=1)}")

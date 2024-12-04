@@ -1142,3 +1142,123 @@ class PartitionBalancerTest(PartitionBalancerService):
                                          target_id=transfer_to_idx)
 
             self.wait_until_ready()
+
+    @skip_debug_mode
+    @cluster(num_nodes=7, log_allow_list=CHAOS_LOG_ALLOW_LIST)
+    def test_recovery_mode_rebalance_finish(self):
+        """
+        Test that rebalancing on node add correctly finishes
+        if some (but not all) nodes were in recovery mode.
+        """
+
+        # start first 3 nodes and create some partitions on them
+        self.start_redpanda(num_nodes=5,
+                            num_started_nodes=3,
+                            new_bootstrap=True)
+        self.topic = TopicSpec(partition_count=50)
+        self.client().create_topic(self.topic)
+
+        self.start_producer(1)
+        self.start_consumer(1)
+        self.await_startup()
+
+        # restart seed nodes in recovery mode
+        seed_nodes = self.redpanda.nodes[:3]
+        self.redpanda.restart_nodes(
+            seed_nodes,
+            auto_assign_node_id=True,
+            omit_seeds_on_idx_one=False,
+            override_cfg_params={"recovery_mode_enabled": True})
+
+        # add 2 more nodes and make sure the balancer runs on one of them
+        # (it can't run on seed nodes because of recovery mode)
+        joiner_nodes = self.redpanda.nodes[3:]
+        for node in joiner_nodes:
+            self.redpanda.start_node(node,
+                                     auto_assign_node_id=True,
+                                     omit_seeds_on_idx_one=False)
+        self.redpanda.wait_for_membership(first_start=False)
+
+        admin = Admin(self.redpanda)
+
+        admin.transfer_leadership_to(namespace='redpanda',
+                                     topic='controller',
+                                     partition=0,
+                                     target_id=self.redpanda.node_id(
+                                         joiner_nodes[0]))
+
+        # the balancer will stall because not all partitions are moveable
+        self.wait_until_status(lambda s: s["status"] == "stalled")
+
+        # restart seed nodes in normal mode
+        self.redpanda.restart_nodes(seed_nodes, auto_assign_node_id=True)
+        self.redpanda.wait_for_membership(first_start=False)
+
+        self.wait_until_ready()
+
+        # check that partition counts are balanced
+        partition_counts = [
+            len(admin.get_partitions(node=n)) for n in self.redpanda.nodes
+        ]
+        self.logger.info(f"partition counts: {partition_counts}")
+        avg = sum(partition_counts) / len(partition_counts)
+        assert all(abs(c - avg) / avg < 0.05 for c in partition_counts), \
+            "partition counts not balanced"
+
+        self.run_validation(consumer_timeout_sec=CONSUMER_TIMEOUT)
+
+    @cluster(num_nodes=7, log_allow_list=CHAOS_LOG_ALLOW_LIST)
+    @matrix(disable_license=[True, False])
+    def test_partition_autobalancer_sanction(self, disable_license):
+        def partitions_in_node(node_id):
+            return self.node2partition_count().get(node_id, 0)
+
+        if disable_license:
+            environment = dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE='1')
+        else:
+            environment = dict()
+
+        self.start_redpanda(num_nodes=5, environment=environment)
+
+        self.topic = TopicSpec(partition_count=20)
+        self.client().create_topic(self.topic)
+
+        self.start_producer(1)
+        self.start_consumer(1)
+        self.await_startup()
+
+        with self.NodeStopper(self) as ns:
+            to_kill = random.choice(self.redpanda.nodes)
+
+            kill_id = int(self.redpanda.node_id(to_kill))
+            partitions_in_node_before = partitions_in_node(kill_id)
+            assert partitions_in_node_before != 0, f"Invalid Setup: Initial node partitions is \"{partitions_in_node_before}\""
+
+            ns.make_unavailable(to_kill,
+                                failure_types=[FailureSpec.FAILURE_KILL])
+
+            time.sleep(30)
+
+            admin = Admin(self.redpanda,
+                          retry_codes=[503, 504],
+                          retries_amount=10)
+            status = admin.get_partition_balancer_status(timeout=10)
+
+            partitions_in_node_after = partitions_in_node(kill_id)
+
+            s = status['status']
+            assert s == 'ready', f"Expected status == 'ready' but got '{s}' instead"
+
+            unavailable = status['violations'].get('unavailable_nodes', [])
+            if disable_license:
+                assert len( unavailable) == 0, \
+                    f"Expected no nodes in unavailable. unavailable: {unavailable}"
+                assert partitions_in_node_after == partitions_in_node_before
+            else:
+                assert kill_id in unavailable, f"Expected node with id \"{kill_id}\" in unavailable. unavailable: {unavailable}"
+                assert partitions_in_node_after == 0
+
+            # Restore the system to a fully healthy state before validation:
+            # not strictly necessary but simplifies debugging.
+            ns.make_available()
+            self.run_validation(consumer_timeout_sec=CONSUMER_TIMEOUT)

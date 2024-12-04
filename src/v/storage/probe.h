@@ -13,7 +13,6 @@
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
 #include "storage/fwd.h"
-#include "storage/logger.h"
 #include "storage/types.h"
 
 #include <seastar/core/metrics_registration.hh>
@@ -32,10 +31,10 @@ struct disk_metrics {
 class node_probe {
 public:
     void setup_node_metrics();
-    void set_disk_metrics(
+    void set_data_disk_metrics(
       uint64_t total_bytes, uint64_t free_bytes, disk_space_alert alert);
-
-    const disk_metrics& get_disk_metrics() const { return _disk; }
+    void set_cache_disk_metrics(
+      uint64_t total_bytes, uint64_t free_bytes, disk_space_alert alert);
 
     node_probe() = default;
     node_probe(const node_probe&) = delete;
@@ -45,7 +44,8 @@ public:
     ~node_probe() = default;
 
 private:
-    disk_metrics _disk;
+    disk_metrics _data_disk;
+    disk_metrics _cache_disk;
     metrics::public_metric_groups _public_metrics;
 };
 
@@ -90,15 +90,14 @@ public:
         _compaction_removed_bytes += bytes;
     }
 
-    void batch_write_error(const std::exception_ptr& e) {
-        stlog.error("Error writing record batch {}", e);
-        ++_batch_write_errors;
-    }
+    void batch_write_error(const std::exception_ptr& e);
 
     void add_batches_read(uint32_t batches) { _batches_read += batches; }
     void add_cached_batches_read(uint32_t batches) {
         _cached_batches_read += batches;
     }
+
+    void add_removed_tombstone() { ++_tombstones_removed; }
 
     void batch_parse_error() { ++_batch_parse_errors; }
 
@@ -140,6 +139,7 @@ private:
     uint32_t _batch_parse_errors = 0;
     uint32_t _batch_write_errors = 0;
     double _compaction_ratio = 1.0;
+    uint64_t _tombstones_removed = 0;
 
     ssize_t _compaction_removed_bytes = 0;
 

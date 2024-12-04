@@ -25,8 +25,7 @@
 #include "kafka/client/utils.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/fetch.h"
-#include "kafka/protocol/list_offsets.h"
-#include "kafka/types.h"
+#include "kafka/protocol/list_offset.h"
 #include "ssx/semaphore.h"
 #include "utils/retry.h"
 #include "utils/unresolved_address.h"
@@ -71,14 +70,14 @@ constexpr auto default_external_mitigate = [](std::exception_ptr ex) {
     return ss::make_exception_future(ex);
 };
 
-}
+} // namespace impl
 
 class client {
 public:
     using external_mitigate
       = ss::noncopyable_function<ss::future<>(std::exception_ptr)>;
     explicit client(
-      YAML::Node const& cfg,
+      const YAML::Node& cfg,
       external_mitigate mitigater = impl::default_external_mitigate);
 
     /// \brief Connect to all brokers.
@@ -194,7 +193,7 @@ private:
     ss::future<> apply(metadata_response res);
 
     /// \brief Log the client ID if it exists, otherwise don't log
-    friend std::ostream& operator<<(std::ostream& os, client const& c) {
+    friend std::ostream& operator<<(std::ostream& os, const client& c) {
         if (c._config.client_identifier().has_value()) {
             fmt::print(os, "{}: ", c._config.client_identifier().value());
         }

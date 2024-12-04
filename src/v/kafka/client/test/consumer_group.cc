@@ -24,7 +24,7 @@
 #include "kafka/protocol/join_group.h"
 #include "kafka/protocol/leave_group.h"
 #include "kafka/protocol/list_groups.h"
-#include "kafka/protocol/list_offsets.h"
+#include "kafka/protocol/list_offset.h"
 #include "kafka/protocol/metadata.h"
 #include "kafka/protocol/offset_fetch.h"
 #include "kafka/protocol/schemata/join_group_request.h"
@@ -33,7 +33,6 @@
 #include "kafka/protocol/sync_group.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/group.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "redpanda/tests/fixture.h"
@@ -186,7 +185,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     auto remove_consumers = ss::defer([&client, &group_id, &members]() {
         for (const auto& m_id : members) {
             client.remove_consumer(group_id, m_id)
-              .handle_exception([](std::exception_ptr e) {})
+              .handle_exception([](std::exception_ptr) {})
               .get();
         }
     });
@@ -224,7 +223,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     }
 
     // Check topic subscriptions - one each expected
-    for (int i = 0; i < members.size(); ++i) {
+    for (size_t i = 0; i < members.size(); ++i) {
         auto consumer_topics
           = client.consumer_topics(group_id, members[i]).get();
         BOOST_REQUIRE_EQUAL(consumer_topics.size(), 1);
@@ -246,7 +245,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     info("list res: {}", list_res);
 
     // Check topic subscriptions - one each expected
-    for (int i = 0; i < members.size(); ++i) {
+    for (size_t i = 0; i < members.size(); ++i) {
         auto consumer_topics
           = client.consumer_topics(group_id, members[i]).get();
         BOOST_REQUIRE_EQUAL(consumer_topics.size(), 1);
@@ -257,11 +256,11 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     // range_assignment is allocated according to sorted member ids
     auto sorted_members = members;
     std::sort(sorted_members.begin(), sorted_members.end());
-    for (int i = 0; i < sorted_members.size(); ++i) {
+    for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
         auto assignment = client.consumer_assignment(group_id, m_id).get();
         BOOST_REQUIRE_EQUAL(assignment.size(), 3);
-        for (auto const& [topic, partitions] : assignment) {
+        for (const auto& [topic, partitions] : assignment) {
             BOOST_REQUIRE_EQUAL(partitions.size(), 1);
             BOOST_REQUIRE_EQUAL(partitions[0](), i);
         }
@@ -272,9 +271,9 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               .get();
         BOOST_REQUIRE_EQUAL(offsets.data.error_code, kafka::error_code::none);
         BOOST_REQUIRE_EQUAL(offsets.data.topics.size(), 3);
-        for (auto const& t : offsets.data.topics) {
+        for (const auto& t : offsets.data.topics) {
             BOOST_REQUIRE_EQUAL(t.partitions.size(), 1);
-            for (auto const& p : t.partitions) {
+            for (const auto& p : t.partitions) {
                 BOOST_REQUIRE_EQUAL(p.error_code, kafka::error_code::none);
                 BOOST_REQUIRE_EQUAL(p.partition_index(), i);
                 BOOST_REQUIRE_EQUAL(p.committed_offset(), -1);
@@ -303,7 +302,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
           .get();
 
     // Commit 5 offsets, with metadata of the member id.
-    for (int i = 0; i < sorted_members.size(); ++i) {
+    for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
         auto t = std::vector<kafka::offset_commit_request_topic>{};
         t.reserve(3);
@@ -315,7 +314,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               return kafka::offset_commit_request_topic{
                 .name = topic,
                 .partitions = {
-                  {.partition_index = model::partition_id{i},
+                  {.partition_index = model::partition_id{static_cast<int>(i)},
                    .committed_offset = model::offset{5},
                    .committed_metadata{m_id()}}}};
           });
@@ -332,11 +331,11 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
 
     // Check member assignment and offsets
     // range_assignment is allocated according to sorted member ids
-    for (int i = 0; i < sorted_members.size(); ++i) {
+    for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
         auto assignment = client.consumer_assignment(group_id, m_id).get();
         BOOST_REQUIRE_EQUAL(assignment.size(), 3);
-        for (auto const& [topic, partitions] : assignment) {
+        for (const auto& [topic, partitions] : assignment) {
             BOOST_REQUIRE_EQUAL(partitions.size(), 1);
             BOOST_REQUIRE_EQUAL(partitions[0](), i);
         }
@@ -347,9 +346,9 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               .get();
         BOOST_REQUIRE_EQUAL(offsets.data.error_code, kafka::error_code::none);
         BOOST_REQUIRE_EQUAL(offsets.data.topics.size(), 3);
-        for (auto const& t : offsets.data.topics) {
+        for (const auto& t : offsets.data.topics) {
             BOOST_REQUIRE_EQUAL(t.partitions.size(), 1);
-            for (auto const& p : t.partitions) {
+            for (const auto& p : t.partitions) {
                 BOOST_REQUIRE_EQUAL(p.error_code, kafka::error_code::none);
                 BOOST_REQUIRE_EQUAL(p.partition_index(), i);
                 BOOST_REQUIRE_EQUAL(p.committed_offset(), 5);
@@ -360,7 +359,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
 
     // Commit all offsets
     // empty list means commit all offsets
-    for (int i = 0; i < sorted_members.size(); ++i) {
+    for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
         auto t = std::vector<kafka::offset_commit_request_topic>{};
         auto res
@@ -376,7 +375,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
 
     // Check comimtted offsets match the fetched offsets
     // range_assignment is allocated according to sorted member ids
-    for (int i = 0; i < sorted_members.size(); ++i) {
+    for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
         auto assignment = client.consumer_assignment(group_id, m_id).get();
 
@@ -386,9 +385,9 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               .get();
         BOOST_REQUIRE_EQUAL(offsets.data.error_code, kafka::error_code::none);
         BOOST_REQUIRE_EQUAL(offsets.data.topics.size(), 3);
-        for (auto const& t : offsets.data.topics) {
+        for (const auto& t : offsets.data.topics) {
             BOOST_REQUIRE_EQUAL(t.partitions.size(), 1);
-            for (auto const& p : t.partitions) {
+            for (const auto& p : t.partitions) {
                 BOOST_REQUIRE_EQUAL(p.error_code, kafka::error_code::none);
                 BOOST_REQUIRE_EQUAL(p.partition_index(), i);
                 auto part_it = std::find_if(

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -35,18 +36,19 @@ func newStartCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 This command starts the process of restoring topics from the archival bucket.
 If the wait flag (--wait/-w) is set, the command will poll the status of the
 recovery process until it's finished.`,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			ctx := cmd.Context()
 
 			_, err = client.StartAutomatedRecovery(ctx)
-			var he *adminapi.HTTPResponseError
+			var he *rpadmin.HTTPResponseError
 			if errors.As(err, &he) {
 				if he.Response.StatusCode == 404 {
 					body, bodyErr := he.DecodeGenericErrorBody()

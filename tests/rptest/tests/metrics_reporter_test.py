@@ -41,6 +41,9 @@ class MetricsReporterServer:
             "metrics_reporter_url": f"{self.http.url}/metrics",
         }
 
+    def clear_requests(self):
+        self.http.requests.clear()
+
     def requests(self):
         return self.http.requests
 
@@ -63,7 +66,7 @@ class MetricsReporterTest(RedpandaTest):
         self.redpanda.set_environment({"REDPANDA_ENVIRONMENT": "test"})
 
     def setUp(self):
-        # Start HTTP server before redpanda
+        # Start HTTP server before redpanda to avoid connection errors
         self.metrics.start()
         self.redpanda.start()
 
@@ -82,6 +85,9 @@ class MetricsReporterTest(RedpandaTest):
 
         assert admin.put_license(
             license).status_code == 200, "PUT License failed"
+
+        # blow away the metrics state so we can test the has_license flag later
+        self.metrics.clear_requests()
 
         total_topics = 5
         total_partitions = 0
@@ -128,6 +134,13 @@ class MetricsReporterTest(RedpandaTest):
         assert_fields_are_the_same(metadata, 'config')
         # No transforms are deployed
         assert_fields_are_the_same(metadata, 'data_transforms_count')
+        # license violation status should not change across requests
+        assert_fields_are_the_same(metadata, 'has_valid_license')
+        assert_fields_are_the_same(metadata, 'has_enterprise_features')
+        assert_fields_are_the_same(metadata, 'enterprise_features')
+        assert_fields_are_the_same(metadata, 'hostname')
+        assert_fields_are_the_same(metadata, 'domainname')
+        assert_fields_are_the_same(metadata, 'fqdns')
         # get the last report
         last = metadata.pop()
         assert last['topic_count'] == total_topics
@@ -138,6 +151,15 @@ class MetricsReporterTest(RedpandaTest):
         assert last['active_logical_version'] == features['cluster_version']
         assert last['original_logical_version'] == features[
             'original_cluster_version']
+        assert last['has_valid_license']
+        # NOTE: value will vary depending on FIPS mode. we're confident that
+        # the source of the value is sound, so assert on presence instead.
+        assert 'has_enterprise_features' in last
+        assert 'enterprise_features' in last
+        assert type(last['enterprise_features']) == list
+        assert 'hostname' in last
+        assert 'domainname' in last
+        assert 'fqdns' in last
         nodes_meta = last['nodes']
 
         assert len(last['nodes']) == len(self.redpanda.nodes)
@@ -149,6 +171,7 @@ class MetricsReporterTest(RedpandaTest):
         assert all('uptime_ms' in n for n in nodes_meta)
         assert all('is_alive' in n for n in nodes_meta)
         assert all('disks' in n for n in nodes_meta)
+        assert all('kafka_advertised_listeners' in n for n in nodes_meta)
 
         # Check cluster UUID and creation time survive a restart
         for n in self.redpanda.nodes:

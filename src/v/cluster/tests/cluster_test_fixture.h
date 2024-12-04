@@ -19,6 +19,7 @@
 #include "redpanda/tests/fixture.h"
 #include "resource_mgmt/cpu_scheduling.h"
 #include "test_utils/async.h"
+#include "types.h"
 
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/sharded.hh>
@@ -38,14 +39,14 @@ void wait_for(model::timeout_clock::duration timeout, Pred&& p) {
       do_until(
         [p = std::forward<Pred>(p)] { return p(); },
         [] { return ss::sleep(std::chrono::milliseconds(400)); }))
-      .get0();
+      .get();
 }
 
 template<typename T>
 void set_configuration(ss::sstring p_name, T v) {
     ss::smp::invoke_on_all([p_name, v = std::move(v)] {
         config::shard_local_cfg().get(p_name).set_value(v);
-    }).get0();
+    }).get();
 }
 
 class cluster_test_fixture {
@@ -68,7 +69,7 @@ public:
         std::filesystem::remove_all(std::filesystem::path(_base_dir));
     }
 
-    virtual fixture_ptr make_redpanda_fixture(
+    fixture_ptr make_redpanda_fixture(
       model::node_id node_id,
       int16_t kafka_port,
       int16_t rpc_port,
@@ -81,7 +82,8 @@ public:
       = std::nullopt,
       std::optional<archival::configuration> archival_cfg = std::nullopt,
       std::optional<cloud_storage::configuration> cloud_cfg = std::nullopt,
-      bool enable_legacy_upload_mode = true) {
+      bool enable_legacy_upload_mode = true,
+      bool iceberg_enabled = false) {
         return std::make_unique<redpanda_thread_fixture>(
           node_id,
           kafka_port,
@@ -99,7 +101,8 @@ public:
           empty_seed_starts_cluster_val,
           std::nullopt,
           false,
-          enable_legacy_upload_mode);
+          enable_legacy_upload_mode,
+          iceberg_enabled);
     }
 
     void add_node(
@@ -116,7 +119,8 @@ public:
       = std::nullopt,
       std::optional<archival::configuration> archival_cfg = std::nullopt,
       std::optional<cloud_storage::configuration> cloud_cfg = std::nullopt,
-      bool enable_legacy_upload_mode = true) {
+      bool enable_legacy_upload_mode = true,
+      bool iceberg_enabled = false) {
         _instances.emplace(
           node_id,
           make_redpanda_fixture(
@@ -131,7 +135,8 @@ public:
             s3_config,
             archival_cfg,
             cloud_cfg,
-            enable_legacy_upload_mode));
+            enable_legacy_upload_mode,
+            iceberg_enabled));
     }
 
     application* get_node_application(model::node_id id) {
@@ -164,7 +169,8 @@ public:
       = std::nullopt,
       std::optional<archival::configuration> archival_cfg = std::nullopt,
       std::optional<cloud_storage::configuration> cloud_cfg = std::nullopt,
-      bool legacy_upload_mode_enabled = true) {
+      bool legacy_upload_mode_enabled = true,
+      bool iceberg_enabled = false) {
         std::vector<config::seed_server> seeds = {};
         if (!empty_seed_starts_cluster_val || node_id != 0) {
             seeds.push_back(
@@ -182,7 +188,8 @@ public:
           s3_config,
           archival_cfg,
           cloud_cfg,
-          legacy_upload_mode_enabled);
+          legacy_upload_mode_enabled,
+          iceberg_enabled);
         return get_node_application(node_id);
     }
 
@@ -232,52 +239,55 @@ public:
      */
     scheduling_groups create_scheduling_groups() {
         scheduling_groups groups;
-        groups.create_groups().get0();
+        groups.create_groups().get();
         return groups;
     }
 
-    void create_topic(
+    ss::future<> create_topic(
       model::topic_namespace_view tp_ns,
       int partitions = 1,
-      int16_t replication_factor = 1) {
+      int16_t replication_factor = 1,
+      std::optional<cluster::topic_properties> custom_properties
+      = std::nullopt) {
         vassert(!_instances.empty(), "no nodes in the cluster");
         // wait until there is a controller stm leader.
-        tests::cooperative_spin_wait_with_timeout(10s, [this] {
+        co_await tests::cooperative_spin_wait_with_timeout(10s, [this] {
             return std::any_of(
               _instances.begin(), _instances.end(), [](auto& it) {
-                  return it.second->app.controller->linearizable_barrier()
-                    .get0();
+                  return it.second->app.controller->is_raft0_leader();
               });
-        }).get0();
+        });
         auto leader_it = std::find_if(
           _instances.begin(), _instances.end(), [](auto& it) {
               return it.second->app.controller->is_raft0_leader();
           });
         auto& app_0 = leader_it->second->app;
-        cluster::topic_configuration_vector cfgs = {
-          cluster::topic_configuration{
-            tp_ns.ns, tp_ns.tp, partitions, replication_factor}};
-        auto results = app_0.controller->get_topics_frontend()
+        auto topic_cfg = cluster::topic_configuration{
+          tp_ns.ns, tp_ns.tp, partitions, replication_factor};
+        if (custom_properties) {
+            topic_cfg.properties = custom_properties.value();
+        }
+        cluster::topic_configuration_vector cfgs = {std::move(topic_cfg)};
+        auto results = co_await app_0.controller->get_topics_frontend()
                          .local()
                          .create_topics(
                            cluster::without_custom_assignments(std::move(cfgs)),
-                           model::no_timeout)
-                         .get0();
+                           model::no_timeout);
         BOOST_REQUIRE_EQUAL(results.size(), 1);
         auto& result = results.at(0);
         BOOST_REQUIRE_EQUAL(result.ec, cluster::errc::success);
         auto& leaders = app_0.controller->get_partition_leaders().local();
-        tests::cooperative_spin_wait_with_timeout(10s, [&]() {
+        co_await tests::cooperative_spin_wait_with_timeout(10s, [&]() {
             auto md = app_0.metadata_cache.local().get_topic_metadata(
               result.tp_ns);
             return md && md->get_assignments().size() == partitions
                    && std::all_of(
                      md->get_assignments().begin(),
                      md->get_assignments().end(),
-                     [&](const cluster::partition_assignment& p) {
-                         return leaders.get_leader(tp_ns, p.id);
+                     [&](const cluster::assignments_set::value_type& p) {
+                         return leaders.get_leader(tp_ns, p.second.id);
                      });
-        }).get0();
+        });
     }
 
     std::tuple<redpanda_thread_fixture*, ss::lw_shared_ptr<cluster::partition>>
@@ -295,24 +305,46 @@ public:
         return std::make_tuple(nullptr, nullptr);
     }
 
-    void shuffle_leadership(model::ntp ntp) {
+    ss::future<> shuffle_leadership(model::ntp ntp) {
         BOOST_REQUIRE(!_instances.empty());
         auto& app = _instances.begin()->second.get()->app;
         auto& leaders = app.controller->get_partition_leaders().local();
         auto current_leader = leaders.get_leader(ntp);
         if (!current_leader) {
-            return;
+            return ss::now();
         }
         auto& leader_app = _instances.at(*current_leader).get()->app;
         auto partition = leader_app.partition_manager.local().get(ntp);
         BOOST_REQUIRE(partition);
-        partition
-          ->transfer_leadership(
-            raft::transfer_leadership_request{.group = partition->group()})
-          .get();
+        auto current_leader_id = current_leader.value()();
+        auto new_leader_id = model::node_id{
+          ++current_leader_id % static_cast<int>(_instances.size())};
+        return partition
+          ->transfer_leadership(raft::transfer_leadership_request{
+            .group = partition->group(), .target = new_leader_id})
+          .discard_result();
     }
 
 protected:
+    std::vector<model::node_id> instance_ids() const {
+        std::vector<model::node_id> ret;
+        for (const auto& [id, _] : _instances) {
+            ret.push_back(id);
+        }
+        return ret;
+    }
+
+    model::node_id next_node_id() const {
+        model::node_id max;
+        for (const auto& [id, _] : _instances) {
+            max = std::max(max, id);
+        }
+        if (max < 0) {
+            return model::node_id{0};
+        }
+        return max + model::node_id{1};
+    }
+
     redpanda_thread_fixture* instance(model::node_id id) {
         return _instances[id].get();
     }

@@ -32,7 +32,10 @@
 struct manual_deletion_fixture : public raft_test_fixture {
     manual_deletion_fixture()
       : gr(
-        raft::group_id(0), 3, model::cleanup_policy_bitflags::deletion, 1_KiB) {
+          raft::group_id(0),
+          3,
+          model::cleanup_policy_bitflags::deletion,
+          1_KiB) {
         config::shard_local_cfg().log_segment_size_min.set_value(
           std::optional<uint64_t>());
         gr.enable_all();
@@ -62,7 +65,7 @@ struct manual_deletion_fixture : public raft_test_fixture {
             auto& kvstore = member.storage.local().kvs();
             auto eviction_stm = std::make_unique<cluster::log_eviction_stm>(
               member.consensus.get(), tstlog, kvstore);
-            eviction_stm->start().get0();
+            eviction_stm->start().get();
             eviction_stms.emplace(id, std::move(eviction_stm));
             member.kill_eviction_stm_cb
               = std::make_unique<ss::noncopyable_function<ss::future<>()>>(
@@ -89,7 +92,7 @@ struct manual_deletion_fixture : public raft_test_fixture {
         auto first_ts = model::timestamp::now();
         // append some entries
         [[maybe_unused]] bool res
-          = replicate_compactible_batches(gr, first_ts).get0();
+          = replicate_compactible_batches(gr, first_ts).get();
         // make it so that above batch will be collected by time based
         // retention, by setting the threshold to 2 seconds after it
         retention_timestamp = model::to_timestamp(
@@ -98,7 +101,7 @@ struct manual_deletion_fixture : public raft_test_fixture {
                              // the next batch
         auto second_ts = model::timestamp(first_ts() + 200000);
         // append some more entries
-        res = replicate_compactible_batches(gr, second_ts).get0();
+        res = replicate_compactible_batches(gr, second_ts).get();
         validate_logs_replication(gr);
     }
 
@@ -112,10 +115,11 @@ struct manual_deletion_fixture : public raft_test_fixture {
                       retention_timestamp,
                       100_MiB,
                       model::offset::max(),
+                      std::nullopt,
                       ss::default_priority_class(),
                       as,
                       storage::ntp_sanitizer_config{.sanitize_only = true}))
-                    .get0();
+                    .get();
                   if (n.log->offsets().start_offset <= model::offset(0)) {
                       return false;
                   }

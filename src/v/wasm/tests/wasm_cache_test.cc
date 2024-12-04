@@ -15,8 +15,9 @@
 #include "model/tests/randoms.h"
 #include "model/transform.h"
 #include "random/generators.h"
-#include "wasm/api.h"
 #include "wasm/cache.h"
+#include "wasm/engine.h"
+#include "wasm/wasi_logger.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
@@ -80,9 +81,7 @@ public:
     }
 
     ss::future<> transform(
-      model::record_batch batch,
-      transform_probe*,
-      transform_callback) override {
+      model::record_batch, transform_probe*, transform_callback) override {
         if (_state->engine_transform_should_throw) {
             throw std::runtime_error("test error");
         }

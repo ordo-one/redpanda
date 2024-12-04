@@ -11,12 +11,12 @@
 
 #include "base/likely.h"
 #include "base/outcome.h"
+#include "base/outcome_future_utils.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
-#include "outcome_future_utils.h"
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
@@ -73,46 +73,34 @@ replicate_entries_stm::send_append_entries_request(
     auto opts = rpc::client_opts(append_entries_timeout());
     opts.resource_units = ss::make_foreign<ss::lw_shared_ptr<units_t>>(_units);
 
-    auto f = _ptr->_fstats.get_append_entries_unit(n).then_wrapped(
-      [this, batches = std::move(batches), opts = std::move(opts), n](
-        ss::future<ssx::semaphore_units> f) mutable {
-          // we want to signal dispatch semaphore after calling append entries.
-          // When dispatch semaphore is released the append_entries_stm releases
-          // op_lock so next append entries request can be dispatched to the
-          // follower
-          auto signal_dispatch_sem = ss::defer(
-            [this] { _dispatch_sem.signal(); });
-          if (f.failed()) {
-              f.ignore_ready_future();
-              return ss::make_ready_future<result<append_entries_reply>>(
-                make_error_code(errc::append_entries_dispatch_error));
-          }
-          auto u = f.get();
+    // we want to signal dispatch semaphore after calling append entries.
+    // When dispatch semaphore is released the append_entries_stm releases
+    // op_lock so next append entries request can be dispatched to the
+    // follower
+    auto signal_dispatch_sem = ss::defer([this] { _dispatch_sem.signal(); });
+    return _ptr->_client_protocol
+      .append_entries(
+        n.id(),
+        append_entries_request(
+          _ptr->self(),
+          n,
+          _meta,
+          std::move(batches),
+          _batches_size,
+          _is_flush_required),
+        std::move(opts))
 
-          return _ptr->_client_protocol
-            .append_entries(
-              n.id(),
-              append_entries_request(
-                _ptr->self(), n, _meta, std::move(batches), _is_flush_required),
-              std::move(opts),
-              _ptr->use_all_serde_append_entries())
-            .then([this, target_node_id = n.id()](
-                    result<append_entries_reply> reply) {
-                return _ptr->validate_reply_target_node(
-                  "append_entries_replicate", reply, target_node_id);
-            })
-            .finally([this, n, u = std::move(u)] {
-                _ptr->_fstats.return_append_entries_units(n);
-            });
-      });
-
-    return f
+      .then(
+        [this, target_node_id = n.id()](result<append_entries_reply> reply) {
+            return _ptr->validate_reply_target_node(
+              "append_entries_replicate", reply, target_node_id);
+        })
       .handle_exception([this](const std::exception_ptr& e) {
           vlog(_ctxlog.warn, "Error while replicating entries {}", e);
           return result<append_entries_reply>(
             errc::append_entries_dispatch_error);
       })
-      .finally([this, n] { _hb_guards[n].unsuppress(); });
+      .finally([this, n] { _inflight_appends[n].mark_finished(); });
 }
 
 ss::future<> replicate_entries_stm::dispatch_one(vnode id) {
@@ -259,7 +247,7 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
     cfg.for_each_broker_id([this](const vnode& rni) {
         // suppress follower heartbeat, before appending to self log
         if (rni != _ptr->_self) {
-            _hb_guards.emplace(rni, _ptr->suppress_heartbeats(rni));
+            _inflight_appends.emplace(rni, _ptr->track_append_inflight(rni));
         }
     });
     _units = ss::make_lw_shared<units_t>(std::move(u));
@@ -276,7 +264,7 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
         // We are not dispatching request to followers that are
         // recovering
         if (should_skip_follower_request(rni)) {
-            _hb_guards[rni].unsuppress();
+            _inflight_appends[rni].mark_finished();
             return;
         }
         if (rni != _ptr->self()) {
@@ -327,9 +315,9 @@ replicate_entries_stm::wait_for_majority() {
     auto appended_term = append_result.last_term;
     auto result = _is_flush_required
                     ? _ptr->_replication_monitor.wait_until_committed(
-                      append_result)
+                        append_result)
                     : _ptr->_replication_monitor.wait_until_majority_replicated(
-                      append_result);
+                        append_result);
     co_return process_result(
       co_await std::move(result), appended_offset, appended_term);
 }
@@ -381,6 +369,7 @@ replicate_entries_stm::replicate_entries_stm(
   : _ptr(p)
   , _meta(r.metadata())
   , _is_flush_required(r.is_flush_required())
+  , _batches_size(r.batches_size())
   , _batches(std::move(r).release_batches())
   , _followers_seq(std::move(seqs))
   , _ctxlog(_ptr->_ctxlog) {}

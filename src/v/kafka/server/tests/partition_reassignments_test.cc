@@ -15,7 +15,6 @@
 #include "kafka/protocol/schemata/alter_partition_reassignments_request.h"
 #include "kafka/protocol/schemata/list_partition_reassignments_request.h"
 #include "kafka/server/handlers/topics/types.h"
-#include "kafka/types.h"
 #include "model/namespace.h"
 #include "redpanda/tests/fixture.h"
 
@@ -80,7 +79,7 @@ FIXTURE_TEST(
     model::topic test_tp{"topic-1"};
     create_topic(test_tp, 6);
 
-    auto client = make_kafka_client().get0();
+    auto client = make_kafka_client().get();
     client.connect().get();
     model::partition_id pid0{0};
 
@@ -261,7 +260,7 @@ FIXTURE_TEST(
     int num_partitions = 6;
     create_topic(test_tp, num_partitions);
 
-    auto client = make_kafka_client().get0();
+    auto client = make_kafka_client().get();
     client.connect().get();
 
     {

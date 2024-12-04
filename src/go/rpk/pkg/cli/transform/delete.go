@@ -12,7 +12,7 @@ package transform
 import (
 	"fmt"
 
-	dataplanev1alpha1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha1"
+	dataplanev1alpha2 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha2"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -33,7 +33,7 @@ func newDeleteCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitServerlessAdmin(p)
 
-			api, err := adminapi.NewClient(fs, p)
+			api, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 			functionName := args[0]
 
@@ -53,7 +53,7 @@ func newDeleteCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 				_, err = cl.Transform.DeleteTransform(
 					cmd.Context(),
-					connect.NewRequest(&dataplanev1alpha1.DeleteTransformRequest{
+					connect.NewRequest(&dataplanev1alpha2.DeleteTransformRequest{
 						Name: functionName,
 					}))
 				out.MaybeDie(err, "unable to delete transform %q: %v", functionName, err)

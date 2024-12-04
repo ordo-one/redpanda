@@ -9,11 +9,13 @@
 
 #include "storage/snapshot.h"
 
+#include "base/vlog.h"
 #include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "hashing/crc32c.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
+#include "storage/logger.h"
 #include "storage/segment_utils.h"
 #include "utils/directory_walker.h"
 
@@ -95,6 +97,10 @@ ss::future<> snapshot_manager::finish_snapshot(file_snapshot_writer& writer) {
       .then([this] { return ss::sync_directory(_dir.string()); });
 }
 
+ss::future<bool> snapshot_manager::snapshot_exists(ss::sstring filename) const {
+    return ss::file_exists(snapshot_path(std::move(filename)).string());
+}
+
 ss::future<> snapshot_manager::remove_partial_snapshots() {
     std::regex re(fmt::format(
       R"(^{}\.partial\.(\d+)\.([a-zA-Z0-9]{{4}})$)", _partial_prefix));
@@ -113,7 +119,7 @@ ss::future<> snapshot_manager::remove_partial_snapshots() {
 }
 
 ss::future<> snapshot_manager::remove_snapshot(ss::sstring target) {
-    if (co_await ss::file_exists(snapshot_path(target).string())) {
+    if (co_await snapshot_exists(target)) {
         const auto path = snapshot_path(target).string();
         vlog(
           stlog.info,

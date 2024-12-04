@@ -21,7 +21,6 @@
 #include "raft/types.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
-#include "serde/serde.h"
 #include "storage/record_batch_builder.h"
 #include "test_utils/randoms.h"
 #include "test_utils/rpc.h"
@@ -72,7 +71,7 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
     }
 
     auto rdr = model::make_memory_record_batch_reader(std::move(batches));
-    auto readers = raft::details::share_n(std::move(rdr), 2).get0();
+    auto readers = raft::details::share_n(std::move(rdr), 2).get();
     auto meta = raft::protocol_metadata{
       .group = raft::group_id(1),
       .commit_index = model::offset(100),
@@ -86,7 +85,8 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
       raft::vnode(model::node_id(1), model::revision_id(10)),
       raft::vnode(model::node_id(10), model::revision_id(101)),
       meta,
-      std::move(readers.back()));
+      std::move(readers.back()),
+      0);
 
     readers.pop_back();
     const auto target_node_id = req.target_node();
@@ -110,11 +110,11 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
 
     auto batches_result = model::consume_reader_to_memory(
                             std::move(readers.back()), model::no_timeout)
-                            .get0();
+                            .get();
     std::move(d)
       .release_batches()
       .consume(checking_consumer(std::move(batches_result)), model::no_timeout)
-      .get0();
+      .get();
 }
 
 model::broker create_test_broker() {
@@ -327,7 +327,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_failures) {
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -390,7 +390,7 @@ SEASTAR_THREAD_TEST_CASE(
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -450,7 +450,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_only_failures) {
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -567,7 +567,7 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
 
     auto rdr = model::make_memory_record_batch_reader(std::move(batches));
     // share readers to have a copy of data to compare
-    auto readers = raft::details::share_n(std::move(rdr), 2).get0();
+    auto readers = raft::details::share_n(std::move(rdr), 2).get();
 
     auto meta = raft::protocol_metadata{
       .group = raft::group_id(1),
@@ -582,7 +582,8 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
       raft::vnode(model::node_id(1), model::revision_id(10)),
       raft::vnode(model::node_id(10), model::revision_id(101)),
       meta,
-      std::move(readers.back()));
+      std::move(readers.back()),
+      0);
 
     readers.pop_back();
 
@@ -614,9 +615,9 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
 
     auto batches_result = model::consume_reader_to_memory(
                             std::move(readers.back()), model::no_timeout)
-                            .get0();
+                            .get();
     std::move(decoded_req)
       .release_batches()
       .consume(checking_consumer(std::move(batches_result)), model::no_timeout)
-      .get0();
+      .get();
 }

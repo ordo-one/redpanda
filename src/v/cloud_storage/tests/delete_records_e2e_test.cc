@@ -8,11 +8,11 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/produce_utils.h"
 #include "cloud_storage/tests/s3_imposter.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "config/configuration.h"
 #include "kafka/server/tests/delete_records_utils.h"
 #include "kafka/server/tests/list_offsets_utils.h"
@@ -79,8 +79,8 @@ public:
     static constexpr auto segs_per_spill = 10;
     delete_records_e2e_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{},
-        httpd_port_number()) {
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number()) {
         // No expectations: tests will PUT and GET organically.
         set_expectations_and_listen({});
         wait_for_controller_leadership().get();
@@ -321,7 +321,7 @@ FIXTURE_TEST(test_delete_from_archive_consume, delete_records_e2e_fixture) {
     deleter.start().get();
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
-    for (size_t i = 1; i < total_records; i++) {
+    for (int i = 1; i < total_records; i++) {
         auto lwm = deleter
                      .delete_records_from_partition(
                        topic_name, model::partition_id(0), model::offset(i), 5s)

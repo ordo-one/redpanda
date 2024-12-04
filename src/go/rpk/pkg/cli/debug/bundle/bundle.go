@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/docker/go-units"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug/common"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/httpapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
@@ -42,6 +43,7 @@ type bundleParams struct {
 	controllerLogLimitBytes int
 	timeout                 time.Duration
 	metricsInterval         time.Duration
+	metricsSampleCount      int
 	partitions              []topicPartitionFilter
 	labelSelector           map[string]string
 	cpuProfilerWait         time.Duration
@@ -58,33 +60,25 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	var (
 		outFile   string
 		uploadURL string
-
-		logsSince     string
-		logsUntil     string
-		logsSizeLimit string
-
-		controllerLogsSizeLimit string
-		namespace               string
-		labelSelector           []string
-		partitionFlag           []string
-
-		timeout         time.Duration
-		metricsInterval time.Duration
-		cpuProfilerWait time.Duration
+		timeout   time.Duration
+		opts      common.DebugBundleSharedOptions
 	)
 	cmd := &cobra.Command{
 		Use:   "bundle",
 		Short: "Collect environment data and create a bundle file for the Redpanda Data support team to inspect",
 		Long:  bundleHelpText,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			//  Redpanda queries for samples from Seastar every ~13 seconds by
 			//  default. Setting wait_ms to anything less than 13 seconds will
 			//  result in no samples being returned.
-			if cpuProfilerWait < 15*time.Second {
+			if opts.CPUProfilerWait < 15*time.Second {
 				out.Die("--cpu-profiler-wait must be higher than 15 seconds")
 			}
-			path, err := determineFilepath(fs, outFile, cmd.Flags().Changed(outputFlag))
-			out.MaybeDie(err, "unable to determine filepath %q: %v", outFile, err)
+
+			if opts.MetricsSampleCount < 2 {
+				out.Die("--metrics-samples must be 2 or higher")
+			}
 
 			cfg, err := p.Load(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
@@ -100,17 +94,20 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				yActual = y
 			}
 
-			partitions, err := parsePartitionFlag(partitionFlag)
-			out.MaybeDie(err, "unable to parse partition flag %v: %v", partitionFlag, err)
+			path, err := determineFilepath(fs, yActual, outFile, cmd.Flags().Changed(outputFlag))
+			out.MaybeDie(err, "unable to determine filepath %q: %v", outFile, err)
+
+			partitions, err := parsePartitionFlag(opts.PartitionFlag)
+			out.MaybeDie(err, "unable to parse partition flag %v: %v", opts.PartitionFlag, err)
 
 			cl, err := kafka.NewFranzClient(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
 			defer cl.Close()
 
-			logsLimit, err := units.FromHumanSize(logsSizeLimit)
+			logsLimit, err := units.FromHumanSize(opts.LogsSizeLimit)
 			out.MaybeDie(err, "unable to parse --logs-size-limit: %v", err)
 
-			controllerLogsLimit, err := units.FromHumanSize(controllerLogsSizeLimit)
+			controllerLogsLimit, err := units.FromHumanSize(opts.ControllerLogsSizeLimit)
 			out.MaybeDie(err, "unable to parse --controller-logs-size-limit: %v", err)
 			bp := bundleParams{
 				fs:                      fs,
@@ -118,19 +115,20 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				y:                       y,
 				yActual:                 yActual,
 				cl:                      cl,
-				logsSince:               logsSince,
-				logsUntil:               logsUntil,
 				path:                    path,
-				namespace:               namespace,
 				logsLimitBytes:          int(logsLimit),
 				controllerLogLimitBytes: int(controllerLogsLimit),
 				timeout:                 timeout,
-				metricsInterval:         metricsInterval,
 				partitions:              partitions,
-				cpuProfilerWait:         cpuProfilerWait,
+				namespace:               opts.Namespace,
+				logsSince:               opts.LogsSince,
+				logsUntil:               opts.LogsUntil,
+				metricsInterval:         opts.MetricsInterval,
+				metricsSampleCount:      opts.MetricsSampleCount,
+				cpuProfilerWait:         opts.CPUProfilerWait,
 			}
-			if len(labelSelector) > 0 {
-				labelsMap, err := labels.ConvertSelectorToLabelsMap(strings.Join(labelSelector, ","))
+			if len(opts.LabelSelector) > 0 {
+				labelsMap, err := labels.ConvertSelectorToLabelsMap(strings.Join(opts.LabelSelector, ","))
 				out.MaybeDie(err, "unable to parse label-selector flag: %v", err)
 				bp.labelSelector = labelsMap
 			}
@@ -157,17 +155,10 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVarP(&outFile, outputFlag, "o", "", "The file path where the debug file will be written (default ./<timestamp>-bundle.zip)")
-	f.DurationVar(&timeout, "timeout", 31*time.Second, "How long to wait for child commands to execute (e.g. 30s, 1.5m)")
-	f.DurationVar(&metricsInterval, "metrics-interval", 10*time.Second, "Interval between metrics snapshots (e.g. 30s, 1.5m)")
-	f.StringVar(&logsSince, "logs-since", "", "Include log entries on or newer than the specified date (journalctl date format, e.g. YYYY-MM-DD")
-	f.StringVar(&logsUntil, "logs-until", "", "Include log entries on or older than the specified date (journalctl date format, e.g. YYYY-MM-DD")
-	f.StringVar(&logsSizeLimit, "logs-size-limit", "100MiB", "Read the logs until the given size is reached (e.g. 3MB, 1GiB)")
-	f.StringVar(&controllerLogsSizeLimit, "controller-logs-size-limit", "20MB", "The size limit of the controller logs that can be stored in the bundle (e.g. 3MB, 1GiB)")
+	f.DurationVar(&timeout, "timeout", 31*time.Second, "How long to wait for child commands to execute. For example: 30s, 1.5m")
 	f.StringVar(&uploadURL, "upload-url", "", "If provided, where to upload the bundle in addition to creating a copy on disk")
-	f.StringVarP(&namespace, "namespace", "n", "redpanda", "The namespace to use to collect the resources from (k8s only)")
-	f.StringArrayVarP(&labelSelector, "label-selector", "l", []string{"app.kubernetes.io/name=redpanda"}, "Comma-separated label selectors to filter your resources. e.g: <label>=<value>,<label>=<value> (k8s only)")
-	f.StringArrayVarP(&partitionFlag, "partition", "p", nil, "Comma-separated partition IDs; when provided, rpk saves extra admin API requests for those partitions. Check help for extended usage")
-	f.DurationVar(&cpuProfilerWait, "cpu-profiler-wait", 30*time.Second, "For how long to collect samples for the CPU profiler (e.g. 30s, 1.5m). Must be higher than 15s")
+	// Debug bundle options.
+	opts.InstallFlags(f)
 
 	return cmd
 }
@@ -267,9 +258,10 @@ BARE-METAL
 
  - Disk usage: The disk usage for the data directory, as output by 'du'.
 
- - redpanda logs: The node's redpanda logs written to journald. If --logs-since 
-   or --logs-until are passed, then only the logs within the resulting time frame
-   will be included.
+ - Redpanda logs: The node's Redpanda logs written to journald since yesterday
+   (00:00:00 of the previous day based on systemd.time). If '--logs-since' or 
+   '--logs-until' are passed, then only the logs within the resulting time frame
+   are included.
 
  - Socket info: The active sockets data output by 'ss'.
 

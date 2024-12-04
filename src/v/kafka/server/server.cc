@@ -17,11 +17,15 @@
 #include "config/broker_authn_endpoint.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
+#include "features/enterprise_feature_messages.h"
 #include "features/feature_table.h"
+#include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/list_groups_response.h"
 #include "kafka/server/connection_context.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/errors.h"
+#include "kafka/server/group.h"
+#include "kafka/server/group_manager.h"
 #include "kafka/server/group_router.h"
 #include "kafka/server/handlers/add_offsets_to_txn.h"
 #include "kafka/server/handlers/add_partitions_to_txn.h"
@@ -50,6 +54,7 @@
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
 #include "kafka/server/usage_manager.h"
+#include "model/record.h"
 #include "net/connection.h"
 #include "security/acl.h"
 #include "security/audit/schemas/iam.h"
@@ -70,6 +75,7 @@
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/socket_defs.hh>
@@ -115,6 +121,8 @@ server::server(
   ss::sharded<cluster::topics_frontend>& tf,
   ss::sharded<cluster::config_frontend>& cf,
   ss::sharded<features::feature_table>& ft,
+  ss::sharded<cluster::client_quota::frontend>& quota_frontend,
+  ss::sharded<cluster::client_quota::store>& quota_store,
   ss::sharded<quota_manager>& quota,
   ss::sharded<snc_quota_manager>& snc_quota_mgr,
   ss::sharded<kafka::group_router>& router,
@@ -129,7 +137,7 @@ server::server(
   ss::sharded<cluster::security_frontend>& sec_fe,
   ss::sharded<cluster::controller_api>& controller_api,
   ss::sharded<cluster::tx_gateway_frontend>& tx_gateway_frontend,
-  std::optional<qdc_monitor::config> qdc_config,
+  std::optional<qdc_monitor_config> qdc_config,
   ssx::singleton_thread_worker& tw,
   const std::unique_ptr<pandaproxy::schema_registry::api>& sr) noexcept
   : net::server(cfg, klog)
@@ -139,12 +147,15 @@ server::server(
   , _config_frontend(cf)
   , _feature_table(ft)
   , _metadata_cache(meta)
+  , _quota_frontend(quota_frontend)
+  , _quota_store(quota_store)
   , _quota_mgr(quota)
   , _snc_quota_mgr(snc_quota_mgr)
   , _group_router(router)
   , _usage_manager(usage_manager)
   , _shard_table(tbl)
   , _partition_manager(pm)
+  , _fetch_pid_controller(fetch_sg)
   , _fetch_session_cache(
       config::shard_local_cfg().fetch_session_eviction_timeout_ms())
   , _id_allocator_frontend(id_allocator_frontend)
@@ -172,6 +183,7 @@ server::server(
       "kafka/server-mem-fetch")
   , _probe(std::make_unique<class latency_probe>())
   , _sasl_probe(std::make_unique<class sasl_probe>())
+  , _read_dist_probe(std::make_unique<read_distribution_probe>())
   , _thread_worker(tw)
   , _replica_selector(
       std::make_unique<rack_aware_replica_selector>(_metadata_cache.local()))
@@ -188,6 +200,7 @@ server::server(
     _probe->setup_public_metrics();
 
     _sasl_probe->setup_metrics(cfg->local().name);
+    _read_dist_probe->setup_metrics();
 }
 
 void server::setup_metrics() {
@@ -312,7 +325,8 @@ ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
     // Only initialise sasl state if sasl is enabled
     auto sasl = authn_method == config::broker_authn_method::sasl
                   ? std::make_optional<security::sasl_server>(
-                    security::sasl_server::sasl_state::initial, sasl_max_reauth)
+                      security::sasl_server::sasl_state::initial,
+                      sasl_max_reauth)
                   : std::nullopt;
 
     // Only initialise mtls state if mtls_identity is enabled
@@ -336,6 +350,10 @@ ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
 
     std::exception_ptr eptr;
     try {
+        co_await ctx->start();
+        // Must call start() to ensure `ctx` is inserted into the `_connections`
+        // list.  Otherwise if enqueing the audit message fails and `stop()` is
+        // called, this will result in a segfault.
         if (authn_method == config::broker_authn_method::mtls_identity) {
             auto authn_event = make_auth_event_options(mtls_state.value(), ctx);
             if (!ctx->server().audit_mgr().enqueue_authn_event(
@@ -345,7 +363,6 @@ ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
                   "system error");
             }
         }
-        co_await ctx->start();
         co_await ctx->process();
     } catch (...) {
         eptr = std::current_exception();
@@ -596,11 +613,31 @@ ss::future<response_ptr> list_groups_handler::handle(
     list_groups_request request{};
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
-    auto&& [error, groups] = co_await ctx.groups().list_groups();
-
     list_groups_response resp;
-    resp.data.error_code = error;
-    resp.data.groups = std::move(groups);
+
+    auto [invalid_req, filter] = [&request]() {
+        using list_groups_filter_data = group_manager::list_groups_filter_data;
+        list_groups_filter_data filter;
+        filter.states_filter.reserve(request.data.states_filter.size());
+        for (auto& state : request.data.states_filter) {
+            auto parsed = group_state_from_kafka_name(state);
+            if (!parsed) {
+                return std::make_pair(true, list_groups_filter_data{});
+            } else {
+                filter.states_filter.insert(*parsed);
+            }
+        }
+        return std::make_pair(false, std::move(filter));
+    }();
+
+    if (invalid_req) {
+        resp.data.error_code = kafka::error_code::invalid_request;
+    } else {
+        auto [error, groups] = co_await ctx.groups().list_groups(
+          std::move(filter));
+        resp.data.error_code = error;
+        resp.data.groups = std::move(groups);
+    }
 
     auto additional_resources_func = [&resp]() {
         std::vector<kafka::group_id> groups;
@@ -629,7 +666,7 @@ ss::future<response_ptr> list_groups_handler::handle(
                 security::acl_operation::describe, group.group_id);
           });
 
-        resp.data.groups.erase(non_visible_it, resp.data.groups.end());
+        resp.data.groups.erase_to_end(non_visible_it);
     }
 
     if (!ctx.audit()) {
@@ -683,9 +720,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
         }
     }
 
-    const bool has_kafka_gssapi = ctx.feature_table().local().is_active(
-      features::feature::kafka_gssapi);
-    if (has_kafka_gssapi && supports("GSSAPI")) {
+    if (supports("GSSAPI")) {
         supported_sasl_mechanisms.emplace_back(
           security::gssapi_authenticator::name);
 
@@ -855,32 +890,7 @@ ss::future<response_ptr> end_txn_handler::handle(
             tx_request, config::shard_local_cfg().create_topic_timeout_ms())
           .then([&ctx](cluster::end_tx_reply tx_response) {
               end_txn_response_data data;
-              switch (tx_response.error_code) {
-              case cluster::tx_errc::none:
-                  data.error_code = error_code::none;
-                  break;
-              case cluster::tx_errc::not_coordinator:
-                  data.error_code = error_code::not_coordinator;
-                  break;
-              case cluster::tx_errc::coordinator_not_available:
-                  data.error_code = error_code::coordinator_not_available;
-                  break;
-              case cluster::tx_errc::fenced:
-                  data.error_code = error_code::invalid_producer_epoch;
-                  break;
-              case cluster::tx_errc::invalid_producer_id_mapping:
-                  data.error_code = error_code::invalid_producer_id_mapping;
-                  break;
-              case cluster::tx_errc::invalid_txn_state:
-                  data.error_code = error_code::invalid_txn_state;
-                  break;
-              case cluster::tx_errc::timeout:
-                  data.error_code = error_code::request_timed_out;
-                  break;
-              default:
-                  data.error_code = error_code::unknown_server_error;
-                  break;
-              }
+              data.error_code = map_tx_errc(tx_response.error_code);
               end_txn_response response;
               response.data = data;
               return ctx.respond(response);
@@ -933,32 +943,7 @@ add_offsets_to_txn_handler::handle(request_context ctx, ss::smp_service_group) {
 
         return f.then([&ctx](cluster::add_offsets_tx_reply tx_response) {
             add_offsets_to_txn_response_data data;
-            switch (tx_response.error_code) {
-            case cluster::tx_errc::none:
-                data.error_code = error_code::none;
-                break;
-            case cluster::tx_errc::not_coordinator:
-                data.error_code = error_code::not_coordinator;
-                break;
-            case cluster::tx_errc::coordinator_not_available:
-                data.error_code = error_code::coordinator_not_available;
-                break;
-            case cluster::tx_errc::coordinator_load_in_progress:
-                data.error_code = error_code::coordinator_load_in_progress;
-                break;
-            case cluster::tx_errc::invalid_producer_id_mapping:
-                data.error_code = error_code::invalid_producer_id_mapping;
-                break;
-            case cluster::tx_errc::fenced:
-                data.error_code = error_code::invalid_producer_epoch;
-                break;
-            case cluster::tx_errc::invalid_txn_state:
-                data.error_code = error_code::invalid_txn_state;
-                break;
-            default:
-                data.error_code = error_code::unknown_server_error;
-                break;
-            }
+            data.error_code = map_tx_errc(tx_response.error_code);
             add_offsets_to_txn_response res;
             res.data = data;
             return ctx.respond(res);
@@ -1010,14 +995,14 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
             return ctx.respond(std::move(response));
         }
 
-        cluster::add_paritions_tx_request tx_request{
+        cluster::add_partitions_tx_request tx_request{
           .transactional_id = request.data.transactional_id,
           .producer_id = request.data.producer_id,
           .producer_epoch = request.data.producer_epoch};
         tx_request.topics.reserve(request.data.topics.size());
 
         for (auto& topic : request.data.topics) {
-            cluster::add_paritions_tx_request::topic tx_topic{
+            cluster::add_partitions_tx_request::topic tx_topic{
               .name = std::move(topic.name),
               .partitions = std::move(topic.partitions),
             };
@@ -1027,7 +1012,7 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
         return ctx.tx_gateway_frontend()
           .add_partition_to_tx(
             tx_request, config::shard_local_cfg().create_topic_timeout_ms())
-          .then([&ctx](cluster::add_paritions_tx_reply tx_response) {
+          .then([&ctx](cluster::add_partitions_tx_reply tx_response) {
               add_partitions_to_txn_response_data data;
               for (auto& tx_topic : tx_response.results) {
                   add_partitions_to_txn_topic_result topic{
@@ -1036,40 +1021,9 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
                   for (const auto& tx_partition : tx_topic.results) {
                       add_partitions_to_txn_partition_result partition{
                         .partition_index = tx_partition.partition_index};
-                      switch (tx_partition.error_code) {
-                      case cluster::tx_errc::none:
-                          partition.error_code = error_code::none;
-                          break;
-                      case cluster::tx_errc::not_coordinator:
-                          partition.error_code = error_code::not_coordinator;
-                          break;
-                      case cluster::tx_errc::coordinator_not_available:
-                          partition.error_code
-                            = error_code::coordinator_not_available;
-                          break;
-                      case cluster::tx_errc::invalid_producer_id_mapping:
-                          partition.error_code
-                            = error_code::invalid_producer_id_mapping;
-                          break;
-                      case cluster::tx_errc::fenced:
-                          partition.error_code
-                            = error_code::invalid_producer_epoch;
-                          break;
-                      case cluster::tx_errc::invalid_txn_state:
-                          partition.error_code = error_code::invalid_txn_state;
-                          break;
-                      case cluster::tx_errc::timeout:
-                          partition.error_code = error_code::request_timed_out;
-                          break;
-                      case cluster::tx_errc::partition_disabled:
-                          partition.error_code
-                            = error_code::replica_not_available;
-                          break;
-                      default:
-                          partition.error_code
-                            = error_code::unknown_server_error;
-                          break;
-                      }
+                      partition.error_code = map_tx_errc(
+                        tx_partition.error_code);
+
                       topic.results.push_back(partition);
                   }
                   data.results.push_back(std::move(topic));
@@ -1448,11 +1402,13 @@ ss::future<response_ptr> init_producer_id_handler::handle(
             // or {-1, x >= 0}.
             const bool is_invalid_pid =
               [](model::producer_identity expected_pid) {
-                  if (expected_pid == model::unknown_pid) {
+                  if (expected_pid == model::no_pid) {
                       return false;
                   }
 
-                  if (expected_pid.id < 0 || expected_pid.epoch < 0) {
+                  if (
+                    expected_pid.id < model::producer_id(0)
+                    || expected_pid.epoch < model::producer_epoch(0)) {
                       return true;
                   }
                   return false;
@@ -1469,40 +1425,15 @@ ss::future<response_ptr> init_producer_id_handler::handle(
                 request.data.transactional_id.value(),
                 request.data.transaction_timeout_ms,
                 config::shard_local_cfg().create_topic_timeout_ms(),
-                expected_pid)
+                expected_pid == model::no_pid
+                  ? std::optional<model::producer_identity>()
+                  : expected_pid)
               .then([&ctx](cluster::init_tm_tx_reply r) {
                   init_producer_id_response reply;
-
-                  switch (r.ec) {
-                  case cluster::tx_errc::none:
+                  reply.data.error_code = map_tx_errc(r.ec);
+                  if (r.ec == cluster::tx::errc::none) {
                       reply.data.producer_id = kafka::producer_id(r.pid.id);
                       reply.data.producer_epoch = r.pid.epoch;
-                      vlog(
-                        klog.trace,
-                        "allocated pid {} with epoch {} via tx_gateway",
-                        reply.data.producer_id,
-                        reply.data.producer_epoch);
-                      break;
-                  case cluster::tx_errc::invalid_txn_state:
-                      reply.data.error_code = error_code::invalid_txn_state;
-                      break;
-                  case cluster::tx_errc::not_coordinator:
-                      reply.data.error_code = error_code::not_coordinator;
-                      break;
-                  case cluster::tx_errc::invalid_producer_epoch:
-                      reply.data.error_code
-                        = error_code::invalid_producer_epoch;
-                      break;
-                  case cluster::tx_errc::timeout:
-                      reply.data.error_code = error_code::request_timed_out;
-                      break;
-                  case cluster::tx_errc::shard_not_found:
-                      reply.data.error_code = error_code::not_coordinator;
-                      break;
-                  default:
-                      vlog(klog.warn, "failed to allocate pid, ec: {}", r.ec);
-                      reply.data.error_code = error_code::broker_not_available;
-                      break;
                   }
 
                   return ctx.respond(reply);
@@ -1648,9 +1579,14 @@ ss::future<response_ptr> create_acls_handler::handle(
         ss::visit(
           result,
           [&response, &results](size_t i) {
-              auto ec = map_topic_error_code(results[i]);
-              response.data.results.push_back(
-                creatable_acl_result{.error_code = ec});
+              if (results[i] == cluster::errc::feature_disabled) {
+                  response.data.results.emplace_back(
+                    error_code::invalid_config,
+                    features::enterprise_error_message::acl_with_rbac());
+              } else {
+                  response.data.results.emplace_back(
+                    map_topic_error_code(results[i]));
+              }
           },
           [&response](creatable_acl_result r) {
               response.data.results.push_back(std::move(r));
@@ -1963,7 +1899,7 @@ list_transactions_handler::handle(request_context ctx, ss::smp_service_group) {
 
     auto filter_tx = [](
                        const list_transactions_request& req,
-                       const cluster::tm_transaction& tx) -> bool {
+                       const cluster::tx_metadata& tx) -> bool {
         if (!req.data.producer_id_filters.empty()) {
             if (std::none_of(
                   req.data.producer_id_filters.begin(),
@@ -2015,13 +1951,13 @@ list_transactions_handler::handle(request_context ctx, ss::smp_service_group) {
         // In this 2 errors not coordinator got request and we just return empty
         // array
         if (
-          txs.error() != cluster::tx_errc::shard_not_found
-          && txs.error() != cluster::tx_errc::not_coordinator) {
+          txs.error() != cluster::tx::errc::shard_not_found
+          && txs.error() != cluster::tx::errc::not_coordinator) {
             vlog(
               klog.error,
               "Can not return list of transactions. Error: {}",
               txs.error());
-            response.data.error_code = kafka::error_code::unknown_server_error;
+            response.data.error_code = map_tx_errc(txs.error());
         }
     }
 

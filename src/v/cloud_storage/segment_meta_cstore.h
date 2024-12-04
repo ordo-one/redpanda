@@ -30,7 +30,7 @@ namespace cloud_storage {
 constexpr size_t cstore_max_frame_size = 0x400;
 // every #cstore_sampling_rate element inserted, the byte position in the
 // compressed buffer is recorded to speed up random access
-constexpr size_t cstore_sampling_rate = 8;
+inline constexpr size_t cstore_sampling_rate = 8;
 
 /// Column-store iterator
 ///
@@ -99,7 +99,7 @@ public:
     segment_meta_cstore& operator=(segment_meta_cstore&&) noexcept;
     ~segment_meta_cstore();
 
-    bool operator==(segment_meta_cstore const& oth) const;
+    bool operator==(const segment_meta_cstore& oth) const;
     /// Return iterator
     const_iterator begin() const;
     const_iterator end() const;
@@ -123,7 +123,7 @@ public:
     const_iterator upper_bound(model::offset) const;
     const_iterator lower_bound(model::offset) const;
     const_iterator at_index(size_t ix) const;
-    const_iterator prev(const_iterator const& it) const;
+    const_iterator prev(const const_iterator& it) const;
 
     void insert(const segment_meta&);
 

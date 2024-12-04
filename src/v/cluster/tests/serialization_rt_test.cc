@@ -15,6 +15,7 @@
 #include "cluster/tests/randoms.h"
 #include "cluster/tests/topic_properties_generator.h"
 #include "cluster/tests/utils.h"
+#include "cluster/tx_protocol_types.h"
 #include "cluster/types.h"
 #include "compat/check.h"
 #include "container/fragmented_vector.h"
@@ -24,6 +25,7 @@
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
 #include "model/timestamp.h"
+#include "pandaproxy/schema_registry/test/random.h"
 #include "raft/fundamental.h"
 #include "raft/group_configuration.h"
 #include "raft/types.h"
@@ -34,7 +36,7 @@
 #include "storage/types.h"
 #include "test_utils/randoms.h"
 #include "test_utils/rpc.h"
-#include "tristate.h"
+#include "utils/tristate.h"
 #include "v8_engine/data_policy.h"
 
 #include <seastar/core/chunked_fifo.hh>
@@ -95,7 +97,7 @@ SEASTAR_THREAD_TEST_CASE(broker_metadata_rt_test) {
         .mount_paths = {"/", "/var/lib"},
         .etc_props = {{"max_segment_size", "1233451"}},
         .available_memory_bytes = 1024 * 1_GiB,
-        .in_fips_mode = true});
+        .in_fips_mode = model::fips_mode_flag::enabled});
     auto d = serialize_roundtrip_rpc(std::move(b));
 
     BOOST_REQUIRE_EQUAL(d.id(), model::node_id(0));
@@ -114,7 +116,8 @@ SEASTAR_THREAD_TEST_CASE(broker_metadata_rt_test) {
       d.properties().etc_props.find("max_segment_size")->second, "1233451");
     BOOST_CHECK(d.rack() == std::optional<ss::sstring>("test"));
     BOOST_REQUIRE_EQUAL(d.properties().available_memory_bytes, 1024 * 1_GiB);
-    BOOST_REQUIRE(d.properties().in_fips_mode);
+    BOOST_REQUIRE_EQUAL(
+      d.properties().in_fips_mode, model::fips_mode_flag::enabled);
 }
 
 SEASTAR_THREAD_TEST_CASE(partition_assignment_rt_test) {
@@ -624,28 +627,28 @@ model::timeout_clock::duration random_timeout_clock_duration() {
       random_generators::get_int<int64_t>(-100000, 100000) * 1000000);
 }
 
-cluster::tx_errc random_tx_errc() {
-    return random_generators::random_choice(std::vector<cluster::tx_errc>{
-      cluster::tx_errc::none,
-      cluster::tx_errc::leader_not_found,
-      cluster::tx_errc::shard_not_found,
-      cluster::tx_errc::partition_not_found,
-      cluster::tx_errc::stm_not_found,
-      cluster::tx_errc::partition_not_exists,
-      cluster::tx_errc::pid_not_found,
-      cluster::tx_errc::timeout,
-      cluster::tx_errc::conflict,
-      cluster::tx_errc::fenced,
-      cluster::tx_errc::stale,
-      cluster::tx_errc::not_coordinator,
-      cluster::tx_errc::coordinator_not_available,
-      cluster::tx_errc::preparing_rebalance,
-      cluster::tx_errc::rebalance_in_progress,
-      cluster::tx_errc::coordinator_load_in_progress,
-      cluster::tx_errc::unknown_server_error,
-      cluster::tx_errc::request_rejected,
-      cluster::tx_errc::invalid_producer_id_mapping,
-      cluster::tx_errc::invalid_txn_state});
+cluster::tx::errc random_tx_errc() {
+    return random_generators::random_choice(std::vector<cluster::tx::errc>{
+      cluster::tx::errc::none,
+      cluster::tx::errc::leader_not_found,
+      cluster::tx::errc::shard_not_found,
+      cluster::tx::errc::partition_not_found,
+      cluster::tx::errc::stm_not_found,
+      cluster::tx::errc::partition_not_exists,
+      cluster::tx::errc::pid_not_found,
+      cluster::tx::errc::timeout,
+      cluster::tx::errc::conflict,
+      cluster::tx::errc::fenced,
+      cluster::tx::errc::stale,
+      cluster::tx::errc::not_coordinator,
+      cluster::tx::errc::coordinator_not_available,
+      cluster::tx::errc::preparing_rebalance,
+      cluster::tx::errc::rebalance_in_progress,
+      cluster::tx::errc::coordinator_load_in_progress,
+      cluster::tx::errc::unknown_server_error,
+      cluster::tx::errc::request_rejected,
+      cluster::tx::errc::invalid_producer_id_mapping,
+      cluster::tx::errc::invalid_txn_state});
 }
 
 cluster::partitions_filter random_partitions_filter() {
@@ -745,7 +748,6 @@ cluster::cluster_health_report random_cluster_health_report() {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          /*include_drain_status=*/true,
           random_drain_status());
 
         // Reduce to an ADL-encodable state
@@ -792,7 +794,7 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
       tests::random_named_int<model::term_id>(),
       tests::random_named_int<model::node_id>(),
       tests::random_named_int<model::revision_id>()));
-    fragmented_vector<cluster::ntp_leader_revision> l_revs;
+    chunked_vector<cluster::ntp_leader_revision> l_revs;
     l_revs.emplace_back(
       model::random_ntp(),
       tests::random_named_int<model::term_id>(),
@@ -841,25 +843,27 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           [] { return random_generators::get_int<size_t>(0, 100000); })));
     }
     {
-        cluster::incremental_topic_updates updates{
-          .compression = random_property_update(
-            tests::random_optional([] { return model::random_compression(); })),
-          .cleanup_policy_bitflags = random_property_update(
-            tests::random_optional(
-              [] { return model::random_cleanup_policy(); })),
-          .compaction_strategy = random_property_update(tests::random_optional(
-            [] { return model::random_compaction_strategy(); })),
-          .timestamp_type = random_property_update(tests::random_optional(
-            [] { return model::random_timestamp_type(); })),
-          .segment_size = random_property_update(tests::random_optional(
-            [] { return random_generators::get_int(100_MiB, 1_GiB); })),
-          .retention_bytes = random_property_update(tests::random_tristate(
-            [] { return random_generators::get_int(100_MiB, 1_GiB); })),
-          .retention_duration = random_property_update(
-            tests::random_tristate([] { return tests::random_duration_ms(); })),
-          .shadow_indexing = random_property_update(tests::random_optional(
-            [] { return model::random_shadow_indexing_mode(); })),
-          .remote_delete = random_property_update(tests::random_bool())};
+        cluster::incremental_topic_updates updates;
+        updates.compression = random_property_update(
+          tests::random_optional([] { return model::random_compression(); }));
+        updates.cleanup_policy_bitflags = random_property_update(
+          tests::random_optional(
+            [] { return model::random_cleanup_policy(); }));
+        updates.compaction_strategy = random_property_update(
+          tests::random_optional(
+            [] { return model::random_compaction_strategy(); }));
+        updates.timestamp_type = random_property_update(tests::random_optional(
+          [] { return model::random_timestamp_type(); }));
+        updates.segment_size = random_property_update(tests::random_optional(
+          [] { return random_generators::get_int(100_MiB, 1_GiB); }));
+        updates.retention_bytes = random_property_update(tests::random_tristate(
+          [] { return random_generators::get_int(100_MiB, 1_GiB); }));
+        updates.retention_duration = random_property_update(
+          tests::random_tristate([] { return tests::random_duration_ms(); }));
+        updates.remote_delete = random_property_update(tests::random_bool());
+        updates.get_shadow_indexing() = random_property_update(
+          tests::random_optional(
+            [] { return model::random_shadow_indexing_mode(); }));
         roundtrip_test(updates);
     }
     { roundtrip_test(old_random_topic_configuration()); }
@@ -898,14 +902,6 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         for (auto i = 0, mi = random_generators::get_int(5, 25); i < mi; ++i) {
             data.filters.push_back(tests::random_acl_binding_filter());
         }
-        roundtrip_test(data);
-    }
-    {
-        cluster::create_data_policy_cmd_data data;
-        data.dp = v8_engine::data_policy(
-          random_generators::gen_alphanum_string(20),
-          random_generators::gen_alphanum_string(20));
-
         roundtrip_test(data);
     }
     {
@@ -1604,14 +1600,13 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          true,
           random_drain_status());
 
         // Squash local_state to a form that ADL represents, since we will
         // test ADL roundtrip.
         data.local_state.cache_disk = std::nullopt;
 
-        roundtrip_test(data);
+        roundtrip_test(cluster::node_health_report_serde{data});
     }
     {
         chunked_vector<cluster::topic_status> topics;
@@ -1622,20 +1617,20 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           tests::random_named_int<model::node_id>(),
           random_local_state(),
           std::move(topics),
-          true,
           random_drain_status());
 
         // Squash to ADL-understood disk state
         report.local_state.cache_disk = report.local_state.data_disk;
 
-        cluster::get_node_health_reply data{
-          .report = report,
-        };
-        roundtrip_test(data);
+        roundtrip_test(cluster::get_node_health_reply{
+          .report = cluster::node_health_report_serde{report},
+        });
         // try serde with non-default error code. adl doesn't encode error so
         // this is a serde only test.
-        data.error = cluster::errc::error_collecting_health_report;
-        roundtrip_test(data);
+        roundtrip_test(cluster::get_node_health_reply{
+          .error = cluster::errc::error_collecting_health_report,
+          .report = cluster::node_health_report_serde{report},
+        });
     }
     {
         std::vector<model::node_id> nodes;
@@ -1946,83 +1941,6 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         roundtrip_test(data);
     }
     {
-        const auto gold
-          = model::test::make_random_batches(model::offset(0), 20).get();
-
-        // make a copy of the source batches for later comparison because the
-        // copy moved into the request will get eaten.
-        ss::circular_buffer<model::record_batch> batches_in;
-        for (const auto& batch : gold) {
-            batches_in.push_back(batch.copy());
-        }
-
-        raft::protocol_metadata pmd{
-          .group = tests::random_named_int<raft::group_id>(),
-          .commit_index = tests::random_named_int<model::offset>(),
-          .term = tests::random_named_int<model::term_id>(),
-          .prev_log_index = tests::random_named_int<model::offset>(),
-          .prev_log_term = tests::random_named_int<model::term_id>(),
-          .last_visible_index = tests::random_named_int<model::offset>(),
-          .dirty_offset = tests::random_named_int<model::offset>(),
-        };
-
-        raft::append_entries_request data{
-          raft::vnode{
-            tests::random_named_int<model::node_id>(),
-            tests::random_named_int<model::revision_id>()},
-          raft::vnode{
-            tests::random_named_int<model::node_id>(),
-            tests::random_named_int<model::revision_id>()},
-          pmd,
-          model::make_memory_record_batch_reader(std::move(batches_in)),
-          raft::flush_after_append(tests::random_bool()),
-        };
-
-        // append_entries_request -> iobuf
-        iobuf serde_out;
-        const auto node_id = data.source_node();
-        const auto target_node_id = data.target_node();
-        const auto meta = data.metadata();
-        const auto flush = data.is_flush_required();
-        serde::write_async(serde_out, std::move(data)).get();
-
-        // iobuf -> append_entries_request
-        iobuf_parser serde_in(std::move(serde_out));
-        auto from_serde
-          = serde::read_async<raft::append_entries_request>(serde_in).get0();
-
-        BOOST_REQUIRE(from_serde.source_node() == node_id);
-        BOOST_REQUIRE(from_serde.target_node() == target_node_id);
-        BOOST_REQUIRE(from_serde.metadata() == meta);
-        BOOST_REQUIRE(from_serde.is_flush_required() == flush);
-
-        auto batches_from_serde = model::consume_reader_to_memory(
-                                    std::move(from_serde).release_batches(),
-                                    model::no_timeout)
-                                    .get0();
-        BOOST_REQUIRE(gold.size() > 0);
-        BOOST_REQUIRE(batches_from_serde.size() == gold.size());
-        for (size_t i = 0; i < gold.size(); i++) {
-            BOOST_REQUIRE(batches_from_serde[i] == gold[i]);
-        }
-    }
-    {
-        raft::append_entries_reply data{
-          .target_node_id = raft::
-            vnode{tests::random_named_int<model::node_id>(), tests::random_named_int<model::revision_id>()},
-          .node_id = raft::
-            vnode{tests::random_named_int<model::node_id>(), tests::random_named_int<model::revision_id>()},
-          .group = tests::random_named_int<raft::group_id>(),
-          .term = tests::random_named_int<model::term_id>(),
-          .last_flushed_log_index = tests::random_named_int<model::offset>(),
-          .last_dirty_log_index = tests::random_named_int<model::offset>(),
-          .last_term_base_offset = tests::random_named_int<model::offset>(),
-          .result = raft::reply_result::group_unavailable,
-          .may_recover = tests::random_bool(),
-        };
-        roundtrip_test(data);
-    }
-    {
         cluster::cancel_node_partition_movements_request request{
           .node_id = tests::random_named_int<model::node_id>(),
           .direction = random_generators::random_choice(
@@ -2036,9 +1954,9 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
     {
         // Test schema ID validation topic_create
         auto key_validation = tests::random_bool();
-        auto key_strategy = model::random_subject_name_strategy();
+        auto key_strategy = tests::random_subject_name_strategy();
         auto val_validation = tests::random_bool();
-        auto val_strategy = model::random_subject_name_strategy();
+        auto val_strategy = tests::random_subject_name_strategy();
 
         cluster::topic_properties props{};
 
@@ -2064,27 +1982,30 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
     {
         // Test schema ID validation incremental_topic_updates
         auto key_validation = tests::random_bool();
-        auto key_strategy = model::random_subject_name_strategy();
+        auto key_strategy = tests::random_subject_name_strategy();
         auto val_validation = tests::random_bool();
-        auto val_strategy = model::random_subject_name_strategy();
+        auto val_strategy = tests::random_subject_name_strategy();
 
-        cluster::incremental_topic_updates updates{
-          .record_key_schema_id_validation = random_property_update(
-            tests::random_optional([=] { return key_validation; })),
-          .record_key_schema_id_validation_compat = random_property_update(
-            tests::random_optional([=] { return key_validation; })),
-          .record_key_subject_name_strategy = random_property_update(
-            tests::random_optional([=] { return key_strategy; })),
-          .record_key_subject_name_strategy_compat = random_property_update(
-            tests::random_optional([=] { return key_strategy; })),
-          .record_value_schema_id_validation = random_property_update(
-            tests::random_optional([=] { return val_validation; })),
-          .record_value_schema_id_validation_compat = random_property_update(
-            tests::random_optional([=] { return val_validation; })),
-          .record_value_subject_name_strategy = random_property_update(
-            tests::random_optional([=] { return val_strategy; })),
-          .record_value_subject_name_strategy_compat = random_property_update(
-            tests::random_optional([=] { return val_strategy; }))};
+        cluster::incremental_topic_updates updates;
+        updates.record_key_schema_id_validation = random_property_update(
+          tests::random_optional([=] { return key_validation; }));
+        updates.record_key_schema_id_validation_compat = random_property_update(
+          tests::random_optional([=] { return key_validation; }));
+        updates.record_key_subject_name_strategy = random_property_update(
+          tests::random_optional([=] { return key_strategy; }));
+        updates.record_key_subject_name_strategy_compat
+          = random_property_update(
+            tests::random_optional([=] { return key_strategy; }));
+        updates.record_value_schema_id_validation = random_property_update(
+          tests::random_optional([=] { return val_validation; }));
+        updates.record_value_schema_id_validation_compat
+          = random_property_update(
+            tests::random_optional([=] { return val_validation; }));
+        updates.record_value_subject_name_strategy = random_property_update(
+          tests::random_optional([=] { return val_strategy; }));
+        updates.record_value_subject_name_strategy_compat
+          = random_property_update(
+            tests::random_optional([=] { return val_strategy; }));
 
         roundtrip_test(updates);
     }
@@ -2258,17 +2179,6 @@ SEASTAR_THREAD_TEST_CASE(commands_serialization_test) {
         }
 
         roundtrip_cmd<cluster::delete_acls_cmd>(std::move(delete_acl_data), 0);
-        cluster::create_data_policy_cmd_data create_dp;
-        create_dp.dp = v8_engine::data_policy(
-          random_generators::gen_alphanum_string(15),
-          random_generators::gen_alphanum_string(15));
-
-        roundtrip_cmd<cluster::create_data_policy_cmd>(
-          model::random_topic_namespace(), std::move(create_dp));
-
-        roundtrip_cmd<cluster::delete_data_policy_cmd>(
-          model::random_topic_namespace(),
-          random_generators::gen_alphanum_string(20));
 
         roundtrip_cmd<cluster::decommission_node_cmd>(
           tests::random_named_int<model::node_id>(), 0);

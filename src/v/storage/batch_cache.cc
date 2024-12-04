@@ -14,8 +14,8 @@
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "resource_mgmt/available_memory.h"
+#include "ssx/async_algorithm.h"
 #include "ssx/future-util.h"
-#include "storage/logger.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/coroutine.hh>
@@ -139,7 +139,7 @@ register_memory_reporter(const batch_cache& bc) {
 
 batch_cache::batch_cache(const reclaim_options& opts)
   : _reclaimer(
-    [this](reclaimer::request r) { return reclaim(r); }, reclaim_scope::sync)
+      [this](reclaimer::request r) { return reclaim(r); }, reclaim_scope::sync)
   , _reclaim_opts(opts)
   , _reclaim_size(_reclaim_opts.min_size)
   , _background_reclaimer(
@@ -471,6 +471,18 @@ void batch_cache_index::mark_clean(model::offset up_to_inclusive) {
     });
 
     _dirty_tracker.mark_clean(up_to_inclusive);
+}
+ss::future<> batch_cache_index::clear_async() {
+    lock_guard lk(*this);
+    vassert(
+      _dirty_tracker.clean(),
+      "Destroying batch_cache_index ({}) tracking dirty batches.",
+      *this);
+    co_await ssx::async_for_each(
+      _index.begin(), _index.end(), [this](index_type::value_type& value) {
+          _cache->evict(std::move(value.second.range()));
+      });
+    _index.clear();
 }
 
 void batch_cache::background_reclaimer::start() {

@@ -20,7 +20,10 @@
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "config/configuration.h"
+#include "config/node_config.h"
+#include "config/types.h"
 #include "config/validators.h"
+#include "features/enterprise_feature_messages.h"
 #include "features/feature_state.h"
 #include "features/feature_table.h"
 #include "model/timeout_clock.h"
@@ -29,7 +32,12 @@
 #include "security/role_store.h"
 #include "security/types.h"
 
+#include <seastar/core/semaphore.hh>
+
 #include <absl/algorithm/container.h>
+#include <fmt/format.h>
+
+#include <stdexcept>
 
 namespace cluster {
 
@@ -45,6 +53,7 @@ feature_manager::feature_manager(
   ss::sharded<features::feature_table>& table,
   ss::sharded<rpc::connection_cache>& connection_cache,
   ss::sharded<security::role_store>& role_store,
+  ss::sharded<topic_table>& topic_table,
   raft::group_id raft0_group)
   : _stm(stm)
   , _as(as)
@@ -55,6 +64,7 @@ feature_manager::feature_manager(
   , _feature_table(table)
   , _connection_cache(connection_cache)
   , _role_store(role_store)
+  , _topic_table(topic_table)
   , _raft0_group(raft0_group)
   , _barrier_state(
       *config::node().node_id(),
@@ -166,7 +176,7 @@ feature_manager::start(std::vector<model::node_id>&& cluster_founder_nodes) {
                           return ss::do_until(
                             [this] { return _as.local().abort_requested(); },
                             [this] { return maybe_update_feature_table(); });
-                      }).handle_exception([](std::exception_ptr const& e) {
+                      }).handle_exception([](const std::exception_ptr& e) {
         vlog(clusterlog.warn, "Exception from updater: {}", e);
     });
 
@@ -189,7 +199,79 @@ ss::future<> feature_manager::stop() {
       _leader_notify_handle);
     _hm_backend.local().unregister_node_callback(_health_notify_handle);
     _update_wait.broken();
+    _verified_enterprise_license.broken();
     co_await _gate.close();
+}
+
+features::enterprise_feature_report
+feature_manager::report_enterprise_features() const {
+    const auto& cfg = config::shard_local_cfg();
+    const auto& node_cfg = config::node();
+    auto has_gssapi = [&cfg]() {
+        return absl::c_any_of(
+          cfg.sasl_mechanisms(), [](const auto& m) { return m == "GSSAPI"; });
+    };
+    auto has_oidc = []() {
+        return config::oidc_is_enabled_kafka()
+               || config::oidc_is_enabled_http();
+    };
+    auto has_schema_id_validation = [&cfg]() {
+        return cfg.enable_schema_id_validation()
+               != pandaproxy::schema_registry::schema_id_validation_mode::none;
+    };
+    auto fips_enabled = [&node_cfg]() {
+        auto fips_mode = node_cfg.fips_mode();
+        return fips_mode == config::fips_mode_flag::permissive
+               || fips_mode == config::fips_mode_flag::enabled;
+    };
+    auto n_roles = _role_store.local().size();
+    auto has_non_default_roles
+      = n_roles >= 2
+        || (n_roles == 1 && !_role_store.local().contains(security::default_role));
+    auto leadership_pinning_enabled = [&cfg, this]() {
+        const config::leaders_preference no_leaders_preference{};
+        if (cfg.default_leaders_preference() != no_leaders_preference) {
+            return true;
+        }
+        for (const auto& topic : _topic_table.local().topics_map()) {
+            const auto leaders_preference
+              = topic.second.get_configuration().properties.leaders_preference;
+            if (
+              leaders_preference.has_value()
+              && leaders_preference.value() != no_leaders_preference) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    features::enterprise_feature_report report;
+    report.set(
+      features::license_required_feature::audit_logging, cfg.audit_enabled());
+    report.set(
+      features::license_required_feature::cloud_storage,
+      cfg.cloud_storage_enabled());
+    report.set(
+      features::license_required_feature::partition_auto_balancing_continuous,
+      cfg.partition_autobalancing_mode()
+        == model::partition_autobalancing_mode::continuous);
+    report.set(
+      features::license_required_feature::core_balancing_continuous,
+      cfg.core_balancing_continuous());
+    report.set(features::license_required_feature::gssapi, has_gssapi());
+    report.set(features::license_required_feature::oidc, has_oidc());
+    report.set(
+      features::license_required_feature::schema_id_validation,
+      has_schema_id_validation());
+    report.set(features::license_required_feature::rbac, has_non_default_roles);
+    report.set(features::license_required_feature::fips, fips_enabled());
+    report.set(
+      features::license_required_feature::datalake_iceberg,
+      cfg.iceberg_enabled());
+    report.set(
+      features::license_required_feature::leadership_pinning,
+      leadership_pinning_enabled());
+    return report;
 }
 
 ss::future<> feature_manager::maybe_log_license_check_info() {
@@ -212,53 +294,95 @@ ss::future<> feature_manager::maybe_log_license_check_info() {
               interval_override);
         }
     }
-    if (_feature_table.local().is_active(features::feature::license)) {
-        const auto& cfg = config::shard_local_cfg();
-        auto has_gssapi = [&cfg]() {
-            return absl::c_any_of(cfg.sasl_mechanisms(), [](const auto& m) {
-                return m == "GSSAPI";
-            });
-        };
-        auto has_oidc = []() {
-            return config::oidc_is_enabled_kafka()
-                   || config::oidc_is_enabled_http();
-        };
-        auto has_schma_id_validation = [&cfg]() {
-            return cfg.enable_schema_id_validation()
-                   != pandaproxy::schema_registry::schema_id_validation_mode::
-                     none;
-        };
-        auto n_roles = _role_store.local().size();
-        auto has_non_default_roles
-          = n_roles >= 2
-            || (n_roles == 1 && !_role_store.local().contains(security::default_role));
-
-        if (
-          cfg.audit_enabled || cfg.cloud_storage_enabled
-          || cfg.partition_autobalancing_mode
-               == model::partition_autobalancing_mode::continuous
-          || has_gssapi() || has_oidc() || has_schma_id_validation()
-          || has_non_default_roles) {
-            const auto& license = _feature_table.local().get_license();
-            if (!license || license->is_expired()) {
-                vlog(
-                  clusterlog.warn,
-                  "Looks like you’ve enabled a Redpanda Enterprise feature(s) "
-                  "without a valid license. Please enter an active Redpanda "
-                  "license key (e.g. rpk cluster license set <key>). If you "
-                  "don’t have one, please request a new/trial license at "
-                  "https://redpanda.com/license-request");
-            }
-        }
-    }
     try {
         co_await ss::sleep_abortable(license_check_retry, _as.local());
-    } catch (ss::sleep_aborted) {
+    } catch (const ss::sleep_aborted&) {
         // Shutting down - next iteration will drop out
+        co_return;
+    }
+    auto enterprise_features = report_enterprise_features();
+    if (enterprise_features.any()) {
+        if (_feature_table.local().should_sanction()) {
+            vlog(
+              clusterlog.warn,
+              "{}",
+              features::enterprise_error_message::license_nag(
+                enterprise_features.enabled()));
+        }
     }
 }
 
+bool feature_manager::need_to_verify_enterprise_license() {
+    return features::is_major_version_upgrade(
+      _feature_table.local().get_active_version(),
+      _feature_table.local().get_latest_logical_version());
+}
+
+void feature_manager::verify_enterprise_license() {
+    vlog(clusterlog.debug, "Verifying enterprise license...");
+
+    if (!need_to_verify_enterprise_license()) {
+        vlog(clusterlog.debug, "Enterprise license verification skipped...");
+        _verified_enterprise_license.signal();
+        return;
+    }
+
+    std::optional<security::license> fallback_license = std::nullopt;
+    auto fallback_license_str = std::getenv(
+      "REDPANDA_FALLBACK_ENTERPRISE_LICENSE");
+    if (fallback_license_str != nullptr) {
+        try {
+            fallback_license.emplace(
+              security::make_license(fallback_license_str));
+        } catch (const security::license_exception& e) {
+            // Log the error and continue without a fallback license
+            vlog(
+              clusterlog.warn,
+              "Failed to parse fallback license: {}",
+              e.what());
+        }
+    }
+
+    auto invalid = [](const std::optional<security::license>& license) {
+        return !license || license->is_expired();
+    };
+    auto license_missing_or_expired = _feature_table.local().should_sanction()
+                                      && invalid(fallback_license);
+    auto enterprise_features = report_enterprise_features();
+
+    vlog(
+      clusterlog.info,
+      "Verifying enterprise license: active_version={}, latest_version={}, "
+      "enterprise_features=[{}], license_missing_or_expired={}{}",
+      _feature_table.local().get_active_version(),
+      _feature_table.local().get_latest_logical_version(),
+      fmt::join(enterprise_features.enabled(), ", "),
+      license_missing_or_expired,
+      fallback_license ? " (detected fallback license)" : "");
+
+    if (enterprise_features.any() && license_missing_or_expired) {
+        throw std::runtime_error{
+          features::enterprise_error_message::upgrade_failure(
+            enterprise_features.enabled())};
+    }
+
+    _verified_enterprise_license.signal();
+}
+
 ss::future<> feature_manager::maybe_update_feature_table() {
+    // Before doing any feature enablement or active version update, check that
+    // the cluster has an enterprise license if they use enterprise features
+    if (need_to_verify_enterprise_license()) {
+        vlog(
+          clusterlog.debug,
+          "Waiting for enterprise license to be verified before checking for "
+          "active version updates...");
+        // Immediately release the semaphore units because we are only using it
+        // to wait for the precondition to be met
+        std::ignore = co_await ss::get_units(
+          _verified_enterprise_license, 1, _as.local());
+    }
+
     vlog(clusterlog.debug, "Checking for active version update...");
     bool failed = false;
     try {
@@ -296,11 +420,11 @@ ss::future<> feature_manager::maybe_update_feature_table() {
             // some feature activations to do.
             co_await _update_wait.wait([this]() { return updates_pending(); });
         }
-    } catch (ss::condition_variable_timed_out&) {
+    } catch (const ss::condition_variable_timed_out&) {
         // Wait complete - proceed around next loop of do_until
-    } catch (ss::broken_condition_variable&) {
+    } catch (const ss::broken_condition_variable&) {
         // Shutting down - nextiteration will drop out
-    } catch (ss::sleep_aborted&) {
+    } catch (const ss::sleep_aborted&) {
         // Shutting down - next iteration will drop out
     }
 }

@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <cstring>
+#include <snappy-sinksource.h>
 #include <snappy.h>
 
 namespace compression::internal {

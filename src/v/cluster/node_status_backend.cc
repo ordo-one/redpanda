@@ -172,11 +172,6 @@ void node_status_backend::tick() {
 }
 
 ss::future<> node_status_backend::collect_and_store_updates() {
-    if (!_feature_table.local().is_active(
-          features::feature::raftless_node_status)) {
-        co_return;
-    }
-
     auto updates = co_await collect_updates_from_peers();
     co_return co_await _node_status_table.invoke_on_all(
       [updates = std::move(updates)](auto& table) {
@@ -236,7 +231,7 @@ ss::future<result<node_status>> node_status_backend::send_node_status_request(
             })
           .then(&rpc::get_ctx_data<node_status_reply>);
 
-    co_return process_reply(reply);
+    co_return process_reply(target, reply);
 }
 
 ss::future<> node_status_backend::maybe_create_client(
@@ -245,18 +240,11 @@ ss::future<> node_status_backend::maybe_create_client(
       target, address, _rpc_tls_config, create_backoff_policy());
 }
 
-result<node_status>
-node_status_backend::process_reply(result<node_status_reply> reply) {
+result<node_status> node_status_backend::process_reply(
+  model::node_id target_node_id, result<node_status_reply> reply) {
     vassert(ss::this_shard_id() == shard, "invoked on a wrong shard");
-
-    if (!reply.has_error()) {
-        _stats.rpcs_sent += 1;
-        auto& replier_metadata = reply.value().replier_metadata;
-
-        return node_status{
-          .node_id = replier_metadata.node_id,
-          .last_seen = rpc::clock_type::now()};
-    } else {
+    static constexpr auto rate_limit = std::chrono::seconds(1);
+    if (reply.has_error()) {
         auto err = reply.error();
         if (
           err.category() == rpc::error_category()
@@ -264,7 +252,6 @@ node_status_backend::process_reply(result<node_status_reply> reply) {
                == rpc::errc::client_request_timeout) {
             _stats.rpcs_timed_out += 1;
         }
-        static constexpr auto rate_limit = std::chrono::seconds(1);
         static ss::logger::rate_limit rate(rate_limit);
         clusterlog.log(
           ss::log_level::debug,
@@ -273,6 +260,23 @@ node_status_backend::process_reply(result<node_status_reply> reply) {
           err.message());
         return err;
     }
+
+    _stats.rpcs_sent += 1;
+    auto& replier_metadata = reply.value().replier_metadata;
+    if (replier_metadata.node_id != target_node_id) {
+        static ss::logger::rate_limit rate(rate_limit);
+        clusterlog.log(
+          ss::log_level::debug,
+          rate,
+          "Received reply from node with different node id. Expected: {}, "
+          "current: {}",
+          target_node_id,
+          replier_metadata.node_id);
+        return errc::invalid_target_node_id;
+    }
+
+    return node_status{
+      .node_id = replier_metadata.node_id, .last_seen = rpc::clock_type::now()};
 }
 
 ss::future<node_status_reply>

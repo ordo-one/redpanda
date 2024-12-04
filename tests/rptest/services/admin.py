@@ -7,22 +7,24 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from dataclasses import dataclass
 from enum import Enum
 from logging import Logger
 import random
 import json
-import requests
 import time
-from time import sleep
 import urllib.parse
-from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException
-from requests.packages.urllib3.util.retry import Retry
-from ducktape.cluster.cluster import ClusterNode
 from typing import Any, Optional, Callable, NamedTuple, Protocol, cast
-from rptest.util import wait_until_result
-from requests.exceptions import HTTPError
+from json.decoder import JSONDecodeError
+from uuid import UUID
+from ducktape.cluster.cluster import ClusterNode
+import requests
 from requests import Response
+from requests.adapters import HTTPAdapter
+from requests.exceptions import HTTPError, RequestException
+from urllib3.util.retry import Retry
+from rptest.util import wait_until_result
+from rptest.services.redpanda_types import SaslCredentials
 
 DEFAULT_TIMEOUT = 30
 
@@ -260,6 +262,187 @@ class RoleMemberUpdateResponse:
         return cls.from_json(rsp.content)
 
 
+class NamespacedTopic:
+    def __init__(self, topic: str, namespace: str | None = "kafka"):
+        self.ns = namespace
+        self.topic = topic
+
+    def as_dict(self):
+        ret = {'topic': self.topic}
+        if self.ns is not None:
+            ret['ns'] = self.ns
+        return ret
+
+    @classmethod
+    def from_json(cls, body: bytes):
+        d = json.loads(body)
+        expected_keys = set(['ns', 'topic'])
+        assert all(k in expected_keys
+                   for k in d), f"Unexpected key(s): {d.keys()}"
+        assert 'topic' in d, "Expected 'topic' key"
+        topic = d['topic']
+        namespace = "kafka"
+        if 'ns' in d:
+            namespace = d['ns']
+
+        return cls(topic, namespace)
+
+
+class OutboundDataMigration:
+    migration_type: str
+    topics: list[NamespacedTopic]
+    consumer_groups: list[str]
+
+    def __init__(self, topics: list[NamespacedTopic],
+                 consumer_groups: list[str]):
+        self.migration_type = "outbound"
+        self.topics = topics
+        self.consumer_groups = consumer_groups
+
+    @classmethod
+    def from_json(cls, body: bytes):
+        d = json.loads(body)
+        expected_keys = set(['type', 'topics', 'consumer_groups'])
+        assert all(k in expected_keys
+                   for k in d), f"Unexpected key(s): {d.keys()}"
+        assert all(
+            k in d
+            for k in expected_keys), f"Missing keys: {expected_keys - set(d)}"
+
+        return cls(d['topics'], d['consumer_groups'])
+
+    def as_dict(self):
+        return {
+            'migration_type': self.migration_type,
+            'topics': [t.as_dict() for t in self.topics],
+            'consumer_groups': self.consumer_groups
+        }
+
+
+class InboundTopic:
+    def __init__(self,
+                 source_topic_reference: NamespacedTopic,
+                 alias: NamespacedTopic | None = None):
+        self.source_topic_reference = source_topic_reference
+        self.alias = alias
+
+    def as_dict(self):
+        d = {
+            'source_topic_reference': self.source_topic_reference.as_dict(),
+        }
+        if self.alias:
+            d['alias'] = self.alias.as_dict()
+        return d
+
+
+class InboundDataMigration:
+    migration_type: str
+    topics: list[InboundTopic]
+    consumer_groups: list[str]
+
+    def __init__(self, topics: list[InboundTopic], consumer_groups: list[str]):
+        self.migration_type = "inbound"
+        self.topics = topics
+        self.consumer_groups = consumer_groups
+
+    def as_dict(self):
+        return {
+            "migration_type": self.migration_type,
+            'topics': [t.as_dict() for t in self.topics],
+            'consumer_groups': self.consumer_groups
+        }
+
+
+class MigrationAction(Enum):
+    prepare = "prepare"
+    execute = "execute"
+    finish = "finish"
+    cancel = "cancel"
+
+
+class EnterpriseLicenseStatus(Enum):
+    valid = "valid"
+    expired = "expired"
+    not_present = "not_present"
+
+
+class DebugBundleEncoder(json.JSONEncoder):
+    """
+    DebugBundleEncoder is a custom JSON encoder that extends the default JSONEncoder
+    to handle named tuples and UUIDs.
+
+    Attributes:
+        ignore_none (bool): If True, fields with None values are ignored during encoding.
+
+    Methods:
+        default(o):
+            Overrides the default method to provide custom serialization for named tuples
+            and UUIDs. Named tuples are converted to dictionaries, and UUIDs are converted
+            to strings. Other types are handled by the superclass method.
+
+        encode(o: Any) -> str:
+            Overrides the encode method to ensure that the custom default method is used
+            during encoding.
+
+    Usage:
+        encoder = DebugBundleEncoder(ignore_none=True)
+        json_str = encoder.encode(your_object)
+    """
+    def __init__(self, *args, ignore_none: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ignore_none = ignore_none
+
+    def default(self, o):
+        if isinstance(o, tuple) and hasattr(o, '_fields'):  # Detect NamedTuple
+            return {
+                k: self.default(v)
+                for k, v in o._asdict().items()
+                if not (self.ignore_none and v is None)
+            }
+        if isinstance(o, UUID):
+            return str(o)
+        if isinstance(o,
+                      (dict, list, tuple, str, int, float, bool)) or o is None:
+            return o
+        if hasattr(o, '__dataclass_fields__'):  # assume SaslCredentials
+            creds = o.__dict__
+            if isinstance(o, SaslCredentials):
+                # Swap algorithm for mechansim
+                creds['mechanism'] = creds.pop('algorithm')
+            return creds
+        return super().default(o)
+
+    def encode(self, o: Any) -> str:
+        return super().encode(self.default(o))
+
+
+@dataclass
+class DebugBundleLabelSelection:
+    key: str
+    value: str
+
+
+class DebugBundleStartConfigParams(NamedTuple):
+    authentication: Optional[SaslCredentials] = None
+    controller_logs_size_limit_bytes: Optional[int] = None
+    cpu_profiler_wait_seconds: Optional[int] = None
+    logs_since: Optional[str] = None
+    logs_size_limit_bytes: Optional[int] = None
+    logs_until: Optional[str] = None
+    metrics_interval_seconds: Optional[int] = None
+    metrics_samples: Optional[int] = None
+    partition: Optional[list[str]] = None
+    tls_enabled: Optional[bool] = None
+    tls_insecure_skip_verify: Optional[bool] = None
+    namespace: Optional[str] = None
+    label_selector: Optional[list[DebugBundleLabelSelection]] = None
+
+
+class DebugBundleStartConfig(NamedTuple):
+    job_id: UUID
+    config: Optional[DebugBundleStartConfigParams] = None
+
+
 class Admin:
     """
     Wrapper for Redpanda admin REST API.
@@ -333,7 +516,7 @@ class Admin:
                 json = r.json()
                 self.redpanda.logger.debug(f"Response OK, JSON: {json}")
                 return json
-            except json.decoder.JSONDecodeError as e:
+            except JSONDecodeError as e:
                 self.redpanda.logger.debug(
                     f"Response OK, Malformed JSON: '{r.text}' ({e})")
                 return None
@@ -488,6 +671,9 @@ class Admin:
                                                   backoff_s=backoff_s)
             if check(info.leader):
                 return True, info.leader
+
+            self.redpanda.logger.debug(
+                f"check failed (leader id: {info.leader})")
             return False
 
         return wait_until_result(
@@ -593,8 +779,10 @@ class Admin:
     def get_status_ready(self, node=None):
         return self._request("GET", "status/ready", node=node).json()
 
-    def get_cluster_config(self, node=None, include_defaults=None):
-        if include_defaults is not None:
+    def get_cluster_config(self, node=None, include_defaults=None, key=None):
+        if key is not None:
+            kwargs = {"params": {"key": key}}
+        elif include_defaults is not None:
             kwargs = {"params": {"include_defaults": include_defaults}}
         else:
             kwargs = {}
@@ -717,8 +905,30 @@ class Admin:
                              node=node,
                              timeout=timeout).json()
 
+    @staticmethod
+    def is_sample_license(resp) -> bool:
+        """
+        Returns true if the given response to a `get_license` request returned the same license as the sample license
+        configured in `sample_license` ("REDPANDA_SAMPLE_LICENSE" env var). Returns false for the built in evaluation
+        period license and the second sample license 'REDPANDA_SECOND_SAMPLE_LICENSE'.
+        """
+        # NOTE: the initial implementation of the get license endpoint (before v22.3) didn't return the sha256.
+        # We could remove those old tests, but it's simpler to use the type and the org to detect the installed
+        # license instead.
+
+        # REDPANDA_SAMPLE_LICENSE: {'loaded': True, 'license': {'format_version': 0, 'org': 'redpanda-testing', 'type': 'enterprise', 'expires': 4813252273, 'sha256': '2730125070a934ca1067ed073d7159acc9975dc61015892308aae186f7455daf'}}
+        # REDPANDA_SECOND_SAMPLE_LICENSE: {'loaded': True, 'license': {'format_version': 0, 'org': 'redpanda-testing-2', 'type': 'enterprise', 'expires': 4827156118, 'sha256': '54240716865c1196fa6bd0ebb31821ab69160a3ed312b13bc810c17c9ec8852c'}}
+        # Evaluation Period: {'loaded': True, 'license': {'format_version': 0, 'org': 'Redpanda Built-In Evaluation Period', 'type': 'free_trial', 'expires': 1733992567, 'sha256': ''}}
+
+        return resp is not None and resp.get('license', None) is not None \
+                and resp['license']['type'] == 'enterprise' \
+                and resp['license']['org'] == 'redpanda-testing'
+
     def put_license(self, license):
         return self._request("PUT", "features/license", data=license)
+
+    def get_enterprise_features(self):
+        return self._request("GET", "features/enterprise")
 
     def get_loggers(self, node):
         """
@@ -809,6 +1019,14 @@ class Admin:
         Trigger on demand partitions rebalancing
         """
         path = f"partitions/rebalance"
+
+        return self._request('post', path, node=node)
+
+    def trigger_cores_rebalance(self, node):
+        """
+        Trigger core placement rebalancing for partitions in this node.
+        """
+        path = f"partitions/rebalance_cores"
 
         return self._request('post', path, node=node)
 
@@ -927,24 +1145,6 @@ class Admin:
         path = f"transaction/{tid}/find_coordinator"
         return self._request('get', path, node=node).json()
 
-    def describe_tx_registry(self, node=None):
-        """
-        describe_tx_registry
-        """
-        path = f"tx_registry"
-        info = self._request('get', path, node=node).json()
-        mapping = {
-            x["partition_id"]: x["hosted_txs"]
-            for x in info["tx_mapping"]
-        }
-        for key in mapping:
-            if "excluded_transactions" not in mapping[key]:
-                mapping[key]["excluded_transactions"] = []
-            if "included_transactions" not in mapping[key]:
-                mapping[key]["included_transactions"] = []
-        info["tx_mapping"] = mapping
-        return info
-
     def set_partition_replicas(self,
                                topic,
                                partition,
@@ -1002,6 +1202,16 @@ class Admin:
         assert payload
         path = "partitions/force_recover_from_nodes"
         return self._request('post', path, node, json=payload)
+
+    def set_partition_replica_core(self,
+                                   topic: str,
+                                   partition: int,
+                                   replica: int,
+                                   core: int,
+                                   namespace: str = "kafka",
+                                   node=None):
+        path = f"partitions/{namespace}/{topic}/{partition}/replicas/{replica}"
+        return self._request('post', path, node=node, json={"core": core})
 
     def create_user(self,
                     username,
@@ -1065,7 +1275,8 @@ class Admin:
     def list_roles(self,
                    filter: Optional[str] = None,
                    principal: Optional[str] = None,
-                   principal_type: Optional[str] = None):
+                   principal_type: Optional[str] = None,
+                   node=None):
         params = {}
         if filter is not None:
             params['filter'] = filter
@@ -1073,7 +1284,7 @@ class Admin:
             params['principal'] = principal
         if principal_type is not None:
             params['principal_type'] = principal_type
-        return self._request("get", "security/roles", params=params)
+        return self._request("get", "security/roles", params=params, node=node)
 
     def update_role_members(self,
                             role: str,
@@ -1230,7 +1441,7 @@ class Admin:
         return self._request("GET", f"debug/controller_status",
                              node=node).json()
 
-    def get_cluster_uuid(self, node):
+    def get_cluster_uuid(self, node=None):
         try:
             r = self._request("GET", "cluster/uuid", node=node)
         except HTTPError as ex:
@@ -1472,6 +1683,7 @@ class Admin:
                                ns: str | None = None,
                                topic: str | None = None,
                                disabled: bool | None = None,
+                               with_internal: bool | None = None,
                                node=None):
         if topic is not None:
             assert ns is not None
@@ -1482,6 +1694,9 @@ class Admin:
 
         if disabled is not None:
             req += f"?disabled={disabled}"
+
+        if with_internal is not None:
+            req += f"?with_internal={with_internal}"
 
         return self._request("GET", req, node=node).json()
 
@@ -1540,3 +1755,97 @@ class Admin:
                                         node: Optional[ClusterNode] = None):
         path = "transform/debug/committed_offsets/garbage_collect"
         return self._request("POST", path, node=node)
+
+    def transforms_patch_meta(self,
+                              name: str,
+                              pause: bool | None = None,
+                              env: dict[str, str] | None = None):
+        path = f"transform/{name}/meta"
+        body = {}
+        if pause is not None:
+            body["is_paused"] = pause
+        if env is not None:
+            body["env"] = [dict(key=k, value=env[k]) for k in env]
+        return self._request("PUT", path, json=body)
+
+    def list_data_migrations(self, node: Optional[ClusterNode] = None):
+        path = "migrations"
+        return self._request("GET", path, node=node)
+
+    def get_data_migration(self,
+                           migration_id: int,
+                           node: Optional[ClusterNode] = None):
+        path = f"migrations/{migration_id}"
+        return self._request("GET", path, node=node)
+
+    def create_data_migration(self,
+                              migration: InboundDataMigration
+                              | OutboundDataMigration,
+                              node: Optional[ClusterNode] = None):
+
+        path = "migrations"
+        return self._request("PUT", path, node=node, json=migration.as_dict())
+
+    def execute_data_migration_action(self,
+                                      migration_id: int,
+                                      action: MigrationAction,
+                                      node: Optional[ClusterNode] = None):
+
+        path = f"migrations/{migration_id}?action={action.value}"
+        return self._request("POST", path, node=node)
+
+    def delete_data_migration(self,
+                              migration_id: int,
+                              node: Optional[ClusterNode] = None):
+
+        path = f"migrations/{migration_id}"
+        return self._request("DELETE", path, node=node)
+
+    def list_mountable_topics(self, node: Optional[ClusterNode] = None):
+        path = "topics/mountable"
+        return self._request("GET", path, node=node)
+
+    def unmount_topics(self,
+                       topics: list[NamespacedTopic],
+                       node: Optional[ClusterNode] = None):
+        path = "topics/unmount"
+        return self._request("POST",
+                             path,
+                             node=node,
+                             json={"topics": [t.as_dict() for t in topics]})
+
+    def mount_topics(self,
+                     topics: list[InboundTopic],
+                     node: Optional[ClusterNode] = None):
+        path = "topics/mount"
+        return self._request("POST",
+                             path,
+                             node=node,
+                             json={"topics": [t.as_dict() for t in topics]})
+
+    def post_debug_bundle(self,
+                          config: DebugBundleStartConfig,
+                          ignore_none: bool = True,
+                          node: MaybeNode = None):
+        path = "debug/bundle"
+        body = json.dumps(config,
+                          cls=DebugBundleEncoder,
+                          ignore_none=ignore_none)
+        self.redpanda.logger.debug(f"Posting debug bundle: {body}")
+        return self._request("POST", path, data=body, node=node)
+
+    def get_debug_bundle(self, node: MaybeNode = None):
+        path = "debug/bundle"
+        return self._request("GET", path, node=node)
+
+    def delete_debug_bundle(self, job_id: UUID, node: MaybeNode = None):
+        path = f"debug/bundle/{job_id}"
+        return self._request("DELETE", path, node=node)
+
+    def get_debug_bundle_file(self, filename: str, node: MaybeNode = None):
+        path = f"debug/bundle/file/{filename}"
+        return self._request("GET", path, node=node)
+
+    def delete_debug_bundle_file(self, filename: str, node: MaybeNode = None):
+        path = f"debug/bundle/file/{filename}"
+        return self._request("DELETE", path, node=node)

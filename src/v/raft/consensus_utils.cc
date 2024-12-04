@@ -23,6 +23,7 @@
 #include "random/generators.h"
 #include "reflection/adl.h"
 #include "resource_mgmt/io_priority.h"
+#include "serde/peek.h"
 #include "serde/rw/rw.h"
 #include "ssx/future-util.h"
 #include "storage/api.h"
@@ -123,7 +124,7 @@ ss::future<std::vector<model::record_batch_reader>> share_reader(
           for (auto& b : batches) {
               auto r = use_foreign_share
                          ? model::make_foreign_memory_record_batch_reader(
-                           std::move(b))
+                             std::move(b))
                          : model::make_memory_record_batch_reader(std::move(b));
               retval.emplace_back(std::move(r));
           }
@@ -236,9 +237,9 @@ bytes serialize_group_key(raft::group_id group, metadata_key key_type) {
     return iobuf_to_bytes(buf);
 }
 
-ss::future<> move_persistent_state(
+ss::future<> copy_persistent_state(
   raft::group_id group,
-  ss::shard_id source_shard,
+  storage::kvstore& source_kvs,
   ss::shard_id target_shard,
   ss::sharded<storage::api>& api) {
     struct persistent_state {
@@ -249,98 +250,87 @@ ss::future<> move_persistent_state(
         std::optional<iobuf> highest_known_offset;
         std::optional<iobuf> next_cfg_idx;
     };
-    using state_ptr = std::unique_ptr<persistent_state>;
-    using state_fptr = ss::foreign_ptr<std::unique_ptr<persistent_state>>;
-
-    state_fptr state = co_await api.invoke_on(
-      source_shard, [gr = group](storage::api& api) {
-          const auto ks = storage::kvstore::key_space::consensus;
-          persistent_state state{
-            .voted_for = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::voted_for)),
-            .last_applied = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::last_applied_offset)),
-            .unique_run_id = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::unique_local_id)),
-            .configuration_map = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::config_map)),
-            .highest_known_offset = api.kvs().get(
-              ks,
-              serialize_group_key(
-                gr, metadata_key::config_latest_known_offset)),
-            .next_cfg_idx = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::config_next_cfg_idx))};
-          return ss::make_foreign<state_ptr>(
-            std::make_unique<persistent_state>(std::move(state)));
-      });
+    const auto ks = storage::kvstore::key_space::consensus;
+    const persistent_state state{
+      .voted_for = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::voted_for)),
+      .last_applied = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::last_applied_offset)),
+      .unique_run_id = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::unique_local_id)),
+      .configuration_map = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::config_map)),
+      .highest_known_offset = source_kvs.get(
+        ks,
+        serialize_group_key(group, metadata_key::config_latest_known_offset)),
+      .next_cfg_idx = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::config_next_cfg_idx))};
 
     co_await api.invoke_on(
-      target_shard, [gr = group, state = std::move(state)](storage::api& api) {
+      target_shard, [gr = group, &state](storage::api& api) {
           const auto ks = storage::kvstore::key_space::consensus;
           std::vector<ss::future<>> write_futures;
           write_futures.reserve(6);
-          if (state->voted_for) {
+          if (state.voted_for) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::voted_for),
-                state->voted_for->copy()));
+                state.voted_for->copy()));
           }
-          if (state->last_applied) {
+          if (state.last_applied) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::last_applied_offset),
-                state->last_applied->copy()));
+                state.last_applied->copy()));
           }
-          if (state->unique_run_id) {
+          if (state.unique_run_id) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::unique_local_id),
-                state->unique_run_id->copy()));
+                state.unique_run_id->copy()));
           }
-          if (state->configuration_map) {
+          if (state.configuration_map) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::config_map),
-                state->configuration_map->copy()));
+                state.configuration_map->copy()));
           }
-          if (state->highest_known_offset) {
+          if (state.highest_known_offset) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(
                   gr, metadata_key::config_latest_known_offset),
-                state->highest_known_offset->copy()));
+                state.highest_known_offset->copy()));
           }
-          if (state->next_cfg_idx) {
+          if (state.next_cfg_idx) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::config_next_cfg_idx),
-                state->next_cfg_idx->copy()));
+                state.next_cfg_idx->copy()));
           }
-          return ss::when_all_succeed(
-            write_futures.begin(), write_futures.end());
+          return ss::when_all_succeed(std::move(write_futures));
       });
+}
 
-    // remove on source shard
-    co_await api.invoke_on(source_shard, [gr = group](storage::api& api) {
-        const auto ks = storage::kvstore::key_space::consensus;
-        std::vector<ss::future<>> remove_futures;
-        remove_futures.reserve(6);
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::voted_for)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::last_applied_offset)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::unique_local_id)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::config_map)));
-        remove_futures.push_back(api.kvs().remove(
-          ks,
-          serialize_group_key(gr, metadata_key::config_latest_known_offset)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::config_next_cfg_idx)));
-        return ss::when_all_succeed(
-          remove_futures.begin(), remove_futures.end());
-    });
+ss::future<>
+remove_persistent_state(raft::group_id group, storage::kvstore& kvs) {
+    const auto ks = storage::kvstore::key_space::consensus;
+    std::vector<ss::future<>> remove_futures;
+    remove_futures.reserve(6);
+    remove_futures.push_back(
+      kvs.remove(ks, serialize_group_key(group, metadata_key::voted_for)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::last_applied_offset)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::unique_local_id)));
+    remove_futures.push_back(
+      kvs.remove(ks, serialize_group_key(group, metadata_key::config_map)));
+    remove_futures.push_back(kvs.remove(
+      ks,
+      serialize_group_key(group, metadata_key::config_latest_known_offset)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::config_next_cfg_idx)));
+    co_await ss::when_all_succeed(std::move(remove_futures));
 }
 
 // Return previous offset. This is different from
@@ -387,7 +377,7 @@ ss::future<> create_raft_state_for_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes) {
+  std::vector<raft::vnode> initial_nodes) {
     // Prepare Raft state in kvstore
     vlog(
       raftlog.debug,
@@ -403,7 +393,7 @@ ss::future<> create_raft_state_for_pre_existing_partition(
 
     // Prepare Raft snapshot
     raft::group_configuration group_config(
-      initial_nodes, ntp_cfg.get_revision());
+      std::move(initial_nodes), ntp_cfg.get_revision());
     raft::snapshot_metadata meta = {
       // `last_included_index` should be the last offset included in
       // this fake snapshot. That's why we set it to be the first offest
@@ -455,7 +445,7 @@ ss::future<> bootstrap_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes,
+  std::vector<raft::vnode> initial_nodes,
   ss::lw_shared_ptr<storage::offset_translator_state> ot_state) {
     co_await create_offset_translator_state_for_pre_existing_partition(
       api, ntp_cfg, group, min_rp_offset, max_rp_offset, ot_state);

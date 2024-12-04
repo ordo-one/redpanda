@@ -11,11 +11,15 @@
 #pragma once
 #include "absl/container/flat_hash_map.h"
 #include "base/seastarx.h"
+#include "cluster/health_monitor_types.h"
 #include "cluster/partition_manager.h"
 #include "cluster/scheduling/leader_balancer_probe.h"
 #include "cluster/scheduling/leader_balancer_strategy.h"
 #include "cluster/scheduling/leader_balancer_types.h"
 #include "cluster/types.h"
+#include "config/property.h"
+#include "features/enterprise_features.h"
+#include "raft/notification.h"
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
@@ -64,13 +68,6 @@ class leader_balancer {
     static constexpr clock_type::duration leader_transfer_rpc_timeout = 30s;
 
     /*
-     * Used to reschedule the balancer after it has been throttled due to it
-     * hitting its max in flight limit. This delay will occur after one of the
-     * in flight transfers successfully completes.
-     */
-    static constexpr clock_type::duration throttle_reactivation_delay = 5s;
-
-    /*
      * Used to specify how long a leader should spend trying to recover a
      * replica the balancer is trying to transfer leadership to.
      */
@@ -94,6 +91,8 @@ public:
       config::binding<std::chrono::milliseconds>&&,
       config::binding<std::chrono::milliseconds>&&,
       config::binding<size_t>&&,
+      config::binding<bool> enable_rack_awareness,
+      std::chrono::milliseconds metadata_dissemination_interval,
       consensus_ptr);
 
     ss::future<> start();
@@ -103,21 +102,31 @@ private:
     using index_type = leader_balancer_strategy::index_type;
     using reassignment = leader_balancer_strategy::reassignment;
 
-    using group_replicas_t = absl::btree_map<raft::group_id, replicas_t>;
+    using group_replicas_t = chunked_hash_map<raft::group_id, replicas_t>;
     ss::future<std::optional<group_replicas_t>>
-    collect_group_replicas_from_health_report();
-    leader_balancer_types::group_id_to_topic_revision_t
-    build_group_id_to_topic_rev() const;
+    collect_group_replicas_from_health_report(const cluster_health_report&);
+
+    leader_balancer_types::group_id_to_topic_id
+    build_group_id_to_topic_id() const;
+
+    leader_balancer_types::preference_index build_preference_index();
+
     index_type build_index(std::optional<group_replicas_t>);
+    absl::flat_hash_set<model::node_id>
+    collect_muted_nodes(const cluster_health_report&);
+
     leader_balancer_types::muted_groups_t muted_groups() const;
-    absl::flat_hash_set<model::node_id> muted_nodes() const;
 
     ss::future<bool> do_transfer(reassignment);
     ss::future<bool> do_transfer_local(reassignment) const;
     ss::future<bool> do_transfer_remote(reassignment);
     ss::future<bool> do_transfer_remote_legacy(reassignment);
 
+    bool can_schedule_sooner() const;
+    void schedule_sooner(clock_type::duration timeout);
+
     void on_enable_changed();
+    void on_default_preference_changed();
 
     void check_if_controller_leader(model::ntp, model::term_id, model::node_id);
 
@@ -125,13 +134,24 @@ private:
 
     void on_maintenance_change(model::node_id, model::maintenance_state);
 
+    void handle_topic_deltas(const chunked_vector<topic_table_topic_delta>&);
+
     void check_register_leadership_change_notification();
     void check_unregister_leadership_change_notification();
 
     void trigger_balance();
+    ss::future<> balance_fiber();
     ss::future<ss::stop_iteration> balance();
 
+    // Min time between balance iterations. Chosen so as to allow leadership
+    // updates from the previous iteration to propagate.
+    clock_type::duration min_iteration_interval() const;
+
     bool should_stop_balance() const;
+
+    bool leadership_pinning_enabled() const;
+
+    /// Config binding fields
 
     // On/off switch: when off, leader balancer tick will run
     // but do nothing
@@ -179,20 +199,14 @@ private:
      */
     config::binding<size_t> _transfer_limit_per_shard;
 
-    struct last_known_leader {
-        model::broker_shard shard;
-        clock_type::time_point expires;
-    };
-    absl::btree_map<raft::group_id, last_known_leader> _last_leader;
+    config::binding<bool> _enable_rack_awareness;
+    features::sanctioning_binding<config::property<config::leaders_preference>>
+      _default_preference;
 
-    leader_balancer_probe _probe;
-    bool _need_controller_refresh{true};
-    bool _throttled{false};
-    absl::btree_map<raft::group_id, clock_type::time_point> _muted;
-    cluster::notification_id_type _leader_notify_handle;
-    std::optional<cluster::notification_id_type>
-      _leadership_change_notify_handle;
-    cluster::notification_id_type _maintenance_state_notify_handle;
+    std::chrono::milliseconds _metadata_dissemination_interval;
+
+    /// Service dependencies
+
     topic_table& _topics;
     partition_leaders_table& _leaders;
     members_table& _members;
@@ -203,8 +217,31 @@ private:
     ss::sharded<partition_manager>& _partition_manager;
     ss::sharded<ss::abort_source>& _as;
     consensus_ptr _raft0;
+
+    /// Notifications
+
+    cluster::notification_id_type _leader_notify_handle;
+    std::optional<cluster::notification_id_type>
+      _leadership_change_notify_handle;
+    cluster::notification_id_type _maintenance_state_notify_handle;
+    cluster::notification_id_type _topic_deltas_handle;
+
     ss::gate _gate;
     ss::timer<clock_type> _timer;
+    clock_type::time_point _last_iteration_at;
+    int64_t _pending_notifies = 0;
+
+    /// Internal state
+
+    struct last_known_leader {
+        model::broker_shard shard;
+        clock_type::time_point expires;
+    };
+    chunked_hash_map<raft::group_id, last_known_leader> _last_leader;
+
+    model::term_id _sync_term;
+    bool _throttled{false};
+    chunked_hash_map<raft::group_id, clock_type::time_point> _muted;
 
     struct in_flight_reassignment {
         reassignment value;
@@ -212,6 +249,11 @@ private:
     };
     absl::flat_hash_map<raft::group_id, in_flight_reassignment>
       _in_flight_changes;
+
+    std::optional<leader_balancer_types::topic_map<config::leaders_preference>>
+      _last_seen_preferences;
+
+    leader_balancer_probe _probe;
 };
 
 } // namespace cluster

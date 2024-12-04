@@ -441,39 +441,49 @@ class NodeOpsExecutor():
 
 
 class FailureInjectorBackgroundThread():
-    def __init__(self, redpanda: RedpandaService, logger,
-                 lock: threading.Lock):
+    def __init__(self,
+                 redpanda: RedpandaService,
+                 logger,
+                 lock: threading.Lock = threading.Lock(),
+                 max_suspend_duration_seconds: int = 10,
+                 min_inter_failure_time: int = 30,
+                 max_inter_failure_time: int = 60,
+                 failure_specs: list = FailureSpec.FAILURE_TYPES):
         self.stop_ev = threading.Event()
         self.redpanda = redpanda
         self.thread = None
         self.logger = logger
-        self.max_suspend_duration_seconds = 10
-        self.min_inter_failure_time = 30
-        self.max_inter_failure_time = 60
-        self.node_start_stop_mutexes = {}
+        self.max_suspend_duration_seconds = max_suspend_duration_seconds
+        self.min_inter_failure_time = min_inter_failure_time
+        self.max_inter_failure_time = max_inter_failure_time
+        self.allowed_failures = failure_specs
         self.lock = lock
         self.error = None
 
     def start(self):
+        assert self.thread is None, "failure injector thread already started"
         self.logger.info(
             f"Starting failure injector thread with: (max suspend duration {self.max_suspend_duration_seconds},"
             f"min inter failure time: {self.min_inter_failure_time}, max inter failure time: {self.max_inter_failure_time})"
         )
+        self.redpanda.tolerate_not_running += 1
         self.thread = threading.Thread(target=lambda: self._worker(), args=())
         self.thread.daemon = True
         self.thread.start()
 
     def stop(self):
-        self.logger.info(f"Stopping failure injector thread")
+        assert self.thread is not None, "failure injector thread not started"
+        self.logger.info("Stopping failure injector thread")
         self.stop_ev.set()
         self.thread.join()
+        self.redpanda.tolerate_not_running -= 1
         assert self.error is None, f"failure injector error, most likely node failed to stop: {self.error}"
 
     def _worker(self):
         with FailureInjector(self.redpanda) as f_injector:
             while not self.stop_ev.is_set():
 
-                f_type = random.choice(FailureSpec.FAILURE_TYPES)
+                f_type = random.choice(self.allowed_failures)
                 # failure injector uses only started nodes, this way
                 # we guarantee that failures will not interfere with
                 # nodes start checks

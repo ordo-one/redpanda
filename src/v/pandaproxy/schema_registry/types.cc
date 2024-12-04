@@ -11,6 +11,8 @@
 
 #include "types.h"
 
+#include "util.h"
+
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -47,7 +49,8 @@ std::ostream& operator<<(
       os,
       "type: {}, definition: {}, references: {}",
       to_string_view(def.type()),
-      def.raw(),
+      // TODO BP: Prevent this linearization
+      to_string(def.shared_raw()),
       def.refs());
     return os;
 }
@@ -59,15 +62,20 @@ std::ostream& operator<<(
       os,
       "type: {}, definition: {}, references: {}",
       to_string_view(def.type()),
-      def.raw(),
+      // TODO BP: Prevent this linearization
+      to_string(def.shared_raw()),
       def.refs());
     return os;
 }
 
 std::ostream& operator<<(std::ostream& os, const schema_reference& ref) {
-    fmt::print(
-      os, "name: {}, subject: {}, version: {}", ref.name, ref.sub, ref.version);
+    fmt::print(os, "{:l}", ref);
     return os;
+}
+
+bool operator<(const schema_reference& lhs, const schema_reference& rhs) {
+    return std::tie(lhs.name, lhs.sub, lhs.version)
+           < std::tie(rhs.name, rhs.sub, rhs.version);
 }
 
 std::ostream& operator<<(std::ostream& os, const unparsed_schema& ref) {
@@ -77,6 +85,11 @@ std::ostream& operator<<(std::ostream& os, const unparsed_schema& ref) {
 
 std::ostream& operator<<(std::ostream& os, const canonical_schema& ref) {
     fmt::print(os, "subject: {}, {}", ref.sub(), ref.def());
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const compatibility_result& res) {
+    fmt::print(os, "is_compat: {}, messages: {}", res.is_compat, res.messages);
     return os;
 }
 

@@ -14,6 +14,7 @@
 #include "base/likely.h"
 #include "model/record.h"
 #include "raft/configuration_bootstrap_state.h"
+#include "raft/group_configuration.h"
 #include "raft/types.h"
 #include "storage/log.h"
 #include "storage/snapshot.h"
@@ -99,9 +100,7 @@ public:
         });
     }
 
-    void print(std::ostream& os) final {
-        fmt::print(os, "{term assigning reader}");
-    }
+    void print(std::ostream& os) final { os << "{term assigning reader}"; }
 
 private:
     std::unique_ptr<model::record_batch_reader::impl> _source;
@@ -170,7 +169,7 @@ auto for_each_ref_extract_configuration(
 
         ReferenceConsumer wrapped;
         model::offset next_offset;
-        std::vector<offset_configuration> configurations;
+        chunked_vector<offset_configuration> configurations;
     };
 
     return std::move(rdr).for_each_ref(
@@ -182,14 +181,19 @@ auto for_each_ref_extract_configuration(
 
 bytes serialize_group_key(raft::group_id, metadata_key);
 /**
- * moves raft persistent state from KV store on source shard to the one on
+ * copies raft persistent state from KV store on source shard to the one on
  * target shard.
  */
-ss::future<> move_persistent_state(
+ss::future<> copy_persistent_state(
   raft::group_id,
-  ss::shard_id source_shard,
+  storage::kvstore& source_kvs,
   ss::shard_id target_shard,
   ss::sharded<storage::api>&);
+
+/**
+ * removes raft persistent state from a kvstore.
+ */
+ss::future<> remove_persistent_state(raft::group_id, storage::kvstore&);
 
 /// Creates persitent state for pre-existing partition (stored in S3 bucket).
 ///
@@ -206,6 +210,6 @@ ss::future<> bootstrap_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes,
+  std::vector<raft::vnode> initial_nodes,
   ss::lw_shared_ptr<storage::offset_translator_state> ot_state);
 } // namespace raft::details

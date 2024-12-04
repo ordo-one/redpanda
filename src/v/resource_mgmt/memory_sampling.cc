@@ -35,7 +35,8 @@ constexpr std::string_view confluence_reference() {
 }
 
 fmt::appender fmt::formatter<seastar::memory::allocation_site>::format(
-  const seastar::memory::allocation_site& site, fmt::format_context& ctx) {
+  const seastar::memory::allocation_site& site,
+  fmt::format_context& ctx) const {
     return fmt::format_to(
       ctx.out(),
       "size: {} count: {} at: {}",
@@ -155,7 +156,7 @@ void memory_sampling::start_low_available_memory_logging() {
 memory_sampling::memory_sampling(
   ss::logger& logger, config::binding<bool> enabled)
   : memory_sampling(
-    logger, std::move(enabled), std::chrono::seconds(60), 0.2, 0.1) {}
+      logger, std::move(enabled), std::chrono::seconds(60), 0.2, 0.1) {}
 
 memory_sampling::memory_sampling(
   ss::logger& logger,

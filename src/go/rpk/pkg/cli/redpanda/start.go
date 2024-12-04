@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -394,7 +393,7 @@ https://redpanda.com/feedback
 	f.IntVar(&sFlags.maxIoRequests, maxIoRequestsFlag, 0, "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of IO queues")
 	f.StringVar(&sFlags.ioPropertiesFile, ioPropertiesFileFlag, "", "Path to a YAML file describing the characteristics of the I/O Subsystem")
 	f.StringVar(&sFlags.ioProperties, ioPropertiesFlag, "", "A YAML string describing the characteristics of the I/O Subsystem")
-	f.StringVar(&wellKnownIo, wellKnownIOFlag, "", "The cloud vendor and VM type, in the format <vendor>:<vm type>:<storage type>")
+	f.StringVar(&wellKnownIo, wellKnownIOFlag, "", "The cloud provider and VM type, in the format <provider>:<vm type>:<storage type>")
 	f.BoolVar(&sFlags.mbind, mbindFlag, true, "Enable mbind")
 	f.BoolVar(&sFlags.overprovisioned, overprovisionedFlag, false, "Enable overprovisioning")
 	f.BoolVar(&sFlags.unsafeBypassFsync, unsafeBypassFsyncFlag, false, "Enable unsafe-bypass-fsync")
@@ -546,26 +545,6 @@ func flagsFromConf(
 	return flagsMap
 }
 
-func mergeFlags(
-	current map[string]interface{}, overrides []string,
-) map[string]interface{} {
-	overridesMap := map[string]string{}
-	for _, o := range overrides {
-		pattern := regexp.MustCompile(`[\s=]+`)
-		parts := pattern.Split(o, 2)
-		flagName := strings.ReplaceAll(parts[0], "--", "")
-		if len(parts) == 2 {
-			overridesMap[flagName] = parts[1]
-		} else {
-			overridesMap[flagName] = ""
-		}
-	}
-	for k, v := range overridesMap {
-		current[k] = v
-	}
-	return current
-}
-
 func setConfig(y *config.RedpandaYaml, configKvs []string) error {
 	for _, rawKv := range configKvs {
 		parts := strings.SplitN(rawKv, "=", 2)
@@ -591,7 +570,7 @@ func resolveWellKnownIo(
 		wellKnownIoTokens := strings.Split(y.Rpk.Tuners.WellKnownIo, ":")
 		if len(wellKnownIoTokens) != 3 {
 			err := errors.New(
-				"--well-known-io should have the format '<vendor>:<vm type>:<storage type>'",
+				"--well-known-io should have the format '<provider>:<vm type>:<storage type>'",
 			)
 			return nil, err
 		}
@@ -607,16 +586,16 @@ func resolveWellKnownIo(
 		}
 		return ioProps, nil
 	}
-	// Skip detecting the cloud vendor if skipChecks is true
+	// Skip detecting the cloud provider if skipChecks is true
 	if skipChecks {
 		return nil, nil
 	}
-	fmt.Println("Detecting the current cloud vendor and VM")
-	vendor, err := cloud.AvailableVendor()
+	fmt.Println("Detecting the current cloud provider and VM")
+	provider, err := cloud.AvailableProviders()
 	if err != nil {
-		return nil, errors.New("Could not detect the current cloud vendor")
+		return nil, errors.New("Could not detect the current cloud provider")
 	}
-	ioProps, err = iotune.DataForVendor(y.Redpanda.Directory, vendor)
+	ioProps, err = iotune.DataForProvider(y.Redpanda.Directory, provider)
 	if err != nil {
 		// Log the error to let the user know that the data wasn't found
 		return nil, err

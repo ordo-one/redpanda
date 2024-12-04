@@ -15,7 +15,10 @@
 #include "cluster/feature_barrier.h"
 #include "cluster/fwd.h"
 #include "cluster/types.h"
+#include "features/enterprise_features.h"
+#include "raft/notification.h"
 #include "security/fwd.h"
+#include "ssx/semaphore.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
@@ -64,6 +67,7 @@ public:
       ss::sharded<features::feature_table>& table,
       ss::sharded<rpc::connection_cache>& connection_cache,
       ss::sharded<security::role_store>& role_store,
+      ss::sharded<topic_table>&,
       raft::group_id raft0_group);
 
     /**
@@ -97,6 +101,16 @@ public:
 
     ss::future<std::error_code> update_license(security::license&& license);
 
+    features::enterprise_feature_report report_enterprise_features() const;
+
+    /**
+     * This method is always called during startup to verify that the cluster is
+     * only upgraded with a valid enterprise license if enterprise features are
+     * enabled. It throws if the cluster is non-compliant during an upgrade or
+     * unblocks the advancement of the active_version otherwise.
+     */
+    void verify_enterprise_license();
+
 private:
     void update_node_version(model::node_id, cluster_version v);
 
@@ -129,6 +143,7 @@ private:
     }
 
     ss::future<> maybe_log_license_check_info();
+    bool need_to_verify_enterprise_license();
 
     // Compose a command struct, replicate it via raft and wait for apply.
     // Silently swallow not_leader errors, raise on other errors;
@@ -151,12 +166,13 @@ private:
     ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<rpc::connection_cache>& _connection_cache;
     ss::sharded<security::role_store>& _role_store;
+    ss::sharded<topic_table>& _topic_table;
     raft::group_id _raft0_group;
 
     version_map _updates;
     ss::condition_variable _update_wait;
 
-    cluster::notification_id_type _leader_notify_handle{
+    raft::group_manager_notification_id _leader_notify_handle{
       notification_id_type_invalid};
     cluster::notification_id_type _health_notify_handle{
       notification_id_type_invalid};
@@ -173,6 +189,10 @@ private:
     // Keep track of whether this node is the controller leader
     // via leadership notifications
     bool _am_controller_leader{false};
+
+    // Blocks cluster upgrades until the enterprise license has been verified
+    ssx::semaphore _verified_enterprise_license{
+      0, "feature_manager/enterprise-license-verified"};
 };
 
 } // namespace cluster

@@ -357,6 +357,7 @@ struct compat_check<cluster::topic_properties> {
           wr, "write_caching", obj.write_caching);
         json_write(flush_ms);
         json_write(flush_bytes);
+        json_write(remote_topic_namespace_override);
     }
 
     static cluster::topic_properties from_json(json::Value& rd) {
@@ -392,6 +393,7 @@ struct compat_check<cluster::topic_properties> {
         json_read(write_caching);
         json_read(flush_ms);
         json_read(flush_bytes);
+        json_read(remote_topic_namespace_override);
         return obj;
     }
 
@@ -422,6 +424,7 @@ struct compat_check<cluster::topic_properties> {
         obj.write_caching = std::nullopt;
         obj.flush_bytes = std::nullopt;
         obj.flush_ms = std::nullopt;
+        obj.remote_topic_namespace_override = std::nullopt;
 
         if (reply != obj) {
             throw compat_error(fmt::format(
@@ -454,6 +457,7 @@ struct compat_check<cluster::topic_configuration> {
         json_write(tp_ns);
         json_write(partition_count);
         json_write(replication_factor);
+        json_write(is_migrated);
         json_write(properties);
     }
 
@@ -462,6 +466,7 @@ struct compat_check<cluster::topic_configuration> {
         json_read(tp_ns);
         json_read(partition_count);
         json_read(replication_factor);
+        json_read(is_migrated);
         json_read(properties);
         return obj;
     }
@@ -481,6 +486,7 @@ struct compat_check<cluster::topic_configuration> {
         auto cfg = reflection::adl<cluster::topic_configuration>{}.from(iobp);
         obj.properties.read_replica = std::nullopt;
         obj.properties.read_replica_bucket = std::nullopt;
+        obj.properties.remote_topic_namespace_override = std::nullopt;
         obj.properties.remote_topic_properties = std::nullopt;
         obj.properties.batch_max_bytes = std::nullopt;
         obj.properties.retention_local_target_bytes = tristate<size_t>{
@@ -504,9 +510,12 @@ struct compat_check<cluster::topic_configuration> {
 
         obj.properties.mpx_virtual_cluster_id = std::nullopt;
 
+        // ADL will always squash is_migrated to false
+        obj.is_migrated = false;
+
         if (cfg != obj) {
             throw compat_error(fmt::format(
-              "Verify of {{cluster::topic_property}} decoding "
+              "Verify of {{cluster::topic_property}} adl decoding "
               "failed:\n Expected: {}\nDecoded: {}",
               obj,
               cfg));
@@ -622,7 +631,7 @@ GEN_COMPAT_CHECK(
       json_write(segment_size);
       json_write(retention_bytes);
       json_write(retention_duration);
-      json_write(shadow_indexing);
+      json_write(get_shadow_indexing());
       json_write(remote_delete);
   },
   {
@@ -633,7 +642,7 @@ GEN_COMPAT_CHECK(
       json_read(segment_size);
       json_read(retention_bytes);
       json_read(retention_duration);
-      json_read(shadow_indexing);
+      json_read(get_shadow_indexing());
       json_read(remote_delete);
   })
 

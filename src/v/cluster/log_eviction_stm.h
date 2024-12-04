@@ -94,15 +94,17 @@ public:
     /// This only returns the start override, if one exists. It does not take
     /// into account local storage, and may not even point to an offset that
     /// exists in local storage (e.g. if we have locally truncated).
-    ss::future<offset_result>
-    sync_start_offset_override(model::timeout_clock::duration timeout);
+    ///
+    /// If `kafka::offset{}` is returned and archival storage is enabled for the
+    /// given ntp then the caller should fall back on the archival stm to check
+    /// if a start offset override exists and if so what its value is.
+    ss::future<result<kafka::offset, std::error_code>>
+    sync_kafka_start_offset_override(model::timeout_clock::duration timeout);
 
-    model::offset start_offset_override() const {
-        if (_delete_records_eviction_offset == model::offset{}) {
-            return model::offset{};
-        }
-        return model::next_offset(_delete_records_eviction_offset);
-    }
+    /// If `kafka::offset{}` is returned and archival storage is enabled for the
+    /// given ntp then the caller should fall back on the archival stm to check
+    /// if a start offset override exists and if so what its value is.
+    kafka::offset kafka_start_offset_override();
 
     ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
 
@@ -110,18 +112,20 @@ protected:
     ss::future<>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&&) override;
 
-    ss::future<raft::stm_snapshot> take_local_snapshot() override;
+    ss::future<raft::stm_snapshot>
+    take_local_snapshot(ssx::semaphore_units apply_units) override;
 
     virtual ss::future<model::offset> storage_eviction_event();
 
 private:
+    using base_t = raft::persisted_stm<raft::kvstore_backed_stm_snapshot>;
     void increment_start_offset(model::offset);
     bool should_process_evict(model::offset);
 
     ss::future<> monitor_log_eviction();
     ss::future<> do_write_raft_snapshot(model::offset);
     ss::future<> handle_log_eviction_events();
-    ss::future<> apply(const model::record_batch&) final;
+    ss::future<> do_apply(const model::record_batch&) final;
     ss::future<> apply_raft_snapshot(const iobuf&) final;
 
     ss::future<offset_result> replicate_command(
@@ -144,6 +148,9 @@ private:
 
     // Should be signaled every time either of the above offsets are updated.
     ss::condition_variable _has_pending_truncation;
+
+    // Kafka offset of the last `prefix_truncate_record` applied to this stm.
+    kafka::offset _cached_kafka_start_offset_override;
 };
 
 class log_eviction_stm_factory : public state_machine_factory {

@@ -331,12 +331,6 @@ inline bool moving_to_node(
 
 cluster::errc map_update_interruption_error_code(std::error_code);
 
-partition_allocation_domain get_allocation_domain(model::topic_namespace_view);
-inline partition_allocation_domain
-get_allocation_domain(const model::ntp& ntp) {
-    return get_allocation_domain(model::topic_namespace_view(ntp));
-}
-
 partition_state get_partition_state(ss::lw_shared_ptr<cluster::partition>);
 partition_raft_state get_partition_raft_state(consensus_ptr);
 std::vector<partition_stm_state> get_partition_stm_state(consensus_ptr);
@@ -353,5 +347,27 @@ std::vector<partition_stm_state> get_partition_stm_state(consensus_ptr);
 std::optional<ss::sstring> check_result_configuration(
   const members_table::cache_t& current_brokers,
   const model::broker& to_update);
+
+/// Copies the state of all persisted stms from source kvs
+ss::future<> copy_persistent_stm_state(
+  model::ntp ntp,
+  storage::kvstore& source_kvs,
+  ss::shard_id target_shard,
+  ss::sharded<storage::api>&);
+
+ss::future<> remove_persistent_stm_state(model::ntp ntp, storage::kvstore&);
+
+/// Copies all bits of partition kvstore state from source kvstore to kvstore on
+/// target shard.
+ss::future<> copy_persistent_state(
+  const model::ntp&,
+  raft::group_id,
+  storage::kvstore& source_kvs,
+  ss::shard_id target_shard,
+  ss::sharded<storage::api>&);
+
+/// Removes all bits of partition kvstore state in source kvstore.
+ss::future<> remove_persistent_state(
+  const model::ntp&, raft::group_id, storage::kvstore& source_kvs);
 
 } // namespace cluster

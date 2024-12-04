@@ -13,9 +13,17 @@
 
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/errc.h"
+#include "cluster/feature_update_action.h"
 #include "cluster/fwd.h"
+#include "cluster/nt_revision.h"
+#include "cluster/remote_topic_properties.h"
+#include "cluster/snapshot.h"
+#include "cluster/topic_configuration.h"
+#include "cluster/topic_properties.h"
+#include "cluster/tx_errc.h"
 #include "cluster/tx_hash_ranges.h"
 #include "cluster/version.h"
+#include "container/contiguous_range_map.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -31,16 +39,23 @@
 #include "security/role.h"
 #include "security/scram_credential.h"
 #include "security/types.h"
-#include "serde/envelope.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/chrono.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/inet_address.h"
+#include "serde/rw/map.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/sstring.h"
+#include "serde/rw/vector.h"
 #include "storage/ntp_config.h"
-#include "tristate.h"
+#include "utils/tristate.h"
 #include "v8_engine/data_policy.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/btree_set.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/node_hash_map.h>
 #include <absl/hash/hash.h>
@@ -161,55 +176,6 @@ struct reset_id_allocator_reply
     auto serde_fields() { return std::tie(ec); }
 };
 
-enum class tx_errc {
-    none = 0,
-    leader_not_found,
-    shard_not_found,
-    partition_not_found,
-    stm_not_found,
-    partition_not_exists,
-    pid_not_found,
-    // when a request times out a client should not do any assumptions about its
-    // effect. the request may time out before reaching the server, the request
-    // may be successuly processed or may fail and the reply times out
-    timeout,
-    conflict,
-    fenced,
-    stale,
-    not_coordinator,
-    coordinator_not_available,
-    preparing_rebalance,
-    rebalance_in_progress,
-    coordinator_load_in_progress,
-    // an unspecified error happened, the effect of the request is unknown
-    // the error code is very similar to timeout
-    unknown_server_error,
-    // an unspecified error happened, a client may assume it had zero effect on
-    // the target node
-    request_rejected,
-    invalid_producer_id_mapping,
-    invalid_txn_state,
-    invalid_producer_epoch,
-    tx_not_found,
-    tx_id_not_found,
-    partition_disabled,
-};
-
-std::ostream& operator<<(std::ostream&, const tx_errc&);
-
-struct tx_errc_category final : public std::error_category {
-    const char* name() const noexcept final { return "cluster::tx_errc"; }
-
-    std::string message(int) const final;
-};
-inline const std::error_category& tx_error_category() noexcept {
-    static tx_errc_category e;
-    return e;
-}
-inline std::error_code make_error_code(tx_errc e) noexcept {
-    return std::error_code(static_cast<int>(e), tx_error_category());
-}
-
 struct kafka_result {
     kafka::offset last_offset;
 };
@@ -236,926 +202,6 @@ enum class partition_removal_mode : uint8_t {
     // The partition is being permanently deleted from all nodes:
     // remove remote data as well as local data.
     global = 1
-};
-
-struct try_abort_reply
-  : serde::
-      envelope<try_abort_reply, serde::version<0>, serde::compat_version<0>> {
-    using committed_type = ss::bool_class<struct committed_type_tag>;
-    using aborted_type = ss::bool_class<struct aborted_type_tag>;
-
-    using rpc_adl_exempt = std::true_type;
-
-    committed_type commited;
-    aborted_type aborted;
-    tx_errc ec;
-
-    try_abort_reply() noexcept = default;
-
-    try_abort_reply(committed_type committed, aborted_type aborted, tx_errc ec)
-      : commited(committed)
-      , aborted(aborted)
-      , ec(ec) {}
-
-    explicit try_abort_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool operator==(const try_abort_reply&, const try_abort_reply&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const try_abort_reply& r);
-
-    static try_abort_reply make_aborted() {
-        return {committed_type::no, aborted_type::yes, tx_errc::none};
-    }
-
-    static try_abort_reply make_committed() {
-        return {committed_type::yes, aborted_type::no, tx_errc::none};
-    }
-
-    auto serde_fields() { return std::tie(commited, aborted, ec); }
-};
-
-struct try_abort_request
-  : serde::
-      envelope<try_abort_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    using reply = try_abort_reply;
-    static constexpr const std::string_view name = "try_abort";
-
-    model::partition_id tm;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    try_abort_request() noexcept = default;
-
-    try_abort_request(
-      model::partition_id tm,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : tm(tm)
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    friend bool operator==(const try_abort_request&, const try_abort_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const try_abort_request& r);
-
-    auto serde_fields() { return std::tie(tm, pid, tx_seq, timeout); }
-};
-
-struct init_tm_tx_request
-  : serde::envelope<
-      init_tm_tx_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    kafka::transactional_id tx_id{};
-    std::chrono::milliseconds transaction_timeout_ms{};
-    model::timeout_clock::duration timeout{};
-
-    init_tm_tx_request() noexcept = default;
-
-    init_tm_tx_request(
-      kafka::transactional_id tx_id,
-      std::chrono::milliseconds tx_timeout,
-      model::timeout_clock::duration timeout)
-      : tx_id(std::move(tx_id))
-      , transaction_timeout_ms(tx_timeout)
-      , timeout(timeout) {}
-
-    friend bool operator==(const init_tm_tx_request&, const init_tm_tx_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const init_tm_tx_request& r);
-
-    auto serde_fields() {
-        return std::tie(tx_id, transaction_timeout_ms, timeout);
-    }
-};
-
-struct init_tm_tx_reply
-  : serde::
-      envelope<init_tm_tx_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    // partition_not_exists, not_leader, topic_not_exists
-    model::producer_identity pid;
-    tx_errc ec;
-
-    init_tm_tx_reply() noexcept = default;
-
-    init_tm_tx_reply(model::producer_identity pid, tx_errc ec)
-      : pid(pid)
-      , ec(ec) {}
-
-    friend bool operator==(const init_tm_tx_reply&, const init_tm_tx_reply&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const init_tm_tx_reply& r);
-
-    explicit init_tm_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    auto serde_fields() { return std::tie(pid, ec); }
-};
-
-struct add_paritions_tx_request {
-    struct topic {
-        model::topic name{};
-        std::vector<model::partition_id> partitions{};
-        friend std::ostream& operator<<(std::ostream&, const topic&);
-    };
-    kafka::transactional_id transactional_id{};
-    kafka::producer_id producer_id{};
-    int16_t producer_epoch{};
-    std::vector<topic> topics{};
-};
-struct add_paritions_tx_reply {
-    struct partition_result {
-        model::partition_id partition_index{};
-        tx_errc error_code{};
-    };
-    struct topic_result {
-        model::topic name{};
-        std::vector<add_paritions_tx_reply::partition_result> results{};
-    };
-    std::vector<add_paritions_tx_reply::topic_result> results{};
-};
-struct add_offsets_tx_request {
-    kafka::transactional_id transactional_id{};
-    kafka::producer_id producer_id{};
-    int16_t producer_epoch{};
-    kafka::group_id group_id{};
-};
-struct add_offsets_tx_reply {
-    tx_errc error_code{};
-};
-struct end_tx_request {
-    kafka::transactional_id transactional_id{};
-    kafka::producer_id producer_id{};
-    int16_t producer_epoch{};
-    bool committed{};
-};
-struct end_tx_reply {
-    tx_errc error_code{};
-};
-struct fetch_tx_request
-  : serde::
-      envelope<fetch_tx_request, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    kafka::transactional_id tx_id{};
-    model::term_id term{};
-    model::partition_id tm{0};
-
-    fetch_tx_request() noexcept = default;
-
-    fetch_tx_request(
-      kafka::transactional_id tx_id,
-      model::term_id term,
-      model::partition_id tm)
-      : tx_id(tx_id)
-      , term(term)
-      , tm(tm) {}
-
-    friend bool operator==(const fetch_tx_request&, const fetch_tx_request&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const fetch_tx_request& r);
-
-    auto serde_fields() { return std::tie(tx_id, term, tm); }
-};
-
-struct fetch_tx_reply
-  : serde::
-      envelope<fetch_tx_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    enum tx_status : int32_t {
-        ongoing,
-        preparing,
-        prepared,
-        aborting,
-        killed,
-        ready,
-        tombstone,
-    };
-
-    struct tx_partition
-      : serde::
-          envelope<tx_partition, serde::version<0>, serde::compat_version<0>> {
-        using rpc_adl_exempt = std::true_type;
-
-        model::ntp ntp;
-        model::term_id etag;
-        model::revision_id topic_revision;
-
-        tx_partition() noexcept = default;
-
-        tx_partition(
-          model::ntp ntp,
-          model::term_id etag,
-          model::revision_id topic_revision)
-          : ntp(ntp)
-          , etag(etag)
-          , topic_revision(topic_revision) {}
-
-        friend bool operator==(const tx_partition&, const tx_partition&)
-          = default;
-
-        friend std::ostream& operator<<(std::ostream& o, const tx_partition& r);
-
-        auto serde_fields() { return std::tie(ntp, etag, topic_revision); }
-    };
-
-    struct tx_group
-      : serde::envelope<tx_group, serde::version<0>, serde::compat_version<0>> {
-        using rpc_adl_exempt = std::true_type;
-
-        kafka::group_id group_id;
-        model::term_id etag;
-
-        tx_group() noexcept = default;
-
-        tx_group(kafka::group_id group_id, model::term_id etag)
-          : group_id(group_id)
-          , etag(etag) {}
-
-        friend bool operator==(const tx_group&, const tx_group&) = default;
-
-        friend std::ostream& operator<<(std::ostream& o, const tx_group& r);
-
-        auto serde_fields() { return std::tie(group_id, etag); }
-    };
-
-    tx_errc ec{};
-    model::producer_identity pid{};
-    model::producer_identity last_pid{};
-    model::tx_seq tx_seq{};
-    std::chrono::milliseconds timeout_ms{};
-    tx_status status{};
-    std::vector<tx_partition> partitions{};
-    std::vector<tx_group> groups{};
-
-    fetch_tx_reply() noexcept = default;
-
-    fetch_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    fetch_tx_reply(
-      tx_errc ec,
-      model::producer_identity pid,
-      model::producer_identity last_pid,
-      model::tx_seq tx_seq,
-      std::chrono::milliseconds timeout_ms,
-      tx_status status,
-      std::vector<tx_partition> partitions,
-      std::vector<tx_group> groups)
-      : ec(ec)
-      , pid(pid)
-      , last_pid(last_pid)
-      , tx_seq(tx_seq)
-      , timeout_ms(timeout_ms)
-      , status(status)
-      , partitions(partitions)
-      , groups(groups) {}
-
-    friend bool operator==(const fetch_tx_reply&, const fetch_tx_reply&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const fetch_tx_reply& r);
-
-    auto serde_fields() {
-        return std::tie(
-          ec, pid, last_pid, tx_seq, timeout_ms, status, partitions, groups);
-    }
-};
-
-struct begin_tx_request
-  : serde::
-      envelope<begin_tx_request, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    model::ntp ntp;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    std::chrono::milliseconds transaction_timeout_ms{};
-    model::partition_id tm_partition{0};
-
-    begin_tx_request() noexcept = default;
-
-    begin_tx_request(
-      model::ntp ntp,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      std::chrono::milliseconds transaction_timeout_ms,
-      model::partition_id tm_partition)
-      : ntp(std::move(ntp))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , transaction_timeout_ms(transaction_timeout_ms)
-      , tm_partition(tm_partition) {}
-
-    friend bool operator==(const begin_tx_request&, const begin_tx_request&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const begin_tx_request& r);
-
-    auto serde_fields() {
-        return std::tie(ntp, pid, tx_seq, transaction_timeout_ms, tm_partition);
-    }
-};
-
-struct begin_tx_reply
-  : serde::
-      envelope<begin_tx_reply, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    model::ntp ntp;
-    model::term_id etag;
-    tx_errc ec;
-    model::revision_id topic_revision = model::revision_id(-1);
-
-    begin_tx_reply() noexcept = default;
-
-    begin_tx_reply(
-      model::ntp ntp,
-      model::term_id etag,
-      tx_errc ec,
-      model::revision_id topic_revision)
-      : ntp(std::move(ntp))
-      , etag(etag)
-      , ec(ec)
-      , topic_revision(topic_revision) {}
-
-    begin_tx_reply(model::ntp ntp, model::term_id etag, tx_errc ec)
-      : ntp(std::move(ntp))
-      , etag(etag)
-      , ec(ec) {}
-
-    begin_tx_reply(model::ntp ntp, tx_errc ec)
-      : ntp(std::move(ntp))
-      , ec(ec) {}
-
-    friend bool operator==(const begin_tx_reply&, const begin_tx_reply&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const begin_tx_reply& r);
-
-    auto serde_fields() { return std::tie(ntp, etag, ec, topic_revision); }
-};
-
-struct prepare_tx_request
-  : serde::envelope<
-      prepare_tx_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    model::term_id etag;
-    model::partition_id tm;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    prepare_tx_request() noexcept = default;
-
-    prepare_tx_request(
-      model::ntp ntp,
-      model::term_id etag,
-      model::partition_id tm,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , etag(etag)
-      , tm(tm)
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    friend bool operator==(const prepare_tx_request&, const prepare_tx_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const prepare_tx_request& r);
-
-    auto serde_fields() {
-        return std::tie(ntp, etag, tm, pid, tx_seq, timeout);
-    }
-};
-
-struct prepare_tx_reply
-  : serde::
-      envelope<prepare_tx_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    tx_errc ec{};
-
-    prepare_tx_reply() noexcept = default;
-
-    explicit prepare_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool operator==(const prepare_tx_reply&, const prepare_tx_reply&)
-      = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const prepare_tx_reply& r);
-
-    auto serde_fields() { return std::tie(ec); }
-};
-
-struct commit_tx_request
-  : serde::
-      envelope<commit_tx_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    commit_tx_request() noexcept = default;
-
-    commit_tx_request(
-      model::ntp ntp,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    friend bool operator==(const commit_tx_request&, const commit_tx_request&)
-      = default;
-
-    auto serde_fields() { return std::tie(ntp, pid, tx_seq, timeout); }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const commit_tx_request& r);
-};
-
-struct commit_tx_reply
-  : serde::
-      envelope<commit_tx_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    tx_errc ec{};
-
-    commit_tx_reply() noexcept = default;
-
-    explicit commit_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool operator==(const commit_tx_reply&, const commit_tx_reply&)
-      = default;
-
-    auto serde_fields() { return std::tie(ec); }
-
-    friend std::ostream& operator<<(std::ostream& o, const commit_tx_reply& r);
-};
-
-struct abort_tx_request
-  : serde::
-      envelope<abort_tx_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    abort_tx_request() noexcept = default;
-
-    abort_tx_request(
-      model::ntp ntp,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    friend bool operator==(const abort_tx_request&, const abort_tx_request&)
-      = default;
-
-    auto serde_fields() { return std::tie(ntp, pid, tx_seq, timeout); }
-
-    friend std::ostream& operator<<(std::ostream& o, const abort_tx_request& r);
-};
-
-struct abort_tx_reply
-  : serde::
-      envelope<abort_tx_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    tx_errc ec{};
-
-    abort_tx_reply() noexcept = default;
-
-    explicit abort_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool operator==(const abort_tx_reply&, const abort_tx_reply&)
-      = default;
-
-    auto serde_fields() { return std::tie(ec); }
-
-    friend std::ostream& operator<<(std::ostream& o, const abort_tx_reply& r);
-};
-
-struct begin_group_tx_request
-  : serde::envelope<
-      begin_group_tx_request,
-      serde::version<1>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    kafka::group_id group_id;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-    model::partition_id tm_partition{0};
-
-    begin_group_tx_request() noexcept = default;
-
-    begin_group_tx_request(
-      model::ntp ntp,
-      kafka::group_id group_id,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout,
-      model::partition_id tm)
-      : ntp(std::move(ntp))
-      , group_id(std::move(group_id))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout)
-      , tm_partition(tm) {}
-
-    /*
-     * construct with default value model::ntp
-     * https://github.com/redpanda-data/redpanda/issues/5055
-     */
-    begin_group_tx_request(
-      kafka::group_id group_id,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout,
-      model::partition_id tm)
-      : begin_group_tx_request(
-        model::ntp(), std::move(group_id), pid, tx_seq, timeout, tm) {}
-
-    friend bool
-    operator==(const begin_group_tx_request&, const begin_group_tx_request&)
-      = default;
-
-    auto serde_fields() {
-        return std::tie(ntp, group_id, pid, tx_seq, timeout, tm_partition);
-    }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const begin_group_tx_request& r);
-};
-
-struct begin_group_tx_reply
-  : serde::envelope<
-      begin_group_tx_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::term_id etag;
-    tx_errc ec{};
-
-    begin_group_tx_reply() noexcept = default;
-
-    explicit begin_group_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    begin_group_tx_reply(model::term_id etag, tx_errc ec)
-      : etag(etag)
-      , ec(ec) {}
-
-    friend bool
-    operator==(const begin_group_tx_reply&, const begin_group_tx_reply&)
-      = default;
-
-    auto serde_fields() { return std::tie(etag, ec); }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const begin_group_tx_reply& r);
-};
-
-struct prepare_group_tx_request
-  : serde::envelope<
-      prepare_group_tx_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    kafka::group_id group_id;
-    model::term_id etag;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    prepare_group_tx_request() noexcept = default;
-
-    prepare_group_tx_request(
-      model::ntp ntp,
-      kafka::group_id group_id,
-      model::term_id etag,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , group_id(std::move(group_id))
-      , etag(etag)
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    /*
-     * construct with default value model::ntp
-     * https://github.com/redpanda-data/redpanda/issues/5055
-     */
-    prepare_group_tx_request(
-      kafka::group_id group_id,
-      model::term_id etag,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : prepare_group_tx_request(
-        model::ntp(), std::move(group_id), etag, pid, tx_seq, timeout) {}
-
-    auto serde_fields() {
-        return std::tie(ntp, group_id, etag, pid, tx_seq, timeout);
-    }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const prepare_group_tx_request& r);
-
-    friend bool
-    operator==(const prepare_group_tx_request&, const prepare_group_tx_request&)
-      = default;
-};
-
-struct prepare_group_tx_reply
-  : serde::envelope<
-      prepare_group_tx_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    tx_errc ec{};
-
-    prepare_group_tx_reply() noexcept = default;
-
-    explicit prepare_group_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool
-    operator==(const prepare_group_tx_reply&, const prepare_group_tx_reply&)
-      = default;
-
-    auto serde_fields() { return std::tie(ec); }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const prepare_group_tx_reply& r);
-};
-
-struct commit_group_tx_request
-  : serde::envelope<
-      commit_group_tx_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    model::ntp ntp;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    kafka::group_id group_id;
-    model::timeout_clock::duration timeout{};
-
-    commit_group_tx_request() noexcept = default;
-
-    commit_group_tx_request(
-      model::ntp ntp,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      kafka::group_id group_id,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , group_id(std::move(group_id))
-      , timeout(timeout) {}
-
-    /*
-     * construct with default value model::ntp
-     * https://github.com/redpanda-data/redpanda/issues/5055
-     */
-    commit_group_tx_request(
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      kafka::group_id group_id,
-      model::timeout_clock::duration timeout)
-      : commit_group_tx_request(
-        model::ntp(), pid, tx_seq, std::move(group_id), timeout) {}
-
-    friend bool
-    operator==(const commit_group_tx_request&, const commit_group_tx_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const commit_group_tx_request& r);
-
-    auto serde_fields() {
-        return std::tie(ntp, pid, tx_seq, group_id, timeout);
-    }
-};
-
-struct commit_group_tx_reply
-  : serde::envelope<
-      commit_group_tx_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    tx_errc ec{};
-
-    commit_group_tx_reply() noexcept = default;
-
-    explicit commit_group_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool
-    operator==(const commit_group_tx_reply&, const commit_group_tx_reply&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const commit_group_tx_reply& r);
-
-    auto serde_fields() { return std::tie(ec); }
-};
-
-struct abort_group_tx_request
-  : serde::envelope<
-      abort_group_tx_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    model::ntp ntp;
-    kafka::group_id group_id;
-    model::producer_identity pid;
-    model::tx_seq tx_seq;
-    model::timeout_clock::duration timeout{};
-
-    abort_group_tx_request() noexcept = default;
-
-    abort_group_tx_request(
-      model::ntp ntp,
-      kafka::group_id group_id,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : ntp(std::move(ntp))
-      , group_id(std::move(group_id))
-      , pid(pid)
-      , tx_seq(tx_seq)
-      , timeout(timeout) {}
-
-    /*
-     * construct with default value model::ntp
-     * https://github.com/redpanda-data/redpanda/issues/5055
-     */
-    abort_group_tx_request(
-      kafka::group_id group_id,
-      model::producer_identity pid,
-      model::tx_seq tx_seq,
-      model::timeout_clock::duration timeout)
-      : abort_group_tx_request(
-        model::ntp(), std::move(group_id), pid, tx_seq, timeout) {}
-
-    friend bool
-    operator==(const abort_group_tx_request&, const abort_group_tx_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const abort_group_tx_request& r);
-
-    auto serde_fields() {
-        return std::tie(ntp, group_id, pid, tx_seq, timeout);
-    }
-};
-
-struct abort_group_tx_reply
-  : serde::envelope<
-      abort_group_tx_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    tx_errc ec{};
-
-    abort_group_tx_reply() noexcept = default;
-
-    explicit abort_group_tx_reply(tx_errc ec)
-      : ec(ec) {}
-
-    friend bool
-    operator==(const abort_group_tx_reply&, const abort_group_tx_reply&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const abort_group_tx_reply& r);
-
-    auto serde_fields() { return std::tie(ec); }
-};
-
-struct find_coordinator_reply
-  : serde::envelope<
-      find_coordinator_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
-    std::optional<model::node_id> coordinator{std::nullopt};
-    std::optional<model::ntp> ntp{std::nullopt};
-    errc ec{errc::generic_tx_error}; // this should have been tx_errc
-
-    find_coordinator_reply() noexcept = default;
-
-    // this is a hack to blend find_coordinator_reply into do_route_locally
-    find_coordinator_reply(tx_errc tx_ec)
-      : coordinator(std::nullopt)
-      , ntp(std::nullopt) {
-        if (tx_ec == tx_errc::none) {
-            ec = errc::success;
-        } else if (tx_ec == tx_errc::shard_not_found) {
-            ec = errc::not_leader;
-        } else {
-            ec = errc::generic_tx_error;
-        }
-    }
-
-    find_coordinator_reply(errc ec)
-      : coordinator(std::nullopt)
-      , ntp(std::nullopt)
-      , ec(ec) {}
-
-    find_coordinator_reply(
-      std::optional<model::node_id> coordinator,
-      std::optional<model::ntp> ntp,
-      errc ec)
-      : coordinator(coordinator)
-      , ntp(ntp)
-      , ec(ec) {}
-
-    friend bool
-    operator==(const find_coordinator_reply&, const find_coordinator_reply&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const find_coordinator_reply& r);
-
-    auto serde_fields() { return std::tie(coordinator, ntp, ec); }
-};
-
-struct find_coordinator_request
-  : serde::envelope<
-      find_coordinator_request,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    using reply = find_coordinator_reply;
-    static constexpr const std::string_view name = "find_coordinator";
-
-    kafka::transactional_id tid;
-
-    find_coordinator_request() noexcept = default;
-
-    find_coordinator_request(kafka::transactional_id tid)
-      : tid(std::move(tid)) {}
-
-    friend bool
-    operator==(const find_coordinator_request&, const find_coordinator_request&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const find_coordinator_request& r);
-
-    auto serde_fields() { return std::tie(tid); }
 };
 
 struct join_node_request
@@ -1436,205 +482,6 @@ struct partition_assignment
       = default;
 };
 
-struct remote_topic_properties
-  : serde::envelope<
-      remote_topic_properties,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    remote_topic_properties() = default;
-    remote_topic_properties(
-      model::initial_revision_id remote_revision,
-      int32_t remote_partition_count)
-      : remote_revision(remote_revision)
-      , remote_partition_count(remote_partition_count) {}
-
-    model::initial_revision_id remote_revision;
-    int32_t remote_partition_count;
-
-    auto serde_fields() {
-        return std::tie(remote_revision, remote_partition_count);
-    }
-
-    friend bool
-    operator==(const remote_topic_properties&, const remote_topic_properties&)
-      = default;
-
-    friend std::ostream&
-    operator<<(std::ostream&, const remote_topic_properties&);
-};
-
-/**
- * Structure holding topic properties overrides, empty values will be replaced
- * with defaults
- */
-struct topic_properties
-  : serde::
-      envelope<topic_properties, serde::version<8>, serde::compat_version<0>> {
-    topic_properties() noexcept = default;
-    topic_properties(
-      std::optional<model::compression> compression,
-      std::optional<model::cleanup_policy_bitflags> cleanup_policy_bitflags,
-      std::optional<model::compaction_strategy> compaction_strategy,
-      std::optional<model::timestamp_type> timestamp_type,
-      std::optional<size_t> segment_size,
-      tristate<size_t> retention_bytes,
-      tristate<std::chrono::milliseconds> retention_duration,
-      std::optional<bool> recovery,
-      std::optional<model::shadow_indexing_mode> shadow_indexing,
-      std::optional<bool> read_replica,
-      std::optional<ss::sstring> read_replica_bucket,
-      std::optional<remote_topic_properties> remote_topic_properties,
-      std::optional<uint32_t> batch_max_bytes,
-      tristate<size_t> retention_local_target_bytes,
-      tristate<std::chrono::milliseconds> retention_local_target_ms,
-      bool remote_delete,
-      tristate<std::chrono::milliseconds> segment_ms,
-      std::optional<bool> record_key_schema_id_validation,
-      std::optional<bool> record_key_schema_id_validation_compat,
-      std::optional<pandaproxy::schema_registry::subject_name_strategy>
-        record_key_subject_name_strategy,
-      std::optional<pandaproxy::schema_registry::subject_name_strategy>
-        record_key_subject_name_strategy_compat,
-      std::optional<bool> record_value_schema_id_validation,
-      std::optional<bool> record_value_schema_id_validation_compat,
-      std::optional<pandaproxy::schema_registry::subject_name_strategy>
-        record_value_subject_name_strategy,
-      std::optional<pandaproxy::schema_registry::subject_name_strategy>
-        record_value_subject_name_strategy_compat,
-      tristate<size_t> initial_retention_local_target_bytes,
-      tristate<std::chrono::milliseconds> initial_retention_local_target_ms,
-      std::optional<model::vcluster_id> mpx_virtual_cluster_id,
-      std::optional<model::write_caching_mode> write_caching,
-      std::optional<std::chrono::milliseconds> flush_ms,
-      std::optional<size_t> flush_bytes)
-      : compression(compression)
-      , cleanup_policy_bitflags(cleanup_policy_bitflags)
-      , compaction_strategy(compaction_strategy)
-      , timestamp_type(timestamp_type)
-      , segment_size(segment_size)
-      , retention_bytes(retention_bytes)
-      , retention_duration(retention_duration)
-      , recovery(recovery)
-      , shadow_indexing(shadow_indexing)
-      , read_replica(read_replica)
-      , read_replica_bucket(std::move(read_replica_bucket))
-      , remote_topic_properties(remote_topic_properties)
-      , batch_max_bytes(batch_max_bytes)
-      , retention_local_target_bytes(retention_local_target_bytes)
-      , retention_local_target_ms(retention_local_target_ms)
-      , remote_delete(remote_delete)
-      , segment_ms(segment_ms)
-      , record_key_schema_id_validation(record_key_schema_id_validation)
-      , record_key_schema_id_validation_compat(
-          record_key_schema_id_validation_compat)
-      , record_key_subject_name_strategy(record_key_subject_name_strategy)
-      , record_key_subject_name_strategy_compat(
-          record_key_subject_name_strategy_compat)
-      , record_value_schema_id_validation(record_value_schema_id_validation)
-      , record_value_schema_id_validation_compat(
-          record_value_schema_id_validation_compat)
-      , record_value_subject_name_strategy(record_value_subject_name_strategy)
-      , record_value_subject_name_strategy_compat(
-          record_value_subject_name_strategy_compat)
-      , initial_retention_local_target_bytes(
-          initial_retention_local_target_bytes)
-      , initial_retention_local_target_ms(initial_retention_local_target_ms)
-      , mpx_virtual_cluster_id(mpx_virtual_cluster_id)
-      , write_caching(write_caching)
-      , flush_ms(flush_ms)
-      , flush_bytes(flush_bytes) {}
-
-    std::optional<model::compression> compression;
-    std::optional<model::cleanup_policy_bitflags> cleanup_policy_bitflags;
-    std::optional<model::compaction_strategy> compaction_strategy;
-    std::optional<model::timestamp_type> timestamp_type;
-    std::optional<size_t> segment_size;
-    tristate<size_t> retention_bytes{std::nullopt};
-    tristate<std::chrono::milliseconds> retention_duration{std::nullopt};
-    std::optional<bool> recovery;
-    std::optional<model::shadow_indexing_mode> shadow_indexing;
-    std::optional<bool> read_replica;
-    std::optional<ss::sstring> read_replica_bucket;
-    std::optional<remote_topic_properties> remote_topic_properties;
-    std::optional<uint32_t> batch_max_bytes;
-    tristate<size_t> retention_local_target_bytes{std::nullopt};
-    tristate<std::chrono::milliseconds> retention_local_target_ms{std::nullopt};
-
-    // Remote deletes are enabled by default in new tiered storage topics,
-    // disabled by default in legacy topics during upgrade.
-    // This is intentionally not an optional: all topics have a concrete value
-    // one way or another.  There is no "use the cluster default".
-    bool remote_delete{storage::ntp_config::default_remote_delete};
-
-    tristate<std::chrono::milliseconds> segment_ms{std::nullopt};
-
-    std::optional<bool> record_key_schema_id_validation;
-    std::optional<bool> record_key_schema_id_validation_compat;
-    std::optional<pandaproxy::schema_registry::subject_name_strategy>
-      record_key_subject_name_strategy;
-    std::optional<pandaproxy::schema_registry::subject_name_strategy>
-      record_key_subject_name_strategy_compat;
-    std::optional<bool> record_value_schema_id_validation;
-    std::optional<bool> record_value_schema_id_validation_compat;
-    std::optional<pandaproxy::schema_registry::subject_name_strategy>
-      record_value_subject_name_strategy;
-    std::optional<pandaproxy::schema_registry::subject_name_strategy>
-      record_value_subject_name_strategy_compat;
-
-    tristate<size_t> initial_retention_local_target_bytes{std::nullopt};
-    tristate<std::chrono::milliseconds> initial_retention_local_target_ms{
-      std::nullopt};
-    std::optional<model::vcluster_id> mpx_virtual_cluster_id;
-    std::optional<model::write_caching_mode> write_caching;
-    std::optional<std::chrono::milliseconds> flush_ms;
-    std::optional<size_t> flush_bytes;
-
-    bool is_compacted() const;
-    bool has_overrides() const;
-    bool requires_remote_erase() const;
-
-    storage::ntp_config::default_overrides get_ntp_cfg_overrides() const;
-
-    friend std::ostream& operator<<(std::ostream&, const topic_properties&);
-    auto serde_fields() {
-        return std::tie(
-          compression,
-          cleanup_policy_bitflags,
-          compaction_strategy,
-          timestamp_type,
-          segment_size,
-          retention_bytes,
-          retention_duration,
-          recovery,
-          shadow_indexing,
-          read_replica,
-          read_replica_bucket,
-          remote_topic_properties,
-          batch_max_bytes,
-          retention_local_target_bytes,
-          retention_local_target_ms,
-          remote_delete,
-          segment_ms,
-          record_key_schema_id_validation,
-          record_key_schema_id_validation_compat,
-          record_key_subject_name_strategy,
-          record_key_subject_name_strategy_compat,
-          record_value_schema_id_validation,
-          record_value_schema_id_validation_compat,
-          record_value_subject_name_strategy,
-          record_value_subject_name_strategy_compat,
-          initial_retention_local_target_bytes,
-          initial_retention_local_target_ms,
-          mpx_virtual_cluster_id,
-          write_caching,
-          flush_ms,
-          flush_bytes);
-    }
-
-    friend bool operator==(const topic_properties&, const topic_properties&)
-      = default;
-};
-
 enum incremental_update_operation : int8_t { none, set, remove };
 
 inline std::string_view
@@ -1688,7 +535,7 @@ struct property_update<tristate<T>>
       serde::version<0>,
       serde::compat_version<0>> {
     property_update()
-      : value(std::nullopt){};
+      : value(std::nullopt) {};
 
     property_update(tristate<T> v, incremental_update_operation op)
       : value(std::move(v))
@@ -1716,7 +563,7 @@ struct property_update<tristate<T>>
 struct incremental_topic_updates
   : serde::envelope<
       incremental_topic_updates,
-      serde::version<6>,
+      serde::version<7>,
       serde::compat_version<0>> {
     static constexpr int8_t version_with_data_policy = -1;
     static constexpr int8_t version_with_shadow_indexing = -3;
@@ -1734,6 +581,10 @@ struct incremental_topic_updates
     // -6 - topic updates with schema id validation
     // -7 - topic updates with initial retention
     // -8 - write caching properties
+    // NOTE: As newly-serialized objects will always use serde format, we don't
+    // need to support subsequently added fields in ADL routines - those should
+    // just be able to deserialize fields that could be present in older
+    // objects.
     static constexpr int8_t version = version_with_write_caching;
     property_update<std::optional<model::compression>> compression;
     property_update<std::optional<model::cleanup_policy_bitflags>>
@@ -1744,11 +595,14 @@ struct incremental_topic_updates
     property_update<std::optional<size_t>> segment_size;
     property_update<tristate<size_t>> retention_bytes;
     property_update<tristate<std::chrono::milliseconds>> retention_duration;
-    property_update<std::optional<model::shadow_indexing_mode>> shadow_indexing;
     property_update<std::optional<uint32_t>> batch_max_bytes;
     property_update<tristate<size_t>> retention_local_target_bytes;
     property_update<tristate<std::chrono::milliseconds>>
       retention_local_target_ms;
+    property_update<bool> remote_read{
+      false, incremental_update_operation::none};
+    property_update<bool> remote_write{
+      false, incremental_update_operation::none};
     property_update<bool> remote_delete{
       false, incremental_update_operation::none};
     property_update<tristate<std::chrono::milliseconds>> segment_ms;
@@ -1775,6 +629,18 @@ struct incremental_topic_updates
     property_update<std::optional<model::write_caching_mode>> write_caching;
     property_update<std::optional<std::chrono::milliseconds>> flush_ms;
     property_update<std::optional<size_t>> flush_bytes;
+    property_update<model::iceberg_mode> iceberg_mode{
+      storage::ntp_config::default_iceberg_mode,
+      incremental_update_operation::none};
+    property_update<std::optional<config::leaders_preference>>
+      leaders_preference;
+    property_update<tristate<std::chrono::milliseconds>> delete_retention_ms;
+    property_update<std::optional<bool>> iceberg_delete;
+
+    // To allow us to better control use of the deprecated shadow_indexing
+    // field, use getters and setters instead.
+    const auto& get_shadow_indexing() const { return shadow_indexing; }
+    auto& get_shadow_indexing() { return shadow_indexing; }
 
     auto serde_fields() {
         return std::tie(
@@ -1803,7 +669,13 @@ struct incremental_topic_updates
           initial_retention_local_target_ms,
           write_caching,
           flush_ms,
-          flush_bytes);
+          flush_bytes,
+          iceberg_mode,
+          leaders_preference,
+          remote_read,
+          remote_write,
+          delete_retention_ms,
+          iceberg_delete);
     }
 
     friend std::ostream&
@@ -1812,6 +684,11 @@ struct incremental_topic_updates
     friend bool operator==(
       const incremental_topic_updates&, const incremental_topic_updates&)
       = default;
+
+private:
+    // This field is kept here for legacy purposes, but should be considered
+    // deprecated in favour of remote_read and remote_write.
+    property_update<std::optional<model::shadow_indexing_mode>> shadow_indexing;
 };
 
 using replication_factor
@@ -1891,78 +768,6 @@ struct topic_properties_update
 
 using topic_properties_update_vector = chunked_vector<topic_properties_update>;
 
-// Structure holding topic configuration, optionals will be replaced by broker
-// defaults
-struct topic_configuration
-  : serde::envelope<
-      topic_configuration,
-      serde::version<1>,
-      serde::compat_version<0>> {
-    topic_configuration(
-      model::ns ns,
-      model::topic topic,
-      int32_t partition_count,
-      int16_t replication_factor)
-      : tp_ns(std::move(ns), std::move(topic))
-      , partition_count(partition_count)
-      , replication_factor(replication_factor) {}
-
-    topic_configuration() = default;
-
-    storage::ntp_config make_ntp_config(
-      const ss::sstring&,
-      model::partition_id,
-      model::revision_id,
-      model::initial_revision_id) const;
-
-    bool is_internal() const {
-        return tp_ns.ns == model::kafka_internal_namespace
-               || tp_ns == model::kafka_consumer_offsets_nt;
-    }
-    bool is_read_replica() const {
-        return properties.read_replica && properties.read_replica.value();
-    }
-    bool is_recovery_enabled() const {
-        return properties.recovery && properties.recovery.value();
-    }
-
-    model::topic_namespace tp_ns;
-    // using signed integer because Kafka protocol defines it as signed int
-    int32_t partition_count;
-    // using signed integer because Kafka protocol defines it as signed int
-    int16_t replication_factor;
-
-    topic_properties properties;
-
-    auto serde_fields() {
-        return std::tie(tp_ns, partition_count, replication_factor, properties);
-    }
-
-    void serde_read(iobuf_parser& in, const serde::header& h) {
-        using serde::read_nested;
-
-        tp_ns = read_nested<model::topic_namespace>(in, h._bytes_left_limit);
-        partition_count = read_nested<int32_t>(in, h._bytes_left_limit);
-        replication_factor = read_nested<int16_t>(in, h._bytes_left_limit);
-        properties = read_nested<topic_properties>(in, h._bytes_left_limit);
-
-        if (h._version < 1) {
-            // Legacy tiered storage topics do not delete data on
-            // topic deletion.
-            properties.remote_delete
-              = storage::ntp_config::legacy_remote_delete;
-        }
-    }
-
-    friend std::ostream& operator<<(std::ostream&, const topic_configuration&);
-
-    friend bool
-    operator==(const topic_configuration&, const topic_configuration&)
-      = default;
-};
-
-using topic_configuration_vector = chunked_vector<topic_configuration>;
-
 struct custom_partition_assignment {
     model::partition_id id;
     std::vector<model::node_id> replicas;
@@ -1976,7 +781,7 @@ struct custom_partition_assignment {
  */
 struct custom_assignable_topic_configuration {
     explicit custom_assignable_topic_configuration(topic_configuration cfg)
-      : cfg(std::move(cfg)){};
+      : cfg(std::move(cfg)) {};
 
     topic_configuration cfg;
     std::vector<custom_partition_assignment> custom_assignments;
@@ -1984,6 +789,9 @@ struct custom_assignable_topic_configuration {
     bool has_custom_assignment() const { return !custom_assignments.empty(); }
     bool is_read_replica() const { return cfg.is_read_replica(); }
     bool is_recovery_enabled() const { return cfg.is_recovery_enabled(); }
+    bool is_schema_id_validation_enabled() const {
+        return cfg.is_schema_id_validation_enabled();
+    }
 
     friend std::ostream&
     operator<<(std::ostream&, const custom_assignable_topic_configuration&);
@@ -2007,7 +815,7 @@ struct create_partitions_configuration
     // This is new total number of partitions in topic.
     int32_t new_total_partition_count;
 
-    // TODO: use when we will start supporting custom partitions assignment
+    // TODO: use when we start supporting custom partitions assignment
     std::vector<custom_assignment> custom_assignments;
 
     friend bool operator==(
@@ -2081,6 +889,15 @@ struct configuration_with_assignment
 using create_partitions_configuration_assignment
   = configuration_with_assignment<create_partitions_configuration>;
 
+// GC process consists of deleting topic data in several places, and these
+// deletions have to be tracked separately.
+enum class topic_purge_domain {
+    cloud_storage = 0,
+    iceberg = 1,
+};
+
+std::ostream& operator<<(std::ostream&, const topic_purge_domain&);
+
 /**
  * Soft-deleting a topic may put it into different modes: initially this is
  * just a two stage thing: create a marker that acts as a tombstone, later
@@ -2091,9 +908,8 @@ using create_partitions_configuration_assignment
  * no intention of deletion.
  */
 enum class topic_lifecycle_transition_mode : uint8_t {
-    // Drop the lifecycle marker: we do this after we're done with any
-    // garbage collection.
-    drop = 0,
+    // Purging of topic-related data in some topic_purge_domain is complete.
+    purged = 0,
 
     // Enter garbage collection phase: the topic appears deleted externally,
     // while internally we are garbage collecting any data that belonged
@@ -2103,6 +919,9 @@ enum class topic_lifecycle_transition_mode : uint8_t {
     // Legacy-style deletion, where we attempt to delete local data and drop
     // the topic entirely from the topic table in one step.
     oneshot_delete = 2,
+
+    // Local-only delete for migrated-from topics
+    delete_migrated = 3
 };
 
 struct nt_lifecycle_marker
@@ -2120,74 +939,64 @@ struct nt_lifecycle_marker
     auto serde_fields() { return std::tie(config, initial_revision_id); }
 };
 
-/**
- * The namespace-topic-revision tuple refers to a particular incarnation
- * of a named topic.  For topic lifecycle markers,
- */
-struct nt_revision
-  : serde::envelope<nt_revision, serde::version<0>, serde::compat_version<0>> {
-    model::topic_namespace nt;
+// A record in the topic table for a deleted topic that is pending iceberg table
+// deletion.
+struct nt_iceberg_tombstone
+  : serde::envelope<
+      nt_iceberg_tombstone,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // The topic revision of a last deleted topic for which the corresponding
+    // iceberg table has to be deleted. It is used to avoid deleting iceberg
+    // data from a topic with the same name that was created later. If several
+    // iceberg-enabled topics with the same name are created and deleted in a
+    // rapid succession, we just update this revision (the corresponding table
+    // only has to be deleted once).
+    model::revision_id last_deleted_revision;
 
-    // The initial revision ID of partition 0.
-    model::initial_revision_id initial_revision_id;
-
-    template<typename H>
-    friend H AbslHashValue(H h, const nt_revision& ntr) {
-        return H::combine(std::move(h), ntr.nt, ntr.initial_revision_id);
-    }
-
-    friend bool operator==(const nt_revision& lhs, const nt_revision& rhs);
-    friend std::ostream& operator<<(std::ostream&, const nt_revision&);
-
-    auto serde_fields() { return std::tie(nt, initial_revision_id); }
-};
-
-struct nt_revision_hash {
-    using is_transparent = void;
-
-    size_t operator()(const nt_revision& v) const {
-        return absl::Hash<nt_revision>{}(v);
-    }
-};
-
-struct nt_revision_eq {
-    using is_transparent = void;
-
-    bool operator()(const nt_revision& lhs, const nt_revision& rhs) const {
-        return lhs.nt == rhs.nt
-               && lhs.initial_revision_id == rhs.initial_revision_id;
-    }
+    auto serde_fields() { return std::tie(last_deleted_revision); }
 };
 
 struct topic_lifecycle_transition
   : serde::envelope<
       topic_lifecycle_transition,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     nt_revision topic;
 
     topic_lifecycle_transition_mode mode;
 
-    auto serde_fields() { return std::tie(topic, mode); }
+    // Used together with mode=purged. Default is cloud_storage for
+    // backwards compat (legacy lifecycle transitions were always cloud-storage
+    // related).
+    topic_purge_domain domain = topic_purge_domain::cloud_storage;
+
+    auto serde_fields() { return std::tie(topic, mode, domain); }
 };
 
 using topic_configuration_assignment
   = configuration_with_assignment<topic_configuration>;
 
 struct topic_result
-  : serde::envelope<topic_result, serde::version<0>, serde::compat_version<0>> {
+  : serde::envelope<topic_result, serde::version<1>, serde::compat_version<0>> {
     topic_result() noexcept = default;
     explicit topic_result(model::topic_namespace t, errc ec = errc::success)
       : tp_ns(std::move(t))
       , ec(ec) {}
+    topic_result(model::topic_namespace t, errc ec, std::string_view msg)
+      : tp_ns(std::move(t))
+      , ec(ec)
+      , error_message{
+          ssx::sformat("{}: {}", make_error_code(ec).message(), msg)} {}
     model::topic_namespace tp_ns;
-    errc ec;
+    errc ec{errc::success};
+    std::optional<ss::sstring> error_message;
 
     friend bool operator==(const topic_result&, const topic_result&) = default;
 
     friend std::ostream& operator<<(std::ostream& o, const topic_result& r);
 
-    auto serde_fields() { return std::tie(tp_ns, ec); }
+    auto serde_fields() { return std::tie(tp_ns, ec, error_message); }
 };
 
 struct create_topics_request
@@ -2250,12 +1059,13 @@ struct create_topics_reply
 struct purged_topic_request
   : serde::envelope<
       purged_topic_request,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
 
     nt_revision topic;
     model::timeout_clock::duration timeout;
+    topic_purge_domain domain = topic_purge_domain::cloud_storage;
 
     friend bool
     operator==(const purged_topic_request&, const purged_topic_request&)
@@ -2263,7 +1073,7 @@ struct purged_topic_request
 
     friend std::ostream& operator<<(std::ostream&, const purged_topic_request&);
 
-    auto serde_fields() { return std::tie(topic, timeout); }
+    auto serde_fields() { return std::tie(topic, timeout, domain); }
 };
 
 struct purged_topic_reply
@@ -2391,9 +1201,9 @@ public:
       const configuration_invariants& expected,
       const configuration_invariants& current)
       : _msg(ssx::sformat(
-        "Configuration invariants changed. Expected: {}, current: {}",
-        expected,
-        current)) {}
+          "Configuration invariants changed. Expected: {}, current: {}",
+          expected,
+          current)) {}
 
     const char* what() const noexcept final { return _msg.c_str(); }
 
@@ -2442,10 +1252,13 @@ using replicas_revision_map
 /// Log revision is needed to distinguish different incarnations of the
 /// partition.
 struct shard_placement_target {
-    shard_placement_target(model::revision_id lr, ss::shard_id s)
-      : log_revision(lr)
+    shard_placement_target(
+      raft::group_id g, model::revision_id lr, ss::shard_id s)
+      : group(g)
+      , log_revision(lr)
       , shard(s) {}
 
+    raft::group_id group;
     model::revision_id log_revision;
     ss::shard_id shard;
 
@@ -2476,34 +1289,67 @@ enum class partition_operation_type {
 };
 std::ostream& operator<<(std::ostream&, const partition_operation_type&);
 
+/// Notification of topic table state change related to a topic as a whole
+
+enum class topic_table_topic_delta_type {
+    added,
+    removed,
+    properties_updated,
+};
+std::ostream& operator<<(std::ostream&, const topic_table_topic_delta_type&);
+
+struct topic_table_topic_delta {
+    // revision of topic creation command (can be used to identify a topic
+    // incarnation).
+    model::revision_id creation_revision;
+    model::topic_namespace ns_tp;
+    // revision corresponding to the change itself.
+    model::revision_id revision;
+    topic_table_topic_delta_type type;
+
+    topic_table_topic_delta(
+      model::revision_id creation_rev,
+      model::topic_namespace ns_tp,
+      model::revision_id rev,
+      topic_table_topic_delta_type type)
+      : creation_revision(creation_rev)
+      , ns_tp(std::move(ns_tp))
+      , revision(rev)
+      , type(type) {}
+
+    friend std::ostream&
+    operator<<(std::ostream&, const topic_table_topic_delta&);
+};
+
 /// Notification of topic table state change related to a single ntp
 
-enum class topic_table_delta_type {
+enum class topic_table_ntp_delta_type {
     added,
     removed,
     replicas_updated,
     properties_updated,
     disabled_flag_updated,
 };
-std::ostream& operator<<(std::ostream&, const topic_table_delta_type&);
+std::ostream& operator<<(std::ostream&, const topic_table_ntp_delta_type&);
 
-struct topic_table_delta {
+struct topic_table_ntp_delta {
     model::ntp ntp;
     raft::group_id group;
     model::revision_id revision;
-    topic_table_delta_type type;
+    topic_table_ntp_delta_type type;
 
-    topic_table_delta(
+    topic_table_ntp_delta(
       model::ntp ntp,
       raft::group_id gr,
       model::revision_id rev,
-      topic_table_delta_type type)
+      topic_table_ntp_delta_type type)
       : ntp(std::move(ntp))
       , group(gr)
       , revision(rev)
       , type(type) {}
 
-    friend std::ostream& operator<<(std::ostream&, const topic_table_delta&);
+    friend std::ostream&
+    operator<<(std::ostream&, const topic_table_ntp_delta&);
 };
 
 struct create_acls_cmd_data
@@ -2694,22 +1540,6 @@ struct backend_operation
     }
 };
 
-struct create_data_policy_cmd_data
-  : serde::envelope<
-      create_data_policy_cmd_data,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    static constexpr int8_t current_version = 1; // In future dp will be vector
-
-    auto serde_fields() { return std::tie(dp); }
-
-    v8_engine::data_policy dp;
-
-    friend bool operator==(
-      const create_data_policy_cmd_data&, const create_data_policy_cmd_data&)
-      = default;
-};
-
 using config_version = named_type<int64_t, struct config_version_type>;
 constexpr config_version config_version_unset = config_version{-1};
 
@@ -2786,37 +1616,6 @@ struct cluster_config_status_cmd_data
     auto serde_fields() { return std::tie(status); }
 
     config_status status;
-};
-
-struct feature_update_action
-  : serde::envelope<
-      feature_update_action,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    static constexpr int8_t current_version = 1;
-    enum class action_t : std::uint16_t {
-        // Notify when a feature is done with preparing phase
-        complete_preparing = 1,
-        // Notify when a feature is made available, either by an administrator
-        // or via auto-activation policy
-        activate = 2,
-        // Notify when a feature is explicitly disabled by an administrator
-        deactivate = 3
-    };
-
-    // Features have an internal bitflag representation, but it is not
-    // meant to be stable for use on the wire, so we refer to features by name
-    ss::sstring feature_name;
-    action_t action;
-
-    friend bool
-    operator==(const feature_update_action&, const feature_update_action&)
-      = default;
-
-    auto serde_fields() { return std::tie(feature_name, action); }
-
-    friend std::ostream&
-    operator<<(std::ostream&, const feature_update_action&);
 };
 
 struct feature_update_cmd_data
@@ -3696,29 +2495,8 @@ struct leader_term {
     friend std::ostream& operator<<(std::ostream&, const leader_term&);
 };
 
-struct partition_assignment_cmp {
-    using is_transparent = void;
-    constexpr bool operator()(
-      const partition_assignment& lhs, const partition_assignment& rhs) const {
-        return lhs.id < rhs.id;
-    }
-
-    constexpr bool operator()(
-      const model::partition_id& id, const partition_assignment& rhs) const {
-        return id < rhs.id;
-    }
-    constexpr bool operator()(
-      const partition_assignment& lhs, const model::partition_id& id) const {
-        return lhs.id < id;
-    }
-    constexpr bool operator()(
-      const model::partition_id& lhs, const model::partition_id& rhs) const {
-        return lhs < rhs;
-    }
-};
-
 using assignments_set
-  = absl::btree_set<partition_assignment, partition_assignment_cmp>;
+  = contiguous_range_map<model::partition_id::type, partition_assignment>;
 
 struct topic_metadata_fields
   : serde::envelope<
@@ -3777,6 +2555,8 @@ public:
     assignments_set& get_assignments();
 
     replication_factor get_replication_factor() const;
+
+    topic_metadata copy() const;
 
 private:
     topic_metadata_fields _fields;
@@ -4108,7 +2888,7 @@ struct partition_raft_state
 
 struct partition_state
   : serde::
-      envelope<partition_state, serde::version<0>, serde::compat_version<0>> {
+      envelope<partition_state, serde::version<1>, serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
 
     model::offset start_offset;
@@ -4126,6 +2906,7 @@ struct partition_state
     bool is_remote_fetch_enabled;
     bool is_cloud_data_available;
     ss::sstring read_replica_bucket;
+    ss::sstring iceberg_mode;
     partition_raft_state raft_state;
 
     auto serde_fields() {
@@ -4145,7 +2926,8 @@ struct partition_state
           is_remote_fetch_enabled,
           is_cloud_data_available,
           read_replica_bucket,
-          raft_state);
+          raft_state,
+          iceberg_mode);
     }
 
     friend bool operator==(const partition_state&, const partition_state&)
@@ -4381,24 +3163,6 @@ struct node_decommission_progress {
     std::vector<partition_reconfiguration_state> current_reconfigurations;
 };
 
-/*
- * Partition Allocation Domains is the way to make certain partition replicas
- * distributed evenly across the nodes of the cluster. When partition allocation
- * is done within any domain but `common`, all existing allocations outside
- * of that domain will be ignored while assigning partition a node.
- * The `common` domain will consider allocations in all domains.
- * Negative values are used for hardcoded domains, positive values are reserved
- * for future use as user assigned domains, and may be used for a feature that
- * would allow users to designate certain topics to have their partition
- * replicas and leaders evenly distrbuted regardless of other topics.
- */
-using partition_allocation_domain
-  = named_type<int32_t, struct partition_allocation_domain_tag>;
-namespace partition_allocation_domains {
-constexpr auto common = partition_allocation_domain(0);
-constexpr auto consumer_offsets = partition_allocation_domain(-1);
-} // namespace partition_allocation_domains
-
 enum class cloud_storage_mode : uint8_t {
     disabled = 0,
     write_only = 1,
@@ -4460,6 +3224,8 @@ struct controller_committed_offset_request
       serde::version<0>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
+
+    auto serde_fields() { return std::tie(); }
 };
 
 struct controller_committed_offset_reply
@@ -4484,13 +3250,6 @@ std::ostream& operator<<(
       with_assignment.assignments);
     return o;
 }
-
-/// Names of snapshot files used by stm's
-static const ss::sstring archival_stm_snapshot = "archival_metadata.snapshot";
-static const ss::sstring rm_stm_snapshot = "tx.snapshot";
-static const ss::sstring tm_stm_snapshot = "tx.coordinator.snapshot";
-static const ss::sstring id_allocator_snapshot = "id.snapshot";
-static const ss::sstring tx_registry_snapshot = "tx_registry.snapshot";
 
 /**
  * Create/update a (Wasm) plugin.
@@ -4650,19 +3409,42 @@ struct delete_topics_reply
     auto serde_fields() { return std::tie(results); }
 };
 
+struct set_partition_shard_request
+  : serde::envelope<
+      set_partition_shard_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
+
+    model::ntp ntp;
+    uint32_t shard = -1;
+
+    friend bool operator==(
+      const set_partition_shard_request&, const set_partition_shard_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(ntp, shard); }
+};
+
+struct set_partition_shard_reply
+  : serde::envelope<
+      set_partition_shard_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using rpc_adl_exempt = std::true_type;
+
+    errc ec;
+
+    friend bool operator==(
+      const set_partition_shard_reply&, const set_partition_shard_reply&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
 } // namespace cluster
-namespace std {
-template<>
-struct is_error_code_enum<cluster::tx_errc> : true_type {};
-} // namespace std
 
 namespace reflection {
-
-template<>
-struct adl<cluster::topic_configuration> {
-    void to(iobuf&, cluster::topic_configuration&&);
-    cluster::topic_configuration from(iobuf_parser&);
-};
 
 template<>
 struct adl<cluster::topic_result> {
@@ -4719,12 +3501,6 @@ struct adl<cluster::create_partitions_configuration> {
 };
 
 template<>
-struct adl<cluster::create_data_policy_cmd_data> {
-    void to(iobuf&, cluster::create_data_policy_cmd_data&&);
-    cluster::create_data_policy_cmd_data from(iobuf_parser&);
-};
-
-template<>
 struct adl<cluster::incremental_topic_updates> {
     void to(iobuf& out, cluster::incremental_topic_updates&&);
     cluster::incremental_topic_updates from(iobuf_parser&);
@@ -4772,18 +3548,6 @@ struct adl<cluster::partition_assignment> {
     cluster::partition_assignment from(iobuf_parser&);
 };
 
-template<>
-struct adl<cluster::remote_topic_properties> {
-    void to(iobuf&, cluster::remote_topic_properties&&);
-    cluster::remote_topic_properties from(iobuf_parser&);
-};
-
-template<>
-struct adl<cluster::topic_properties> {
-    void to(iobuf&, cluster::topic_properties&&);
-    cluster::topic_properties from(iobuf_parser&);
-};
-
 template<typename T>
 struct adl<cluster::property_update<T>> {
     void to(iobuf& out, cluster::property_update<T>&& update) {
@@ -4827,22 +3591,3 @@ struct adl<cluster::move_cancellation_result> {
     }
 };
 } // namespace reflection
-
-namespace absl {
-
-template<typename K, typename V>
-std::ostream& operator<<(std::ostream& o, const absl::flat_hash_map<K, V>& r) {
-    o << "{";
-    bool first = true;
-    for (const auto& [k, v] : r) {
-        if (!first) {
-            o << ", ";
-        }
-        o << "{" << k << " -> " << v << "}";
-        first = false;
-    }
-    o << "}";
-    return o;
-}
-
-} // namespace absl

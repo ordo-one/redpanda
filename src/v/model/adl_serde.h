@@ -17,7 +17,7 @@
 #include "model/record.h"
 #include "model/timeout_clock.h"
 #include "reflection/adl.h"
-#include "tristate.h"
+#include "utils/tristate.h"
 
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
@@ -87,12 +87,6 @@ template<>
 struct adl<model::broker> {
     void to(iobuf& out, model::broker&& r);
     model::broker from(iobuf_parser& in);
-};
-
-template<>
-struct adl<model::internal::broker_v0> {
-    void to(iobuf& out, model::internal::broker_v0&& r);
-    model::internal::broker_v0 from(iobuf_parser& in);
 };
 
 // TODO: optimize this transmition with varints
@@ -193,7 +187,7 @@ adl<model::record_batch_header>::parse_from(Parser& in) {
     auto sz = adl<int32_t>{}.from(in);
     auto off = adl<model::offset>{}.from(in);
     auto type = adl<model::record_batch_type>{}.from(in);
-    auto crc = adl<int32_t>{}.from(in);
+    auto crc = adl<uint32_t>{}.from(in);
     using attr_t = model::record_batch_attributes::type;
     auto attrs = model::record_batch_attributes(adl<attr_t>{}.from(in));
     auto delta = adl<int32_t>{}.from(in);

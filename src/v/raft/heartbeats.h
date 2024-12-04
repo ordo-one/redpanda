@@ -14,7 +14,9 @@
 #include "bytes/iobuf.h"
 #include "model/metadata.h"
 #include "raft/fundamental.h"
+#include "serde/async.h"
 #include "serde/envelope.h"
+#include "serde/rw/enum.h"
 #include "serde/rw/rw.h"
 #include "utils/delta_for.h"
 
@@ -153,7 +155,7 @@ public:
     friend inline void read_nested(
       iobuf_parser& in,
       deltafor_column<ValueT, DeltaT, FieldT>& c,
-      size_t const bytes_left_limit) {
+      const size_t bytes_left_limit) {
         using serde::read_async_nested;
         using serde::read_nested;
         c._remainder_buffer = read_nested<row_t>(in, bytes_left_limit);
@@ -273,7 +275,7 @@ struct full_heartbeat_reply {
     friend inline void read_nested(
       iobuf_parser& in,
       full_heartbeat_reply& req,
-      size_t const bytes_left_limit) {
+      const size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, req.group, bytes_left_limit);
         read_nested(in, req.result, bytes_left_limit);
@@ -300,7 +302,7 @@ struct full_heartbeat {
       = default;
 
     friend inline void read_nested(
-      iobuf_parser& in, full_heartbeat& fh, size_t const bytes_left_limit) {
+      iobuf_parser& in, full_heartbeat& fh, const size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, fh.group, bytes_left_limit);
         read_nested(in, fh.data, bytes_left_limit);
@@ -347,7 +349,7 @@ public:
     };
 
     ss::future<> serde_async_write(iobuf& out);
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
 
     heartbeat_request_v2 copy() const;
 
@@ -431,7 +433,7 @@ public:
     };
 
     ss::future<> serde_async_write(iobuf& out);
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
 
     heartbeat_reply_v2 copy() const;
 

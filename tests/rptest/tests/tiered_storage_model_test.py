@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Condition
 from collections import defaultdict
+from typing import List
 
 from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
@@ -29,9 +30,10 @@ from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
 from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer, KgoVerifierRandomConsumer, KgoVerifierSeqConsumer
-from rptest.services.redpanda import SISettings, get_cloud_storage_type, make_redpanda_service, CHAOS_LOG_ALLOW_LIST, MetricsEndpoint
+from rptest.services.redpanda import SISettings, CloudStorageTypeAndUrlStyle, get_cloud_storage_type, get_cloud_storage_type_and_url_style, make_redpanda_service, CHAOS_LOG_ALLOW_LIST, MetricsEndpoint
+from rptest.utils.mode_checks import skip_fips_mode
 from rptest.utils.si_utils import nodes_report_cloud_segments, BucketView, NTP
-from rptest.tests.tiered_storage_model import TestCase, TieredStorageEndToEndTest, get_tiered_storage_test_cases, TestRunStage, CONFIDENCE_THRESHOLD
+from rptest.tests.tiered_storage_model import TestCase, TieredStorageEndToEndTest, get_tiered_storage_test_cases, TestRunStage, CONFIDENCE_THRESHOLD, get_test_case_from_name
 
 MAX_RETRIES = 20
 
@@ -545,10 +547,15 @@ class TieredStorageTest(TieredStorageEndToEndTest, RedpandaTest):
         self.stop_flag = True
         self.thread_pool.shutdown()
 
+    # fips on S3 is not compatible with path-style urls. TODO remove this once get_cloud_storage_type_and_url_style is fips aware
+    @skip_fips_mode
     @cluster(num_nodes=4)
-    @matrix(cloud_storage_type=get_cloud_storage_type(),
-            test_case=get_tiered_storage_test_cases(fast_run=True))
-    def test_tiered_storage(self, cloud_storage_type, test_case: TestCase):
+    @matrix(
+        cloud_storage_type_and_url_style=get_cloud_storage_type_and_url_style(
+        ),
+        test_case=get_tiered_storage_test_cases(fast_run=True))
+    def test_tiered_storage(self, cloud_storage_type_and_url_style: List[
+        CloudStorageTypeAndUrlStyle], test_case: TestCase):
         """This is a main entry point of the test.
            The test runs if 5 phases:
             - Configuration phase
@@ -557,34 +564,37 @@ class TieredStorageTest(TieredStorageEndToEndTest, RedpandaTest):
             - Consuming the data (use timequery)
             - Shutting down
         """
+        if not isinstance(test_case, TestCase):
+            test_case_name = json.loads(test_case)["name"]
+            test_case = get_test_case_from_name(test_case_name)
+            assert test_case is not None, f"no test case found with name {test_case_name}"
         # Configuration phase
         self.start_inputs(test_case)
         self.start_validators(test_case)
         self.run_bg_validators(test_case)
 
-        try:
-            # Setup stage
-            self.prepare_stage(TestRunStage.Startup, test_case)
-            self.run_stage_validators(TestRunStage.Startup, test_case)
+        # Setup stage
+        self.prepare_stage(TestRunStage.Startup, test_case)
+        self.run_stage_validators(TestRunStage.Startup, test_case)
 
-            # Producing the data
-            self.prepare_stage(TestRunStage.Produce, test_case)
-            self.produce_until_validated(test_case)
+        # Producing the data
+        self.prepare_stage(TestRunStage.Produce, test_case)
+        self.produce_until_validated(test_case)
 
-            # Intermediate step
-            self.prepare_stage(TestRunStage.Intermediate, test_case)
-            self.run_stage_validators(TestRunStage.Intermediate, test_case)
+        # Intermediate step
+        self.prepare_stage(TestRunStage.Intermediate, test_case)
+        self.run_stage_validators(TestRunStage.Intermediate, test_case)
 
-            # Consuming the data
-            self.prepare_stage(TestRunStage.Consume, test_case)
-            self.consume_until_validated(test_case)
+        # Consuming the data
+        self.prepare_stage(TestRunStage.Consume, test_case)
+        self.consume_until_validated(test_case)
 
-            # Shutting down
-            self.prepare_stage(TestRunStage.Shutdown, test_case)
-            self.run_stage_validators(TestRunStage.Shutdown, test_case)
+        # Shutting down
+        self.prepare_stage(TestRunStage.Shutdown, test_case)
+        self.run_stage_validators(TestRunStage.Shutdown, test_case)
 
-            self.shutdown_bg_tasks()
-        finally:
-            # Check that all validators are done and raise error if
-            # some of them failed.
-            test_case.assert_validators(self)
+        self.shutdown_bg_tasks()
+
+        # Check that all validators are done and raise error if
+        # some of them failed.
+        test_case.assert_validators(self)

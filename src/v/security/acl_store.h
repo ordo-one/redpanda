@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "container/fragmented_vector.h"
 #include "security/acl.h"
 #include "security/acl_entry_set.h"
 
@@ -106,9 +107,8 @@ private:
                | std::views::filter([&name](const auto& e) {
                      return std::string_view(name).starts_with(e.first.name());
                  })
-               | std::views::transform([](const auto& e) {
-                     return RefT{e.first, e.second};
-                 });
+               | std::views::transform(
+                 [](const auto& e) { return RefT{e.first, e.second}; });
     }
 
 public:

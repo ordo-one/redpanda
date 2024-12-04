@@ -16,6 +16,7 @@
 #include "cloud_storage/tests/cache_test_fixture.h"
 #include "cloud_storage/tests/s3_imposter.h"
 #include "test_utils/fixture.h"
+#include "utils/lazy_abort_source.h"
 
 #include <seastar/core/seastar.hh>
 #include <seastar/testing/test_case.hh>
@@ -25,9 +26,8 @@
 
 namespace {
 
-const cloud_storage_clients::bucket_name bucket{"bucket"};
 ss::abort_source never_abort;
-cloud_storage::lazy_abort_source always_continue{[]() { return std::nullopt; }};
+lazy_abort_source always_continue{[]() { return std::nullopt; }};
 constexpr model::cloud_credentials_source config_file{
   model::cloud_credentials_source::config_file};
 
@@ -52,11 +52,15 @@ public:
           .start(
             10, ss::sharded_parameter([this] { return get_configuration(); }))
           .get();
-        remote
-          .start(
+        io.start(
             std::ref(pool),
             ss::sharded_parameter([this] { return get_configuration(); }),
             ss::sharded_parameter([] { return config_file; }))
+          .get();
+        remote
+          .start(std::ref(io), ss::sharded_parameter([this] {
+                     return get_configuration();
+                 }))
           .get();
         set_expectations_and_listen({});
     }
@@ -87,19 +91,22 @@ public:
         ss::file f = ss::open_file_dma(file_path.string(), flags).get();
         return remote.local()
           .upload_controller_snapshot(
-            bucket, remote_path, f, retry_node, always_continue)
+            bucket_name, remote_path, f, retry_node, always_continue)
           .get();
     }
 
     ~remote_file_fixture() {
         data_dir.remove().get();
         pool.local().shutdown_connections();
+        io.local().request_stop();
         remote.stop().get();
+        io.stop().get();
         pool.stop().get();
     }
 
     temporary_dir data_dir;
     ss::sharded<cloud_storage_clients::client_pool> pool;
+    ss::sharded<cloud_io::remote> io;
     ss::sharded<remote> remote;
 };
 
@@ -121,7 +128,7 @@ FIXTURE_TEST(test_cached_file, remote_file_fixture) {
     remote_file rfile(
       remote.local(),
       sharded_cache.local(),
-      bucket,
+      bucket_name,
       remote_path,
       retry_node,
       ss::sstring("log_prefix"));
@@ -152,7 +159,7 @@ FIXTURE_TEST(test_missing_file, remote_file_fixture) {
     remote_file rfile(
       remote.local(),
       sharded_cache.local(),
-      bucket,
+      bucket_name,
       remote_path,
       retry_node,
       ss::sstring("log_prefix"));

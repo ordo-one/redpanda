@@ -23,8 +23,6 @@
 
 namespace security {
 
-seastar::logger seclog("security");
-
 void acl_entry_set::insert(acl_entry entry) {
     auto [it, ins] = _entries.insert(std::move(entry));
     if (const auto& principal = it->principal();
@@ -531,7 +529,7 @@ bool resource_pattern_filter::matches(const resource_pattern& pattern) const {
 void read_nested(
   iobuf_parser& in,
   resource_pattern_filter& filter,
-  size_t const bytes_left_limit) {
+  const size_t bytes_left_limit) {
     using serde::read_nested;
 
     read_nested(in, filter._resource, bytes_left_limit);

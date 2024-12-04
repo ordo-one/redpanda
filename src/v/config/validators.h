@@ -53,4 +53,10 @@ validate_audit_event_types(const std::vector<ss::sstring>& vs);
 std::optional<ss::sstring>
 validate_audit_excluded_topics(const std::vector<ss::sstring>&);
 
+std::optional<ss::sstring>
+validate_api_endpoint(const std::optional<ss::sstring>& os);
+
+std::optional<ss::sstring> validate_tombstone_retention_ms(
+  const std::optional<std::chrono::milliseconds>& ms);
+
 }; // namespace config

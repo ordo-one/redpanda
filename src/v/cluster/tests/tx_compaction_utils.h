@@ -107,6 +107,7 @@ public:
                       model::timestamp::now().value() - ret_duration.count()),
                     std::nullopt,
                     log->stm_manager()->max_collectible_offset(),
+                    std::nullopt,
                     ss::default_priority_class(),
                     dummy_as,
                   })
@@ -218,8 +219,8 @@ public:
         execute(std::move(ops), log).get();
 
         //---- Step 3: Force a roll and compact the log.
-        log->flush().get0();
-        log->force_roll(ss::default_priority_class()).get0();
+        log->flush().get();
+        log->force_roll(ss::default_priority_class()).get();
         if (!s._compact) {
             return;
         }
@@ -228,6 +229,7 @@ public:
           model::timestamp::min(),
           std::nullopt,
           model::offset::max(),
+          std::nullopt,
           ss::default_priority_class(),
           as);
         // Compacts until a single sealed segment remains, other than the
@@ -272,7 +274,7 @@ public:
             RPTEST_REQUIRE_EQ_CORO(
               co_await _ctx._stm->commit_tx(
                 _ctx._pid, model::tx_seq{0}, tx_timeout),
-              cluster::tx_errc::none);
+              cluster::tx::errc::none);
         }
         tx_op_type type() override { return tx_op_type::commit; }
         ss::sstring debug() override {
@@ -288,7 +290,7 @@ public:
             RPTEST_REQUIRE_EQ_CORO(
               co_await _ctx._stm->abort_tx(
                 _ctx._pid, model::tx_seq{0}, tx_timeout),
-              cluster::tx_errc::none);
+              cluster::tx::errc::none);
         }
         tx_op_type type() override { return tx_op_type::abort; }
         ss::sstring debug() override {

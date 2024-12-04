@@ -105,7 +105,7 @@ public:
     build_coarse_index(uint64_t step_size, std::string_view index_path) const;
 
     /// Serialize offset_index
-    iobuf to_iobuf();
+    iobuf to_iobuf() const;
 
     /// Deserialize offset_index
     void from_iobuf(iobuf in);
@@ -197,6 +197,8 @@ struct segment_record_stats {
     model::timestamp base_timestamp;
     // Last timestamp
     model::timestamp last_timestamp;
+
+    auto operator<=>(const segment_record_stats&) const noexcept = default;
 };
 
 class remote_segment_index_builder : public storage::batch_consumer {

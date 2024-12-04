@@ -19,8 +19,11 @@
 #include "model/record_batch_types.h"
 #include "model/record_utils.h"
 #include "model/timestamp.h"
-#include "serde/envelope.h"
-#include "serde/serde.h"
+#include "serde/async.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/rw.h"
 
 #include <seastar/core/smp.hh>
 #include <seastar/util/optimized_optional.hh>
@@ -102,6 +105,15 @@ public:
     iobuf release_value() { return std::exchange(_value, {}); }
     iobuf share_value() { return _value.share(0, _value.size_bytes()); }
 
+    std::optional<iobuf> share_key_opt() {
+        return key_size() < 0 ? std::nullopt
+                              : std::make_optional<iobuf>(share_key());
+    }
+    std::optional<iobuf> share_value_opt() {
+        return value_size() < 0 ? std::nullopt
+                                : std::make_optional<iobuf>(share_value());
+    }
+
     bool operator==(const record_header& rhs) const {
         return _key_size == rhs._key_size && _val_size == rhs._val_size
                && _key == rhs._key && _value == rhs._value;
@@ -110,8 +122,10 @@ public:
     friend std::ostream& operator<<(std::ostream&, const record_header&);
 
 private:
+    // If negative, the key is nil.
     int32_t _key_size{-1};
     iobuf _key;
+    // If negative, the value is nil.
     int32_t _val_size{-1};
     iobuf _value;
 };
@@ -219,12 +233,26 @@ public:
     const iobuf& key() const { return _key; }
     iobuf release_key() { return std::exchange(_key, {}); }
     iobuf share_key() { return _key.share(0, _key.size_bytes()); }
+    std::optional<iobuf> share_key_opt() {
+        if (!has_key()) {
+            return std::nullopt;
+        }
+        return share_key();
+    }
+    std::optional<iobuf> share_value_opt() {
+        if (!has_value()) {
+            return std::nullopt;
+        }
+        return share_value();
+    }
 
     int32_t value_size() const { return _val_size; }
     const iobuf& value() const { return _value; }
     iobuf release_value() { return std::exchange(_value, {}); }
     iobuf share_value() { return _value.share(0, _value.size_bytes()); }
     bool has_value() const { return _val_size >= 0; }
+    bool has_key() const { return _key_size >= 0; }
+    bool is_tombstone() const { return !has_value(); }
 
     const std::vector<record_header>& headers() const { return _headers; }
     std::vector<record_header>& headers() { return _headers; }
@@ -357,7 +385,7 @@ public:
     record_batch_attributes& operator|=(model::compression c) {
         // clang-format off
         _attributes |=
-        static_cast<std::underlying_type_t<model::compression>>(c) 
+        static_cast<std::underlying_type_t<model::compression>>(c)
             & record_batch_attributes::compression_mask;
         // clang-format on
         return *this;
@@ -374,7 +402,7 @@ public:
     friend inline void read_nested(
       iobuf_parser& in,
       record_batch_attributes& attrs,
-      size_t const bytes_left_limit) {
+      const size_t bytes_left_limit) {
         attrs._attributes = serde::read_nested<uint64_t>(in, bytes_left_limit);
     }
 
@@ -460,7 +488,7 @@ struct record_batch_header
     offset base_offset;
     /// \brief redpanda extension
     record_batch_type type;
-    int32_t crc{0};
+    uint32_t crc{0};
 
     // -- below the CRC are checksummed by the kafka crc. see @crc field
 
@@ -532,11 +560,13 @@ using tx_seq = named_type<int64_t, struct tm_tx_seq>;
 using producer_id = named_type<int64_t, struct producer_identity_id>;
 using producer_epoch = named_type<int16_t, struct producer_identity_epoch>;
 
+static constexpr producer_epoch no_producer_epoch{-1};
+static constexpr producer_id no_producer_id{-1};
 struct producer_identity
   : serde::
       envelope<producer_identity, serde::version<0>, serde::compat_version<0>> {
-    int64_t id{-1};
-    int16_t epoch{0};
+    producer_id id{no_producer_id};
+    producer_epoch epoch{0};
 
     producer_identity() noexcept = default;
 
@@ -548,6 +578,15 @@ struct producer_identity
 
     model::producer_epoch get_epoch() const {
         return model::producer_epoch(epoch);
+    }
+
+    static model::producer_identity
+    with_next_epoch(const model::producer_identity pid) {
+        return {pid.id, pid.epoch + producer_epoch(1)};
+    }
+
+    bool has_exhausted_epoch() const {
+        return epoch >= (producer_epoch::max() - producer_epoch{1});
     }
 
     auto operator<=>(const producer_identity&) const = default;
@@ -565,13 +604,28 @@ struct producer_identity
 /// This structure is a part of rm_stm snapshot.
 /// Any change has to be reconciled with the
 /// snapshot (de)serialization logic.
-struct tx_range {
+struct tx_range
+  : serde::envelope<tx_range, serde::version<0>, serde::compat_version<0>> {
+    tx_range() = default;
+
+    tx_range(model::producer_identity pid, model::offset f, model::offset l)
+      : pid(pid)
+      , first(f)
+      , last(l) {}
+
     model::producer_identity pid;
     model::offset first;
     model::offset last;
 
+    auto serde_fields() { return std::tie(pid, first, last); }
+
     auto operator<=>(const tx_range&) const = default;
     friend std::ostream& operator<<(std::ostream&, const tx_range&);
+
+    template<typename H>
+    friend H AbslHashValue(H h, const tx_range& range) {
+        return H::combine(std::move(h), range.first, range.last, range.pid);
+    }
 };
 
 // Comparator that sorts in ascending order by first offset.
@@ -581,7 +635,7 @@ struct tx_range_cmp {
     }
 };
 
-static constexpr producer_identity unknown_pid{-1, -1};
+inline constexpr producer_identity no_pid{no_producer_id, no_producer_epoch};
 
 struct batch_identity {
     static int32_t increment_sequence(int32_t sequence, int32_t increment) {
@@ -610,7 +664,7 @@ struct batch_identity {
     timestamp max_timestamp;
     bool is_transactional{false};
 
-    bool is_idempotent() const { return pid.id >= 0; }
+    bool is_idempotent() const { return pid.id > no_producer_id; }
 
     friend std::ostream& operator<<(std::ostream&, const batch_identity&);
 };

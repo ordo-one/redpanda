@@ -11,10 +11,10 @@
 #pragma once
 #include "base/seastarx.h"
 #include "config/property.h"
+#include "container/chunked_hash_map.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/handler_probe.h"
 #include "kafka/server/logger.h"
-#include "kafka/types.h"
 #include "net/connection.h"
 #include "net/server_probe.h"
 #include "security/acl.h"
@@ -28,6 +28,7 @@
 #include "utils/named_type.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
@@ -38,6 +39,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace kafka {
@@ -60,6 +62,8 @@ public:
  * authz failures should be quiet or logged at a reduced severity level.
  */
 using authz_quiet = ss::bool_class<struct authz_quiet_tag>;
+
+using audit_authz_check = ss::bool_class<struct audit_authz_check_tag>;
 
 struct request_header;
 class request_context;
@@ -99,7 +103,7 @@ private:
 
 struct request_data {
     api_key request_key;
-    ss::sstring client_id;
+    std::optional<ss::sstring> client_id;
 };
 
 // Used to hold resources associated with a given request until
@@ -120,7 +124,28 @@ struct session_resources {
     std::unique_ptr<request_tracker> tracker;
     request_data request_data;
 };
+using vcluster_connection_id
+  = named_type<uint32_t, struct vcluster_connection_id_tag>;
+/**
+ * Struct representing virtual connection identifier. Each virtual cluster may
+ * have multiple connections identified with connection_id.
+ */
+struct virtual_connection_id {
+    xid virtual_cluster_id;
+    vcluster_connection_id connection_id;
 
+    template<typename H>
+    friend H AbslHashValue(H h, const virtual_connection_id& id) {
+        return H::combine(
+          std::move(h), id.virtual_cluster_id, id.connection_id);
+    }
+    friend bool
+    operator==(const virtual_connection_id&, const virtual_connection_id&)
+      = default;
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const virtual_connection_id& id);
+};
 class connection_context final
   : public ss::enable_lw_shared_from_this<connection_context>
   , public boost::intrusive::list_base_hook<> {
@@ -215,8 +240,8 @@ private:
     /// Update throughput trackers (per-client, per-shard, and whatever are
     /// going to emerge) on ingress traffic and claculate aggregated throttle
     /// delays from all of them.
-    delay_t record_tp_and_calculate_throttle(
-      const request_header& hdr, size_t request_size);
+    ss::future<delay_t>
+    record_tp_and_calculate_throttle(request_data r_data, size_t request_size);
 
     // Apply backpressure sequence, where the request processing may be
     // delayed for various reasons, including throttling but also because
@@ -226,7 +251,7 @@ private:
     // the associated resouces have been obtained and are tracked by the
     // contained session_resources object.
     ss::future<session_resources>
-    throttle_request(const request_header&, size_t sz);
+    throttle_request(request_data r_data, size_t sz);
 
     ss::future<> do_process(request_context);
 
@@ -346,6 +371,8 @@ private:
          */
         ss::future<>
           maybe_process_responses(ss::lw_shared_ptr<connection_context>);
+        ss::future<ss::stop_iteration>
+          do_process_responses(ss::lw_shared_ptr<connection_context>);
 
         ss::future<> handle_response(
           ss::lw_shared_ptr<connection_context>,
@@ -399,6 +426,38 @@ private:
         ss::lowres_clock::time_point _last_request_timestamp;
     };
 
+    class throttling_state {
+    public:
+        ss::lowres_clock::duration update_fetch_delay(
+          ss::lowres_clock::duration new_delay,
+          ss::lowres_clock::time_point now) {
+            auto result_enforced = fetch_throttled_until - now;
+            fetch_throttled_until = now + new_delay;
+            return result_enforced;
+        }
+
+        ss::lowres_clock::duration update_produce_delay(
+          ss::lowres_clock::duration new_delay,
+          ss::lowres_clock::time_point now) {
+            auto result_enforced = produce_throttled_until - now;
+            produce_throttled_until = now + new_delay;
+            return result_enforced;
+        }
+
+        ss::lowres_clock::duration update_snc_delay(
+          ss::lowres_clock::duration new_delay,
+          ss::lowres_clock::time_point now) {
+            auto result_enforced = snc_throttled_until - now;
+            snc_throttled_until = now + new_delay;
+            return result_enforced;
+        }
+
+    private:
+        ss::lowres_clock::time_point snc_throttled_until;
+        ss::lowres_clock::time_point produce_throttled_until;
+        ss::lowres_clock::time_point fetch_throttled_until;
+    };
+
     std::optional<
       std::reference_wrapper<boost::intrusive::list<connection_context>>>
       _hook;
@@ -416,7 +475,9 @@ private:
      * A map keeping virtual connection states, during default operation the map
      * is empty
      */
-    absl::node_hash_map<bytes, ss::lw_shared_ptr<virtual_connection_state>>
+    chunked_hash_map<
+      virtual_connection_id,
+      ss::lw_shared_ptr<virtual_connection_state>>
       _virtual_states;
 
     ss::gate _gate;
@@ -433,6 +494,11 @@ private:
     ss::promise<> _wait_input_shutdown;
 
     bool _is_virtualized_connection = false;
+
+    /// What time the client on this conection should be throttled until
+    /// Used to enforce client quotas and ingress/egress quotas broker-side
+    /// if the client does not obey the ThrottleTimeMs in the response
+    throttling_state _throttling_state;
 };
 
 } // namespace kafka

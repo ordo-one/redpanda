@@ -10,11 +10,14 @@
 #include "base/vlog.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/tests/partition_balancer_planner_fixture.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "random/generators.h"
 #include "test_utils/fixture.h"
 
 #include <seastar/testing/thread_test_case.hh>
+
+#include <cstddef>
 
 static ss::logger logger("balancer_sim");
 
@@ -123,6 +126,7 @@ public:
               as.replicas,
               human::bytes(size));
         }
+        _total_replicas += static_cast<size_t>(replication_factor) * partitions;
     }
 
     void set_decommissioning(model::node_id id) {
@@ -285,7 +289,7 @@ public:
 
     void print_replica_map() const {
         for (const auto& t : topics().topics_map()) {
-            for (const auto& a : t.second.get_assignments()) {
+            for (const auto& [_, a] : t.second.get_assignments()) {
                 auto ntp = model::ntp(t.first.ns, t.first.tp, a.id);
                 std::vector<model::node_id> replicas;
                 for (const auto& bs : a.replicas) {
@@ -344,7 +348,7 @@ public:
 
         for (auto& [tp_ns, topic_md] :
              _workers.table.local().all_topics_metadata()) {
-            for (auto& p_as : topic_md.get_assignments()) {
+            for (auto& [_, p_as] : topic_md.get_assignments()) {
                 total_topic_replicas[tp_ns] += p_as.replicas.size();
                 for (auto& r : p_as.replicas) {
                     topic_replica_distribution[tp_ns][r.node_id]++;
@@ -414,6 +418,8 @@ public:
                     < 0.8 * double(_last_run_in_progress_updates);
     }
 
+    size_t total_replicas() const { return _total_replicas; }
+
 private:
     void
     do_validate_replica_pair_frequencies(std::optional<ss::sstring> topic) {
@@ -428,7 +434,7 @@ private:
                 continue;
             }
 
-            for (const auto& p_as : topic_md.get_assignments()) {
+            for (const auto& [_, p_as] : topic_md.get_assignments()) {
                 for (const auto& r1 : p_as.replicas) {
                     for (const auto& r2 : p_as.replicas) {
                         if (r1.node_id != r2.node_id) {
@@ -694,11 +700,10 @@ private:
         size_t ticks_since_refill = 0;
 
         cluster::node_health_report_ptr get_health_report() const {
-            cluster::node_health_report report;
+            cluster::node::local_state local_state;
             storage::disk node_disk{.free = total - used, .total = total};
-            report.id = id;
-            report.local_state.set_disk(node_disk);
-            report.local_state.log_data_size = {
+            local_state.set_disk(node_disk);
+            local_state.log_data_size = {
               .data_target_size = total,
               .data_current_size = used,
               .data_reclaimable_size = 0};
@@ -713,13 +718,15 @@ private:
                     .id = ntp.tp.partition, .size_bytes = repl.local_size});
             }
 
+            chunked_vector<cluster::topic_status> topics;
             for (auto& [topic, partitions] : topic2partitions) {
-                report.topics.push_back(
+                topics.push_back(
                   cluster::topic_status(topic, std::move(partitions)));
             }
 
             return ss::make_foreign(
-              ss::make_lw_shared<const cluster::node_health_report>(report));
+              ss::make_lw_shared<const cluster::node_health_report>(
+                id, local_state, std::move(topics), std::nullopt));
         }
     };
 
@@ -728,6 +735,7 @@ private:
     size_t _cur_tick = 0;
     size_t _last_run_in_progress_updates = 0;
     controller_workers _workers;
+    size_t _total_replicas = 0;
 };
 
 FIXTURE_TEST(test_decommission, partition_balancer_sim_fixture) {
@@ -918,4 +926,49 @@ FIXTURE_TEST(test_replica_pair_frequency, partition_balancer_sim_fixture) {
     logger.info("second rebalance finished");
     validate_even_replica_distribution();
     validate_replica_pair_frequencies();
+}
+
+FIXTURE_TEST(test_mixed_replication_factors, partition_balancer_sim_fixture) {
+    add_node(model::node_id{0}, 100_GiB, 1);
+    add_node(model::node_id{1}, 400_GiB, 1);
+    add_node(model::node_id{2}, 100_GiB, 1);
+    /**
+     * Corner case from real deployment with the following configuration of
+     * topics:
+     * - partitions:  1, rf: 3, topic_count:  96
+     * - partitions:  5, rf: 1, topic_count: 118
+     * - partitions: 16, rf: 3, topic_count:   1
+     * - partitions:  5, rf: 3, topic_count:  36
+     * - partitions: 25, rf: 3, topic_count:  16
+     * - partitions:  3, rf: 3, topic_count:   2
+     * - partitions:  1, rf: 1, topic_count:  37
+     * - partitions: 10, rf: 1, topic_count:   1
+     */
+    for (int i = 0; i < 96; ++i) {
+        add_topic(fmt::format("topic_1_3_{}", i), 1, 3, 10_MiB);
+    }
+    for (int i = 0; i < 118; ++i) {
+        add_topic(fmt::format("topic_5_1_{}", i), 5, 1, 10_MiB);
+    }
+
+    add_topic("topic_10_1", 10, 1, 10_MiB);
+    for (int i = 0; i < 36; ++i) {
+        add_topic(fmt::format("topic_5_3_{}", i), 5, 3, 10_MiB);
+    }
+    for (int i = 0; i < 16; ++i) {
+        add_topic(fmt::format("topic_25_1_{}", i), 25, 3, 10_MiB);
+    }
+    for (int i = 0; i < 2; ++i) {
+        add_topic(fmt::format("topic_3_3_{}", i), 3, 3, 10_MiB);
+    }
+
+    for (int i = 0; i < 37; ++i) {
+        add_topic(fmt::format("topic_1_1_{}", i), 3, 3, 10_MiB);
+    }
+
+    add_node(model::node_id{4}, 300_GiB, 1);
+    add_node_to_rebalance(model::node_id{4});
+    BOOST_REQUIRE(run_to_completion(total_replicas() * 3));
+    set_decommissioning(model::node_id{4});
+    BOOST_REQUIRE(run_to_completion(total_replicas() * 3));
 }

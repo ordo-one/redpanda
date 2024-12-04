@@ -26,7 +26,7 @@
 namespace kafka::client {
 
 /// \brief during connection, the node_id isn't known.
-const model::node_id unknown_node_id{-1};
+inline const model::node_id unknown_node_id{-1};
 
 class brokers {
     using brokers_t
@@ -34,10 +34,10 @@ class brokers {
 
 public:
     explicit brokers(const configuration& config)
-      : _config(config){};
+      : _config(config) {};
     brokers(const brokers&) = delete;
     brokers(brokers&&) = default;
-    brokers& operator=(brokers const&) = delete;
+    brokers& operator=(const brokers&) = delete;
     brokers& operator=(brokers&&) = delete;
     ~brokers() noexcept = default;
 

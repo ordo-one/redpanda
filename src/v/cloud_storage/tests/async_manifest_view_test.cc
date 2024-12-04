@@ -43,6 +43,7 @@ using eof = async_manifest_view_cursor::eof;
 
 static ss::logger test_log("async_manifest_view_log");
 static const model::initial_revision_id manifest_rev(111);
+static const remote_path_provider path_provider(std::nullopt, std::nullopt);
 
 class set_config_mixin {
 public:
@@ -71,7 +72,7 @@ public:
       , rtc(as)
       , ctxlog(test_log, rtc)
       , probe(manifest_ntp)
-      , view(api, cache, stm_manifest, bucket) {
+      , view(api, cache, stm_manifest, bucket, path_provider) {
         stm_manifest.set_archive_start_offset(
           model::offset{0}, model::offset_delta{0});
         stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
@@ -85,7 +86,7 @@ public:
     expectation spill_manifest(const spillover_manifest& spm, bool hydrate) {
         stm_manifest.spillover(spm.make_manifest_metadata());
         // update cache
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
@@ -130,7 +131,7 @@ public:
     }
 
     void put_spill_to_cache(const spillover_manifest& spm) {
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         auto stream = spm.serialize().get();
         auto reservation = cache.local().reserve_space(123, 1).get();
         cache.local()
@@ -162,7 +163,7 @@ public:
         in_stream.close().get();
         out_stream.close().get();
         ss::sstring body = linearize_iobuf(std::move(tmp_buf));
-        auto path = pm.get_manifest_path();
+        auto path = pm.get_manifest_path(path_provider);
         _expectations.push_back({
           .url = path().string(),
           .body = body,
@@ -208,7 +209,7 @@ public:
         stm_manifest.spillover(spm.make_manifest_metadata());
 
         // update cache
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
@@ -455,8 +456,19 @@ FIXTURE_TEST(test_async_manifest_view_truncate, async_manifest_view_fixture) {
 
     model::offset so = model::offset{0};
     auto maybe_cursor = view.get_cursor(so).get();
+    BOOST_REQUIRE(
+      maybe_cursor.has_error()
+      && maybe_cursor.error() == cloud_storage::error_outcome::out_of_range);
+
     // The clean offset should still be accesible such that retention
     // can operate above it.
+    maybe_cursor = view
+                     .get_cursor(
+                       so,
+                       std::nullopt,
+                       cloud_storage::async_manifest_view::cursor_base_t::
+                         archive_clean_offset)
+                     .get();
     BOOST_REQUIRE(!maybe_cursor.has_failure());
 
     maybe_cursor = view.get_cursor(new_so).get();
@@ -1106,7 +1118,8 @@ FIXTURE_TEST(test_async_manifest_view_timequery, async_manifest_view_fixture) {
 
     // Find exact matches for all segments
     for (const auto& meta : expected) {
-        auto target = meta.base_timestamp;
+        auto target = async_view_timestamp_query(
+          kafka::offset(0), meta.base_timestamp, kafka::offset::max());
         auto maybe_cursor = view.get_cursor(target).get();
         BOOST_REQUIRE(!maybe_cursor.has_failure());
         auto cursor = std::move(maybe_cursor.value());
@@ -1119,9 +1132,9 @@ FIXTURE_TEST(test_async_manifest_view_timequery, async_manifest_view_fixture) {
                 m.last_segment()->max_timestamp,
                 stm_manifest.begin()->base_timestamp,
                 stm_manifest.last_segment()->max_timestamp);
-              auto res = m.timequery(target);
+              auto res = m.timequery(target.ts);
               BOOST_REQUIRE(res.has_value());
-              BOOST_REQUIRE(res.value().base_timestamp == target);
+              BOOST_REQUIRE(res.value().base_timestamp == target.ts);
           })
           .get();
     }
@@ -1148,7 +1161,10 @@ FIXTURE_TEST(
     // that there is a gap between any two segments.
 
     for (const auto& meta : expected) {
-        auto target = model::timestamp(meta.base_timestamp.value() - 1);
+        auto target = async_view_timestamp_query(
+          kafka::offset(0),
+          model::timestamp(meta.base_timestamp() - 1),
+          kafka::offset::max());
         auto maybe_cursor = view.get_cursor(target).get();
         BOOST_REQUIRE(!maybe_cursor.has_failure());
         auto cursor = std::move(maybe_cursor.value());
@@ -1162,11 +1178,11 @@ FIXTURE_TEST(
                 m.last_segment()->max_timestamp,
                 stm_manifest.begin()->base_timestamp,
                 stm_manifest.last_segment()->max_timestamp);
-              auto res = m.timequery(target);
+              auto res = m.timequery(target.ts);
               BOOST_REQUIRE(res.has_value());
               BOOST_REQUIRE(
                 model::timestamp(res.value().base_timestamp.value() - 1)
-                == target);
+                == target.ts);
           })
           .get();
     }

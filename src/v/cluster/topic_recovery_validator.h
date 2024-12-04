@@ -10,6 +10,7 @@
 #pragma once
 
 #include "cloud_storage/remote.h"
+#include "cloud_storage/remote_path_provider.h"
 #include "cluster/types.h"
 
 #include <seastar/core/abort_source.hh>
@@ -43,7 +44,7 @@ enum class validation_result {
 /// if the map is empty, it has to be interpreted as "validation ok"
 ss::future<absl::flat_hash_map<model::partition_id, validation_result>>
 maybe_validate_recovery_topic(
-  custom_assignable_topic_configuration const& assignable_config,
+  const custom_assignable_topic_configuration& assignable_config,
   cloud_storage_clients::bucket_name bucket,
   cloud_storage::remote& remote,
   ss::abort_source& as);
@@ -59,10 +60,11 @@ public:
 
     partition_validator(
       cloud_storage::remote& remote,
-      cloud_storage_clients::bucket_name const& bucket,
+      const cloud_storage_clients::bucket_name& bucket,
       ss::abort_source& as,
       model::ntp ntp,
       model::initial_revision_id rev_id,
+      const cloud_storage::remote_path_provider&,
       recovery_checks checks);
 
     /// Perform validation on the ntp as specified with checks
@@ -81,15 +83,14 @@ private:
     ss::future<validation_result> do_validate_manifest_metadata();
 
     // utility method for logging
-    cloud_storage::remote_manifest_path get_path(
-      cloud_storage::manifest_format format
-      = cloud_storage::manifest_format::serde);
+    cloud_storage::remote_manifest_path get_path();
 
     cloud_storage::remote* remote_;
-    cloud_storage_clients::bucket_name const* bucket_;
+    const cloud_storage_clients::bucket_name* bucket_;
     ss::abort_source* as_;
     model::ntp ntp_;
     model::initial_revision_id rev_id_;
+    const cloud_storage::remote_path_provider& remote_path_provider_;
     retry_chain_node op_rtc_;
     retry_chain_logger op_logger_;
     recovery_checks checks_;

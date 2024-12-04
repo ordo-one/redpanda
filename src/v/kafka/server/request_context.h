@@ -24,7 +24,6 @@
 #include "kafka/server/response.h"
 #include "kafka/server/server.h"
 #include "kafka/server/usage_manager.h"
-#include "kafka/types.h"
 #include "model/namespace.h"
 #include "pandaproxy/schema_registry/fwd.h"
 #include "security/acl.h"
@@ -57,9 +56,9 @@ skip_auditing(api_key key, const security::acl_principal& principal) {
            && principal == security::audit_principal;
 }
 
-constexpr auto request_header_size = sizeof(int16_t) + sizeof(int16_t)
-                                     + sizeof(correlation_id::type)
-                                     + sizeof(int16_t);
+inline constexpr auto request_header_size = sizeof(int16_t) + sizeof(int16_t)
+                                            + sizeof(correlation_id::type)
+                                            + sizeof(int16_t);
 
 using audit_on_success = ss::bool_class<struct audit_on_success_tag>;
 
@@ -106,6 +105,12 @@ public:
 
     const request_header& header() const { return _header; }
 
+    // override the client id. This method is used when handling virtual
+    // connections and an actual client id is part of the client id buffer.
+    void override_client_id(std::optional<std::string_view> new_client_id) {
+        _header.client_id = new_client_id;
+    }
+
     ss::lw_shared_ptr<connection_context> connection() { return _conn; }
 
     ssx::sharded_abort_source& abort_source() { return _conn->abort_source(); }
@@ -133,6 +138,14 @@ public:
 
     cluster::topics_frontend& topics_frontend() const {
         return _conn->server().topics_frontend();
+    }
+
+    cluster::client_quota::frontend& quota_frontend() {
+        return _conn->server().quota_frontend();
+    }
+
+    cluster::client_quota::store& quota_store() {
+        return _conn->server().quota_store();
     }
 
     quota_manager& quota_mgr() { return _conn->server().quota_mgr(); }
@@ -329,14 +342,17 @@ public:
     bool authorized(
       security::acl_operation operation,
       const T& name,
-      authz_quiet quiet = authz_quiet{false}) {
+      authz_quiet quiet = authz_quiet{false},
+      audit_authz_check audit_authz = audit_authz_check::yes) {
         auto result = do_authorized(operation, name, quiet);
         auto resp = bool(result);
 
         auto key = _header.key;
         auto client_id = _header.client_id;
 
-        do_audit(std::move(result), name, key, client_id);
+        if (audit_authz) {
+            do_audit(std::move(result), name, key, client_id);
+        }
         return resp;
     }
 

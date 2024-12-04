@@ -13,7 +13,6 @@
 #include "kafka/server/handlers/handlers.h"
 #include "kafka/server/handlers/produce.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
 
 #include <optional>
 
@@ -104,7 +103,7 @@ private:
  */
 template<KafkaApiHandlerAny H>
 struct handler_holder {
-    static const inline handler_base<KafkaApiTwoPhaseHandler<H>> instance{
+    static inline const handler_base<KafkaApiTwoPhaseHandler<H>> instance{
       handler_info{
         H::api::key,
         H::api::name,

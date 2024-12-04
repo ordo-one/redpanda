@@ -17,11 +17,11 @@
 #include "kafka/client/logger.h"
 #include "kafka/protocol/api_versions.h"
 #include "kafka/protocol/delete_records.h"
+#include "kafka/protocol/fetch.h"
 #include "kafka/protocol/flex_versions.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/protocol/offset_for_leader_epoch.h"
-#include "kafka/server/protocol_utils.h"
-#include "kafka/types.h"
+#include "kafka/protocol/wire.h"
 #include "net/transport.h"
 
 #include <seastar/core/future.hh>
@@ -219,7 +219,7 @@ public:
         }
     }
 
-    std::optional<ss::sstring> const& client_id() const { return _client_id; }
+    const std::optional<ss::sstring>& client_id() const { return _client_id; }
 
 private:
     void write_header(protocol::encoder& wr, api_key key, api_version version) {

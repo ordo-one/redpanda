@@ -14,7 +14,6 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/leave_group_request.h"
 #include "kafka/protocol/schemata/leave_group_response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 
 #include <seastar/core/future.hh>
@@ -54,8 +53,8 @@ struct leave_group_response final {
 
     explicit leave_group_response(error_code error)
       : data({
-        .error_code = error,
-      }) {}
+          .error_code = error,
+        }) {}
 
     leave_group_response(const leave_group_request&, error_code error)
       : leave_group_response(error) {}

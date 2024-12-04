@@ -17,7 +17,8 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/ostream.h>
 
-#include <ostream>
+#include <iostream>
+#include <string>
 
 uuid_t::uuid_t(const std::vector<uint8_t>& v) {
     if (v.size() != length) {
@@ -42,4 +43,17 @@ std::ostream& operator<<(std::ostream& os, const uuid_t& u) {
     return os << fmt::format("{}", u._uuid);
 }
 
+std::istream& operator>>(std::istream& is, uuid_t& u) {
+    std::string s;
+    is >> s;
+    try {
+        u = uuid_t::from_string(s);
+    } catch (const std::runtime_error&) {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
 uuid_t::operator ss::sstring() const { return fmt::format("{}", _uuid); }
+
+bool operator<(const uuid_t& l, const uuid_t& r) { return l.uuid() < r.uuid(); }

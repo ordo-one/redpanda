@@ -23,7 +23,7 @@ template<typename T>
 static void set_configuration(ss::sstring p_name, T v) {
     ss::smp::invoke_on_all([p_name, v = std::move(v)] {
         config::shard_local_cfg().get(p_name).set_value(v);
-    }).get0();
+    }).get();
 }
 
 FIXTURE_TEST(key_space, kvstore_test_fixture) {
@@ -58,6 +58,18 @@ FIXTURE_TEST(key_space, kvstore_test_fixture) {
     BOOST_REQUIRE(
       kvs->get(storage::kvstore::key_space::consensus, empty_key).value()
       == value_d);
+
+    std::map<bytes, iobuf> testing_kvs;
+    kvs
+      ->for_each(
+        storage::kvstore::key_space::testing,
+        [&](bytes_view key, const iobuf& val) {
+            BOOST_REQUIRE(testing_kvs.emplace(key, val.copy()).second);
+        })
+      .get();
+    BOOST_REQUIRE_EQUAL(testing_kvs.size(), 2);
+    BOOST_REQUIRE(testing_kvs.at(key) == value_a);
+    BOOST_REQUIRE(testing_kvs.at(empty_key) == value_c);
 
     kvs->stop().get();
 
@@ -108,12 +120,12 @@ FIXTURE_TEST(kvstore_empty, kvstore_test_fixture) {
         batch.push_back(kvs->put(
           storage::kvstore::key_space::testing, key, std::move(value)));
         if (batch.size() > 10) {
-            ss::when_all(batch.begin(), batch.end()).get0();
+            ss::when_all(batch.begin(), batch.end()).get();
             batch.clear();
         }
     }
     if (!batch.empty()) {
-        ss::when_all(batch.begin(), batch.end()).get0();
+        ss::when_all(batch.begin(), batch.end()).get();
         batch.clear();
     }
 

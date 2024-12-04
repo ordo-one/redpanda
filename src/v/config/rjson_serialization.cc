@@ -9,6 +9,9 @@
 
 #include "config/rjson_serialization.h"
 
+#include "config/tls_config.h"
+#include "config/types.h"
+
 namespace json {
 
 void rjson_serialize(
@@ -49,16 +52,30 @@ void rjson_serialize_impl(
     w.Bool(v.get_require_client_auth());
 
     if (v.get_key_cert_files()) {
-        w.Key("key_file");
-        w.String(v.get_key_cert_files()->key_file.c_str());
-
-        w.Key("cert_file");
-        w.String(v.get_key_cert_files()->cert_file.c_str());
+        ss::visit(
+          v.get_key_cert_files().value(),
+          [&w](const config::key_cert& k) {
+              w.Key("key_file");
+              w.String(k.key_file.c_str());
+              w.Key("cert_file");
+              w.String(k.cert_file.c_str());
+          },
+          [&w](const config::p12_container& p) {
+              w.Key("p12_file");
+              w.String(p.p12_path.c_str());
+              w.Key("p12_password");
+              w.String("REDACTED");
+          });
     }
 
     if (v.get_truststore_file()) {
         w.Key("truststore_file");
         w.String((*(v.get_truststore_file())).c_str());
+    }
+
+    if (v.get_crl_file()) {
+        w.Key("crl_file");
+        w.String((*(v.get_crl_file())).c_str());
     }
 }
 
@@ -80,7 +97,7 @@ void rjson_serialize(
 }
 
 void rjson_serialize(
-  json::Writer<json::StringBuffer>& w, const custom_aggregate& v) {
+  json::Writer<json::StringBuffer>& w, const testing::custom_aggregate& v) {
     w.StartObject();
 
     w.Key("string_value");
@@ -139,8 +156,7 @@ void rjson_serialize(
 }
 
 void rjson_serialize(
-  json::Writer<json::StringBuffer>& w,
-  const cloud_storage_clients::s3_url_style& v) {
+  json::Writer<json::StringBuffer>& w, const config::s3_url_style& v) {
     stringize(w, v);
 }
 
@@ -162,11 +178,6 @@ void rjson_serialize(
 }
 
 void rjson_serialize(
-  json::Writer<json::StringBuffer>& w, const model::leader_balancer_mode& v) {
-    stringize(w, v);
-}
-
-void rjson_serialize(
   json::Writer<json::StringBuffer>& w, const model::fetch_read_strategy& v) {
     stringize(w, v);
 }
@@ -179,12 +190,6 @@ void rjson_serialize(
 void rjson_serialize(
   json::Writer<json::StringBuffer>& w,
   const model::cloud_storage_chunk_eviction_strategy& v) {
-    stringize(w, v);
-}
-
-void rjson_serialize(
-  json::Writer<json::StringBuffer>& w,
-  const pandaproxy::schema_registry::subject_name_strategy& v) {
     stringize(w, v);
 }
 
@@ -212,4 +217,52 @@ void rjson_serialize(
     w.EndObject();
 }
 
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const config::fips_mode_flag& f) {
+    stringize(w, f);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const config::tls_version& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::node_uuid& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const config::node_id_override& v) {
+    w.StartObject();
+
+    w.Key("current_uuid");
+    stringize(w, v.key);
+    w.Key("new_uuid");
+    stringize(w, v.uuid);
+    w.Key("new_id");
+    stringize(w, v.id);
+
+    w.EndObject();
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w,
+  const std::vector<config::node_id_override>& v) {
+    w.StartArray();
+    for (const auto& e : v) {
+        rjson_serialize(w, e);
+    }
+    w.EndArray();
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const config::leaders_preference& lp) {
+    stringize(w, lp);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, config::datalake_catalog_type ct) {
+    stringize(w, ct);
+}
 } // namespace json

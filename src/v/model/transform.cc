@@ -15,10 +15,15 @@
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/map.h"
 #include "serde/rw/rw.h"
+#include "serde/rw/uuid.h"
+#include "serde/rw/vector.h"
 #include "utils/vint.h"
 
 #include <seastar/core/print.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/util/variant_utils.hh>
 
@@ -74,6 +79,16 @@ void append_vint_to_iobuf(iobuf& b, int64_t v) {
 
 } // namespace
 
+std::ostream& operator<<(std::ostream& os, const transform_from_start& o) {
+    fmt::print(os, "{{ start + {} }}", o.delta);
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const transform_from_end& o) {
+    fmt::print(os, "{{ end - {} }}", o.delta);
+    return os;
+}
+
 std::ostream&
 operator<<(std::ostream& os, const transform_offset_options& opts) {
     ss::visit(
@@ -83,22 +98,124 @@ operator<<(std::ostream& os, const transform_offset_options& opts) {
       },
       [&os](model::timestamp ts) {
           fmt::print(os, "{{ timequery: {} }}", ts.value());
+      },
+      [&os](model::transform_from_start off) {
+          fmt::print(os, "{{ offset: {} }}", off);
+      },
+      [&os](model::transform_from_end off) {
+          fmt::print(os, "{{ offset: {} }}", off);
       });
     return os;
+}
+
+/**
+ * Legacy version of transform_offset_options
+ *
+ * When writing out transform metadata, we write this version if and
+ * only if the position variant contains one of the legacy alternatives.
+ * This allows us to feature-gate the use of the new alternatives
+ * (see model/transform.h) without completely blocking transform deploys
+ * during an upgrade.
+ */
+struct legacy_transform_offset_options
+  : serde::envelope<
+      legacy_transform_offset_options,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    serde::variant<transform_offset_options::latest_offset, model::timestamp>
+      position;
+    bool operator==(const legacy_transform_offset_options&) const = default;
+
+    void serde_write(iobuf& out) const { serde::write(out, position); }
+};
+
+bool transform_offset_options::is_legacy_compat() const {
+    return std::holds_alternative<transform_offset_options::latest_offset>(
+             position)
+           || std::holds_alternative<model::timestamp>(position);
+}
+
+void transform_offset_options::serde_read(
+  iobuf_parser& in, const serde::header& h) {
+    using serde::read_nested;
+
+    if (h._version == 0) {
+        auto p = read_nested<serde::variant<latest_offset, model::timestamp>>(
+          in, h._bytes_left_limit);
+        ss::visit(p, [this](auto v) { position = v; });
+    } else {
+        position = read_nested<decltype(position)>(in, h._bytes_left_limit);
+    }
+
+    if (in.bytes_left() > h._bytes_left_limit) {
+        in.skip(in.bytes_left() - h._bytes_left_limit);
+    }
+}
+
+void transform_offset_options::serde_write(iobuf& out) const {
+    serde::write(out, position);
 }
 
 std::ostream& operator<<(std::ostream& os, const transform_metadata& meta) {
     fmt::print(
       os,
       "{{name: \"{}\", input: {}, outputs: {}, "
-      "env: <redacted>, uuid: {}, source_ptr: {} }}",
+      "env: <redacted>, uuid: {}, source_ptr: {}, is_paused: {} }}",
       meta.name,
       meta.input_topic,
       meta.output_topics,
       // skip env becuase of pii
       meta.uuid,
-      meta.source_ptr);
+      meta.source_ptr,
+      meta.paused);
     return os;
+}
+
+void transform_metadata::serde_write(iobuf& out) const {
+    serde::write(out, name);
+    write(out, input_topic);
+    serde::write(out, output_topics);
+    serde::write(out, environment);
+    serde::write(out, uuid);
+    serde::write(out, source_ptr);
+    ss::visit(
+      offset_options.position,
+      [&out](transform_offset_options::latest_offset v) {
+          serde::write(out, legacy_transform_offset_options{.position = v});
+      },
+      [&out](model::timestamp v) {
+          serde::write(out, legacy_transform_offset_options{.position = v});
+      },
+      [this, &out](auto) { serde::write(out, offset_options); });
+    serde::write(out, paused);
+    serde::write(out, compression_mode);
+}
+
+void transform_metadata::serde_read(iobuf_parser& in, const serde::header& h) {
+    using serde::read_nested;
+
+    name = read_nested<decltype(name)>(in, h._bytes_left_limit);
+    input_topic = read_nested<decltype(input_topic)>(in, h._bytes_left_limit);
+    output_topics = read_nested<decltype(output_topics)>(
+      in, h._bytes_left_limit);
+    environment = read_nested<decltype(environment)>(in, h._bytes_left_limit);
+    uuid = read_nested<decltype(uuid)>(in, h._bytes_left_limit);
+    source_ptr = read_nested<decltype(source_ptr)>(in, h._bytes_left_limit);
+
+    if (h._version >= 1) {
+        offset_options = read_nested<decltype(offset_options)>(
+          in, h._bytes_left_limit);
+    }
+    if (h._version >= 2) {
+        paused = read_nested<decltype(paused)>(in, h._bytes_left_limit);
+        compression_mode = read_nested<decltype(compression_mode)>(
+          in, h._bytes_left_limit);
+    }
+}
+
+bool transform_metadata_patch::empty() const noexcept {
+    return !env.has_value() && !paused.has_value()
+           && !compression_mode.has_value();
 }
 
 std::ostream& operator<<(std::ostream& os, const transform_offsets_key& key) {
@@ -159,7 +276,7 @@ transform_report::transform_report(transform_metadata meta)
 transform_report::transform_report(
   transform_metadata meta, absl::btree_map<model::partition_id, processor> map)
   : metadata(std::move(meta))
-  , processors(std::move(map)){};
+  , processors(std::move(map)) {};
 
 void transform_report::add(processor processor) {
     processors.insert_or_assign(processor.id, processor);
@@ -228,6 +345,7 @@ model::record_batch transformed_data::make_batch(
 
     model::record_batch_header header;
     header.type = record_batch_type::raft_data;
+    header.ctx.owner_shard = ss::this_shard_id();
     // mark the batch as created with broker time
     header.attrs.set_timestamp_type(model::timestamp_type::append_time);
     header.first_timestamp = timestamp;
@@ -321,7 +439,7 @@ void tag_invoke(
   serde::tag_t<serde::read_tag>,
   iobuf_parser& in,
   wasm_binary_iobuf& t,
-  std::size_t const bytes_left_limit) {
+  const std::size_t bytes_left_limit) {
     auto size = serde::read_nested<serde::serde_size_t>(in, bytes_left_limit);
     t = wasm_binary_iobuf(std::make_unique<iobuf>(in.share(size)));
 }
@@ -344,4 +462,5 @@ void tag_invoke(
         }
     }
 }
+
 } // namespace model

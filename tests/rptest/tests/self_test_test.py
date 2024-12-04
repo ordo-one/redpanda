@@ -9,12 +9,15 @@
 
 import re
 import time
+from collections import defaultdict
 from rptest.services.cluster import cluster
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk import RpkTool
 from rptest.services.admin import Admin
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, SISettings
+from rptest.services.redpanda_installer import RedpandaVersionLine
+from rptest.services.redpanda_installer import InstallOptions
 from ducktape.utils.util import wait_until
 from ducktape.mark import matrix
 from rptest.utils.functional import flat_map
@@ -43,67 +46,34 @@ class SelfTestTest(EndToEndTest):
             return not any([x['status'] == 'running'
                             for x in node_reports]), node_reports
 
-        return wait_until_result(all_idle, timeout_sec=30, backoff_sec=1)
+        return wait_until_result(all_idle, timeout_sec=90, backoff_sec=1)
 
     @cluster(num_nodes=3)
-    @matrix(remote_read=[True, False], remote_write=[True, False])
-    def test_self_test(self, remote_read, remote_write):
+    def test_self_test(self):
         """Assert the self test starts/completes with success."""
         num_nodes = 3
         self.start_redpanda(
             num_nodes=num_nodes,
-            si_settings=SISettings(
-                test_context=self.test_context,
-                cloud_storage_enable_remote_read=remote_read,
-                cloud_storage_enable_remote_write=remote_write))
+            si_settings=SISettings(test_context=self.test_context))
         self.rpk_client().self_test_start(2000, 2000, 5000, 100)
 
         # Wait for completion
         node_reports = self.wait_for_self_test_completion()
 
-        # Verify returned results
-        def assert_pass(report):
-            assert 'error' not in report
-            assert 'warning' not in report
-
-        def assert_fail(report, error_msg):
-            assert 'error' in report
-            assert report['error'] == error_msg
-
-        read_tests = ['List', 'Head', 'Get']
-        write_tests = ['Put', 'Delete', 'Plural Delete']
-
         for node in node_reports:
             assert node['status'] == 'idle'
             assert node.get('results') is not None
             for report in node['results']:
-                if report['test_type'] == 'cloud_storage':
-                    if report['info'] in read_tests:
-                        if remote_read:
-                            assert_pass(report)
-                        else:
-                            assert_fail(
-                                report,
-                                'Remote read is not enabled for this cluster.')
-                    else:
-                        assert report['info'] in write_tests
-                        if remote_write:
-                            assert_pass(report)
-                        else:
-                            assert_fail(
-                                report,
-                                'Remote write is not enabled for this cluster.'
-                            )
-                else:
-                    assert_pass(report)
+                assert 'error' not in report
+                assert 'warning' not in report
 
         # Ensure the results appear as expected. Assertions aren't performed
         # on specific results, but rather what tests are oberved to have run
         reports = flat_map(lambda node: node['results'], node_reports)
 
-        # Ensure 4 disk tests per node, read/write & latency/throughput
+        # Ensure 10 disk tests per node (see the RPK code for the full list)
         disk_results = [r for r in reports if r['test_type'] == 'disk']
-        expected_disk_results = num_nodes * 4
+        expected_disk_results = num_nodes * 10
         assert len(
             disk_results
         ) == expected_disk_results, f"Expected {expected_disk_results} disk reports observed {len(disk_results)}"
@@ -111,9 +81,10 @@ class SelfTestTest(EndToEndTest):
         # Assert properties of the network results hold true
         network_results = [r for r in reports if r['test_type'] == 'network']
 
-        cloud_results = [
-            r for r in reports if r['test_type'] == 'cloud_storage'
-        ]
+        cloud_results = [r for r in reports if r['test_type'] == 'cloud']
+
+        read_tests = ['List', 'Head', 'Get']
+        write_tests = ['Put', 'Delete', 'Plural Delete']
 
         num_expected_cloud_storage_read_tests = num_nodes * len(read_tests)
         num_expected_cloud_storage_write_tests = num_nodes * len(write_tests)
@@ -235,3 +206,142 @@ class SelfTestTest(EndToEndTest):
                 # cancelled before it even had a chance to start, resulting in
                 # a 0 value for duration
                 assert report['duration'] >= 0
+
+    @cluster(num_nodes=3)
+    def test_self_test_unknown_test_type(self):
+        """Assert the self test still runs when an invalid test type is passed.
+           This helps ensure the self test will still work in a cluster
+           with mixed versions of Redpanda."""
+        num_nodes = 3
+
+        self.start_redpanda(
+            num_nodes=num_nodes,
+            si_settings=SISettings(test_context=self.test_context))
+
+        # Attempt to run with an unknown test type "pandatest"
+        # and possibly unknown "cloud" test.
+        # The rest of the tests should proceed as normal.
+        request_json = {
+            'tests': [{
+                'type': 'pandatest'
+            }, {
+                'type': 'disk'
+            }, {
+                'type': 'network'
+            }, {
+                'type': 'cloud'
+            }]
+        }
+
+        # Manually invoke self test admin endpoint.
+        self.redpanda._admin._request('POST',
+                                      'debug/self_test/start',
+                                      json=request_json)
+
+        # Populate list of unknown reports.
+        unknown_report_types = ['pandatest']
+        redpanda_versions = [
+            self.redpanda.get_version_int_tuple(node)
+            for node in self.redpanda.nodes
+        ]
+
+        # All nodes should have the same version of
+        # Redpanda running.
+        assert len(set(redpanda_versions)) == 1
+
+        # Cloudcheck was introduced in 24.2.1.
+        # Expect that it will be unknown to nodes running
+        # earlier versions of redpanda.
+        if redpanda_versions[0] < (24, 2, 1):
+            unknown_report_types.append('cloud')
+
+        # Wait for self test completion.
+        node_reports = self.wait_for_self_test_completion()
+
+        # Assert reports are passing, with the exception of unknown tests.
+        reports = flat_map(lambda node: node['results'], node_reports)
+        assert len(reports) > 0
+        for report in reports:
+            if report['test_type'] in unknown_report_types:
+                assert 'error' in report
+            else:
+                assert 'error' not in report
+                assert 'warning' not in report
+
+    @cluster(num_nodes=3)
+    def test_self_test_mixed_node_controller_lower_version(self):
+        """Assert the self test still runs when the controller node
+        is of a lower version than the rest of the nodes in the cluster.
+        The upgraded follower nodes should be able to parse the "unknown"
+        checks (currently just the cloudcheck), and then run and return
+        their results to the controller node."""
+        num_nodes = 3
+
+        install_opts = InstallOptions(version=RedpandaVersionLine((24, 1)),
+                                      num_to_upgrade=2)
+        self.start_redpanda(
+            num_nodes=num_nodes,
+            si_settings=SISettings(test_context=self.test_context),
+            install_opts=install_opts)
+
+        # Attempt to run with a possibly unknown "cloud" test.
+        # The controller, which is of a lower version than the other nodes in the cluster,
+        # doesn't recognize "cloud" as a test, but the other nodes should.
+        request_json = {
+            'tests': [{
+                'type': 'cloud',
+                'backoff_ms': 100,
+                'timeout_ms': 5000
+            }]
+        }
+
+        redpanda_versions = {
+            i: self.redpanda.get_version_int_tuple(node)
+            for (i, node) in enumerate(self.redpanda.nodes)
+        }
+
+        controller_node_index = min(redpanda_versions,
+                                    key=redpanda_versions.get)
+        controller_node_id = controller_node_index + 1
+        # Make sure that the lowest version node is the controller.
+        self.redpanda._admin.partition_transfer_leadership(
+            'redpanda', 'controller', 0, controller_node_id)
+        wait_until(lambda: self.redpanda._admin.get_partition_leader(
+            namespace="redpanda", topic="controller", partition=0) ==
+                   controller_node_id,
+                   timeout_sec=10,
+                   backoff_sec=1,
+                   err_msg="Leadership did not stabilize")
+
+        # Manually invoke self test admin endpoint, using the lowest version node as the target.
+        self.redpanda._admin._request(
+            'POST',
+            'debug/self_test/start',
+            json=request_json,
+            node=self.redpanda.nodes[controller_node_index])
+
+        # Wait for self test completion.
+        node_reports = self.wait_for_self_test_completion()
+
+        unknown_checks_map = defaultdict(set)
+        for node, version in redpanda_versions.items():
+            node_id = node + 1
+            # Cloudcheck was introduced in 24.2.1.
+            # Expect that it will be unknown to nodes running
+            # earlier versions of redpanda.
+            if version < (24, 2, 1):
+                unknown_checks_map[node_id].add('cloud')
+
+        # Assert reports are passing, with the exception of unknown tests.
+        assert len(node_reports) > 0
+        for report in node_reports:
+            node = report['node_id']
+            results = report['results']
+            # Results shouldn't be empty, even for unknown checks.
+            assert len(results) > 0
+            for result in results:
+                if result['test_type'] in unknown_checks_map[node]:
+                    assert 'error' in result
+                else:
+                    assert 'error' not in result
+                    assert 'warning' not in result

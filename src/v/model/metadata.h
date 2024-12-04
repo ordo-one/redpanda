@@ -15,6 +15,11 @@
 #include "base/units.h"
 #include "model/fundamental.h"
 #include "serde/envelope.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/tristate_rw.h"
+#include "serde/rw/vector.h"
 #include "utils/named_type.h"
 #include "utils/unresolved_address.h"
 #include "utils/xid.h"
@@ -47,7 +52,7 @@ struct broker_properties
     // key=value properties in /etc/redpanda/machine_properties.yaml
     std::unordered_map<ss::sstring, ss::sstring> etc_props;
     uint64_t available_memory_bytes = 0;
-    bool in_fips_mode = false;
+    fips_mode_flag in_fips_mode = fips_mode_flag::disabled;
 
     bool operator==(const broker_properties& other) const = default;
 
@@ -191,11 +196,11 @@ public:
       std::optional<rack_id> rack,
       broker_properties props) noexcept
       : broker(
-        id,
-        {broker_endpoint(std::move(kafka_advertised_listener))},
-        std::move(rpc_address),
-        std::move(rack),
-        std::move(props)) {}
+          id,
+          {broker_endpoint(std::move(kafka_advertised_listener))},
+          std::move(rpc_address),
+          std::move(rack),
+          std::move(props)) {}
 
     broker(broker&&) noexcept = default;
     broker& operator=(broker&&) noexcept = default;
@@ -270,7 +275,7 @@ struct broker_shard {
     }
 
     friend void read_nested(
-      iobuf_parser& in, broker_shard& bs, std::size_t const bytes_left_limit) {
+      iobuf_parser& in, broker_shard& bs, const std::size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, bs.node_id, bytes_left_limit);
         read_nested(in, bs.shard, bytes_left_limit);
@@ -369,7 +374,7 @@ struct topic_namespace {
     friend void read_nested(
       iobuf_parser& in,
       topic_namespace& t,
-      std::size_t const bytes_left_limit) {
+      const std::size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, t.ns, bytes_left_limit);
         read_nested(in, t.tp, bytes_left_limit);
@@ -377,6 +382,8 @@ struct topic_namespace {
 
     model::ns ns;
     model::topic tp;
+
+    ss::sstring path() const;
 
     friend std::ostream& operator<<(std::ostream&, const topic_namespace&);
 };
@@ -466,7 +473,8 @@ enum class cloud_storage_backend {
     google_s3_compat = 1,
     azure = 2,
     minio = 3,
-    unknown = 4,
+    oracle_s3_compat = 4,
+    unknown
 };
 
 inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
@@ -479,30 +487,12 @@ inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
         return os << "azure";
     case cloud_storage_backend::minio:
         return os << "minio";
+    case cloud_storage_backend::oracle_s3_compat:
+        return os << "oracle_s3_compat";
     case cloud_storage_backend::unknown:
         return os << "unknown";
     }
 }
-
-enum class leader_balancer_mode : uint8_t {
-    greedy_balanced_shards = 0,
-    random_hill_climbing = 1,
-};
-
-constexpr const char*
-leader_balancer_mode_to_string(leader_balancer_mode mode) {
-    switch (mode) {
-    case leader_balancer_mode::greedy_balanced_shards:
-        return "greedy_balanced_shards";
-    case leader_balancer_mode::random_hill_climbing:
-        return "random_hill_climbing";
-    default:
-        throw std::invalid_argument("unknown leader_balancer_mode");
-    }
-}
-
-std::ostream& operator<<(std::ostream&, leader_balancer_mode);
-std::istream& operator>>(std::istream&, leader_balancer_mode&);
 
 enum class cloud_storage_chunk_eviction_strategy {
     eager = 0,
@@ -525,6 +515,8 @@ operator<<(std::ostream& os, cloud_storage_chunk_eviction_strategy st) {
 enum class fetch_read_strategy : uint8_t {
     polling = 0,
     non_polling = 1,
+    non_polling_with_debounce = 2,
+    non_polling_with_pid = 3,
 };
 
 constexpr const char* fetch_read_strategy_to_string(fetch_read_strategy s) {
@@ -533,6 +525,10 @@ constexpr const char* fetch_read_strategy_to_string(fetch_read_strategy s) {
         return "polling";
     case fetch_read_strategy::non_polling:
         return "non_polling";
+    case fetch_read_strategy::non_polling_with_debounce:
+        return "non_polling_with_debounce";
+    case fetch_read_strategy::non_polling_with_pid:
+        return "non_polling_with_pid";
     default:
         throw std::invalid_argument("unknown fetch_read_strategy");
     }
@@ -578,25 +574,6 @@ std::optional<write_caching_mode>
 std::ostream& operator<<(std::ostream&, write_caching_mode);
 std::istream& operator>>(std::istream&, write_caching_mode&);
 
-namespace internal {
-/*
- * Old version for use in backwards compatibility serialization /
- * deserialization helpers.
- */
-struct broker_v0 {
-    model::node_id id;
-    net::unresolved_address kafka_address;
-    net::unresolved_address rpc_address;
-    std::optional<rack_id> rack;
-    model::broker_properties properties;
-
-    model::broker to_v3() const {
-        return model::broker(id, kafka_address, rpc_address, rack, properties);
-    }
-};
-
-} // namespace internal
-
 enum class recovery_validation_mode : std::uint16_t {
     // ensure that either the manifest is in TS or that no manifest is present.
     // download issues will fail the validation
@@ -610,6 +587,25 @@ enum class recovery_validation_mode : std::uint16_t {
 
 std::ostream& operator<<(std::ostream&, recovery_validation_mode);
 std::istream& operator>>(std::istream&, recovery_validation_mode&);
+
+// Iceberg enablement options for a topic
+enum class iceberg_mode : uint8_t {
+    // Iceberg is disabled
+    disabled = 0,
+    // Iceberg translation interprets record key and value as binary
+    // types and uses default Iceberg table schema.
+    key_value = 1,
+    // Iceberg translation interprets the record value using the schema
+    // id embedded in value. Kafka serializers embed a magic byte as the
+    // first byte of the value to indicate the presence of a schema id
+    // which is then resolved with the schema registry. The value bytes
+    // are then interepted using the schema and the resulting columns are
+    // mapped to appropriate iceberg types and corresponding table columns.
+    value_schema_id_prefix = 2
+};
+
+std::ostream& operator<<(std::ostream&, const iceberg_mode&);
+std::istream& operator>>(std::istream&, iceberg_mode&);
 
 } // namespace model
 
@@ -668,7 +664,8 @@ struct hash<model::broker_properties> {
             boost::hash_combine(h, std::hash<ss::sstring>()(k));
             boost::hash_combine(h, std::hash<ss::sstring>()(v));
         }
-        boost::hash_combine(h, std::hash<bool>()(b.in_fips_mode));
+        boost::hash_combine(
+          h, std::hash<model::fips_mode_flag>()(b.in_fips_mode));
         return h;
     }
 };

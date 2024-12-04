@@ -14,7 +14,6 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
@@ -191,7 +190,7 @@ struct fetch_config {
           cfg.abort_source.has_value()
             ? cfg.abort_source.value().get().abort_requested()
             : false,
-          cfg.client_address.value_or(model::client_address_t{"unknown"}));
+          cfg.client_address.value_or(model::client_address_t{}));
         return o;
     }
 };
@@ -264,11 +263,13 @@ struct read_result {
       model::offset start_offset,
       model::offset hw,
       model::offset lso,
+      std::optional<std::chrono::milliseconds> delta,
       std::vector<cluster::tx::tx_range> aborted_transactions)
       : data(std::move(data))
       , start_offset(start_offset)
       , high_watermark(hw)
       , last_stable_offset(lso)
+      , delta_from_tip_ms(delta)
       , error(error_code::none)
       , aborted_transactions(std::move(aborted_transactions)) {}
 
@@ -311,17 +312,14 @@ struct read_result {
         return ss::visit(
           data,
           [](data_t& d) { return std::move(*d); },
-          [](foreign_data_t& d) {
-              auto ret = d->copy();
-              d.reset();
-              return ret;
-          });
+          [](foreign_data_t& d) { return std::move(*d); });
     }
 
     variant_t data;
     model::offset start_offset;
     model::offset high_watermark;
     model::offset last_stable_offset;
+    std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     std::optional<model::node_id> preferred_replica;
     error_code error;
     model::partition_id partition;
@@ -424,6 +422,8 @@ read_result::memory_units_t reserve_memory_units(
   ssx::semaphore& memory_fetch_sem,
   const size_t max_bytes,
   const bool obligatory_batch_read);
+
+ss::future<> do_fetch(op_context& octx);
 
 } // namespace testing
 } // namespace kafka

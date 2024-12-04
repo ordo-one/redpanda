@@ -12,6 +12,8 @@ package maintenance
 import (
 	"fmt"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -35,7 +37,7 @@ func nullableToStr[V any](v *V) string {
 	return fmt.Sprint(*v)
 }
 
-func addBrokerMaintenanceReport(table *out.TabWriter, b adminapi.Broker) {
+func addBrokerMaintenanceReport(table *out.TabWriter, b rpadmin.Broker) {
 	table.Print(
 		b.NodeID,
 		b.Maintenance.Draining,
@@ -80,12 +82,12 @@ Notes:
      transfer.
 `,
 		Args: cobra.ExactArgs(0),
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			brokers, err := client.Brokers(cmd.Context())

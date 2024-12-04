@@ -21,11 +21,13 @@
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
 #include "strings/string_switch.h"
+#include "utils/tristate.h"
 
 #include <seastar/core/sstring.hh>
 
 #include <bits/stdint-intn.h>
 #include <bits/stdint-uintn.h>
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -66,16 +68,6 @@ config_map_t config_map(const std::vector<creatable_topic_configs>& config) {
     return make_config_map(config);
 }
 
-// Either parse configuration or return nullopt
-template<typename T>
-static std::optional<T>
-get_config_value(const config_map_t& config, std::string_view key) {
-    if (auto it = config.find(key); it != config.end()) {
-        return boost::lexical_cast<T>(it->second);
-    }
-    return std::nullopt;
-}
-
 template<class T>
 requires std::
   is_same_v<T, std::chrono::duration<typename T::rep, typename T::period>>
@@ -106,18 +98,28 @@ get_string_value(const config_map_t& config, std::string_view key) {
 }
 
 // Either parse configuration or return nullopt
-static std::optional<bool>
+std::optional<bool>
 get_bool_value(const config_map_t& config, std::string_view key) {
     if (auto it = config.find(key); it != config.end()) {
-        return string_switch<std::optional<bool>>(it->second)
-          .match("true", true)
-          .match("false", false)
-          .default_match(std::nullopt);
+        try {
+            // Ignore case.
+            auto str_value = it->second;
+            std::transform(
+              str_value.begin(),
+              str_value.end(),
+              str_value.begin(),
+              [](const auto& c) { return std::tolower(c); });
+            return string_switch<std::optional<bool>>(str_value)
+              .match("true", true)
+              .match("false", false);
+        } catch (const std::runtime_error&) {
+            throw boost::bad_lexical_cast();
+        };
     }
     return std::nullopt;
 }
 
-static model::shadow_indexing_mode
+model::shadow_indexing_mode
 get_shadow_indexing_mode(const config_map_t& config) {
     auto arch_enabled = get_bool_value(config, topic_property_remote_write);
     auto si_enabled = get_bool_value(config, topic_property_remote_read);
@@ -145,28 +147,6 @@ get_shadow_indexing_mode(const config_map_t& config) {
     return mode;
 }
 
-// Special case for options where Kafka allows -1
-// In redpanda the mapping is following
-//
-// -1 (feature disabled)   =>  tristate.is_disabled() == true;
-// no value                =>  tristate.has_value() == false;
-// value present           =>  tristate.has_value() == true;
-
-template<typename T>
-static tristate<T>
-get_tristate_value(const config_map_t& config, std::string_view key) {
-    auto v = get_config_value<int64_t>(config, key);
-    // no value set
-    if (!v) {
-        return tristate<T>(std::nullopt);
-    }
-    // disabled case
-    if (v <= 0) {
-        return tristate<T>{};
-    }
-    return tristate<T>(std::make_optional<T>(*v));
-}
-
 template<typename T>
 static std::optional<T>
 get_enum_value(const config_map_t& config, std::string_view key) {
@@ -181,6 +161,34 @@ get_enum_value(const config_map_t& config, std::string_view key) {
         return std::nullopt;
     }
     return ret;
+}
+
+static std::optional<config::leaders_preference>
+get_leaders_preference(const config_map_t& config) {
+    if (auto it = config.find(topic_property_leaders_preference);
+        it != config.end()) {
+        return config::leaders_preference::parse(it->second);
+    }
+    return std::nullopt;
+}
+
+static tristate<std::chrono::milliseconds>
+get_delete_retention_ms(const config_map_t& config) {
+    auto delete_retention_ms = get_tristate_value<std::chrono::milliseconds>(
+      config, topic_property_delete_retention_ms);
+
+    // If the config entry for delete.retention.ms is in the "empty" state, and
+    // the cluster default is also std::nullopt, ensure the option is disabled
+    // by default. DescribeConfigs calls should still return DEFAULT_CONFIG when
+    // describing this state, thanks to override_if_not_default in
+    // config_response_utils.cc.
+    if (
+      delete_retention_ms.is_empty()
+      && !config::shard_local_cfg().tombstone_retention_ms().has_value()) {
+        return tristate<std::chrono::milliseconds>{disable_tristate};
+    }
+
+    return delete_retention_ms;
 }
 
 cluster::custom_assignable_topic_configuration
@@ -251,12 +259,31 @@ to_cluster_type(const creatable_topic& t) {
     cfg.properties.flush_bytes = get_config_value<size_t>(
       config_entries, topic_property_flush_bytes);
 
+    cfg.properties.iceberg_mode
+      = get_config_value<model::iceberg_mode>(
+          config_entries, topic_property_iceberg_mode)
+          .value_or(storage::ntp_config::default_iceberg_mode);
+
+    cfg.properties.leaders_preference = get_leaders_preference(config_entries);
+
+    cfg.properties.delete_retention_ms = get_delete_retention_ms(
+      config_entries);
+
+    cfg.properties.iceberg_delete = get_bool_value(
+      config_entries, topic_property_iceberg_delete);
+
     schema_id_validation_config_parser schema_id_validation_config_parser{
       cfg.properties};
 
     for (auto& p : t.configs) {
         schema_id_validation_config_parser(
           p, kafka::config_resource_operation::set);
+    }
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        cfg.properties.cloud_topic_enabled
+          = get_bool_value(config_entries, topic_property_cloud_topic_enabled)
+              .value_or(storage::ntp_config::default_cloud_topic_enabled);
     }
 
     /// Final topic_property not decoded here is \ref remote_topic_properties,

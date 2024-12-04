@@ -29,7 +29,7 @@ fetch_dep(absl
 
 fetch_dep(fmt
   REPO https://github.com/fmtlib/fmt.git
-  TAG 8.1.1)
+  TAG 9.1.0)
 
 # CMakeLists.txt is patched to avoid registering tests. We still want the
 # Seastar testing library to be built, but we don't want the tests to run. This
@@ -38,6 +38,7 @@ fetch_dep(fmt
 set(Seastar_TESTING ON CACHE BOOL "" FORCE)
 set(Seastar_API_LEVEL 6 CACHE STRING "" FORCE)
 set(Seastar_CXX_FLAGS -Wno-error)
+set(Seastar_WITH_OSSL ON CACHE BOOL "" FORCE)
 set(CMAKE_CXX_STANDARD
   "${CMAKE_CXX_STANDARD}"
   CACHE
@@ -45,18 +46,23 @@ set(CMAKE_CXX_STANDARD
   "C++ standard to build with.")
 fetch_dep(seastar
   REPO https://github.com/redpanda-data/seastar.git
-  TAG v24.2.x
+  TAG v24.3.x
   PATCH_COMMAND sed -i "s/add_subdirectory (tests/# add_subdirectory (tests/g" CMakeLists.txt)
 
 fetch_dep(avro
   REPO https://github.com/redpanda-data/avro
-  TAG release-1.11.1-redpanda
+  TAG release-1.12.0-redpanda
   SOURCE_SUBDIR redpanda_build)
 
 fetch_dep(rapidjson
   REPO https://github.com/redpanda-data/rapidjson.git
   TAG 14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5
   SOURCE_SUBDIR redpanda_build)
+
+FetchContent_Declare(jsoncons
+  URL https://github.com/danielaparker/jsoncons/archive/ffd2540bc9cfb54c16ef4d29d80622605d8dfbe8.tar.gz
+  URL_HASH MD5=8984d54668cdeb924fe1e37ea8dcc236
+  OVERRIDE_FIND_PACKAGE)
 
 fetch_dep(unordered_dense
   REPO https://github.com/redpanda-data/unordered_dense
@@ -141,7 +147,8 @@ FetchContent_MakeAvailable(
     wasmtime
     hdrhistogram
     ada
-    unordered_dense)
+    unordered_dense
+    jsoncons)
 
 add_library(Crc32c::crc32c ALIAS crc32c)
 add_library(aklomp::base64 ALIAS base64)

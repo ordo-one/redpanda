@@ -27,9 +27,11 @@
 #include "redpanda/admin/api-doc/debug.json.hh"
 #include "redpanda/admin/server.h"
 #include "redpanda/admin/util.h"
+#include "resource_mgmt/cpu_profiler.h"
 #include "serde/rw/rw.h"
 #include "storage/kvstore.h"
 
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/json/json_elements.hh>
@@ -99,7 +101,7 @@ void fill_raft_state(
         ss::httpd::debug_json::stm_state state;
         state.name = stm.name;
         state.last_applied_offset = stm.last_applied_offset;
-        state.max_collectible_offset = stm.last_applied_offset;
+        state.max_collectible_offset = stm.max_collectible_offset;
         raft_state.stms.push(std::move(state));
     }
     if (src.recovery_state) {
@@ -493,6 +495,14 @@ void admin_server::register_debug_routes() {
 
 using admin::apply_validator;
 
+void check_shard_id(seastar::shard_id id) {
+    auto max_shard_id = ss::smp::count - 1;
+    if (id > max_shard_id) {
+        throw ss::httpd::bad_param_exception(
+          fmt::format("Shard id too high, max shard id is {}", max_shard_id));
+    }
+}
+
 ss::future<ss::json::json_return_type>
 admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
     vlog(adminlog.info, "Request to sampled cpu profile");
@@ -508,12 +518,7 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
     }
 
     if (shard_id.has_value()) {
-        auto all_cpus = ss::smp::all_cpus();
-        auto max_shard_id = std::max_element(all_cpus.begin(), all_cpus.end());
-        if (*shard_id > *max_shard_id) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "Shard id too high, max shard id is {}", *max_shard_id));
-        }
+        check_shard_id(*shard_id);
     }
 
     std::optional<std::chrono::milliseconds> wait_ms;
@@ -542,23 +547,23 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
           *wait_ms, shard_id);
     }
 
-    std::vector<ss::httpd::debug_json::cpu_profile_shard_samples> response{
-      profiles.size()};
-    for (size_t i = 0; i < profiles.size(); i++) {
-        response[i].shard_id = profiles[i].shard;
-        response[i].dropped_samples = profiles[i].dropped_samples;
-
-        for (auto& sample : profiles[i].samples) {
-            ss::httpd::debug_json::cpu_profile_sample s;
-            s.occurrences = sample.occurrences;
-            s.user_backtrace = sample.user_backtrace;
-
-            response[i].samples.push(s);
-        }
-    }
-
     co_return co_await ss::make_ready_future<ss::json::json_return_type>(
-      std::move(response));
+      ss::json::stream_range_as_array(
+        lw_shared_container(std::move(profiles)),
+        [](const resources::cpu_profiler::shard_samples& profile) {
+            ss::httpd::debug_json::cpu_profile_shard_samples ret;
+            ret.shard_id = profile.shard;
+            ret.dropped_samples = profile.dropped_samples;
+
+            for (auto& sample : profile.samples) {
+                ss::httpd::debug_json::cpu_profile_sample s;
+                s.occurrences = sample.occurrences;
+                s.user_backtrace = sample.user_backtrace;
+
+                ret.samples.push(s);
+            }
+            return ret;
+        }));
 }
 
 ss::future<ss::json::json_return_type>
@@ -693,11 +698,7 @@ admin_server::sampled_memory_profile_handler(
     }
 
     if (shard_id.has_value()) {
-        auto max_shard_id = ss::smp::count;
-        if (*shard_id > max_shard_id) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "Shard id too high, max shard id is {}", max_shard_id));
-        }
+        check_shard_id(*shard_id);
     }
 
     auto profiles = co_await _memory_sampling_service.local()
@@ -802,6 +803,7 @@ admin_server::get_partition_state_handler(
         replica.is_cloud_data_available = state.is_cloud_data_available;
         replica.start_cloud_offset = state.start_cloud_offset;
         replica.next_cloud_offset = state.next_cloud_offset;
+        replica.iceberg_mode = state.iceberg_mode;
         fill_raft_state(replica, std::move(state));
         response.replicas.push(std::move(replica));
     }
@@ -844,14 +846,14 @@ static json::validator make_broker_id_override_validator() {
 namespace {
 ss::future<> override_id_and_uuid(
   storage::kvstore& kvs, model::node_uuid uuid, model::node_id id) {
-    static const bytes node_uuid_key = "node_uuid";
+    static const auto node_uuid_key = bytes::from_string("node_uuid");
     co_await kvs.put(
       storage::kvstore::key_space::controller,
       node_uuid_key,
       serde::to_iobuf(uuid));
     auto invariants_iobuf = kvs.get(
       storage::kvstore::key_space::controller,
-      cluster::controller::invariants_key);
+      cluster::controller::invariants_key());
     if (invariants_iobuf) {
         auto invariants
           = reflection::from_iobuf<cluster::configuration_invariants>(
@@ -860,7 +862,7 @@ ss::future<> override_id_and_uuid(
 
         co_await kvs.put(
           storage::kvstore::key_space::controller,
-          cluster::controller::invariants_key,
+          cluster::controller::invariants_key(),
           reflection::to_iobuf(std::move(invariants)));
     }
 }

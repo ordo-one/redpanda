@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -68,7 +70,7 @@ Enable partition 1, and 2 of topic 'foo', and partition 5 of topic 'bar' in the
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			err = runToggle(cmd.Context(), cl, all, topicArg, partitions, "enable")
@@ -143,7 +145,7 @@ Disable partition 1, and 2 of topic 'foo', and partition 5 of topic 'bar' in the
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			err = runToggle(cmd.Context(), cl, all, topicArg, partitions, "disable")
@@ -162,7 +164,7 @@ Disable partition 1, and 2 of topic 'foo', and partition 5 of topic 'bar' in the
 	return cmd
 }
 
-func runToggle(ctx context.Context, cl *adminapi.AdminAPI, all bool, topicArg, partitionFlag []string, verb string) error {
+func runToggle(ctx context.Context, cl *rpadmin.AdminAPI, all bool, topicArg, partitionFlag []string, verb string) error {
 	isDisable := verb == "disable"
 	if all {
 		ns, topicName := nsTopic(topicArg[0])

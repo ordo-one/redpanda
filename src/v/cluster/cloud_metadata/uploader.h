@@ -16,7 +16,9 @@
 #include "cluster/notification.h"
 #include "cluster/types.h"
 #include "config/property.h"
+#include "raft/notification.h"
 #include "storage/fwd.h"
+#include "utils/lazy_abort_source.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/future.hh>
@@ -109,7 +111,7 @@ public:
     //   callers may retry with the resulting manifest in the same term.
     ss::future<error_outcome> maybe_upload_controller_snapshot(
       cluster_metadata_manifest& manifest,
-      cloud_storage::lazy_abort_source& lazy_as,
+      lazy_abort_source& lazy_as,
       retry_chain_node& retry_node);
 
     auto manifest() const { return _term_manifest; }
@@ -133,7 +135,8 @@ private:
     ss::gate _gate;
     ss::abort_source _as;
 
-    cluster::notification_id_type _leader_cb_id{notification_id_type_invalid};
+    raft::group_manager_notification_id _leader_cb_id{
+      notification_id_type_invalid};
 
     // Abort source to stop sleeping if there is a term change.
     std::optional<std::reference_wrapper<ss::abort_source>> _term_as;

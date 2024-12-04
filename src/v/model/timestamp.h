@@ -81,7 +81,7 @@ public:
     // ADL helpers for interfacing with the serde library.
     friend void write(iobuf& out, timestamp ts);
     friend void
-    read_nested(iobuf_parser& in, timestamp& ts, size_t const bytes_left_limit);
+    read_nested(iobuf_parser& in, timestamp& ts, const size_t bytes_left_limit);
 
     static timestamp now();
 
@@ -94,6 +94,10 @@ using timestamp_clock = std::chrono::system_clock;
 inline timestamp_clock::duration duration_since_epoch(timestamp ts) {
     return std::chrono::duration_cast<timestamp_clock::duration>(
       std::chrono::milliseconds{ts.value()});
+}
+
+inline timestamp_clock::time_point to_time_point(timestamp ts) {
+    return timestamp_clock::time_point(std::chrono::milliseconds(ts.value()));
 }
 
 inline timestamp to_timestamp(timestamp_clock::time_point ts) {

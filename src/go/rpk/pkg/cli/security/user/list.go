@@ -22,6 +22,7 @@ func newListUsersCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		Use:     "list",
 		Aliases: []string{"ls"},
 		Short:   "List SASL users",
+		Args:    cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			f := p.Formatter
 			if h, ok := f.Help([]string{}); ok {
@@ -29,8 +30,9 @@ func newListUsersCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			}
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitNotServerlessAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			users, err := cl.ListUsers(cmd.Context())

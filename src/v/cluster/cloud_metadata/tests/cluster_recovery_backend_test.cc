@@ -7,11 +7,11 @@
  *
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
-#include "archival/archival_metadata_stm.h"
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/types.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/tests/cluster_metadata_utils.h"
 #include "cluster/cloud_metadata/tests/manual_mixin.h"
 #include "cluster/cloud_metadata/uploader.h"
@@ -29,6 +29,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
+#include "partition_manager.h"
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
 #include "security/scram_credential.h"
@@ -57,7 +58,8 @@ class ClusterRecoveryBackendTest
 public:
     ClusterRecoveryBackendTest()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{}, httpd_port_number())
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number())
       , raft0(app.partition_manager.local().get(model::controller_ntp)->raft())
       , controller_stm(app.controller->get_controller_stm().local())
       , remote(app.cloud_storage_api.local())
@@ -166,7 +168,9 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
     cluster::tx_executor{}.run_random_workload(
       spec, remote_p->raft()->term(), remote_p->rm_stm(), remote_p->log());
 
-    auto partitions = app.partition_manager.local().partitions();
+    cluster::partition_manager::ntp_table_container partitions(
+      app.partition_manager.local().partitions().begin(),
+      app.partition_manager.local().partitions().end());
     for (const auto& [ntp, p] : partitions) {
         if (ntp == model::controller_ntp) {
             continue;
@@ -198,14 +202,16 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
     // Create a new cluster.
     raft0 = nullptr;
     restart(should_wipe::yes);
-    config::shard_local_cfg().for_each([](auto& p) { p.reset(); });
+    task_local_cfg.get("log_segment_size_jitter_percent").reset();
     RPTEST_REQUIRE_EVENTUALLY(5s, [this] {
         return app.storage.local().get_cluster_uuid().has_value();
     });
 
     // Sanity check we have a different cluster.
-    ASSERT_TRUE(
-      !app.controller->get_feature_table().local().get_license().has_value());
+    ASSERT_TRUE(!app.controller->get_feature_table()
+                   .local()
+                   .get_configured_license()
+                   .has_value());
     ASSERT_NE(
       1, config::shard_local_cfg().log_segment_size_jitter_percent.value());
     ASSERT_TRUE(!app.controller->get_credential_store().local().contains(
@@ -248,7 +254,7 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
     auto validate_post_recovery = [&] {
         ASSERT_TRUE(app.controller->get_feature_table()
                       .local()
-                      .get_license()
+                      .get_configured_license()
                       .has_value());
         ASSERT_EQ(
           1, config::shard_local_cfg().log_segment_size_jitter_percent.value());
@@ -261,7 +267,9 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
         auto topic_count
           = app.controller->get_topics_state().local().all_topics_count();
         ASSERT_LE(2, topic_count);
-        auto partitions = app.partition_manager.local().partitions();
+        cluster::partition_manager::ntp_table_container partitions(
+          app.partition_manager.local().partitions().begin(),
+          app.partition_manager.local().partitions().end());
         for (const auto& [ntp, p] : partitions) {
             if (!model::is_user_topic(ntp)) {
                 continue;

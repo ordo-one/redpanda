@@ -11,12 +11,11 @@
 
 #include "base/vassert.h"
 #include "compression/lz4_decompression_buffers.h"
-#include "static_deleter_fn.h"
+#include "thirdparty/lz4/lz4.h"
+#include "thirdparty/lz4/lz4frame.h"
+#include "utils/static_deleter_fn.h"
 
 #include <seastar/core/temporary_buffer.hh>
-
-#include <lz4.h>
-#include <lz4frame.h>
 
 namespace compression::internal {
 // from frameCompress.c
@@ -177,7 +176,7 @@ iobuf lz4_frame_compressor::compress_with_block_size(
     return ret;
 }
 
-inline static constexpr size_t
+static inline constexpr size_t
 compute_frame_uncompressed_size(size_t frame_size, size_t original) {
     if (frame_size == 0 || frame_size > original * 255) {
         return original * 4;
@@ -185,7 +184,7 @@ compute_frame_uncompressed_size(size_t frame_size, size_t original) {
     return frame_size;
 }
 
-iobuf lz4_frame_compressor::uncompress(iobuf const& input) {
+iobuf lz4_frame_compressor::uncompress(const iobuf& input) {
     size_t src_size = input.size_bytes();
 
     const size_t max_chunk = details::io_allocation_size::max_chunk_size;

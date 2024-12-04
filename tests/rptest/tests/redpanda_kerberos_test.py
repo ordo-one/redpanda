@@ -14,7 +14,7 @@ import time
 from ducktape.cluster.remoteaccount import RemoteCommandError, RemoteAccountSSHConfig
 from ducktape.cluster.windows_remoteaccount import WindowsRemoteAccount
 from ducktape.errors import TimeoutError
-from ducktape.mark import env, ok_to_fail, parametrize
+from ducktape.mark import env, ignore, parametrize
 from ducktape.tests.test import Test
 from ducktape.utils.util import wait_until
 from rptest.clients.rpk import RpkTool, RpkException
@@ -23,6 +23,7 @@ from rptest.services.cluster import cluster
 from rptest.services.kerberos import KrbKdc, KrbClient, RedpandaKerberosNode, AuthenticationError, KRB5_CONF_PATH, render_krb5_config, ActiveDirectoryKdc
 from rptest.services.redpanda import LoggingConfig, RedpandaService, SecurityConfig
 from rptest.tests.sasl_reauth_test import get_sasl_metrics, REAUTH_METRIC, EXPIRATION_METRIC
+from rptest.utils.mode_checks import skip_fips_mode
 from rptest.utils.rpenv import IsCIOrNotEmpty
 
 LOG_CONFIG = LoggingConfig('info',
@@ -166,11 +167,8 @@ class RedpandaKerberosLicenseTest(RedpandaKerberosTestBase):
                              **kwargs)
         self.redpanda.set_environment({
             '__REDPANDA_LICENSE_CHECK_INTERVAL_SEC':
-            f'{self.LICENSE_CHECK_INTERVAL_SEC}'
+            f'{self.LICENSE_CHECK_INTERVAL_SEC}',
         })
-
-    def _has_license_nag(self):
-        return self.redpanda.search_log_any("Enterprise feature(s).*")
 
     def _license_nag_is_set(self):
         return self.redpanda.search_log_all(
@@ -178,6 +176,7 @@ class RedpandaKerberosLicenseTest(RedpandaKerberosTestBase):
         )
 
     @cluster(num_nodes=3)
+    @skip_fips_mode  # See NOTE below
     def test_license_nag(self):
         wait_until(self._license_nag_is_set,
                    timeout_sec=30,
@@ -185,14 +184,25 @@ class RedpandaKerberosLicenseTest(RedpandaKerberosTestBase):
 
         self.logger.debug("Ensuring no license nag")
         time.sleep(self.LICENSE_CHECK_INTERVAL_SEC * 2)
-        assert not self._has_license_nag()
+        # NOTE: This assertion will FAIL if running in FIPS mode because
+        # being in FIPS mode will trigger the license nag
+        assert not self.redpanda.has_license_nag()
 
         self.logger.debug("Setting cluster config")
         self.redpanda.set_cluster_config(
             {"sasl_mechanisms": ["GSSAPI", "SCRAM"]})
 
+        self.redpanda.set_environment(
+            {'__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE': '1'})
+        self.redpanda.stop()
+        self.redpanda.start(clean_nodes=False)
+
+        wait_until(self._license_nag_is_set,
+                   timeout_sec=30,
+                   err_msg="Failed to set license nag internal")
+
         self.logger.debug("Waiting for license nag")
-        wait_until(self._has_license_nag,
+        wait_until(self.redpanda.has_license_nag,
                    timeout_sec=self.LICENSE_CHECK_INTERVAL_SEC * 2,
                    err_msg="License nag failed to appear")
 
@@ -281,8 +291,10 @@ class RedpandaKerberosConfigTest(RedpandaKerberosTestBase):
 
     def setUp(self):
         super(RedpandaKerberosConfigTest, self).setUp()
-        krb5_config = render_krb5_config(kdc_node=self.kdc.nodes[0],
-                                         realm="INCORRECT.EXAMPLE")
+        krb5_config = render_krb5_config(
+            kdc_node=self.kdc.nodes[0],
+            realm="INCORRECT.EXAMPLE",
+            permitted_enctypes=self.redpanda.permitted_enctypes)
         for node in self.redpanda.nodes:
             self.logger.debug(
                 f"Rendering incorrect KRB5 config for {node.name} using KDC node {self.kdc.nodes[0].name}"
@@ -368,8 +380,8 @@ class RedpandaKerberosExternalActiveDirectoryTest(RedpandaKerberosTestBase):
     def setUp(self):
         super(RedpandaKerberosExternalActiveDirectoryTest, self).setUp()
 
+    @ignore  # Not all CI builders have access to an ADDS - let's find out which ones - ignoring for now
     @env(ACTIVE_DIRECTORY_REALM=IsCIOrNotEmpty())
-    @ok_to_fail  # Not all CI builders have access to an ADDS - let's find out which ones.
     @cluster(num_nodes=2)
     def test_metadata(self):
         principal = f"client/localhost"

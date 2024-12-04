@@ -41,12 +41,12 @@ flag in the 'rpk security acl create' command.`,
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitServerlessAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
 			roleName := args[0]
 			_, err = cl.CreateRole(cmd.Context(), roleName)
-			out.MaybeDie(err, "unable to create role %q: %v", roleName, err)
+			out.MaybeDie(err, "unable to create role %q: %v", roleName, adminapi.TryDecodeMessageFromErr(err))
 
 			if isText, _, s, err := f.Format(createResponse{[]string{roleName}}); !isText {
 				out.MaybeDie(err, "unable to print in the required format %q: %v", f.Kind, err)

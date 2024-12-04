@@ -53,7 +53,7 @@ request_iterator validate_range_duplicates(
     absl::node_hash_map<model::topic_view, uint32_t> freq;
 
     freq.reserve(std::distance(begin, end));
-    for (auto const& r : boost::make_iterator_range(begin, end)) {
+    for (const auto& r : boost::make_iterator_range(begin, end)) {
         freq[r.name]++;
     }
     auto valid_range_end = std::partition(
@@ -316,7 +316,8 @@ ss::future<response_ptr> create_partitions_handler::handle(
           return create_partitions_topic_result{
             .name = std::move(r.tp_ns.tp),
             .error_code = map_topic_error_code(r.ec),
-            .error_message = cluster::make_error_code(r.ec).message(),
+            .error_message = r.error_message.value_or(
+              make_error_code(r.ec).message()),
           };
       });
 

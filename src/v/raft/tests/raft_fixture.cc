@@ -13,13 +13,13 @@
 
 #include "bytes/iobuf_parser.h"
 #include "config/property.h"
-#include "config/throughput_control_group.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
+#include "raft/buffered_protocol.h"
 #include "raft/consensus.h"
 #include "raft/consensus_client_protocol.h"
 #include "raft/coordinated_recovery_throttle.h"
@@ -28,11 +28,9 @@
 #include "raft/heartbeat_manager.h"
 #include "raft/heartbeats.h"
 #include "raft/state_machine_manager.h"
-#include "raft/tests/raft_group_fixture.h"
 #include "raft/timeout_jitter.h"
 #include "raft/types.h"
 #include "random/generators.h"
-#include "serde/serde.h"
 #include "ssx/future-util.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
@@ -42,28 +40,9 @@
 #include "test_utils/async.h"
 #include "utils/prefix_logger.h"
 
-#include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
-#include <seastar/core/gate.hh>
-#include <seastar/core/io_priority_class.hh>
-#include <seastar/core/scheduling.hh>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/timed_out_error.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/file.hh>
-#include <seastar/util/log.hh>
-#include <seastar/util/noncopyable_function.hh>
-
-#include <absl/container/flat_hash_set.h>
-#include <fmt/core.h>
-
-#include <chrono>
-#include <filesystem>
-#include <memory>
-#include <optional>
-#include <stdexcept>
-#include <type_traits>
 
 namespace raft {
 
@@ -81,8 +60,10 @@ ss::future<> channel::stop() {
 
         auto f = _gate.close();
 
-        for (auto& m : _messages) {
-            m.resp_data.set_exception(ss::abort_requested_exception());
+        while (!_messages.empty()) {
+            auto msg = std::move(_messages.front());
+            _messages.pop_front();
+            msg.resp_data.set_exception(ss::abort_requested_exception());
         }
         co_await std::move(f);
     }
@@ -114,7 +95,9 @@ ss::lw_shared_ptr<consensus> channel::raft() {
 ss::future<> channel::dispatch_loop() {
     while (!_as.abort_requested()) {
         co_await _new_messages.wait([this] { return !_messages.empty(); });
-
+        if (_messages.empty()) {
+            continue;
+        }
         auto msg = std::move(_messages.front());
         _messages.pop_front();
         iobuf_parser req_parser(std::move(msg.req_data));
@@ -149,6 +132,7 @@ ss::future<> channel::dispatch_loop() {
                         hb.meta,
                         model::make_memory_record_batch_reader(
                           ss::circular_buffer<model::record_batch>{}),
+                        0,
                         flush_after_append::no));
                     reply.meta.push_back(resp);
                 }
@@ -313,43 +297,43 @@ in_memory_test_protocol::dispatch(model::node_id id, ReqT req) {
 }
 
 ss::future<result<vote_reply>> in_memory_test_protocol::vote(
-  model::node_id id, vote_request&& req, rpc::client_opts) {
+  model::node_id id, vote_request req, rpc::client_opts) {
     return dispatch<vote_request, vote_reply>(id, req);
 };
 
 ss::future<result<append_entries_reply>>
 in_memory_test_protocol::append_entries(
-  model::node_id id, append_entries_request&& req, rpc::client_opts, bool) {
+  model::node_id id, append_entries_request req, rpc::client_opts) {
     return dispatch<append_entries_request, append_entries_reply>(
       id, std::move(req));
 };
 
 ss::future<result<heartbeat_reply>> in_memory_test_protocol::heartbeat(
-  model::node_id id, heartbeat_request&& req, rpc::client_opts) {
+  model::node_id id, heartbeat_request req, rpc::client_opts) {
     return dispatch<heartbeat_request, heartbeat_reply>(id, std::move(req));
 }
 
 ss::future<result<heartbeat_reply_v2>> in_memory_test_protocol::heartbeat_v2(
-  model::node_id id, heartbeat_request_v2&& req, rpc::client_opts) {
+  model::node_id id, heartbeat_request_v2 req, rpc::client_opts) {
     return dispatch<heartbeat_request_v2, heartbeat_reply_v2>(
       id, std::move(req));
 }
 
 ss::future<result<install_snapshot_reply>>
 in_memory_test_protocol::install_snapshot(
-  model::node_id id, install_snapshot_request&& req, rpc::client_opts) {
+  model::node_id id, install_snapshot_request req, rpc::client_opts) {
     return dispatch<install_snapshot_request, install_snapshot_reply>(
       id, std::move(req));
 }
 
 ss::future<result<timeout_now_reply>> in_memory_test_protocol::timeout_now(
-  model::node_id id, timeout_now_request&& req, rpc::client_opts) {
+  model::node_id id, timeout_now_request req, rpc::client_opts) {
     return dispatch<timeout_now_request, timeout_now_reply>(id, std::move(req));
 }
 
 ss::future<result<transfer_leadership_reply>>
 in_memory_test_protocol::transfer_leadership(
-  model::node_id id, transfer_leadership_request&& req, rpc::client_opts) {
+  model::node_id id, transfer_leadership_request req, rpc::client_opts) {
     return dispatch<transfer_leadership_request, transfer_leadership_reply>(
       id, std::move(req));
 }
@@ -360,27 +344,20 @@ raft_node_instance::raft_node_instance(
   raft_node_map& node_map,
   ss::sharded<features::feature_table>& feature_table,
   leader_update_clb_t leader_update_clb,
-  bool enable_longest_log_detection)
-  : _id(id)
-  , _revision(revision)
-  , _logger(test_log, fmt::format("[node: {}]", _id))
-  , _base_directory(fmt::format(
-      "test_raft_{}_{}", _id, random_generators::gen_alphanum_string(12)))
-  , _protocol(ss::make_shared<in_memory_test_protocol>(node_map, _logger))
-  , _features(feature_table)
-  , _recovery_mem_quota([] {
-      return raft::recovery_memory_quota::configuration{
-        .max_recovery_memory = config::mock_binding<std::optional<size_t>>(
-          200_MiB),
-        .default_read_buffer_size = config::mock_binding<size_t>(128_KiB),
-      };
-  })
-  , _recovery_scheduler(
-      config::mock_binding<size_t>(64), config::mock_binding(10ms))
-  , _leader_clb(std::move(leader_update_clb))
-  , _enable_longest_log_detection(enable_longest_log_detection) {
-    config::shard_local_cfg().disable_metrics.set_value(true);
-}
+  bool enable_longest_log_detection,
+  config::binding<std::chrono::milliseconds> election_timeout,
+  config::binding<std::chrono::milliseconds> heartbeat_interval)
+  : raft_node_instance(
+      id,
+      revision,
+      fmt::format(
+        "test_raft_{}_{}", _id, random_generators::gen_alphanum_string(12)),
+      node_map,
+      feature_table,
+      std::move(leader_update_clb),
+      enable_longest_log_detection,
+      std::move(election_timeout),
+      std::move(heartbeat_interval)) {}
 
 raft_node_instance::raft_node_instance(
   model::node_id id,
@@ -389,12 +366,18 @@ raft_node_instance::raft_node_instance(
   raft_node_map& node_map,
   ss::sharded<features::feature_table>& feature_table,
   leader_update_clb_t leader_update_clb,
-  bool enable_longest_log_detection)
+  bool enable_longest_log_detection,
+  config::binding<std::chrono::milliseconds> election_timeout,
+  config::binding<std::chrono::milliseconds> heartbeat_interval)
   : _id(id)
   , _revision(revision)
   , _logger(test_log, fmt::format("[node: {}]", _id))
   , _base_directory(std::move(base_directory))
   , _protocol(ss::make_shared<in_memory_test_protocol>(node_map, _logger))
+  , _buffered_protocol(ss::make_shared<buffered_protocol>(
+      consensus_client_protocol(_protocol),
+      _max_inflight_requests.bind(),
+      _max_queued_bytes.bind()))
   , _features(feature_table)
   , _recovery_mem_quota([] {
       return raft::recovery_memory_quota::configuration{
@@ -406,15 +389,17 @@ raft_node_instance::raft_node_instance(
   , _recovery_scheduler(
       config::mock_binding<size_t>(64), config::mock_binding(10ms))
   , _leader_clb(std::move(leader_update_clb))
-  , _enable_longest_log_detection(enable_longest_log_detection) {
+  , _enable_longest_log_detection(enable_longest_log_detection)
+  , _election_timeout(std::move(election_timeout))
+  , _heartbeat_interval(std::move(heartbeat_interval)) {
     config::shard_local_cfg().disable_metrics.set_value(true);
 }
 
 ss::future<>
 raft_node_instance::initialise(std::vector<raft::vnode> initial_nodes) {
     _hb_manager = std::make_unique<heartbeat_manager>(
-      config::mock_binding<std::chrono::milliseconds>(50ms),
-      consensus_client_protocol(_protocol),
+      _heartbeat_interval,
+      consensus_client_protocol(_buffered_protocol),
       _id,
       config::mock_binding<std::chrono::milliseconds>(1000ms),
       config::mock_binding<bool>(true),
@@ -451,7 +436,7 @@ raft_node_instance::initialise(std::vector<raft::vnode> initial_nodes) {
         ss::default_scheduling_group(), ss::default_priority_class()),
       config::mock_binding<std::chrono::milliseconds>(1s),
       config::mock_binding<bool>(_enable_longest_log_detection),
-      consensus_client_protocol(_protocol),
+      consensus_client_protocol(_buffered_protocol),
       [this](leadership_status ls) { leadership_notification_callback(ls); },
       _storage.local(),
       _recovery_throttle.local(),
@@ -479,6 +464,7 @@ ss::future<> raft_node_instance::stop() {
     if (started) {
         co_await _hb_manager->deregister_group(_raft->group());
         vlog(_logger.debug, "stopping protocol");
+        co_await _buffered_protocol->stop();
         co_await _protocol->stop();
         vlog(_logger.debug, "stopping raft");
         co_await _raft->stop();
@@ -541,10 +527,10 @@ raft_node_instance::read_batches_in_range(
     co_return data_batches;
 }
 
-ss::future<model::offset>
-raft_node_instance::random_batch_base_offset(model::offset max) {
-    model::offset read_start(
-      random_generators::get_int<int64_t>(_raft->start_offset(), max));
+ss::future<model::offset> raft_node_instance::random_batch_base_offset(
+  model::offset max, std::optional<model::offset> min) {
+    model::offset read_start(random_generators::get_int<int64_t>(
+      min.value_or(_raft->start_offset()), max));
 
     model::offset last = model::next_offset(read_start);
 
@@ -597,8 +583,15 @@ raft_fixture::add_node(model::node_id id, model::revision_id rev) {
       rev,
       *this,
       _features,
-      [id, this](leadership_status lst) { _leaders_view[id] = lst; },
-      _enable_longest_log_detection);
+      [id, this](leadership_status lst) {
+          _leaders_view[id] = lst;
+          if (_leader_clb) {
+              _leader_clb.value()(id, lst);
+          }
+      },
+      _enable_longest_log_detection,
+      _election_timeout.bind(),
+      _heartbeat_interval.bind());
 
     auto [it, success] = _nodes.emplace(id, std::move(instance));
     return *it->second;
@@ -612,8 +605,15 @@ raft_node_instance& raft_fixture::add_node(
       std::move(base_dir),
       *this,
       _features,
-      [id, this](leadership_status lst) { _leaders_view[id] = lst; },
-      _enable_longest_log_detection);
+      [id, this](leadership_status lst) {
+          _leaders_view[id] = lst;
+          if (_leader_clb) {
+              _leader_clb.value()(id, lst);
+          }
+      },
+      _enable_longest_log_detection,
+      _election_timeout.bind(),
+      _heartbeat_interval.bind());
 
     auto [it, success] = _nodes.emplace(id, std::move(instance));
     return *it->second;
@@ -641,6 +641,28 @@ raft_fixture::wait_for_leader(model::timeout_clock::time_point deadline) {
                && node(*leader_id).raft()->is_leader();
     };
     while (!has_stable_leader()) {
+        if (model::timeout_clock::now() > deadline) {
+            throw std::runtime_error("Timeout waiting for leader");
+        }
+        co_await ss::sleep(std::chrono::milliseconds(5));
+    }
+
+    co_return get_leader().value();
+}
+
+ss::future<model::node_id> raft_fixture::wait_for_leader_change(
+  model::timeout_clock::time_point deadline, model::term_id term) {
+    auto has_new_leader = [this, term] {
+        auto leader_id = get_leader();
+        if (leader_id && _nodes.contains(*leader_id)) {
+            auto& leader_node = node(*leader_id);
+            return leader_node.raft()->is_leader()
+                   && leader_node.raft()->term() > term;
+        }
+        return false;
+    };
+
+    while (!has_new_leader()) {
         if (model::timeout_clock::now() > deadline) {
             throw std::runtime_error("Timeout waiting for leader");
         }

@@ -21,6 +21,7 @@ from rptest.services.cluster import cluster
 from rptest.services.tls import TLSCertManager
 from rptest.tests.sasl_reauth_test import get_sasl_metrics, REAUTH_METRIC, EXPIRATION_METRIC
 from rptest.util import expect_exception
+from rptest.utils.mode_checks import skip_fips_mode
 from rptest.tests.tls_metrics_test import FaketimeTLSProvider
 
 import requests
@@ -608,11 +609,8 @@ class OIDCLicenseTest(RedpandaOIDCTestBase):
                                               **kwargs)
         self.redpanda.set_environment({
             '__REDPANDA_LICENSE_CHECK_INTERVAL_SEC':
-            f'{self.LICENSE_CHECK_INTERVAL_SEC}'
+            f'{self.LICENSE_CHECK_INTERVAL_SEC}',
         })
-
-    def _has_license_nag(self):
-        return self.redpanda.search_log_any("Enterprise feature(s).*")
 
     def _license_nag_is_set(self):
         return self.redpanda.search_log_all(
@@ -620,6 +618,7 @@ class OIDCLicenseTest(RedpandaOIDCTestBase):
         )
 
     @cluster(num_nodes=3)
+    @skip_fips_mode  # See NOTE below
     @parametrize(authn_config={"sasl_mechanisms": ["OAUTHBEARER", "SCRAM"]})
     @parametrize(authn_config={"http_authentication": ["OIDC", "BASIC"]})
     def test_license_nag(self, authn_config):
@@ -629,12 +628,23 @@ class OIDCLicenseTest(RedpandaOIDCTestBase):
 
         self.logger.debug("Ensuring no license nag")
         time.sleep(self.LICENSE_CHECK_INTERVAL_SEC * 2)
-        assert not self._has_license_nag()
+        # NOTE: This assertion will FAIL if running in FIPS mode because
+        # being in FIPS mode will trigger the license nag
+        assert not self.redpanda.has_license_nag()
 
         self.logger.debug("Setting cluster config")
         self.redpanda.set_cluster_config(authn_config)
 
+        self.redpanda.set_environment(
+            {'__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE': '1'})
+
+        self.redpanda.rolling_restart_nodes(self.redpanda.nodes,
+                                            use_maintenance_mode=False)
+        wait_until(self._license_nag_is_set,
+                   timeout_sec=30,
+                   err_msg="Failed to set license nag internal")
+
         self.logger.debug("Waiting for license nag")
-        wait_until(self._has_license_nag,
+        wait_until(self.redpanda.has_license_nag,
                    timeout_sec=self.LICENSE_CHECK_INTERVAL_SEC * 2,
                    err_msg="License nag failed to appear")

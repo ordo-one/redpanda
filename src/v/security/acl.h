@@ -10,8 +10,13 @@
  */
 #pragma once
 #include "base/seastarx.h"
-#include "kafka/types.h"
+#include "base/type_traits.h"
+#include "kafka/protocol/types.h"
 #include "model/fundamental.h"
+#include "serde/envelope.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
@@ -58,7 +63,7 @@ consteval resource_type get_resource_type() {
     } else if constexpr (std::is_same_v<T, kafka::transactional_id>) {
         return resource_type::transactional_id;
     } else {
-        static_assert(utils::unsupported_type<T>::value, "Unsupported type");
+        static_assert(base::unsupported_type<T>::value, "Unsupported type");
     }
 }
 
@@ -442,7 +447,7 @@ public:
     // NOLINTNEXTLINE(hicpp-explicit-conversions)
     resource_pattern_filter(const resource_pattern& resource)
       : resource_pattern_filter(
-        resource.resource(), resource.name(), resource.pattern()) {}
+          resource.resource(), resource.name(), resource.pattern()) {}
 
     /*
      * A filter that matches any resource.
@@ -472,7 +477,7 @@ public:
     friend void read_nested(
       iobuf_parser& in,
       resource_pattern_filter& filter,
-      size_t const bytes_left_limit);
+      const size_t bytes_left_limit);
 
     friend void write(iobuf& out, resource_pattern_filter filter);
 
@@ -503,10 +508,10 @@ public:
     // NOLINTNEXTLINE(hicpp-explicit-conversions)
     acl_entry_filter(const acl_entry& entry)
       : acl_entry_filter(
-        entry.principal(),
-        entry.host(),
-        entry.operation(),
-        entry.permission()) {}
+          entry.principal(),
+          entry.host(),
+          entry.operation(),
+          entry.permission()) {}
 
     acl_entry_filter(
       std::optional<acl_principal> principal,

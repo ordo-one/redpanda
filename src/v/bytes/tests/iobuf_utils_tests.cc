@@ -10,15 +10,17 @@
 #include "bytes/bytes.h"
 #include "bytes/hash.h"
 #include "bytes/iostream.h"
-#include "bytes/tests/utils.h"
+#include "utils.h"
 
 #include <seastar/testing/thread_test_case.hh>
+
+#include <absl/hash/hash.h>
 
 SEASTAR_THREAD_TEST_CASE(test_reading_zero_bytes_empty_stream) {
     auto buf = iobuf();
     auto is = make_iobuf_input_stream(std::move(buf));
 
-    auto read_buf = read_iobuf_exactly(is, 0).get0();
+    auto read_buf = read_iobuf_exactly(is, 0).get();
     BOOST_REQUIRE_EQUAL(read_buf.size_bytes(), 0);
 };
 
@@ -27,7 +29,7 @@ SEASTAR_THREAD_TEST_CASE(test_reading_zero_bytes) {
     append_sequence(buf, 5);
     auto is = make_iobuf_input_stream(std::move(buf));
 
-    auto read_buf = read_iobuf_exactly(is, 0).get0();
+    auto read_buf = read_iobuf_exactly(is, 0).get();
     BOOST_REQUIRE_EQUAL(read_buf.size_bytes(), 0);
 };
 
@@ -36,7 +38,7 @@ SEASTAR_THREAD_TEST_CASE(test_reading_some_bytes) {
     append_sequence(buf, 5);
     auto is = make_iobuf_input_stream(std::move(buf));
 
-    auto read_buf = read_iobuf_exactly(is, 16).get0();
+    auto read_buf = read_iobuf_exactly(is, 16).get();
     BOOST_REQUIRE_EQUAL(read_buf.size_bytes(), 16);
 };
 

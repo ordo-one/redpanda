@@ -15,7 +15,7 @@
 #include "security/errc.h"
 #include "security/jwt.h"
 #include "security/logger.h"
-#include "security/oidc_principal_mapping.h"
+#include "security/oidc_principal_mapping_applicator.h"
 #include "security/oidc_service.h"
 
 #include <seastar/core/lowres_clock.hh>
@@ -31,8 +31,8 @@
 namespace security::oidc {
 
 result<authentication_data> authenticate(
-  jwt const& jwt,
-  principal_mapping_rule const& mapping,
+  const jwt& jwt,
+  const principal_mapping_rule& mapping,
   std::string_view issuer,
   std::string_view audience,
   std::chrono::seconds clock_skew_tolerance,
@@ -61,7 +61,7 @@ result<authentication_data> authenticate(
         return errc::jwt_invalid_nbf;
     }
 
-    auto principal = mapping.apply(jwt);
+    auto principal = principal_mapping_rule_apply(mapping, jwt);
     if (principal.has_error()) {
         return principal.assume_error();
     }
@@ -73,9 +73,9 @@ result<authentication_data> authenticate(
 }
 
 result<authentication_data> authenticate(
-  jws const& jws,
-  verifier const& verifier,
-  principal_mapping_rule const& mapping,
+  const jws& jws,
+  const verifier& verifier,
+  const principal_mapping_rule& mapping,
   std::string_view issuer,
   std::string_view audience,
   std::chrono::seconds clock_skew_tolerance,
@@ -147,7 +147,7 @@ authenticator::authenticate(std::string_view bearer_token) {
     return _impl->authenticate(bearer_token);
 }
 
-std::ostream& operator<<(std::ostream& os, sasl_authenticator::state const s) {
+std::ostream& operator<<(std::ostream& os, const sasl_authenticator::state s) {
     using state = sasl_authenticator::state;
     switch (s) {
     case state::init:

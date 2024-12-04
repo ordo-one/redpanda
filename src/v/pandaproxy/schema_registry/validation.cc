@@ -20,6 +20,7 @@
 #include "model/timeout_clock.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/avro.h"
+#include "pandaproxy/schema_registry/json.h"
 #include "pandaproxy/schema_registry/protobuf.h"
 #include "pandaproxy/schema_registry/schema_id_cache.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
@@ -103,17 +104,18 @@ std::vector<int32_t> get_proto_offsets(iobuf_parser& p) {
 ss::future<std::optional<ss::sstring>> get_record_name(
   pandaproxy::schema_registry::sharded_store& store,
   subject_name_strategy sns,
-  const canonical_schema_definition& schema,
+  canonical_schema_definition schema,
   std::optional<std::vector<int32_t>>& offsets) {
     if (sns == subject_name_strategy::topic_name) {
-        // Result is succesfully nothing
+        // Result is successfully nothing
         co_return "";
     }
 
-    switch (schema.type()) {
+    auto schema_type = schema.type();
+    switch (schema_type) {
     case schema_type::avro: {
         auto s = co_await make_avro_schema_definition(
-          store, {subject("r"), {schema.raw(), schema.type()}});
+          store, {subject("r"), {std::move(schema).raw(), schema_type}});
         co_return s().root()->name().fullname();
     } break;
     case schema_type::protobuf: {
@@ -121,15 +123,18 @@ ss::future<std::optional<ss::sstring>> get_record_name(
             co_return std::nullopt;
         }
         auto s = co_await make_protobuf_schema_definition(
-          store, {subject("r"), {schema.raw(), schema.type()}});
+          store, {subject("r"), {std::move(schema).raw(), schema_type}});
         auto r = s.name(*offsets);
         if (!r) {
             co_return std::nullopt;
         }
         co_return std::move(r).assume_value();
     } break;
-    case schema_type::json:
-        break;
+    case schema_type::json: {
+        auto s = co_await make_json_schema_definition(
+          store, {subject("r"), {std::move(schema).raw(), schema_type}});
+        co_return s.title();
+    } break;
     }
     co_return std::nullopt;
 }
@@ -137,8 +142,8 @@ ss::future<std::optional<ss::sstring>> get_record_name(
 template<typename T>
 T combine(
   pandaproxy::schema_registry::schema_id_validation_mode mode,
-  std::optional<T> const& redpanda,
-  std::optional<T> const& compat,
+  const std::optional<T>& redpanda,
+  const std::optional<T>& compat,
   T dflt) {
     switch (mode) {
     case pandaproxy::schema_registry::schema_id_validation_mode::none:
@@ -187,8 +192,10 @@ public:
           subject_name_strategy::topic_name)} {}
 
     auto validate_field(
-      field field, model::topic topic, subject_name_strategy sns, iobuf buf)
-      -> ss::future<bool> {
+      field field,
+      model::topic topic,
+      subject_name_strategy sns,
+      iobuf buf) -> ss::future<bool> {
         iobuf_parser parser(std::move(buf));
 
         if (parser.bytes_left() < 5) {
@@ -268,7 +275,7 @@ public:
         }
 
         auto record_name = co_await get_record_name(
-          *_api->_store, sns, *schema, proto_offsets);
+          *_api->_store, sns, *std::move(schema), proto_offsets);
         if (!record_name) {
             vlog(
               plog.debug,

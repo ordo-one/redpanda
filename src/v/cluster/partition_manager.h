@@ -11,14 +11,16 @@
 
 #pragma once
 
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
+#include "cloud_storage/remote_path_provider.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/ntp_callbacks.h"
 #include "cluster/partition.h"
 #include "cluster/state_machine_registry.h"
 #include "cluster/types.h"
 #include "config/property.h"
+#include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
@@ -36,7 +38,7 @@ class partition_manager
   : public ss::peering_sharded_service<partition_manager> {
 public:
     using ntp_table_container
-      = model::ntp_flat_map_type<ss::lw_shared_ptr<partition>>;
+      = model::ntp_map_type<ss::lw_shared_ptr<partition>>;
 
     partition_manager(
       ss::sharded<storage::api>&,
@@ -89,14 +91,16 @@ public:
     ss::future<consensus_ptr> manage(
       storage::ntp_config,
       raft::group_id,
-      std::vector<model::broker>,
+      std::vector<raft::vnode>,
+      raft::with_learner_recovery_throttle,
+      raft::keep_snapshotted_log,
+      std::optional<xshard_transfer_state>,
       std::optional<remote_topic_properties> = std::nullopt,
       std::optional<cloud_storage_clients::bucket_name> = std::nullopt,
-      raft::with_learner_recovery_throttle
-      = raft::with_learner_recovery_throttle::yes,
-      raft::keep_snapshotted_log = raft::keep_snapshotted_log::no);
+      std::optional<cloud_storage::remote_label> = std::nullopt,
+      std::optional<model::topic_namespace> = std::nullopt);
 
-    ss::future<> shutdown(const model::ntp& ntp);
+    ss::future<xshard_transfer_state> shutdown(const model::ntp& ntp);
 
     ss::future<> remove(const model::ntp& ntp, partition_removal_mode mode);
 
@@ -119,7 +123,9 @@ public:
             cb(std::move(p));
         });
         for (auto& e : _ntp_table) {
-            init.notify(e.first, e.second);
+            if (e.second->started()) {
+                init.notify(e.first, e.second);
+            }
         }
 
         // now setup the permenant callback for new partitions
@@ -131,7 +137,9 @@ public:
         init.register_notify(
           ns, [&cb](ss::lw_shared_ptr<partition> p) { cb(std::move(p)); });
         for (auto& e : _ntp_table) {
-            init.notify(e.first, e.second);
+            if (e.second->started()) {
+                init.notify(e.first, e.second);
+            }
         }
         return _manage_watchers.register_notify(ns, std::move(cb));
     }
@@ -240,16 +248,24 @@ private:
         intrusive_list_hook hook;
     };
 
-    /// Download log if partition_recovery_manager is initialized.
+    /// Download log if partition_recovery_manager is initialized
+    /// and there is no archival_metadata_stm snapshot.
     ///
-    /// It might not be initialized if cloud storage is disable.
-    /// In this case this method always returns false.
+    /// Partition recovery manager might not be initialized if cloud storage is
+    /// disabled. Archival metadata stm snapshot presence acts as recovery
+    /// process completion marker: if it is there we don't need to re-download.
+    /// If we do not attempt to download logs because of one of the conditions
+    /// above not met, method returns false.
+    ///
     /// \param ntp_cfg is an ntp_config instance to recover
-    /// \return true if the recovery was invoked, false otherwise
+    /// \return .logs_recovered=true if the recovery was invoked, false
+    /// otherwise
     ss::future<cloud_storage::log_recovery_result> maybe_download_log(
-      storage::ntp_config& ntp_cfg, std::optional<remote_topic_properties> rtp);
+      storage::ntp_config& ntp_cfg,
+      std::optional<remote_topic_properties> rtp,
+      cloud_storage::remote_path_provider& path_provider);
 
-    ss::future<> do_shutdown(ss::lw_shared_ptr<partition>);
+    ss::future<xshard_transfer_state> do_shutdown(ss::lw_shared_ptr<partition>);
 
     void check_partitions_shutdown_state();
 
@@ -262,8 +278,7 @@ private:
     ntp_callbacks<unmanage_cb_t> _unmanage_watchers;
     // XXX use intrusive containers here
     ntp_table_container _ntp_table;
-    absl::flat_hash_map<raft::group_id, ss::lw_shared_ptr<partition>>
-      _raft_table;
+    chunked_hash_map<raft::group_id, ss::lw_shared_ptr<partition>> _raft_table;
 
     ss::sharded<cloud_storage::partition_recovery_manager>&
       _partition_recovery_mgr;
@@ -286,7 +301,7 @@ private:
     bool _block_new_leadership{false};
 
     // Our handle from registering for leadership notifications on group_manager
-    std::optional<cluster::notification_id_type> _leader_notify_handle;
+    std::optional<raft::group_manager_notification_id> _leader_notify_handle;
 
     state_machine_registry _stm_registry;
 

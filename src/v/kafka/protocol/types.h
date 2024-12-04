@@ -9,9 +9,13 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
-#include "absl/container/btree_map.h"
+
 #include "bytes/bytes.h"
+#include "model/fundamental.h"
 #include "utils/named_type.h"
+
+#include <absl/container/btree_map.h>
+#include <boost/numeric/conversion/cast.hpp>
 
 #include <concepts>
 
@@ -127,7 +131,7 @@ using tagged_fields
 ///
 /// The only request that is never flexible is sasl_handshake_request - 17.
 /// Older versions of schemas may also contain values of 'none' that map to -1
-static constexpr api_version never_flexible = api_version(-1);
+inline constexpr api_version never_flexible = api_version(-1);
 
 template<typename T>
 concept KafkaApi = requires(T request) {
@@ -173,11 +177,76 @@ enum class describe_client_quotas_match_type : int8_t {
     exact_name = 0,
     /// Return only the default value (ignoring the match field)
     default_name = 1,
-    /// Return only the specified values, that is everything but the default
-    /// value (ignoring the match field)
+    /// Return all specified values, that includes both the default value and
+    /// non-default values for the given entity type (ignoring the match field)
     any_specified_name = 2,
 };
 
 std::ostream& operator<<(std::ostream&, describe_client_quotas_match_type t);
+
+/*
+ * The names of group states.
+ */
+inline constexpr std::string_view group_state_name_empty = "Empty";
+inline constexpr std::string_view group_state_name_preparing_rebalance
+  = "PreparingRebalance";
+inline constexpr std::string_view group_state_name_completing_rebalance
+  = "CompletingRebalance";
+inline constexpr std::string_view group_state_name_stable = "Stable";
+inline constexpr std::string_view group_state_name_dead = "Dead";
+
+/// An unknown / missing generation id (Kafka protocol specific)
+inline constexpr generation_id unknown_generation_id(-1);
+
+std::ostream& operator<<(std::ostream& os, coordinator_type t);
+
+std::ostream& operator<<(std::ostream& os, config_resource_type t);
+
+std::ostream& operator<<(std::ostream& os, describe_configs_source s);
+
+/*
+ * TODO this can be moved out of the protocol library and into the server if the
+ * batch encoding utility in protocol/wire.h can remove the dependency on this,
+ * for example by having the caller in the server perform this conversion.
+ */
+inline kafka::leader_epoch leader_epoch_from_term(model::term_id term) {
+    try {
+        return kafka::leader_epoch(
+          boost::numeric_cast<kafka::leader_epoch::type>(term()));
+    } catch (const boost::bad_numeric_cast&) {
+        return kafka::invalid_leader_epoch;
+    }
+}
+
+/// Kafka API request correlation.
+using correlation_id = named_type<int32_t, struct kafka_correlation_type>;
+
+using client_id = named_type<ss::sstring, struct kafka_client_id_type>;
+using client_host = named_type<ss::sstring, struct kafka_client_host_type>;
+
+using fetch_session_id = named_type<int32_t, struct session_id_tag>;
+using fetch_session_epoch = named_type<int32_t, struct session_epoch_tag>;
+
+// Unknown/missing/not initialized session (Kafka protocol specific)
+inline constexpr fetch_session_id invalid_fetch_session_id(0);
+
+/**
+ * Used by the client to start new fetch session. (Kafka protocol specific)
+ */
+inline constexpr fetch_session_epoch initial_fetch_session_epoch(0);
+
+/**
+ * Used by the client to close existing fetch session. (Kafka protocol specific)
+ */
+inline constexpr fetch_session_epoch final_fetch_session_epoch(-1);
+
+enum class config_resource_operation : int8_t {
+    set = 0,
+    remove = 1,
+    append = 2,
+    subtract = 3,
+};
+
+std::ostream& operator<<(std::ostream& os, config_resource_operation);
 
 } // namespace kafka

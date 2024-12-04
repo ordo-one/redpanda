@@ -18,14 +18,14 @@
 #include "security/krb5.h"
 #include "security/logger.h"
 #include "ssx/thread_worker.h"
+#include "thirdparty/krb5/gssapi.h"
+#include "thirdparty/krb5/gssapi_ext.h"
 
 #include <seastar/core/lowres_clock.hh>
 
 #include <boost/outcome/basic_outcome.hpp>
 #include <boost/outcome/success_failure.hpp>
 #include <fmt/ranges.h>
-#include <gssapi/gssapi.h>
-#include <gssapi/gssapi_ext.h>
 
 #include <array>
 #include <sstream>
@@ -35,7 +35,7 @@
 namespace security {
 
 std::ostream&
-operator<<(std::ostream& os, gssapi_authenticator::state const s) {
+operator<<(std::ostream& os, const gssapi_authenticator::state s) {
     using state = gssapi_authenticator::state;
     switch (s) {
     case state::init:
@@ -64,7 +64,11 @@ static void display_status_1(std::string_view m, OM_uint32 code, int type) {
             vlog(seclog.info, "gss status from {}", m);
             break;
         } else {
-            vlog(seclog.info, "GSS_API error {}: {}", m, msg);
+            vlog(
+              seclog.info,
+              "GSS_API error {}: {}",
+              m,
+              msg.operator std::string_view());
         }
 
         if (!msg_ctx) {

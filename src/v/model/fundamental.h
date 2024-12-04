@@ -14,12 +14,16 @@
 #include "base/seastarx.h"
 #include "base/vassert.h"
 #include "bytes/iobuf.h"
-#include "serde/serde.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/sstring.h"
 #include "ssx/sformat.h"
 #include "utils/named_type.h"
 #include "utils/uuid.h"
 
 #include <seastar/core/sstring.hh>
+#include <seastar/net/socket_defs.hh>
 #include <seastar/util/bool_class.hh>
 
 #include <boost/container_hash/hash.hpp>
@@ -33,10 +37,13 @@
 namespace kafka {
 
 using offset = named_type<int64_t, struct kafka_offset_type>;
+using offset_delta = named_type<int64_t, struct kafka_offset_delta_type>;
 
 inline offset next_offset(offset p) {
     if (p < offset{0}) {
         return offset{0};
+    } else if (p == offset::max()) {
+        return offset::max();
     }
     return p + offset{1};
 }
@@ -47,6 +54,24 @@ inline constexpr offset prev_offset(offset o) {
     }
     return o - offset{1};
 }
+
+inline constexpr offset operator+(offset o, offset_delta d) {
+    if (o >= offset{0}) {
+        if (d() <= offset::max() - o) {
+            return offset{o() + d()};
+        } else {
+            return offset::max();
+        }
+    } else {
+        if (d() >= offset::min() - o) {
+            return offset{o() + d()};
+        } else {
+            return offset::min();
+        }
+    }
+}
+
+inline constexpr offset operator-(offset o, offset_delta d) { return o + (-d); }
 
 } // namespace kafka
 
@@ -68,6 +93,8 @@ namespace model {
 using node_uuid = named_type<uuid_t, struct node_uuid_type>;
 using cluster_uuid = named_type<uuid_t, struct cluster_uuid_type>;
 
+inline constexpr cluster_uuid default_cluster_uuid{};
+
 using node_id = named_type<int32_t, struct node_id_model_type>;
 
 /**
@@ -75,7 +102,7 @@ using node_id = named_type<int32_t, struct node_id_model_type>;
  * when node is configured for automatic assignment of node_ids.
  * Never used in node configuration.
  */
-constexpr node_id unassigned_node_id(-1);
+inline constexpr node_id unassigned_node_id(-1);
 
 /**
  * We use revision_id to identify entities evolution in time. f.e. NTP that was
@@ -124,6 +151,16 @@ inline void operator&=(cleanup_policy_bitflags& a, cleanup_policy_bitflags b) {
     a = (a & b);
 }
 
+inline bool is_compaction_enabled(cleanup_policy_bitflags flags) {
+    return (flags & cleanup_policy_bitflags::compaction)
+           == cleanup_policy_bitflags::compaction;
+}
+
+inline bool is_deletion_enabled(cleanup_policy_bitflags flags) {
+    return (flags & cleanup_policy_bitflags::deletion)
+           == cleanup_policy_bitflags::deletion;
+}
+
 std::ostream& operator<<(std::ostream&, cleanup_policy_bitflags);
 std::istream& operator>>(std::istream&, cleanup_policy_bitflags&);
 
@@ -156,7 +193,7 @@ public:
       : named_type<ss::sstring, struct model_topic_type>(ss::sstring(view())) {}
 
     friend void
-    read_nested(iobuf_parser& in, topic& t, size_t const bytes_left_limit) {
+    read_nested(iobuf_parser& in, topic& t, const size_t bytes_left_limit) {
         using serde::read_nested;
         return read_nested(in, t._value, bytes_left_limit);
     }
@@ -197,15 +234,6 @@ inline constexpr model::offset_delta
 operator-(model::offset r, kafka::offset k) {
     return model::offset_delta{r() - k()};
 }
-
-/// \brief offset boundary type
-///
-/// indicate whether or not the offset that encodes the end of the offset
-/// range belongs to the offset range
-enum class boundary_type {
-    exclusive,
-    inclusive,
-};
 
 /// \brief cast to model::offset
 ///
@@ -254,7 +282,7 @@ inline constexpr model::offset prev_offset(model::offset o) {
 
 // An invalid offset indicating that actual LSO is not yet ready to be returned.
 // Follows the policy that LSO is the next offset of the decided offset.
-static constexpr model::offset invalid_lso{next_offset(model::offset::min())};
+inline constexpr model::offset invalid_lso{next_offset(model::offset::min())};
 
 struct topic_partition_view {
     topic_partition_view(model::topic_view tp, model::partition_id p)
@@ -293,6 +321,8 @@ struct topic_partition {
                || (topic == other.topic && partition < other.partition);
     }
 
+    auto operator<=>(const topic_partition& other) const noexcept = default;
+
     operator topic_partition_view() {
         return topic_partition_view(topic, partition);
     }
@@ -304,7 +334,7 @@ struct topic_partition {
     friend std::ostream& operator<<(std::ostream&, const topic_partition&);
 
     friend void read_nested(
-      iobuf_parser& in, topic_partition& tp, size_t const bytes_left_limit) {
+      iobuf_parser& in, topic_partition& tp, const size_t bytes_left_limit) {
         using serde::read_nested;
 
         read_nested(in, tp.topic, bytes_left_limit);
@@ -348,7 +378,7 @@ struct ntp {
     }
 
     friend void
-    read_nested(iobuf_parser& in, ntp& ntp, size_t const bytes_left_limit) {
+    read_nested(iobuf_parser& in, ntp& ntp, const size_t bytes_left_limit) {
         using serde::read_nested;
 
         read_nested(in, ntp.ns, bytes_left_limit);
@@ -387,7 +417,7 @@ std::ostream& operator<<(std::ostream&, const control_record_type&);
 using control_record_version
   = named_type<int16_t, struct control_record_version_tag>;
 
-static constexpr control_record_version current_control_record_version{0};
+inline constexpr control_record_version current_control_record_version{0};
 
 enum class shadow_indexing_mode : uint8_t {
     // Upload is disabled
@@ -468,8 +498,30 @@ static_assert(
 
 std::ostream& operator<<(std::ostream&, const shadow_indexing_mode&);
 
-using client_address_t = named_type<ss::sstring, struct client_address_tag>;
+using client_address_t = ss::socket_address;
 
+enum class fips_mode_flag : uint8_t {
+    // FIPS mode disabled
+    disabled = 0,
+    // FIPS mode enabled with permissive environment checks
+    permissive = 1,
+    // FIPS mode enabled with strict environment checks
+    enabled = 2,
+};
+
+constexpr std::string_view to_string_view(fips_mode_flag f) {
+    switch (f) {
+    case fips_mode_flag::disabled:
+        return "disabled";
+    case fips_mode_flag::permissive:
+        return "permissive";
+    case fips_mode_flag::enabled:
+        return "enabled";
+    }
+}
+
+std::ostream& operator<<(std::ostream& os, const fips_mode_flag& f);
+std::istream& operator>>(std::istream& is, fips_mode_flag& f);
 } // namespace model
 
 namespace kafka {

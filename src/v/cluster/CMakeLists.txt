@@ -83,17 +83,41 @@ rpcgen(
   INCLUDES ${CMAKE_BINARY_DIR}/src/v
 )
 
+rpcgen(
+  TARGET data_migrations_rpc
+  IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/data_migration_rpc.json
+  OUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/data_migration_rpc_service.h
+  INCLUDES ${CMAKE_BINARY_DIR}/src/v
+)
+
+v_cc_library(
+  NAME cluster_topic_properties
+  SRCS
+    remote_topic_properties.cc
+    topic_configuration.cc
+    topic_properties.cc
+  DEPS
+    v::model
+    v::reflection
+    v::serde
+  )
+
 v_cc_library(
   NAME cluster
   HDRS
     topic_recovery_validator.h
   SRCS
+    errors.cc
     metadata_cache.cc
     partition_manager.cc
     scheduling/partition_allocator.cc
     logger.cc
     config_frontend.cc
     config_manager.cc
+    client_quota_frontend.cc
+    client_quota_serde.cc
+    client_quota_backend.cc
+    client_quota_store.cc
     cluster_utils.cc
     id_allocator.cc
     id_allocator_frontend.cc
@@ -121,7 +145,6 @@ v_cc_library(
     partition.cc
     partition_probe.cc
     id_allocator_stm.cc
-    tm_stm_cache.cc
     tm_stm.cc
     rm_stm.cc
     rm_stm_types.cc
@@ -186,20 +209,25 @@ v_cc_library(
     plugin_table.cc
     plugin_frontend.cc
     plugin_backend.cc
-    ../archival/archival_metadata_stm.cc
-    ../archival/archival_policy.cc
-    ../archival/ntp_archiver_service.cc
-    ../archival/probe.cc
-    ../archival/types.cc
-    ../archival/upload_controller.cc
-    ../archival/segment_reupload.cc
-    ../archival/retention_calculator.cc
-    ../archival/upload_housekeeping_service.cc
-    ../archival/adjacent_segment_merger.cc
-    ../archival/purger.cc
-    ../archival/scrubber.cc
-    ../archival/archiver_manager.cc
-    ../archival/async_data_uploader.cc
+    archival/archival_metadata_stm.cc
+    archival/archival_policy.cc
+    archival/ntp_archiver_service.cc
+    archival/probe.cc
+    archival/types.cc
+    archival/upload_controller.cc
+    archival/segment_reupload.cc
+    archival/retention_calculator.cc
+    archival/upload_housekeeping_service.cc
+    archival/adjacent_segment_merger.cc
+    archival/adjacent_segment_run.cc
+    archival/purger.cc
+    archival/scrubber.cc
+    archival/archiver_manager.cc
+    archival/async_data_uploader.cc
+    archival/archiver_operations_api.cc
+    archival/archiver_operations_impl.cc
+    archival/archiver_scheduler_api.cc
+    archival/archiver_scheduler_impl.cc
     cloud_metadata/cluster_manifest.cc
     cloud_metadata/cluster_recovery_backend.cc
     cloud_metadata/key_utils.cc
@@ -211,9 +239,19 @@ v_cc_library(
     shard_placement_table.cc
     shard_balancer.cc
     topic_recovery_validator.cc
-    ../cloud_storage/topic_manifest.cc
-  HDRS
-    ../cloud_storage/topic_manifest.h
+    tm_stm_types.cc
+    tx_errc.cc
+    tx_protocol_types.cc
+    data_migration_types.cc
+    data_migration_table.cc
+    data_migration_frontend.cc
+    data_migration_worker.cc
+    data_migrated_resources.cc
+    data_migration_irpc_frontend.cc
+    data_migration_service_handler.cc
+    data_migration_backend.cc
+    inventory_service.cc
+    partition_properties_stm.cc
   DEPS
     Seastar::seastar
     bootstrap_rpc
@@ -228,18 +266,23 @@ v_cc_library(
     self_test_rpc
     topic_recovery_status_rpc
     tx_manager_migrator_rpc
+    data_migrations_rpc
     v::raft
     Roaring::roaring
     absl::flat_hash_map
     v::security
     v::model
     v::cloud_storage
+    v::cloud_topics_dl_stm
+    v::cluster_topic_properties
     v::features
     v::version
+    v::enterprise_features
   )
 add_subdirectory(tests)
 add_subdirectory(cloud_metadata/tests)
 add_subdirectory(self_test/tests)
+add_subdirectory(archival)
 
 # Separate library for recovery bits that may depend on Kafka subsystems.
 v_cc_library(

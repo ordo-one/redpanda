@@ -167,7 +167,7 @@ ss::future<> rpc_server::dispatch_method_once(
               if (unlikely(it == _services.end())) {
                   ss::sstring msg_suffix;
                   rpc::status s = rpc::status::method_not_found;
-                  if (!_all_services_added && _service_unavailable_allowed) {
+                  if (!_all_services_added) {
                       msg_suffix = " during startup. Ignoring...";
                       s = rpc::status::service_unavailable;
                   }
@@ -205,7 +205,7 @@ ss::future<> rpc_server::dispatch_method_once(
                     bool error = true;
                     netbuf reply_buf;
                     try {
-                        reply_buf = fut.get0();
+                        reply_buf = fut.get();
                         reply_buf.set_status(rpc::status::success);
                         error = false;
                     } catch (const rpc_internal_body_parsing_exception& e) {

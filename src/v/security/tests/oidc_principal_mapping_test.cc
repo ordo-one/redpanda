@@ -10,7 +10,7 @@
 #include "config/property.h"
 #include "json/document.h"
 #include "security/jwt.h"
-#include "security/oidc_principal_mapping.h"
+#include "security/oidc_principal_mapping_applicator.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -26,7 +26,7 @@ struct principal_mapping_test_data {
     result<security::acl_principal> principal;
 
     friend std::ostream&
-    operator<<(std::ostream& os, principal_mapping_test_data const& d) {
+    operator<<(std::ostream& os, const principal_mapping_test_data& d) {
         fmt::print(
           os,
           "payload: {}, mapping: {}, principal: {}",
@@ -110,7 +110,7 @@ BOOST_DATA_TEST_CASE(
     auto jwt = security::oidc::jwt::make(std::move(header), std::move(payload));
     BOOST_REQUIRE(!jwt.has_error());
 
-    auto principal = mapper.apply(jwt.assume_value());
+    auto principal = principal_mapping_rule_apply(mapper, jwt.assume_value());
     if (
       d.principal.has_error()
       && d.principal.assume_error() != security::oidc::errc::success) {

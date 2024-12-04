@@ -14,11 +14,13 @@
 #include "cluster/health_monitor_types.h"
 #include "cluster/partition_balancer_state.h"
 #include "cluster/partition_balancer_types.h"
+#include "cluster/producer_state.h"
 #include "cluster/rm_stm_types.h"
 #include "model/tests/randoms.h"
 #include "random/generators.h"
 #include "storage/tests/randoms.h"
 #include "test_utils/randoms.h"
+#include "utils/prefix_logger.h"
 
 #include <iterator>
 
@@ -92,7 +94,6 @@ inline node_health_report random_node_health_report() {
       tests::random_named_int<model::node_id>(),
       node::random_local_state(),
       tests::random_chunked_vector(random_topic_status),
-      random_ds.has_value(),
       random_ds};
 }
 
@@ -171,7 +172,7 @@ inline cluster::tx::prepare_marker random_prepare_marker() {
 }
 
 inline cluster::tx::abort_index random_abort_index() {
-    return {model::random_offset(), model::random_offset()};
+    return tx::abort_index{model::random_offset(), model::random_offset()};
 }
 
 inline cluster::tx::deprecated_seq_entry::deprecated_seq_cache_entry
@@ -195,8 +196,9 @@ inline cluster::tx::deprecated_seq_entry random_seq_entry() {
 
 namespace tests {
 
-inline cluster::tx::producer_ptr random_producer_state() {
+inline cluster::tx::producer_ptr random_producer_state(prefix_logger& logger) {
     return ss::make_lw_shared<cluster::tx::producer_state>(
+      logger,
       model::producer_identity{
         random_generators::get_int<int64_t>(),
         random_generators::get_int<int16_t>()},

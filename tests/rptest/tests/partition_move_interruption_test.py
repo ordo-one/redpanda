@@ -286,7 +286,9 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
                                     requested_replication_factor):
 
         admin = Admin(self.redpanda)
-        assignments = self._get_assignments(admin, topic, partition=partition)
+        assignments = self._get_node_assignments(admin,
+                                                 topic,
+                                                 partition=partition)
         assert requested_replication_factor > len(assignments)
 
         self.logger.info(
@@ -302,9 +304,10 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
 
             if any(found):
                 continue
-            assignments.append({'node_id': b['node_id'], 'core': 0})
+            assignments.append({'node_id': b['node_id']})
 
-        admin.set_partition_replicas(self.topic, partition, assignments)
+        self._set_partition_assignments(self.topic, partition, assignments,
+                                        admin)
         self._wait_post_move(self.topic, partition, assignments, 60)
 
     @cluster(num_nodes=5, log_allow_list=RESTART_LOG_ALLOW_LIST)
@@ -330,9 +333,9 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         partition = random.randint(0, partitions - 1)
 
         # get current assignments
-        assignment = self._get_assignments(admin,
-                                           self.topic,
-                                           partition=partition)
+        assignment = self._get_node_assignments(admin,
+                                                self.topic,
+                                                partition=partition)
 
         # drop one of the replicas, new quorum requires both of them to be up
         new_assignment = assignment[0:2]
@@ -354,7 +357,8 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         wait_until(new_controller, 10, 1)
 
         # update replica set
-        admin.set_partition_replicas(self.topic, partition, new_assignment)
+        self._set_partition_assignments(self.topic, partition, new_assignment,
+                                        admin)
 
         self._wait_for_move_in_progress(self.topic, partition)
 
@@ -535,7 +539,7 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         metadata = self.client().describe_topics()
         topic, partition = self._random_partition(metadata)
         admin = Admin(self.redpanda)
-        assignments = self._get_assignments(admin, topic, partition)
+        assignments = self._get_node_assignments(admin, topic, partition)
         prev_assignments = assignments.copy()
 
         self.logger.info(
@@ -549,7 +553,7 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
             id = self.redpanda.node_id(n)
             if id not in replica_ids:
                 previous = assignments.pop()
-                assignments.append({"node_id": id, "core": 0})
+                assignments.append({"node_id": id})
                 # stop a node that is going to be removed from current partition assignment
                 to_stop = self.get_node_by_id(previous['node_id'])
                 self.redpanda.stop_node(to_stop)
@@ -567,7 +571,7 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         self.logger.info(
             f"moving {topic}/{partition}: {prev_assignments} -> {assignments}")
 
-        admin.set_partition_replicas(topic, partition, assignments)
+        self._set_partition_assignments(topic, partition, assignments, admin)
 
         self._wait_for_move_in_progress(topic, partition)
 
@@ -618,7 +622,7 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         partition = 0
         admin = Admin(self.redpanda)
 
-        assignments = self._get_assignments(admin, topic, partition)
+        assignments = self._get_node_assignments(admin, topic, partition)
         prev_assignments = assignments.copy()
 
         # throttle recovery to prevent partition move from finishing
@@ -626,7 +630,7 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
         for i in range(0, 10):
             self._throttle_recovery(10)
             should_cancel = i % 2
-            assignments = self._get_assignments(admin, topic, partition)
+            assignments = self._get_node_assignments(admin, topic, partition)
             prev_assignments = assignments.copy()
             self.logger.info(
                 f"[{i}] current assignments for {topic}/{partition}: {prev_assignments}"
@@ -639,13 +643,14 @@ class PartitionMoveInterruption(PartitionMovementMixin, EndToEndTest):
             for id in available_ids:
                 if id not in replica_ids:
                     assignments.pop()
-                    assignments.append({"node_id": id, "core": 0})
+                    assignments.append({"node_id": id})
 
             self.logger.info(
                 f"[{i}] moving {topic}/{partition}: {prev_assignments} -> {assignments}"
             )
 
-            admin.set_partition_replicas(topic, partition, assignments)
+            self._set_partition_assignments(topic, partition, assignments,
+                                            admin)
 
             self._wait_for_move_in_progress(topic, partition)
 

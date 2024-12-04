@@ -44,10 +44,11 @@ type consumer struct {
 	group    string
 	balancer string
 
-	fetchMaxBytes int32
-	fetchMaxWait  time.Duration
-	readCommitted bool
-	printControl  bool
+	fetchMaxBytes          int32
+	fetchMaxWait           time.Duration
+	fetchMaxPartitionBytes int32
+	readCommitted          bool
+	printControl           bool
 
 	f        *kgo.RecordFormatter // if not json
 	num      int
@@ -89,13 +90,15 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			out.MaybeDie(err, "unable to initialize admin kafka client: %v", err)
 
 			// We fail if the topic does not exist.
-			listed, err := adm.ListTopics(cmd.Context(), topics...)
-			out.MaybeDie(err, "unable to check topic existence: %v", err)
-			listed.EachError(func(d kadm.TopicDetail) {
-				if errors.Is(d.Err, kerr.UnknownTopicOrPartition) {
-					out.Die("unable to consume topic %q: %v", d.Topic, d.Err.Error())
-				}
-			})
+			if !c.regex {
+				listed, err := adm.ListTopics(cmd.Context(), topics...)
+				out.MaybeDie(err, "unable to check topic existence: %v", err)
+				listed.EachError(func(d kadm.TopicDetail) {
+					if errors.Is(d.Err, kerr.UnknownTopicOrPartition) {
+						out.Die("unable to consume topic %q: %v", d.Topic, d.Err.Error())
+					}
+				})
+			}
 
 			err = c.parseOffset(offset, topics, adm)
 			out.MaybeDie(err, "invalid --offset %q: %v", offset, err)
@@ -158,6 +161,7 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 	cmd.Flags().Int32Var(&c.fetchMaxBytes, "fetch-max-bytes", 1<<20, "Maximum amount of bytes per fetch request per broker")
 	cmd.Flags().DurationVar(&c.fetchMaxWait, "fetch-max-wait", 5*time.Second, "Maximum amount of time to wait when fetching from a broker before the broker replies")
+	cmd.Flags().Int32Var(&c.fetchMaxPartitionBytes, "fetch-max-partition-bytes", 1<<20, "Maximum amount of bytes that will be consumed for a single partition per fetch request")
 	cmd.Flags().BoolVar(&c.readCommitted, "read-committed", false, "Opt in to reading only committed offsets")
 	cmd.Flags().BoolVar(&c.printControl, "print-control-records", false, "Opt in to printing control records")
 
@@ -269,10 +273,16 @@ func (c *consumer) writeRecordJSON(r *kgo.Record, toStdErr bool) {
 		Value string `json:"value"`
 	}
 
+	var valuePtr *string
+	if r.Value != nil {
+		valueStr := string(r.Value)
+		valuePtr = &valueStr
+	}
+
 	m := struct {
 		Topic     string   `json:"topic"`
 		Key       string   `json:"key,omitempty"`
-		Value     string   `json:"value,omitempty"`
+		Value     *string  `json:"value,omitempty"`
 		ValueSize *int     `json:"value_size,omitempty"` // non-nil if --meta-only
 		Headers   []Header `json:"headers,omitempty"`
 		Timestamp int64    `json:"timestamp"` // millis
@@ -282,7 +292,7 @@ func (c *consumer) writeRecordJSON(r *kgo.Record, toStdErr bool) {
 	}{
 		Topic:     r.Topic,
 		Key:       string(r.Key),
-		Value:     string(r.Value),
+		Value:     valuePtr,
 		Headers:   make([]Header, 0, len(r.Headers)),
 		Timestamp: r.Timestamp.UnixNano() / 1e6,
 
@@ -291,8 +301,8 @@ func (c *consumer) writeRecordJSON(r *kgo.Record, toStdErr bool) {
 	}
 
 	if c.metaOnly {
-		size := len(m.Value)
-		m.Value = ""
+		size := len(r.Value)
+		m.Value = nil
 		m.ValueSize = &size
 	}
 
@@ -802,6 +812,7 @@ func (c *consumer) intoOptions(topics []string) ([]kgo.Opt, error) {
 	opts = append(opts,
 		kgo.FetchMaxBytes(c.fetchMaxBytes),
 		kgo.FetchMaxWait(c.fetchMaxWait),
+		kgo.FetchMaxPartitionBytes(c.fetchMaxPartitionBytes),
 	)
 	if c.readCommitted {
 		opts = append(opts, kgo.FetchIsolationLevel(kgo.ReadCommitted()))
@@ -1042,6 +1053,13 @@ will print all headers with a space before the key and after the value, an
 equals sign between the key and value, and with the value hex encoded. Header
 formatting actually just parses the internal format as a record format, so all
 of the above rules about %K, %V, text, and numbers apply.
+
+VALUES
+
+Values for consumed records can be omitted by using the '--meta-only' flag.
+Tombstone records (records with a 'null' value) have their value omitted
+from the JSON output by default. All other records, including those with
+an empty-string value (""), will have their values printed.
 
 EXAMPLES
 

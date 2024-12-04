@@ -12,7 +12,8 @@ package role
 import (
 	"strings"
 
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
@@ -44,7 +45,7 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 }
 
 // parsePrincipal returns the prefix, and principal. If no prefix is present,
-// returns User:
+// returns 'User'.
 func parsePrincipal(p string) (principalType string, name string) {
 	if strings.HasPrefix(p, userPrefix) {
 		return "User", strings.TrimPrefix(p, userPrefix)
@@ -52,12 +53,12 @@ func parsePrincipal(p string) (principalType string, name string) {
 	return "User", p
 }
 
-// parseRoleMembers parses a --principal flag to a []adminapi.RoleMember
-func parseRoleMember(principals []string) []adminapi.RoleMember {
-	var members []adminapi.RoleMember
+// parseRoleMembers parses a --principal flag to a []adminapi.RoleMember.
+func parseRoleMember(principals []string) []rpadmin.RoleMember {
+	var members []rpadmin.RoleMember
 	for _, p := range principals {
 		pType, name := parsePrincipal(p)
-		members = append(members, adminapi.RoleMember{Name: name, PrincipalType: pType})
+		members = append(members, rpadmin.RoleMember{Name: name, PrincipalType: pType})
 	}
 	return members
 }

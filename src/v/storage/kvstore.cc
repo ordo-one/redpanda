@@ -13,10 +13,11 @@
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "config/configuration.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/async_adl_serde.h"
 #include "model/namespace.h"
-#include "prometheus/prometheus_sanitize.h"
 #include "reflection/adl.h"
+#include "ssx/async_algorithm.h"
 #include "storage/parser.h"
 #include "storage/record_batch_builder.h"
 #include "storage/segment.h"
@@ -30,18 +31,21 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
+#include <exception>
+
 static ss::logger lg("kvstore");
 
 namespace storage {
 
 kvstore::kvstore(
   kvstore_config kv_conf,
+  ss::shard_id shard,
   storage_resources& resources,
   ss::sharded<features::feature_table>& feature_table)
   : _conf(kv_conf)
   , _resources(resources)
   , _feature_table(feature_table)
-  , _ntpc(model::kvstore_ntp(ss::this_shard_id()), _conf.base_dir)
+  , _ntpc(model::kvstore_ntp(shard), _conf.base_dir)
   , _snap(
       std::filesystem::path(_ntpc.work_directory()),
       simple_snapshot_manager::default_snapshot_filename,
@@ -58,7 +62,9 @@ kvstore::~kvstore() noexcept = default;
 ss::future<> kvstore::start() {
     vlog(lg.debug, "Starting kvstore: dir {}", _ntpc.work_directory());
 
-    if (!config::shard_local_cfg().disable_metrics()) {
+    bool is_main_instance = static_cast<int>(ss::this_shard_id())
+                            == _ntpc.ntp().tp.partition();
+    if (is_main_instance && !config::shard_local_cfg().disable_metrics()) {
         _probe.metrics.add_group(
           prometheus_sanitize::metrics_name("storage:kvstore"),
           {
@@ -151,8 +157,7 @@ static inline bytes make_spaced_key(kvstore::key_space ks, bytes_view key) {
     auto ks_native
       = static_cast<std::underlying_type<kvstore::key_space>::type>(ks);
     auto ks_le = ss::cpu_to_le(ks_native);
-    auto spaced_key = ss::uninitialized_string<bytes>(
-      sizeof(ks_le) + key.size());
+    bytes spaced_key(bytes::initialized_later{}, sizeof(ks_le) + key.size());
     auto out = spaced_key.begin();
     out = std::copy_n(
       reinterpret_cast<const char*>(&ks_le), sizeof(ks_le), out);
@@ -198,8 +203,27 @@ ss::future<> kvstore::put(key_space ks, bytes key, std::optional<iobuf> value) {
       });
 }
 
+ss::future<> kvstore::for_each(
+  key_space ks,
+  ss::noncopyable_function<void(bytes_view, const iobuf&)> visitor) {
+    vassert(_started, "kvstore has not been started");
+    auto gh = _gate.hold();
+    auto units = co_await _db_mut.get_units();
+
+    auto prefix = make_spaced_key(ks, bytes_view{});
+    co_await ssx::async_for_each(
+      _db.begin(), _db.end(), [&](const map_t::value_type& kv) {
+          auto spaced_key = bytes_view{kv.first};
+          if (!spaced_key.starts_with(prefix)) {
+              return;
+          }
+          auto key = spaced_key.substr(prefix.size());
+          visitor(key, kv.second);
+      });
+}
+
 void kvstore::apply_op(
-  bytes key, std::optional<iobuf> value, ssx::semaphore_units const&) {
+  bytes key, std::optional<iobuf> value, const ssx::semaphore_units&) {
     auto it = _db.find(key);
     bool found = it != _db.end();
     if (value) {
@@ -282,7 +306,8 @@ ss::future<> kvstore::roll() {
                  std::nullopt,
                  _resources,
                  _feature_table,
-                 _ntp_sanitizer_config)
+                 _ntp_sanitizer_config,
+                 _conf.max_segment_size)
           .then([this](ss::lw_shared_ptr<segment> seg) {
               _segment = std::move(seg);
           });
@@ -325,7 +350,8 @@ ss::future<> kvstore::roll() {
                        std::nullopt,
                        _resources,
                        _feature_table,
-                       _ntp_sanitizer_config)
+                       _ntp_sanitizer_config,
+                       _conf.max_segment_size)
                 .then([this](ss::lw_shared_ptr<segment> seg) {
                     _segment = std::move(seg);
                 });
@@ -431,7 +457,7 @@ ss::future<> kvstore::load_snapshot() {
 
     co_await reader->close();
     if (ex) {
-        throw ex;
+        std::rethrow_exception(ex);
     }
 }
 

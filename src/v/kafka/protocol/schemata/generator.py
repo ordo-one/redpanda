@@ -503,7 +503,6 @@ override_member_container = {
     'offset_fetch_request_topic': 'std::vector',
     'partition_produce_response': 'std::vector',
     'creatable_acl_result': 'std::vector',
-    'listed_group': 'std::vector',
     'offset_delete_request_partition': 'std::vector',
     'deletable_group_result': 'std::vector',
     'delete_acls_matching_acl': 'std::vector',
@@ -672,17 +671,17 @@ class VersionRange:
         self.min, self.max = self._parse(spec)
 
     def _parse(self, spec):
-        match = re.match("^(?P<min>\d+)$", spec)
+        match = re.match(r"^(?P<min>\d+)$", spec)
         if match:
             min = int(match.group("min"))
             return min, min
 
-        match = re.match("^(?P<min>\d+)\+$", spec)
+        match = re.match(r"^(?P<min>\d+)\+$", spec)
         if match:
             min = int(match.group("min"))
             return min, None
 
-        match = re.match("^(?P<min>\d+)\-(?P<max>\d+)$", spec)
+        match = re.match(r"^(?P<min>\d+)\-(?P<max>\d+)$", spec)
         if match:
             min = int(match.group("min"))
             max = int(match.group("max"))
@@ -743,7 +742,7 @@ def snake_case(name):
 
 
 class FieldType:
-    ARRAY_RE = re.compile("^\[\](?P<type>.+)$")
+    ARRAY_RE = re.compile(r"^\[\](?P<type>.+)$")
 
     def __init__(self, name):
         self._name = name
@@ -1275,6 +1274,8 @@ struct {{ request_name }}_api final {
     static constexpr const char* name = "{{ request_name }}";
     static constexpr api_key key = api_key({{ api_key }});
     static constexpr api_version min_flexible = {% if first_flex == -1 %}never_flexible{% else %}api_version({{ first_flex }}){% endif %};
+    static constexpr api_version min_valid = api_version({{ valid_range.min }});
+    static constexpr api_version max_valid = api_version({{ valid_range.max }});
 };
 {%- endif %}
 }
@@ -1810,15 +1811,15 @@ SCHEMA = {
             "oneOf": [
                 {
                     "type": "string",
-                    "pattern": "^\d+$"
+                    "pattern": r"^\d+$"
                 },
                 {
                     "type": "string",
-                    "pattern": "^\d+\-\d+$"
+                    "pattern": r"^\d+\-\d+$"
                 },
                 {
                     "type": "string",
-                    "pattern": "^\d+\+$"
+                    "pattern": r"^\d+\+$"
                 },
             ],
         },
@@ -1947,7 +1948,7 @@ def codegen(schema_path):
     schema = io.StringIO()
     with open(schema_path, "r") as f:
         for line in f.readlines():
-            line = re.sub("\/\/.*", "", line)
+            line = re.sub(r"//.*", "", line)
             if line.strip():
                 schema.write(line)
 
@@ -1979,6 +1980,9 @@ def codegen(schema_path):
     # either 'none' or 'VersionRange'
     first_flex = parse_flexible_versions(msg["flexibleVersions"])
 
+    valid_range = VersionRange(msg["validVersions"])
+    assert valid_range.min >= 0 and valid_range.max >= valid_range.min, valid_range
+
     def fail(msg):
         assert False, msg
 
@@ -1989,7 +1993,8 @@ def codegen(schema_path):
         fail=fail,
         api_key=api_key,
         request_name=request_name,
-        first_flex=first_flex)
+        first_flex=first_flex,
+        valid_range=valid_range)
 
     src = jinja2.Template(SOURCE_TEMPLATE).render(struct=struct,
                                                   op_type=op_type,

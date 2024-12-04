@@ -11,23 +11,25 @@
 #include "wasmtime.h"
 
 #include "allocator.h"
+#include "base/type_traits.h"
 #include "base/vassert.h"
+#include "base/vlog.h"
 #include "engine_probe.h"
 #include "ffi.h"
 #include "logger.h"
 #include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
-#include "prometheus/prometheus_sanitize.h"
 #include "schema_registry_module.h"
 #include "ssx/thread_worker.h"
 #include "storage/parser_utils.h"
 #include "transform_module.h"
 #include "utils/human.h"
-#include "utils/type_traits.h"
+#include "utils/to_string.h"
 #include "wasi.h"
-#include "wasm/api.h"
+#include "wasm/engine.h"
 #include "wasm/errc.h"
 #include "wasm/parser/parser.h"
 #include "wasm/transform_probe.h"
@@ -49,6 +51,7 @@
 
 #include <absl/algorithm/container.h>
 #include <absl/strings/escaping.h>
+#include <fmt/ostream.h>
 
 #include <alloca.h>
 #include <csignal>
@@ -146,7 +149,7 @@ private:
 
 class wasmtime_runtime : public runtime {
 public:
-    explicit wasmtime_runtime(std::unique_ptr<schema_registry> sr);
+    explicit wasmtime_runtime(std::unique_ptr<schema::registry> sr);
 
     ss::future<> start(runtime::config c) override;
 
@@ -184,13 +187,13 @@ private:
       size_t reserved_size_in_bytes,
       size_t guard_size_in_bytes,
       wasmtime_linear_memory_t* memory_ret);
-    // NOLINTBEGIN(bugprone-easily-swappable-parameters)
+    // NOLINTEND(bugprone-easily-swappable-parameters)
 
     wasmtime_error_t* allocate_heap_memory(
       heap_allocator::request, wasmtime_linear_memory_t* memory_ret);
 
     handle<wasm_engine_t, &wasm_engine_delete> _engine;
-    std::unique_ptr<schema_registry> _sr;
+    std::unique_ptr<schema::registry> _sr;
     ssx::singleton_thread_worker _alien_thread;
     ss::sharded<wasm::heap_allocator> _heap_allocator;
     ss::sharded<stack_allocator> _stack_allocator;
@@ -341,7 +344,7 @@ wasmtime_val_t convert_to_wasmtime(T value) {
           .kind = WASMTIME_I32, .of = {.i32 = static_cast<int32_t>(value)}};
     } else {
         static_assert(
-          utils::unsupported_type<T>::value, "Unsupported wasm result type");
+          base::unsupported_type<T>::value, "Unsupported wasm result type");
     }
 }
 
@@ -477,7 +480,7 @@ public:
       model::transform_metadata metadata,
       ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>>
         preinitialized,
-      schema_registry* sr,
+      schema::registry* sr,
       std::unique_ptr<wasm::logger> logger)
       : _runtime(runtime)
       , _meta(std::move(metadata))
@@ -549,7 +552,7 @@ public:
             return &_sr_module;
         } else {
             static_assert(
-              utils::unsupported_type<T>::value, "unsupported module");
+              base::unsupported_type<T>::value, "unsupported module");
         }
     }
 
@@ -1281,7 +1284,7 @@ public:
       model::transform_metadata meta,
       ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>>
         preinitialized,
-      schema_registry* sr)
+      schema::registry* sr)
       : _runtime(runtime)
       , _preinitialized(std::move(preinitialized))
       , _meta(std::move(meta))
@@ -1299,10 +1302,10 @@ private:
     wasmtime_runtime* _runtime;
     ss::foreign_ptr<ss::lw_shared_ptr<preinitialized_instance>> _preinitialized;
     model::transform_metadata _meta;
-    schema_registry* _sr;
+    schema::registry* _sr;
 };
 
-wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema_registry> sr)
+wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
   : _sr(std::move(sr)) {
     wasm_config_t* config = wasm_config_new();
 
@@ -1736,7 +1739,7 @@ ss::future<> wasmtime_runtime::validate(model::wasm_binary_iobuf buf) {
 
 } // namespace
 
-std::unique_ptr<runtime> create_runtime(std::unique_ptr<schema_registry> sr) {
+std::unique_ptr<runtime> create_runtime(std::unique_ptr<schema::registry> sr) {
     return std::make_unique<wasmtime_runtime>(std::move(sr));
 }
 

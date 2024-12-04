@@ -81,7 +81,7 @@ consteval audit_resource_type get_audit_resource_type() {
     } else if constexpr (std::is_same_v<T, security::acl_binding_filter>) {
         return audit_resource_type::acl_binding_filter;
     } else {
-        static_assert(utils::unsupported_type<T>::value, "Unsupported type");
+        static_assert(base::unsupported_type<T>::value, "Unsupported type");
     }
 }
 
@@ -156,7 +156,8 @@ template<typename Func>
 concept returns_auditable_resource_vector = requires(Func func) {
     {
         func()
-    } -> std::same_as<
+    }
+    -> std::same_as<
       std::vector<typename std::remove_cvref_t<decltype(func())>::value_type>>;
 
     requires AuditableResource<

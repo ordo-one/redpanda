@@ -11,13 +11,12 @@
 
 #include "bytes/iobuf_parser.h"
 #include "json/document.h"
-#include "test_utils/fixture.h"
 #include "wasm/tests/wasm_fixture.h"
 
 #include <absl/container/flat_hash_set.h>
 
 TEST_F(WasmTestFixture, Wasi) {
-    load_wasm("wasi.wasm");
+    load_wasm("wasi");
     auto batch = make_tiny_batch();
     auto result = transform(batch);
     const auto& result_records = result.copy_records();

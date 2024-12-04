@@ -10,6 +10,7 @@ import random
 import requests
 from rptest.services.cluster import cluster
 from rptest.clients.types import TopicSpec
+from rptest.services.kgo_verifier_services import KgoVerifierProducer
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.clients.rpk import RpkTool
 from ducktape.mark import ignore, matrix
@@ -17,11 +18,13 @@ from ducktape.utils.util import wait_until
 from random import shuffle
 import time
 from rptest.tests.partition_movement import PartitionMovementMixin
-from rptest.services.admin import Replica
+from rptest.services.admin import Admin, Replica
 from rptest.clients.kcl import KCL
 from threading import Thread, Condition
-from rptest.services.redpanda import RedpandaService
+from rptest.services.redpanda import RedpandaService, SISettings
+from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import wait_until_result
+from rptest.utils.node_operations import NodeDecommissionWaiter
 
 
 class ControllerLeadershipTransferInjector():
@@ -231,7 +234,8 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
         # Leadership should be stabilized
         self.redpanda._admin.await_stable_leader(topic=self.topic,
                                                  replication=len(alive),
-                                                 hosts=self._alive_nodes())
+                                                 hosts=self._alive_nodes(),
+                                                 timeout_s=self.WAIT_TIMEOUT_S)
 
         self._start_consumer()
         if controller_snapshots:
@@ -368,25 +372,133 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
         self.start_consumer()
         self.run_validation()
 
-    @cluster(num_nodes=5)
+
+class NodeWiseRecoveryTest(RedpandaTest):
+    def __init__(self, test_context, *args, **kwargs):
+        super(NodeWiseRecoveryTest,
+              self).__init__(test_context,
+                             si_settings=SISettings(
+                                 log_segment_size=1024 * 1024,
+                                 test_context=test_context,
+                                 fast_uploads=True,
+                                 retention_local_strict=True,
+                             ),
+                             extra_rp_conf={
+                                 "partition_autobalancing_mode": "continuous",
+                                 "enable_leader_balancer": False,
+                             },
+                             num_brokers=5,
+                             *args,
+                             **kwargs)
+        self.default_timeout_sec = 120
+        self.rpk = RpkTool(self.redpanda)
+        self.admin = Admin(self.redpanda,
+                           retries_amount=20,
+                           retry_codes=[503, 504])
+
+    def _alive_nodes(self):
+        return [n.account.hostname for n in self.redpanda.started_nodes()]
+
+    def setUp(self):
+        # add node config override not to spawn a new cluster with empty seed servers
+        self.redpanda.start(auto_assign_node_id=True,
+                            omit_seeds_on_idx_one=True)
+
+    def collect_topic_partition_states(self, topic):
+        states = {}
+        for p in self.rpk.describe_topic(topic):
+            states[p.id] = self.admin.get_partition_state(
+                namespace="kafka",
+                topic=topic,
+                partition=p.id,
+                node=self.redpanda.get_node_by_id(p.leader))
+        return states
+
+    def get_topic_partition_high_watermarks(self, topic):
+        return {p.id: p.high_watermark for p in self.rpk.describe_topic(topic)}
+
+    def get_topic_partition_status(self, topic, partitions):
+        return {
+            p:
+            self.admin.get_partition_state(namespace="kafka",
+                                           topic=topic,
+                                           partition=p)
+            for p in range(partitions)
+        }
+
+    def produce_until_log_eviction(self, topic):
+        msg_size = 512
+
+        self.producer = KgoVerifierProducer(self.test_context, self.redpanda,
+                                            topic, msg_size, 10000000)
+
+        self.producer.start(clean=False)
+
+        def start_offset_advanced():
+            states = self.collect_topic_partition_states(topic)
+
+            return all(r['start_offset'] > 0 for s in states.values()
+                       for r in s['replicas'])
+
+        wait_until(start_offset_advanced,
+                   timeout_sec=self.default_timeout_sec,
+                   backoff_sec=0.1,
+                   err_msg="Error waiting for start offset to advance",
+                   retry_on_exc=True)
+
+        self.producer.stop()
+        self.producer.clean()
+        self.producer.free()
+
+    def wait_for_final_manifest_uploads(self, topic):
+        def all_uploaded():
+            for p in self.rpk.describe_topic(topic):
+                status = self.admin.get_partition_cloud_storage_status(
+                    topic=topic,
+                    partition=p.id,
+                    node=self.redpanda.get_node_by_id(p.leader))
+                if ("ms_since_last_manifest_upload"
+                        not in status) or status["metadata_update_pending"]:
+                    return False
+            return True
+
+        wait_until(all_uploaded,
+                   timeout_sec=self.default_timeout_sec,
+                   backoff_sec=1,
+                   err_msg="Error waiting for partition manifests upload")
+
+    def wait_for_no_reconfigurations(self):
+        def no_pending_force_reconfigurations():
+            status = self.admin.get_partition_balancer_status()
+            return status['partitions_pending_force_recovery_count'] == 0
+
+        wait_until(no_pending_force_reconfigurations,
+                   timeout_sec=self.default_timeout_sec,
+                   backoff_sec=3,
+                   err_msg="reported force recovery count is non zero",
+                   retry_on_exc=True)
+
+    @cluster(num_nodes=6)
     @matrix(dead_node_count=[1, 2])
     def test_node_wise_recovery(self, dead_node_count):
-        self.start_redpanda(num_nodes=5,
-                            extra_rp_conf={
-                                "partition_autobalancing_mode": "continuous",
-                                "enable_leader_balancer": False,
-                            })
+
         num_topics = 20
         # Create a mix of rf=1 and 3 topics.
         topics = []
         for i in range(0, num_topics):
             rf = 3 if i % 2 == 0 else 1
             parts = random.randint(1, 3)
+            with_ts = random.choice([True, False])
             spec = TopicSpec(name=f"topic-{i}",
                              replication_factor=rf,
-                             partition_count=parts)
+                             partition_count=parts,
+                             redpanda_remote_read=with_ts,
+                             redpanda_remote_write=with_ts)
             topics.append(spec)
             self.client().create_topic(spec)
+            self.client().alter_topic_config(
+                spec.name, TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES,
+                2 * 1024 * 1024)
 
         admin = self.redpanda._admin
 
@@ -395,9 +507,18 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
         to_kill_node_ids = [
             int(self.redpanda.node_id(n)) for n in to_kill_nodes
         ]
+        for t in topics:
+            self.produce_until_log_eviction(t.name)
+        for t in topics:
+            self.wait_for_final_manifest_uploads(t.name)
 
         partitions_lost_majority = admin.get_majority_lost_partitions_from_nodes(
             dead_brokers=to_kill_node_ids)
+        # collect topic partition high watermarks before recovery
+        initial_topic_hws = {
+            t.name: self.get_topic_partition_high_watermarks(t.name)
+            for t in topics
+        }
 
         self.logger.debug(f"Stopping nodes: {to_kill_node_ids}")
         self.redpanda.for_nodes(to_kill_nodes, self.redpanda.stop_node)
@@ -408,7 +529,7 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
                 controller) not in to_kill_node_ids
 
         wait_until(controller_available,
-                   timeout_sec=self.WAIT_TIMEOUT_S,
+                   timeout_sec=self.default_timeout_sec,
                    backoff_sec=3,
                    err_msg="Controller not available")
 
@@ -440,7 +561,7 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
                 try:
                     transfers.pause()
                     wait_until(controller_available,
-                               timeout_sec=self.WAIT_TIMEOUT_S,
+                               timeout_sec=self.default_timeout_sec,
                                backoff_sec=3,
                                err_msg="Controller not available")
                     lost_majority = admin.get_majority_lost_partitions_from_nodes(
@@ -458,7 +579,7 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
 
             # Wait until there are no partition assignments with majority loss due to dead nodes.
             wait_until(no_majority_lost_partitions,
-                       timeout_sec=self.WAIT_TIMEOUT_S,
+                       timeout_sec=self.default_timeout_sec,
                        backoff_sec=3,
                        err_msg="Node wise recovery failed")
 
@@ -474,13 +595,13 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
                 try:
                     transfers.pause()
                     wait_until(controller_available,
-                               timeout_sec=self.WAIT_TIMEOUT_S,
+                               timeout_sec=self.default_timeout_sec,
                                backoff_sec=3,
                                err_msg="Controller not available")
                     # Wait for balancer tick to run so the data is populated.
                     wait_until(lambda: get_partition_balancer_status(
                         lambda s: s["status"] != "starting"),
-                               timeout_sec=self.WAIT_TIMEOUT_S,
+                               timeout_sec=self.default_timeout_sec,
                                backoff_sec=3,
                                err_msg="Balancer tick did not run in time")
                     return get_partition_balancer_status(lambda s: s[
@@ -492,7 +613,7 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
                     transfers.resume()
 
             wait_until(no_pending_force_reconfigurations,
-                       timeout_sec=self.WAIT_TIMEOUT_S,
+                       timeout_sec=self.default_timeout_sec,
                        backoff_sec=3,
                        err_msg="reported force recovery count is non zero")
 
@@ -502,6 +623,128 @@ class PartitionForceReconfigurationTest(EndToEndTest, PartitionMovementMixin):
                     self.redpanda._admin.await_stable_leader(
                         topic=topic.name,
                         partition=part,
-                        timeout_s=self.WAIT_TIMEOUT_S,
+                        timeout_s=self.default_timeout_sec,
                         backoff_s=2,
                         hosts=self._alive_nodes())
+        topic_hws_after_recovery = {
+            t.name: self.get_topic_partition_high_watermarks(t.name)
+            for t in topics
+        }
+
+        for t in topics:
+            for partition_id, initial_hw in initial_topic_hws[t.name].items():
+                final_hw = topic_hws_after_recovery[t.name][partition_id]
+                self.logger.info(
+                    f"partition {t}/{partition_id} replicas initial high watermark: {initial_hw} final high watermark: {final_hw}"
+                )
+                if t.redpanda_remote_write or t.replication_factor == 3:
+                    assert 0.8 * initial_hw <= final_hw <= initial_hw
+
+    @cluster(num_nodes=6)
+    def test_recovery_local_data_missing(self):
+        self.redpanda._disable_cloud_storage_diagnostics = True
+
+        topic = TopicSpec(name=f"topic-0",
+                          replication_factor=3,
+                          partition_count=1,
+                          redpanda_remote_read=True,
+                          redpanda_remote_write=True)
+
+        self.client().create_topic(topic)
+        self.client().alter_topic_config(
+            topic.name, TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES,
+            2 * 1024 * 1024)
+
+        admin = self.redpanda._admin
+        rpk = RpkTool(self.redpanda)
+        replicas = []
+        for p in rpk.describe_topic(topic.name):
+            replicas = [int(r) for r in p.replicas]
+
+        self.logger.info(f"Test topic {topic.name} replicas: {replicas}")
+
+        # produce initial data
+        self.produce_until_log_eviction(topic.name)
+        self.wait_for_final_manifest_uploads(topic.name)
+
+        # collect topic partition high watermarks before recovery
+        initial_status = self.get_topic_partition_status(topic.name, 1)
+        self.logger.info(f"Initial partition status: {initial_status}")
+
+        # stop first partition replica
+        node_to_stop_id = replicas[0]
+        node_to_stop = self.redpanda.get_node_by_id(node_to_stop_id)
+        self.logger.debug(f"Stopping node: {node_to_stop_id}")
+        self.redpanda.stop_node(node_to_stop)
+
+        # produce more data while node 0 is stopped
+        producer = KgoVerifierProducer(self.test_context, self.redpanda,
+                                       topic.name, 512, 5000)
+        producer.start(clean=False)
+        producer.wait()
+        producer.clean()
+        producer.free()
+        self.wait_for_final_manifest_uploads(topic.name)
+
+        status_2nd_step = self.get_topic_partition_status(topic.name, 1)
+
+        # stop other two replicas
+        to_kill_node_ids = replicas[1:]
+        to_kill_nodes = [
+            self.redpanda.get_node_by_id(i) for i in to_kill_node_ids
+        ]
+        self.logger.debug(f"Stopping nodes: {to_kill_node_ids}")
+        self.redpanda.for_nodes(to_kill_nodes, self.redpanda.stop_node)
+
+        # start the first replica back up, it is outdated now
+        self.redpanda.start_node(node_to_stop,
+                                 auto_assign_node_id=True,
+                                 omit_seeds_on_idx_one=True)
+
+        # start the remaining replicas with empty disks
+        for node in to_kill_nodes:
+            self.redpanda.clean_node(node,
+                                     preserve_logs=True,
+                                     preserve_current_install=True)
+            self.redpanda.start_node(node,
+                                     auto_assign_node_id=True,
+                                     omit_seeds_on_idx_one=True)
+
+        partitions_lost_majority = admin.get_majority_lost_partitions_from_nodes(
+            dead_brokers=to_kill_node_ids)
+        self.logger.info(
+            f"Partitions with majority loss: {partitions_lost_majority}")
+
+        self.logger.debug(f"recovering from: {to_kill_node_ids}")
+        # issue a node wise recovery
+        rpk.force_partition_recovery(from_nodes=to_kill_node_ids)
+        self.wait_for_no_reconfigurations()
+        # wait for quiescence
+        for part in range(0, topic.partition_count):
+            self.redpanda._admin.await_stable_leader(
+                topic=topic.name,
+                partition=part,
+                timeout_s=self.default_timeout_sec,
+                backoff_s=2,
+                hosts=self._alive_nodes())
+
+        status_after = self.get_topic_partition_status(topic.name,
+                                                       topic.partition_count)
+
+        for to_decom in to_kill_node_ids:
+            self.admin.decommission_broker(id=to_decom)
+            waiter = NodeDecommissionWaiter(self.redpanda,
+                                            to_decom,
+                                            self.logger,
+                                            progress_timeout=60)
+            waiter.wait_for_removal()
+
+        self.logger.info(f"Final partition status: {status_after}")
+        cloud_offset = max(
+            [r['next_cloud_offset'] for r in status_2nd_step[0]['replicas']])
+
+        # recovered high watermark must be greater than the cloud offset
+        recovered_hw = min(
+            [r['high_watermark'] for r in status_after[0]['replicas']])
+
+        assert recovered_hw >= cloud_offset

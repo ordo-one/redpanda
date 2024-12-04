@@ -190,6 +190,15 @@ private:
     void
     report_decommission_reallocation_failure(model::node_id, const model::ntp&);
 
+    node2count_t& get_topic_to_node_count(model::topic_namespace_view tp_ns) {
+        auto it = _topic2node_counts.find(tp_ns);
+        if (it != _topic2node_counts.end()) {
+            return it->second;
+        }
+        throw iterator_stability_violation(
+          fmt::format("Topic {} not found in topic2node_counts map", tp_ns));
+    }
+
     struct partition_sizes {
         absl::flat_hash_map<model::node_id, size_t> current;
 
@@ -295,7 +304,7 @@ void partition_balancer_planner::init_per_node_state(
   const cluster_health_report& health_report,
   request_context& ctx,
   plan_data& result) {
-    auto const now = rpc::clock_type::now();
+    const auto now = rpc::clock_type::now();
     for (const auto& [id, broker] : _state.members().nodes()) {
         if (
           broker.state.get_membership_state()
@@ -388,9 +397,9 @@ void partition_balancer_planner::init_per_node_state(
 ss::future<> partition_balancer_planner::init_ntp_sizes_from_health_report(
   const cluster_health_report& health_report, request_context& ctx) {
     for (const auto& node_report : health_report.node_reports) {
-        for (const auto& tp_ns : node_report->topics) {
-            for (const auto& partition : tp_ns.partitions) {
-                model::ntp ntp{tp_ns.tp_ns.ns, tp_ns.tp_ns.tp, partition.id};
+        for (const auto& [tp_ns, partitions] : node_report->topics) {
+            for (const auto& partition : partitions) {
+                model::ntp ntp{tp_ns.ns, tp_ns.tp, partition.id};
                 size_t reclaimable = partition.reclaimable_size_bytes.value_or(
                   0);
                 vlog(
@@ -487,7 +496,7 @@ partition_balancer_planner::init_topic_node_counts(request_context& ctx) {
          ++it) {
         auto& counts = ctx._topic2node_counts[it->first];
         const auto& assignments = it->second.get_assignments();
-        for (const auto& p_as : assignments) {
+        for (const auto& [_, p_as] : assignments) {
             for (const auto& bs : p_as.replicas) {
                 counts[bs.node_id] += 1;
             }
@@ -673,7 +682,7 @@ public:
 
             // adjust topic node counts
 
-            auto& node_counts = _ctx._topic2node_counts.at(
+            auto& node_counts = _ctx.get_topic_to_node_count(
               model::topic_namespace_view(ntp()));
             for (const auto& bs : moving_to) {
                 auto& count = node_counts.at(bs.node_id);
@@ -1029,7 +1038,7 @@ ss::future<> partition_balancer_planner::request_context::for_each_partition(
          it != topics.topics_iterator_end();
          ++it) {
         const auto& assignments = it->second.get_assignments();
-        for (const auto& assignment : assignments) {
+        for (const auto& [_, assignment] : assignments) {
             auto ntp = model::ntp(it->first.ns, it->first.tp, assignment.id);
             auto stop = do_with_partition(ntp, assignment, visitor);
             if (stop == ss::stop_iteration::yes) {
@@ -1055,7 +1064,7 @@ partition_balancer_planner::request_context::for_each_replica_random_order(
 
     fragmented_vector<item> replicas;
     for (const auto& t : _parent._state.topics().topics_map()) {
-        for (const auto& a : t.second.get_assignments()) {
+        for (const auto& [_, a] : t.second.get_assignments()) {
             auto reassignment_it = _reassignments.find(
               model::ntp(t.first.ns, t.first.tp, a.id));
             const auto& ntp_replicas
@@ -1108,7 +1117,7 @@ ss::future<> partition_balancer_planner::request_context::with_partition(
         co_return;
     }
 
-    do_with_partition(ntp, *it, visitor);
+    do_with_partition(ntp, it->second, visitor);
 }
 
 allocation_constraints
@@ -1142,12 +1151,12 @@ partition_balancer_planner::reassignable_partition::get_allocation_constraints(
         // Add constraint for balanced topic-wise replica counts
         constraints.add(min_count_in_map(
           "min topic-wise count",
-          _ctx._topic2node_counts.at(model::topic_namespace_view(ntp()))));
+          _ctx.get_topic_to_node_count(model::topic_namespace_view(ntp()))));
     }
 
     // Add constraint for balanced total replica counts
     constraints.ensure_new_level();
-    constraints.add(max_final_capacity(get_allocation_domain(ntp())));
+    constraints.add(max_final_capacity());
 
     // Add constraint on least disk usage
     constraints.ensure_new_level();
@@ -1166,9 +1175,8 @@ partition_balancer_planner::reassignable_partition::move_replica(
   partition_balancer_planner::change_reason reason) {
     if (!_reallocated) {
         _reallocated = request_context::reassignment_info{
-          .partition
-          = _ctx._parent._partition_allocator.make_allocated_partition(
-            _ntp, replicas(), get_allocation_domain(_ntp)),
+          .partition = _ctx._parent._partition_allocator
+                         .make_allocated_partition(_ntp, replicas()),
           .reconfiguration_policy
           = request_context::map_change_reason_to_policy(reason)};
     }
@@ -1224,7 +1232,7 @@ partition_balancer_planner::reassignable_partition::move_replica(
 
         {
             // adjust topic node counts
-            auto& node_counts = _ctx._topic2node_counts.at(
+            auto& node_counts = _ctx.get_topic_to_node_count(
               model::topic_namespace_view(ntp()));
             auto& prev_count = node_counts.at(replica);
             prev_count -= 1;
@@ -1275,15 +1283,21 @@ void partition_balancer_planner::reassignable_partition::revert(
       _reallocated->partition.is_original(move.previous()->node_id),
       "ntp {}: move {}->{} should have been from original node",
       _ntp,
-      move.current(),
-      move.previous());
+      move.previous(),
+      move.current());
 
     auto err = _reallocated->partition.try_revert(move);
     vassert(err == errc::success, "ntp {}: revert error: {}", _ntp, err);
+    vlog(
+      clusterlog.info,
+      "ntp {}: reverted previously scheduled move {} -> {}",
+      _ntp,
+      move.previous()->node_id,
+      move.current().node_id);
 
     {
         // adjust topic node counts
-        auto& node_counts = _ctx._topic2node_counts.at(
+        auto& node_counts = _ctx.get_topic_to_node_count(
           model::topic_namespace_view(ntp()));
         auto& cur_count = node_counts.at(move.current().node_id);
         cur_count -= 1;
@@ -1381,7 +1395,7 @@ void partition_balancer_planner::force_reassignable_partition::
     auto constraints = get_allocation_constraints(max_disk_usage_ratio);
     node2count_t* node2count = nullptr;
     if (_ctx.config().topic_aware) {
-        node2count = &_ctx._topic2node_counts.at(
+        node2count = &_ctx.get_topic_to_node_count(
           model::topic_namespace_view(_ntp.ns, _ntp.tp.topic));
     }
 
@@ -1840,13 +1854,12 @@ ss::future<> partition_balancer_planner::get_counts_rebalancing_actions(
 
         double topic_count = 0;
         if (ctx.config().topic_aware) {
-            const auto& counts = ctx._topic2node_counts.at(
+            const auto& counts = ctx.get_topic_to_node_count(
               model::topic_namespace_view(ntp));
             topic_count = double(counts.at(id)) / alloc_node.max_capacity();
         }
 
-        auto total_count = double(alloc_node.domain_final_partitions(
-                             get_allocation_domain(ntp)))
+        auto total_count = double(alloc_node.final_partitions())
                            / alloc_node.max_capacity();
 
         return scores_t{topic_count, total_count};
@@ -1869,7 +1882,7 @@ ss::future<> partition_balancer_planner::get_counts_rebalancing_actions(
 
     // Reaches its minimum of 1.0 when replica counts (scaled by the node
     // capacity) are equal across all nodes.
-    auto calc_objective = [&](partition_allocation_domain domain) {
+    auto calc_objective = [&]() {
         double sum = 0;
         double sum_sq = 0;
         for (const auto& id : ctx.all_nodes) {
@@ -1878,7 +1891,7 @@ ss::future<> partition_balancer_planner::get_counts_rebalancing_actions(
                 throw balancer_tick_aborted_exception{
                   fmt::format("node id: {} disappeared", id)};
             }
-            auto count = double(it->second->domain_final_partitions(domain))
+            auto count = double(it->second->final_partitions())
                          / it->second->max_capacity();
             sum += count;
             sum_sq += count * count;
@@ -1891,13 +1904,7 @@ ss::future<> partition_balancer_planner::get_counts_rebalancing_actions(
         return ctx.all_nodes.size() * sum_sq / (sum * sum);
     };
 
-    absl::flat_hash_map<partition_allocation_domain, double>
-      domain2orig_objective;
-    for (auto domain :
-         {partition_allocation_domains::common,
-          partition_allocation_domains::consumer_offsets}) {
-        domain2orig_objective[domain] = calc_objective(domain);
-    }
+    double orig_objective = calc_objective();
 
     // The algorithm is simple: just go over all replicas and try to move them
     // to a better node (this is driven by allocation constraints). If we
@@ -1947,20 +1954,21 @@ ss::future<> partition_balancer_planner::get_counts_rebalancing_actions(
                     }
                 }
             },
+            [&](immutable_partition& p) {
+                p.report_failure(change_reason::partition_count_rebalancing);
+                should_stop = false;
+            },
             [](auto&) {});
 
           return ss::stop_iteration::no;
       });
 
-    for (const auto& [domain, orig_objective] : domain2orig_objective) {
-        double cur_objective = calc_objective(domain);
-        vlog(
-          clusterlog.info,
-          "counts rebalancing objective in domain {}: {:6} -> {:6}",
-          domain,
-          orig_objective,
-          cur_objective);
-    }
+    double cur_objective = calc_objective();
+    vlog(
+      clusterlog.info,
+      "counts rebalancing objective: {:.6} -> {:.6}",
+      orig_objective,
+      cur_objective);
 
     auto all_nodes_healthy = [&] {
         // don't count rebalance as finished if not all nodes are fully

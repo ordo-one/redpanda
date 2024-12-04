@@ -9,6 +9,7 @@ v_cc_library(
     Seastar::seastar
     v::model_test_utils
     v::gtest_main
+    v::schema_test_fixture
 )
 
 set(TESTDATA_DIR "${CMAKE_BINARY_DIR}/src/transform-sdk/go/transform/internal/testdata")
@@ -22,6 +23,9 @@ rp_test(
   SOURCES
     wasm_transform_test.cc
     wasi_test.cc
+    wasm_sr_test.cc
+    wasm_lifecycle_test.cc
+    wasm_resources_test.cc
   LIBRARIES 
     v::gtest_main
     v::wasm_test_fixture

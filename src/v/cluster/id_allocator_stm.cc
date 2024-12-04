@@ -41,14 +41,14 @@ id_allocator_stm::id_allocator_stm(ss::logger& logger, raft::consensus* c)
 
 id_allocator_stm::id_allocator_stm(
   ss::logger& logger, raft::consensus* c, config::configuration& cfg)
-  : persisted_stm(id_allocator_snapshot, logger, c)
+  : raft::persisted_stm<>(id_allocator_snapshot, logger, c)
   , _batch_size(cfg.id_allocator_batch_size.value())
   , _log_capacity(cfg.id_allocator_log_capacity.value()) {}
 
 ss::future<bool>
 id_allocator_stm::sync(model::timeout_clock::duration timeout) {
     auto term = _insync_term;
-    auto is_synced = co_await persisted_stm::sync(timeout);
+    auto is_synced = co_await raft::persisted_stm<>::sync(timeout);
     if (is_synced) {
         if (term != _insync_term) {
             _curr_id = _state;
@@ -152,7 +152,7 @@ id_allocator_stm::do_allocate_id(model::timeout_clock::duration timeout) {
     co_return stm_allocation_result{id};
 }
 
-ss::future<> id_allocator_stm::apply(const model::record_batch& b) {
+ss::future<> id_allocator_stm::do_apply(const model::record_batch& b) {
     if (b.header().type != model::record_batch_type::id_allocator) {
         return ss::now();
     }
@@ -229,7 +229,8 @@ id_allocator_stm::apply_local_snapshot(raft::stm_snapshot_header, iobuf&&) {
       std::logic_error("id_allocator_stm doesn't support snapshots"));
 }
 
-ss::future<raft::stm_snapshot> id_allocator_stm::take_local_snapshot() {
+ss::future<raft::stm_snapshot>
+id_allocator_stm::take_local_snapshot(ssx::semaphore_units) {
     return ss::make_exception_future<raft::stm_snapshot>(
       std::logic_error("id_allocator_stm doesn't support snapshots"));
 }

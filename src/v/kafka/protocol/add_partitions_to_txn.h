@@ -16,7 +16,6 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/add_partitions_to_txn_request.h"
 #include "kafka/protocol/schemata/add_partitions_to_txn_response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
 
@@ -52,7 +51,7 @@ struct add_partitions_to_txn_response final {
     add_partitions_to_txn_response(
       const add_partitions_to_txn_request& request, error_code error)
       : add_partitions_to_txn_response(
-        request, [error](auto) { return error; }) {}
+          request, [error](auto) { return error; }) {}
 
     add_partitions_to_txn_response(
       const add_partitions_to_txn_request& request,

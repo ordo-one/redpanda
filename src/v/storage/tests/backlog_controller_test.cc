@@ -28,7 +28,7 @@ static ss::logger ctrl_logger{"test-controller"};
 
 struct simple_backlog_sampler : storage::backlog_controller::sampler {
     explicit simple_backlog_sampler(int64_t& b)
-      : current_backlog(b){};
+      : current_backlog(b) {}
     ss::future<int64_t> sample_backlog() final { co_return current_backlog; }
 
     int64_t& current_backlog;
@@ -82,7 +82,7 @@ struct backlog_controller_fixture {
 };
 
 FIXTURE_TEST(test_feedback_loop, backlog_controller_fixture) {
-    ctrl->start().get0();
+    ctrl->start().get();
     /**
      * current backlog is equal to 0, setpoint is set to 20, error = 20.0
      * since error hasn't changed and want some more backlog we will down

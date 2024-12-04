@@ -10,10 +10,11 @@
  */
 
 #pragma once
-#include "archival/types.h"
 #include "cloud_roles/types.h"
 #include "cloud_storage/configuration.h"
+#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage_clients/configuration.h"
+#include "cluster/archival/types.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/controller.h"
 #include "cluster/controller_stm.h"
@@ -28,6 +29,7 @@
 #include "config/broker_authn_endpoint.h"
 #include "config/mock_property.h"
 #include "config/node_config.h"
+#include "config/types.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/schemata/fetch_request.h"
@@ -79,6 +81,8 @@ using configure_node_id = ss::bool_class<struct configure_node_id_tag>;
 using empty_seed_starts_cluster
   = ss::bool_class<struct empty_seed_starts_cluster_tag>;
 
+using namespace std::chrono_literals;
+
 class redpanda_thread_fixture {
 public:
     static constexpr const char* rack_name = "i-am-rack";
@@ -102,7 +106,8 @@ public:
       = empty_seed_starts_cluster::yes,
       std::optional<uint32_t> kafka_admin_topic_api_rate = std::nullopt,
       bool enable_data_transforms = false,
-      bool enable_legacy_upload_mode = true)
+      bool enable_legacy_upload_mode = true,
+      bool iceberg_enabled = false)
       : app(ssx::sformat("redpanda-{}", node_id()))
       , proxy_port(proxy_port)
       , schema_reg_port(schema_reg_port)
@@ -122,7 +127,8 @@ public:
           empty_seed_starts_cluster_val,
           kafka_admin_topic_api_rate,
           enable_data_transforms,
-          enable_legacy_upload_mode);
+          enable_legacy_upload_mode,
+          iceberg_enabled);
         app.initialize(
           proxy_config(proxy_port),
           proxy_client_config(kafka_port),
@@ -150,6 +156,8 @@ public:
             std::ref(app.controller->get_topics_frontend()),
             std::ref(app.controller->get_config_frontend()),
             std::ref(app.controller->get_feature_table()),
+            std::ref(app.controller->get_quota_frontend()),
+            std::ref(app.controller->get_quota_store()),
             std::ref(app.quota_mgr),
             std::ref(app.snc_quota_mgr),
             std::ref(app.group_router),
@@ -175,28 +183,28 @@ public:
     // creates single node with default configuration
     redpanda_thread_fixture()
       : redpanda_thread_fixture(
-        model::node_id(1),
-        9092,
-        33145,
-        8082,
-        8081,
-        {},
-        ssx::sformat("test.dir_{}", time(0)),
-        std::nullopt,
-        true) {}
+          model::node_id(1),
+          9092,
+          33145,
+          8082,
+          8081,
+          {},
+          ssx::sformat("test.dir_{}", time(0)),
+          std::nullopt,
+          true) {}
 
     // Restart the fixture with an existing data directory
     explicit redpanda_thread_fixture(std::filesystem::path existing_data_dir)
       : redpanda_thread_fixture(
-        model::node_id(1),
-        9092,
-        33145,
-        8082,
-        8081,
-        {},
-        existing_data_dir.string(),
-        std::nullopt,
-        true) {}
+          model::node_id(1),
+          9092,
+          33145,
+          8082,
+          8081,
+          {},
+          existing_data_dir.string(),
+          std::nullopt,
+          true) {}
 
     struct init_cloud_storage_tag {};
 
@@ -204,20 +212,21 @@ public:
     explicit redpanda_thread_fixture(
       init_cloud_storage_tag,
       std::optional<uint16_t> port = std::nullopt,
+      cloud_storage_clients::s3_url_style url_style = default_url_style,
       model::node_id node_id = model::node_id(1))
       : redpanda_thread_fixture(
-        node_id,
-        9092,
-        33145,
-        8082,
-        8081,
-        {},
-        ssx::sformat("test.dir_{}", time(0)),
-        std::nullopt,
-        true,
-        get_s3_config(port),
-        get_archival_config(),
-        get_cloud_config(port)) {}
+          node_id,
+          9092,
+          33145,
+          8082,
+          8081,
+          {},
+          ssx::sformat("test.dir_{}", time(0)),
+          std::nullopt,
+          true,
+          get_s3_config(port, url_style),
+          get_archival_config(),
+          get_cloud_config(port, url_style)) {}
 
     struct init_cloud_storage_no_archiver_tag {};
 
@@ -226,20 +235,21 @@ public:
     // the upload code, to later set it up manually in a test.
     explicit redpanda_thread_fixture(
       init_cloud_storage_no_archiver_tag,
-      std::optional<uint16_t> port = std::nullopt)
+      std::optional<uint16_t> port = std::nullopt,
+      cloud_storage_clients::s3_url_style url_style = default_url_style)
       : redpanda_thread_fixture(
-        model::node_id(1),
-        9092,
-        33145,
-        8082,
-        8081,
-        {},
-        ssx::sformat("test.dir_{}", time(0)),
-        std::nullopt,
-        true,
-        get_s3_config(port),
-        get_archival_config(),
-        std::nullopt) {}
+          model::node_id(1),
+          9092,
+          33145,
+          8082,
+          8081,
+          {},
+          ssx::sformat("test.dir_{}", time(0)),
+          std::nullopt,
+          true,
+          get_s3_config(port, url_style),
+          get_archival_config(),
+          std::nullopt) {}
 
     ~redpanda_thread_fixture() {
         shutdown();
@@ -266,7 +276,7 @@ public:
         ss::smp::invoke_on_all([] {
             auto& config = config::shard_local_cfg();
             config.get("disable_metrics").set_value(false);
-        }).get0();
+        }).get();
         app.initialize(proxy_config(), proxy_client_config());
         app.check_environment();
         app.wire_up_and_start(*app_signal, true);
@@ -274,40 +284,43 @@ public:
 
     config::configuration& lconf() { return config::shard_local_cfg(); }
 
-    static cloud_storage_clients::s3_configuration
-    get_s3_config(std::optional<uint16_t> port = std::nullopt) {
-        net::unresolved_address server_addr("127.0.0.1", port.value_or(4430));
+    static cloud_storage_clients::s3_configuration get_s3_config(
+      std::optional<uint16_t> port = std::nullopt,
+      cloud_storage_clients::s3_url_style url_style = default_url_style) {
+        net::unresolved_address server_addr("localhost", port.value_or(4430));
         cloud_storage_clients::s3_configuration s3conf;
-        s3conf.uri = cloud_storage_clients::access_point_uri("127.0.0.1");
-        s3conf.access_key = cloud_roles::public_key_str("acess-key");
+        s3conf.uri = cloud_storage_clients::access_point_uri("localhost");
+        s3conf.access_key = cloud_roles::public_key_str("access-key");
         s3conf.secret_key = cloud_roles::private_key_str("secret-key");
         s3conf.region = cloud_roles::aws_region_name("us-east-1");
-        s3conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
+        s3conf.url_style = url_style;
         s3conf.server_addr = server_addr;
         return s3conf;
     }
 
     static archival::configuration get_archival_config() {
-        archival::configuration aconf;
+        archival::configuration aconf{
+          .cloud_storage_initial_backoff = config::mock_binding(100ms),
+          .segment_upload_timeout = config::mock_binding(1000ms),
+          .manifest_upload_timeout = config::mock_binding(1000ms),
+          .garbage_collect_timeout = config::mock_binding(1000ms),
+          .upload_loop_initial_backoff = config::mock_binding(100ms),
+          .upload_loop_max_backoff = config::mock_binding(5000ms)};
         aconf.bucket_name = cloud_storage_clients::bucket_name("test-bucket");
         aconf.ntp_metrics_disabled = archival::per_ntp_metrics_disabled::yes;
         aconf.svc_metrics_disabled = archival::service_metrics_disabled::yes;
-        aconf.cloud_storage_initial_backoff = 100ms;
-        aconf.segment_upload_timeout = 1s;
-        aconf.manifest_upload_timeout = 1s;
-        aconf.garbage_collect_timeout = 1s;
         aconf.time_limit = std::nullopt;
         return aconf;
     }
 
-    static cloud_storage::configuration
-    get_cloud_config(std::optional<uint16_t> port = std::nullopt) {
-        auto s3conf = get_s3_config(port);
+    static cloud_storage::configuration get_cloud_config(
+      std::optional<uint16_t> port = std::nullopt,
+      cloud_storage_clients::s3_url_style url_style = default_url_style) {
+        auto s3conf = get_s3_config(port, url_style);
         cloud_storage::configuration cconf;
         cconf.client_config = s3conf;
         cconf.bucket_name = cloud_storage_clients::bucket_name("test-bucket");
         cconf.connection_limit = archival::connection_limit(4);
-        cconf.metrics_disabled = cloud_storage::remote_metrics_disabled::yes;
         return cconf;
     }
 
@@ -325,21 +338,10 @@ public:
       = empty_seed_starts_cluster::yes,
       std::optional<uint32_t> kafka_admin_topic_api_rate = std::nullopt,
       bool data_transforms_enabled = false,
-      bool legacy_upload_mode_enabled = true) {
+      bool legacy_upload_mode_enabled = true,
+      bool iceberg_enabled = false) {
         auto base_path = std::filesystem::path(data_dir);
-        ss::smp::invoke_on_all([node_id,
-                                kafka_port,
-                                rpc_port,
-                                seed_servers = std::move(seed_servers),
-                                base_path,
-                                s3_config,
-                                archival_cfg,
-                                cloud_cfg,
-                                use_node_id,
-                                empty_seed_starts_cluster_val,
-                                kafka_admin_topic_api_rate,
-                                data_transforms_enabled,
-                                legacy_upload_mode_enabled]() mutable {
+        ss::smp::invoke_on_all([=]() {
             auto& config = config::shard_local_cfg();
 
             config.get("enable_pid_file").set_value(false);
@@ -379,30 +381,43 @@ public:
                   .set_value(std::make_optional((*s3_config->secret_key)()));
                 config.get("cloud_storage_api_endpoint")
                   .set_value(std::make_optional(s3_config->server_addr.host()));
+                config.get("cloud_storage_url_style")
+                  .set_value(std::make_optional([&] {
+                      switch (s3_config->url_style) {
+                      case cloud_storage_clients::s3_url_style::virtual_host:
+                          return config::s3_url_style::virtual_host;
+                      case cloud_storage_clients::s3_url_style::path:
+                          return config::s3_url_style::path;
+                      }
+                  }()));
                 config.get("cloud_storage_api_endpoint_port")
                   .set_value(
                     static_cast<int16_t>(s3_config->server_addr.port()));
             }
             if (archival_cfg) {
+                // Copy archival config to this shard to avoid `config::binding`
+                // asserting on cross-shard access.
+                auto local_cfg = archival_cfg;
+
                 config.get("cloud_storage_disable_tls").set_value(true);
                 config.get("cloud_storage_bucket")
-                  .set_value(std::make_optional(archival_cfg->bucket_name()));
+                  .set_value(std::make_optional(local_cfg->bucket_name()));
                 config.get("cloud_storage_initial_backoff_ms")
                   .set_value(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                      archival_cfg->cloud_storage_initial_backoff));
+                      local_cfg->cloud_storage_initial_backoff()));
                 config.get("cloud_storage_manifest_upload_timeout_ms")
                   .set_value(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                      archival_cfg->manifest_upload_timeout));
+                      local_cfg->manifest_upload_timeout()));
                 config.get("cloud_storage_segment_upload_timeout_ms")
                   .set_value(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                      archival_cfg->segment_upload_timeout));
+                      local_cfg->segment_upload_timeout()));
                 config.get("cloud_storage_garbage_collect_timeout_ms")
                   .set_value(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                      archival_cfg->garbage_collect_timeout));
+                      local_cfg->garbage_collect_timeout()));
             }
             if (cloud_cfg) {
                 config.get("cloud_storage_enable_remote_read").set_value(true);
@@ -420,7 +435,8 @@ public:
               .set_value(data_transforms_enabled);
             config.get("cloud_storage_disable_archiver_manager")
               .set_value(legacy_upload_mode_enabled);
-        }).get0();
+            config.get("iceberg_enabled").set_value(iceberg_enabled);
+        }).get();
     }
 
     YAML::Node proxy_config(uint16_t proxy_port = 8082) {
@@ -551,10 +567,11 @@ public:
                            && std::all_of(
                              md->get_assignments().begin(),
                              md->get_assignments().end(),
-                             [this,
-                              &r](const cluster::partition_assignment& p) {
+                             [this, &r](
+                               const cluster::assignments_set::value_type& p) {
                                  return app.shard_table.local().shard_for(
-                                   model::ntp(r.tp_ns.ns, r.tp_ns.tp, p.id));
+                                   model::ntp(
+                                     r.tp_ns.ns, r.tp_ns.tp, p.second.id));
                              });
                 });
           });
@@ -648,7 +665,7 @@ public:
                     auto ctrl_p = p_mgr.get(model::controller_ntp);
                     vassert(ctrl_p, "Controller partition must exists");
                     return ctrl_p->linearizable_barrier().then(
-                      [ctrl_p](result<model::offset> o) {
+                      [ctrl_p](result<model::offset>) {
                           return ctrl_p->committed_offset();
                       });
                 });

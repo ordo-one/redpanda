@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/httpapi"
 	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 	"github.com/spf13/afero"
@@ -126,6 +128,45 @@ type Plugin struct {
 // "_".
 func (p *Plugin) FullName() string { return strings.Join(p.Arguments, "_") }
 
+type uninstallOperation struct {
+	Path    string
+	Message string
+}
+
+// Uninstall uninstalls the plugin. To uninstall the shadowed plugins, use
+// removeShadows.
+func (p *Plugin) Uninstall(removeShadows bool) (ops []uninstallOperation, anyFailed bool) {
+	if err := os.Remove(p.Path); err != nil {
+		ops = append(ops, uninstallOperation{
+			Path:    p.Path,
+			Message: err.Error(),
+		})
+		anyFailed = true
+	} else {
+		ops = append(ops, uninstallOperation{
+			Path:    p.Path,
+			Message: "OK",
+		})
+	}
+	if removeShadows {
+		for _, shadowed := range p.ShadowedPaths {
+			if err := os.Remove(shadowed); err != nil {
+				ops = append(ops, uninstallOperation{
+					Path:    shadowed,
+					Message: fmt.Sprintf("Unable to remove shadowed plugin: %v", err),
+				})
+				anyFailed = true
+			} else {
+				ops = append(ops, uninstallOperation{
+					Path:    shadowed,
+					Message: "OK",
+				})
+			}
+		}
+	}
+	return
+}
+
 // Plugins is a handy alias for a slice of plugins.
 type Plugins []Plugin
 
@@ -164,6 +205,7 @@ func UserPaths() []string {
 	defaultPath, err := DefaultBinPath()
 	pathList := filepath.SplitList(os.Getenv("PATH"))
 	if err != nil {
+		zap.L().Sugar().Warnf("Unable to get default plugin path: %v; using $PATH only", err)
 		// If there is an error getting the default bin path we will only look
 		// for the binary in the $PATH.
 		return pathList
@@ -295,9 +337,13 @@ func WriteBinary(fs afero.Fs, name, dstDir string, contents []byte, autocomplete
 // If the url ends in ".gz", this unzips the binary before shasumming. If the
 // url ends in ".tar.gz", this unzips, then untars ONE file, then shasums.
 func Download(ctx context.Context, url string, isKnownCompressed bool, expShaPrefix string) ([]byte, error) {
+	timeout, err := GetPluginDownloadTimeout()
+	if err != nil {
+		return nil, err
+	}
 	cl := httpapi.NewClient(
 		httpapi.HTTPClient(&http.Client{
-			Timeout: 100 * time.Second,
+			Timeout: timeout,
 		}),
 	)
 
@@ -324,7 +370,6 @@ func Download(ctx context.Context, url string, isKnownCompressed bool, expShaPre
 		plugin = untar
 	}
 
-	var err error
 	if raw, err = io.ReadAll(plugin); err != nil {
 		return nil, fmt.Errorf("unable to read plugin: %w", err)
 	}
@@ -338,4 +383,16 @@ func Download(ctx context.Context, url string, isKnownCompressed bool, expShaPre
 	}
 
 	return raw, nil
+}
+
+func GetPluginDownloadTimeout() (time.Duration, error) {
+	timeout := 300 * time.Second
+	if t := os.Getenv("RPK_PLUGIN_DOWNLOAD_TIMEOUT"); t != "" {
+		duration, err := time.ParseDuration(t)
+		if err != nil {
+			return 0, fmt.Errorf("unable to parse RPK_PLUGIN_DOWNLOAD_TIMEOUT: %v", err)
+		}
+		timeout = duration
+	}
+	return timeout, nil
 }

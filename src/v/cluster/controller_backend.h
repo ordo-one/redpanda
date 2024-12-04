@@ -14,6 +14,7 @@
 #include "base/outcome.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
+#include "cluster/partition_manager.h"
 #include "cluster/shard_placement_table.h"
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
@@ -34,6 +35,7 @@
 
 #include <cstdint>
 #include <iosfwd>
+#include <optional>
 
 namespace cluster {
 
@@ -199,7 +201,6 @@ public:
       ss::sharded<shard_placement_table>&,
       ss::sharded<shard_table>&,
       ss::sharded<partition_manager>&,
-      ss::sharded<members_table>&,
       ss::sharded<cluster::partition_leaders_table>&,
       ss::sharded<topics_frontend>&,
       ss::sharded<storage::api>&,
@@ -209,6 +210,11 @@ public:
         initial_retention_local_target_bytes,
       config::binding<std::optional<std::chrono::milliseconds>>
         initial_retention_local_target_ms,
+      config::binding<std::optional<size_t>>
+        retention_local_target_bytes_default,
+      config::binding<std::chrono::milliseconds>
+        retention_local_target_ms_default,
+      config::binding<bool> retention_local_strict,
       ss::sharded<seastar::abort_source>&);
     ~controller_backend();
 
@@ -232,8 +238,16 @@ public:
 
     void notify_reconciliation(const model::ntp&);
 
+    /// Copy partition kvstore data from an extra shard (i.e. kvstore shard that
+    /// is >= ss::smp::count). This method is expected to be called *before*
+    /// start().
+    ss::future<> transfer_partitions_from_extra_shard(
+      storage::kvstore&, shard_placement_table&);
+
 private:
     struct ntp_reconciliation_state;
+    using force_reconfiguration
+      = ss::bool_class<struct force_reconfiguration_tag>;
 
     // Topics
     ss::future<> bootstrap_controller_backend();
@@ -252,7 +266,7 @@ private:
       model::revision_id bootstrap_revision,
       absl::flat_hash_map<model::ntp, model::revision_id> topic_table_snapshot);
 
-    void process_delta(const topic_table::delta&);
+    void process_delta(const topic_table::ntp_delta&);
 
     ss::future<> reconcile_ntp_fiber(
       model::ntp, ss::lw_shared_ptr<ntp_reconciliation_state>);
@@ -279,7 +293,9 @@ private:
       model::ntp,
       raft::group_id,
       model::revision_id log_revision,
-      replicas_t initial_replicas);
+      replicas_t initial_replicas,
+      const replicas_revision_map& replicas_revisions,
+      force_reconfiguration is_force_reconfigured);
 
     ss::future<> add_to_shard_table(
       model::ntp,
@@ -289,7 +305,9 @@ private:
     ss::future<> remove_from_shard_table(
       model::ntp, raft::group_id, model::revision_id log_revision);
 
-    ss::future<> shutdown_partition(ss::lw_shared_ptr<partition>);
+    /* may fail only with ss::gate_closed_exception */
+    ss::future<xshard_transfer_state>
+      shutdown_partition(ss::lw_shared_ptr<partition>);
 
     ss::future<std::error_code> transfer_partition(
       model::ntp, raft::group_id, model::revision_id log_revision);
@@ -300,8 +318,16 @@ private:
       model::revision_id cmd_revision,
       partition_removal_mode mode);
 
+    ss::future<> remove_partition_kvstore_state(
+      model::ntp, raft::group_id, model::revision_id log_revision);
+
+    ss::future<> transfer_partition_from_extra_shard(
+      const model::ntp&,
+      shard_placement_table::placement_state,
+      storage::kvstore&,
+      shard_placement_table&);
+
     ss::future<result<ss::stop_iteration>> reconcile_partition_reconfiguration(
-      ntp_reconciliation_state&,
       ss::lw_shared_ptr<partition>,
       const topic_table::in_progress_update&,
       const replicas_revision_map& replicas_revisions);
@@ -339,7 +365,6 @@ private:
 
     bool can_finish_update(
       std::optional<model::node_id> current_leader,
-      uint64_t current_retry,
       reconfiguration_state,
       const replicas_t& requested_replicas);
 
@@ -350,18 +375,16 @@ private:
 
     void setup_metrics();
 
-    bool command_based_membership_active() const;
-
     bool should_skip(const model::ntp&) const;
 
     std::optional<model::offset> calculate_learner_initial_offset(
+      reconfiguration_policy policy,
       const ss::lw_shared_ptr<partition>& partition) const;
 
     ss::sharded<topic_table>& _topics;
     shard_placement_table& _shard_placement;
     ss::sharded<shard_table>& _shard_table;
     ss::sharded<partition_manager>& _partition_manager;
-    ss::sharded<members_table>& _members_table;
     ss::sharded<partition_leaders_table>& _partition_leaders_table;
     ss::sharded<topics_frontend>& _topics_frontend;
     ss::sharded<storage::api>& _storage;
@@ -374,12 +397,21 @@ private:
       _initial_retention_local_target_bytes;
     config::binding<std::optional<std::chrono::milliseconds>>
       _initial_retention_local_target_ms;
+    config::binding<std::optional<size_t>>
+      _retention_local_target_bytes_default;
+    config::binding<std::chrono::milliseconds>
+      _retention_local_target_ms_default;
+    config::binding<bool> _retention_local_strict;
     ss::sharded<ss::abort_source>& _as;
 
     absl::btree_map<model::ntp, ss::lw_shared_ptr<ntp_reconciliation_state>>
       _states;
+    // Will hold xshard_transfer_state for partitions that are being transferred
+    // to this shard.
+    chunked_hash_map<model::ntp, xshard_transfer_state> _xst_states;
 
-    cluster::notification_id_type _topic_table_notify_handle;
+    cluster::notification_id_type _topic_table_notify_handle
+      = notification_id_type_invalid;
     // Limits the number of concurrently executing reconciliation fibers.
     // Initially reconciliation is blocked and we deposit a non-zero amount of
     // units when we are ready to start reconciling.

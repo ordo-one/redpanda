@@ -14,6 +14,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/redpanda-data/common-go/rpadmin"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -34,17 +37,32 @@ func newStatusCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	var format string
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Queries the status of the currently running or last completed self-test run",
-		Long: `Returns the status of the currently running or last completed self-test run.
+		Short: "Returns the status of the current running tests or the cached results of the last completed run.",
+		Long: `Returns the status of the current running tests or the cached results of the last completed run.
 
 Use this command after invoking 'self-test start' to determine the status of
 the jobs launched. Possible results are:
 
 * One or more jobs still running
-  * Returns the IDs of Redpanda nodes still running self-tests.
+  * Returns the IDs of Redpanda brokers (nodes) still running self-tests.
 
 * No jobs running:
-  * Returns cached results for all nodes of the last completed test.
+  * Returns the cached results for all brokers of the last completed test.
+
+Test results are grouped by broker ID. Each test returns the following:
+
+* Name: Description of the test.
+* Info: Details about the test run attached by Redpanda.
+* Type: Either 'disk', 'network', or 'cloud' test.
+* Test Id: Unique identifier given to jobs of a run. All IDs in a test should match. If they don't match, then newer and/or older test results have been included erroneously.
+* Timeouts: Number of timeouts incurred during the test.
+* Start time: Time that the test started, in UTC.
+* End time: Time that the test ended, in UTC.
+* Avg Duration: Duration of the test.
+* IOPS: Number of operations per second. For disk, it's 'seastar::dma_read' and 'seastar::dma_write'. For network, it's 'rpc.send()'.
+* Throughput: For disk, throughput rate is in bytes per second. For network, throughput rate is in bits per second. Note that GiB vs. Gib is the correct notation displayed by the UI.
+* Latency: 50th, 90th, etc. percentiles of operation latency, reported in microseconds (μs). Represented as P50, P90, P99, P999, and MAX respectively.
+If Tiered Storage is not enabled, the cloud storage tests won't run and a warning will be displayed showing "Cloud storage is not enabled.". All results will be shown as 0.
 `,
 		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, _ []string) {
@@ -54,7 +72,7 @@ the jobs launched. Possible results are:
 			config.CheckExitCloudAdmin(p)
 
 			// Create new HTTP client for communication w/ admin server
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// Make HTTP GET request to any node requesting for status
@@ -121,7 +139,7 @@ func rowDataAsInterface(row []string) []interface{} {
 	return iarr
 }
 
-func runningNodes(reports []adminapi.SelfTestNodeReport) map[int]string {
+func runningNodes(reports []rpadmin.SelfTestNodeReport) map[int]string {
 	running := map[int]string{}
 	for _, report := range reports {
 		if report.Status == statusRunning {
@@ -131,7 +149,7 @@ func runningNodes(reports []adminapi.SelfTestNodeReport) map[int]string {
 	return running
 }
 
-func isUninitialized(reports []adminapi.SelfTestNodeReport) bool {
+func isUninitialized(reports []rpadmin.SelfTestNodeReport) bool {
 	noResults := 0
 	for _, report := range reports {
 		if report.Status == statusIdle && len(report.Results) == 0 {
@@ -141,11 +159,11 @@ func isUninitialized(reports []adminapi.SelfTestNodeReport) bool {
 	return noResults == len(reports)
 }
 
-func makeReportHeader(report adminapi.SelfTestNodeReport) string {
+func makeReportHeader(report rpadmin.SelfTestNodeReport) string {
 	return fmt.Sprintf("NODE ID: %d | STATUS: %s", report.NodeID, report.Status)
 }
 
-func makeReportTable(report adminapi.SelfTestNodeReport) [][]string {
+func makeReportTable(report rpadmin.SelfTestNodeReport) [][]string {
 	var table [][]string
 	for _, sr := range report.Results {
 		table = append(table, []string{"NAME", sr.TestName})
@@ -155,7 +173,9 @@ func makeReportTable(report adminapi.SelfTestNodeReport) [][]string {
 		table = append(table, []string{"TYPE", sr.TestType})
 		table = append(table, []string{"TEST ID", sr.TestID})
 		table = append(table, []string{"TIMEOUTS", fmt.Sprintf("%d", sr.Timeouts)})
-		table = append(table, []string{"DURATION", fmt.Sprintf("%dms", sr.Duration)})
+		table = append(table, []string{"START TIME", time.Unix(sr.StartTime, 0).UTC().Format(time.UnixDate)})
+		table = append(table, []string{"END TIME", time.Unix(sr.EndTime, 0).UTC().Format(time.UnixDate)})
+		table = append(table, []string{"AVG DURATION", fmt.Sprintf("%dms", sr.Duration)})
 		if sr.Warning != nil {
 			table = append(table, []string{"WARNING", *sr.Warning})
 		}
@@ -164,9 +184,14 @@ func makeReportTable(report adminapi.SelfTestNodeReport) [][]string {
 			table = append(table, []string{""})
 			continue
 		}
+		if sr.TestType == rpadmin.CloudcheckTagIdentifier {
+			// Cloudcheck does not have any IOPS, THROUGHPUT, or LATENCY results.
+			table = append(table, []string{""})
+			continue
+		}
 		table = append(table, []string{"IOPS", fmt.Sprintf("%d req/sec", *sr.RequestsPerSec)})
 		var throughput string
-		if sr.TestType == adminapi.NetcheckTagIdentifier {
+		if sr.TestType == rpadmin.NetcheckTagIdentifier {
 			throughput = system.BitsToHuman(float64(*sr.BytesPerSec))
 		} else {
 			throughput = units.BytesSize(float64(*sr.BytesPerSec))

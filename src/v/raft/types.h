@@ -17,7 +17,9 @@
 #include "raft/group_configuration.h"
 #include "raft/replicate.h"
 #include "reflection/adl.h"
-#include "serde/envelope.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/scalar.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/condition-variable.hh>
@@ -77,8 +79,8 @@ struct follower_index_metadata {
     // resets the follower state i.e. all indicies and sequence numbers
     void reset();
 
-    bool are_heartbeats_suppressed() const {
-        return suppress_heartbeats_count > 0;
+    bool has_inflight_appends() const {
+        return inflight_append_request_count > 0;
     }
 
     follower_req_seq next_follower_sequence() { return ++last_sent_seq; }
@@ -177,7 +179,7 @@ struct follower_index_metadata {
      * We prevent race conditions by counting the number of suppressing requests
      * in flight.
      */
-    size_t suppress_heartbeats_count = 0;
+    size_t inflight_append_request_count = 0;
 
     std::optional<protocol_metadata> last_sent_protocol_meta;
 
@@ -216,23 +218,16 @@ struct append_entries_request
       vnode src,
       protocol_metadata m,
       model::record_batch_reader r,
-      flush_after_append f = flush_after_append::yes) noexcept
-      : _source_node(src)
-      , _meta(m)
-      , _flush(f)
-      , _batches(std::move(r)) {}
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
 
     append_entries_request(
       vnode src,
       vnode target,
       protocol_metadata m,
       model::record_batch_reader r,
-      flush_after_append f = flush_after_append::yes) noexcept
-      : _source_node(src)
-      , _target_node_id(target)
-      , _meta(m)
-      , _flush(f)
-      , _batches(std::move(r)) {}
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
 
     ~append_entries_request() noexcept = default;
     append_entries_request(const append_entries_request&) = delete;
@@ -265,6 +260,11 @@ struct append_entries_request
 
     static ss::future<append_entries_request>
     serde_async_direct_read(iobuf_parser&, serde::header);
+    /// Returns a size of batches and append entries request metadata
+    size_t total_size() const { return _total_size; }
+    /// Returns a size of batches only. This does not include the size of append
+    /// entries metadata
+    size_t batches_size() const;
 
 private:
     vnode _source_node;
@@ -272,6 +272,9 @@ private:
     protocol_metadata _meta;
     flush_after_append _flush;
     model::record_batch_reader _batches;
+
+    // not serialized field used for accounting in raft internals
+    size_t _total_size;
 };
 
 class append_entries_request_serde_wrapper
@@ -568,7 +571,7 @@ public:
     explicit install_snapshot_request_foreign_wrapper(
       install_snapshot_request&& req)
       : _ptr(ss::make_foreign(
-        std::make_unique<install_snapshot_request>(std::move(req)))) {}
+          std::make_unique<install_snapshot_request>(std::move(req)))) {}
 
     install_snapshot_request copy() const {
         // make copy on target core
@@ -722,9 +725,9 @@ enum class metadata_key : int8_t {
 using voter_priority = named_type<uint32_t, struct voter_priority_tag>;
 
 // zero priority doesn't allow node to become a leader
-static constexpr voter_priority zero_voter_priority = voter_priority{0};
+inline constexpr voter_priority zero_voter_priority = voter_priority{0};
 // 1 is smallest possible priority allowing node to become a leader
-static constexpr voter_priority min_voter_priority = voter_priority{1};
+inline constexpr voter_priority min_voter_priority = voter_priority{1};
 
 /**
  * Raft scheduling_config contains Seastar scheduling and IO priority
@@ -758,6 +761,15 @@ using with_learner_recovery_throttle
   = ss::bool_class<struct with_recovery_throttle_tag>;
 
 using keep_snapshotted_log = ss::bool_class<struct keep_snapshotted_log_tag>;
+
+// Raft part of the struct that makes starting the partition
+// instance on the destination shard of the x-shard transfer easier.
+struct xshard_transfer_state {
+    // If before the transfer, this partition was the leader, will contain the
+    // corresponding term. It will be used to try to immediately regain the
+    // leadership on the destination shard.
+    std::optional<model::term_id> leader_term;
+};
 
 } // namespace raft
 

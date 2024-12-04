@@ -25,7 +25,6 @@
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
 #include "rpc/connection_cache.h"
-#include "vformat.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
@@ -45,14 +44,14 @@ allocate_id_router::allocate_id_router(
   ss::sharded<partition_leaders_table>& leaders,
   const model::node_id node_id)
   : allocate_router(
-    shard_table,
-    metadata_cache,
-    connection_cache,
-    leaders,
-    _handler,
-    node_id,
-    config::shard_local_cfg().metadata_dissemination_retries.value(),
-    config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
+      shard_table,
+      metadata_cache,
+      connection_cache,
+      leaders,
+      _handler,
+      node_id,
+      config::shard_local_cfg().metadata_dissemination_retries.value(),
+      config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
   , _handler(ssg, partition_manager) {}
 
 reset_id_router::reset_id_router(
@@ -64,14 +63,14 @@ reset_id_router::reset_id_router(
   ss::sharded<partition_leaders_table>& leaders,
   const model::node_id node_id)
   : reset_router(
-    shard_table,
-    metadata_cache,
-    connection_cache,
-    leaders,
-    _handler,
-    node_id,
-    config::shard_local_cfg().metadata_dissemination_retries.value(),
-    config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
+      shard_table,
+      metadata_cache,
+      connection_cache,
+      leaders,
+      _handler,
+      node_id,
+      config::shard_local_cfg().metadata_dissemination_retries.value(),
+      config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
   , _handler(ssg, partition_manager) {}
 
 ss::future<result<rpc::client_context<allocate_id_reply>>>

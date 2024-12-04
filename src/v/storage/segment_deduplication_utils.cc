@@ -9,6 +9,7 @@
 
 #include "storage/segment_deduplication_utils.h"
 
+#include "model/timestamp.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compaction_reducers.h"
 #include "storage/index_state.h"
@@ -65,7 +66,7 @@ ss::future<bool> build_offset_map_for_segment(
       compaction_idx_path, cfg.sanitizer_config);
     std::exception_ptr eptr;
     auto rdr = make_file_backed_compacted_reader(
-      compaction_idx_path, compaction_idx_file, cfg.iopc, 64_KiB);
+      compaction_idx_path, compaction_idx_file, cfg.iopc, 64_KiB, cfg.asrc);
     try {
         co_await rdr.verify_integrity();
     } catch (...) {
@@ -108,52 +109,37 @@ ss::future<model::offset> build_offset_map(
         if (cfg.asrc) {
             cfg.asrc->check();
         }
-        const auto& seg = iter->get();
-        vlog(gclog.trace, "Adding segment to offset map: {}", seg->filename());
-        auto read_lock = co_await seg->read_lock();
-        segment_full_path idx_path = seg->path().to_compacted_index();
-        std::optional<scoped_file_tracker> to_clean;
-        bool segment_closed = false;
-        while (true) {
-            if (seg->is_closed()) {
-                // Stop early if the segment e.g. has been prefix truncated.
-                // We'll make do with the offset map we have so far.
-                vlog(
-                  gclog.debug,
-                  "Stopping add to offset map, segment closed: {}",
-                  seg->filename());
-                segment_closed = true;
+        auto seg = *iter;
+        if (seg->index().has_clean_compact_timestamp()) {
+            // This segment has already been fully deduplicated, so building the
+            // offset map for it would be pointless.
+            vlog(
+              gclog.trace,
+              "segment is already cleanly compacted, no need to add it to the "
+              "offset_map: {}",
+              seg->filename());
+
+            min_segment_fully_indexed = seg->offsets().get_base_offset();
+
+            if (iter == segs.begin()) {
                 break;
+            } else {
+                --iter;
+                continue;
             }
-            auto state = co_await internal::detect_compaction_index_state(
-              idx_path, cfg);
-            if (!internal::compacted_index_needs_rebuild(state)) {
-                break;
-            }
-            // Rebuilding the compaction index will take the read lock again,
-            // so release here.
-            read_lock.return_all();
-
-            // Until we check the segment isn't closed under lock, we may need
-            // to delete the new index: its segment may already be removed!
-            if (!to_clean.has_value()) {
-                to_clean.emplace(
-                  scoped_file_tracker{cfg.files_to_cleanup, {idx_path}});
-            }
-
-            co_await internal::rebuild_compaction_index(
-              *iter, stm_manager, cfg, probe, resources);
-
-            // Take the lock again before checking the compaction index state
-            // to avoid races with truncations while building the offset map.
-            read_lock = co_await seg->read_lock();
         }
-        if (segment_closed) {
+        vlog(gclog.trace, "Adding segment to offset map: {}", seg->filename());
+
+        try {
+            auto read_lock = co_await seg->read_lock();
+            co_await internal::maybe_rebuild_compaction_index(
+              seg, stm_manager, cfg, read_lock, resources, probe);
+        } catch (const segment_closed_exception& e) {
+            // Stop early if the segment e.g. has been prefix truncated.
+            // We'll make do with the offset map we have so far.
             break;
         }
-        if (to_clean.has_value()) {
-            to_clean->clear();
-        }
+
         auto seg_fully_indexed = co_await build_offset_map_for_segment(
           cfg, *seg, m);
         if (!seg_fully_indexed) {
@@ -197,9 +183,16 @@ ss::future<index_state> deduplicate_segment(
       seg, cfg, probe, std::move(read_holder));
     auto compaction_placeholder_enabled = feature_table.local().is_active(
       features::feature::compaction_placeholder_batch);
+
+    const bool past_tombstone_delete_horizon
+      = internal::is_past_tombstone_delete_horizon(seg, cfg);
+    bool may_have_tombstone_records = false;
     auto copy_reducer = internal::copy_data_segment_reducer(
       [&map,
+       &may_have_tombstone_records,
+       &probe,
        segment_last_offset = seg->offsets().get_committed_offset(),
+       past_tombstone_delete_horizon,
        compaction_placeholder_enabled](
         const model::record_batch& b,
         const model::record& r,
@@ -212,24 +205,46 @@ ss::future<index_state> deduplicate_segment(
             !compaction_placeholder_enabled
             && (is_last_batch && is_last_record_in_batch)) {
               vlog(
-                stlog.trace,
+                gclog.trace,
                 "retaining last record: {} of segment from batch: {}",
                 r,
                 b.header());
               return ss::make_ready_future<bool>(true);
           }
-          return should_keep(map, b, r);
+
+          // Deal with tombstone record removal
+          if (r.is_tombstone() && past_tombstone_delete_horizon) {
+              probe.add_removed_tombstone();
+              return ss::make_ready_future<bool>(false);
+          }
+
+          return should_keep(map, b, r).then(
+            [&may_have_tombstone_records,
+             is_tombstone = r.is_tombstone()](bool keep) {
+                if (is_tombstone && keep) {
+                    may_have_tombstone_records = true;
+                }
+                return keep;
+            });
       },
       &appender,
       seg->path().is_internal_topic(),
       should_offset_delta_times,
       seg->offsets().get_committed_offset(),
       &cmp_idx_writer,
-      inject_reader_failure);
+      inject_reader_failure,
+      cfg.asrc);
 
     auto new_idx = co_await std::move(rdr).consume(
       std::move(copy_reducer), model::no_timeout);
+
+    // restore broker timestamp and clean compact timestamp
     new_idx.broker_timestamp = seg->index().broker_timestamp();
+    new_idx.clean_compact_timestamp = seg->index().clean_compact_timestamp();
+
+    // Set may_have_tombstone_records
+    new_idx.may_have_tombstone_records = may_have_tombstone_records;
+
     co_return new_idx;
 }
 

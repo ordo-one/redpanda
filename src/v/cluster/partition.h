@@ -11,23 +11,38 @@
 
 #pragma once
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/partition_probe.h"
+#include "cluster/partition_properties_stm.h"
 #include "cluster/types.h"
 #include "features/fwd.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
 #include "raft/replicate.h"
+#include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
+#include "utils/rwlock.h"
 
 #include <seastar/core/shared_ptr.hh>
 
+namespace experimental::cloud_topics {
+class dl_stm_api;
+};
+
 namespace cluster {
 class partition_manager;
+
+// A struct holding in-memory state that can make starting the partition
+// instance on the destination shard of the x-shard transfer easier. Note that
+// it is strictly an optimization, as the partition must always be able to
+// perform a "cold start" from persistent state only.
+struct xshard_transfer_state {
+    raft::xshard_transfer_state raft;
+};
 
 /// holds cluster logic that is not raft related
 /// all raft logic is proxied transparently
@@ -46,7 +61,8 @@ public:
     ~partition() = default;
 
     raft::group_id group() const;
-    ss::future<> start(state_machine_registry&);
+    ss::future<>
+    start(state_machine_registry&, const std::optional<xshard_transfer_state>&);
     ss::future<> stop();
 
     /// This method exposes reset mutex for the external subsystem
@@ -175,6 +191,7 @@ public:
 
     model::revision_id get_revision_id() const;
     model::revision_id get_log_revision_id() const;
+    model::revision_id get_topic_revision_id() const;
 
     std::optional<model::node_id> get_leader_id() const;
 
@@ -188,6 +205,8 @@ public:
     get_offset_translator_state() const;
 
     ss::shared_ptr<cluster::rm_stm> rm_stm();
+
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> dl_stm_api();
 
     size_t size_bytes() const;
 
@@ -263,6 +282,16 @@ public:
     ss::future<std::error_code>
     force_abort_replica_set_update(model::revision_id rev);
 
+    /**
+     * Downloads partition manifest to query for latest offset available in
+     * object store.
+     *
+     * IMPORTANT: this may not be the last offset of last segment uploaded to
+     * the cloud as partition manifest is eventually consistent.
+     */
+    ss::future<result<model::offset>> fetch_latest_cloud_offset_from_manifest(
+      model::timeout_clock::time_point deadline);
+
     consensus_ptr raft() const;
 
     std::optional<std::reference_wrapper<archival::ntp_archiver>> archiver() {
@@ -332,7 +361,16 @@ public:
     ss::shared_ptr<cloud_storage::async_manifest_view>
     get_cloud_storage_manifest_view();
 
+    ss::future<std::error_code> set_writes_disabled(
+      partition_properties_stm::writes_disabled disable,
+      model::timeout_clock::time_point deadline);
+
+    bool started() const noexcept { return _started; }
+    void mark_started() noexcept { _started = true; }
+
 private:
+    ss::future<result<ssx::rwlock_unit>> hold_writes_enabled();
+
     ss::future<>
     replicate_unsafe_reset(cloud_storage::partition_manifest manifest);
 
@@ -347,10 +385,17 @@ private:
     ss::future<std::optional<storage::timequery_result>>
     local_timequery(storage::timequery_config, bool allow_cloud_fallback);
 
+    // Restarts the archiver
+    // If should_notify_topic_config is set, it marks the topic_manifest as
+    // dirty so that it gets reuploaded
+    ss::future<> restart_archiver(bool should_notify_topic_config);
+
     consensus_ptr _raft;
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;
+    ss::shared_ptr<partition_properties_stm> _partition_properties_stm;
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> _dl_stm_api;
     ss::abort_source _as;
     partition_probe _probe;
     ss::sharded<features::feature_table>& _feature_table;
@@ -376,6 +421,17 @@ private:
     std::unique_ptr<cluster::topic_configuration> _topic_cfg;
 
     ss::sharded<archival::upload_housekeeping_service>& _upload_housekeeping;
+    config::binding<model::cleanup_policy_bitflags> _log_cleanup_policy;
+
+    // Used in `sync_kafka_start_offset_override` to avoid having to re-sync the
+    // `archival_meta_stm`.
+    bool _has_synced_archival_for_start_override{false};
+
+    // acquire shared ("read") for produce,
+    // exclusive ("write") for enabling/disabling writes
+    ssx::rwlock _produce_lock;
+
+    bool _started{false};
 
     friend std::ostream& operator<<(std::ostream& o, const partition& x);
 };

@@ -11,13 +11,13 @@
 
 #pragma once
 
-#include "cloud_storage_clients/types.h"
+#include "config/leaders_preference.h"
+#include "config/types.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
-#include "pandaproxy/schema_registry/subject_name_strategy.h"
 #include "strings/string_switch.h"
 
 #include <boost/lexical_cast.hpp>
@@ -170,10 +170,8 @@ struct convert<model::cleanup_policy_bitflags> {
     static Node encode(const type& rhs) {
         Node node;
 
-        auto compaction = (rhs & model::cleanup_policy_bitflags::compaction)
-                          == model::cleanup_policy_bitflags::compaction;
-        auto deletion = (rhs & model::cleanup_policy_bitflags::deletion)
-                        == model::cleanup_policy_bitflags::deletion;
+        auto compaction = model::is_compaction_enabled(rhs);
+        auto deletion = model::is_deletion_enabled(rhs);
 
         if (compaction && deletion) {
             node = "compact,delete";
@@ -226,8 +224,8 @@ struct convert<model::timestamp_type> {
 };
 
 template<>
-struct convert<cloud_storage_clients::s3_url_style> {
-    using type = cloud_storage_clients::s3_url_style;
+struct convert<config::s3_url_style> {
+    using type = config::s3_url_style;
     static Node encode(const type& rhs) {
         Node node;
         return node = fmt::format("{}", rhs);
@@ -371,7 +369,12 @@ struct convert<model::cloud_storage_backend> {
     using type = model::cloud_storage_backend;
 
     static constexpr auto acceptable_values = std::to_array(
-      {"aws", "google", "azure", "minio", "unknown"});
+      {"aws",
+       "google_s3_compat",
+       "azure",
+       "minio",
+       "oracle_s3_compat",
+       "unknown"});
 
     static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
 
@@ -391,40 +394,10 @@ struct convert<model::cloud_storage_backend> {
                   model::cloud_storage_backend::google_s3_compat)
                 .match("minio", model::cloud_storage_backend::minio)
                 .match("azure", model::cloud_storage_backend::azure)
+                .match(
+                  "oracle_s3_compat",
+                  model::cloud_storage_backend::oracle_s3_compat)
                 .match("unknown", model::cloud_storage_backend::unknown);
-
-        return true;
-    }
-};
-
-template<>
-struct convert<model::leader_balancer_mode> {
-    using type = model::leader_balancer_mode;
-
-    static constexpr auto acceptable_values = std::to_array(
-      {model::leader_balancer_mode_to_string(type::random_hill_climbing),
-       model::leader_balancer_mode_to_string(type::greedy_balanced_shards)});
-
-    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
-
-    static bool decode(const Node& node, type& rhs) {
-        auto value = node.as<std::string>();
-
-        if (
-          std::find(acceptable_values.begin(), acceptable_values.end(), value)
-          == acceptable_values.end()) {
-            return false;
-        }
-
-        rhs = string_switch<type>(std::string_view{value})
-                .match(
-                  model::leader_balancer_mode_to_string(
-                    type::random_hill_climbing),
-                  type::random_hill_climbing)
-                .match(
-                  model::leader_balancer_mode_to_string(
-                    type::greedy_balanced_shards),
-                  type::greedy_balanced_shards);
 
         return true;
     }
@@ -476,37 +449,6 @@ struct convert<model::cloud_storage_chunk_eviction_strategy> {
 };
 
 template<>
-struct convert<pandaproxy::schema_registry::subject_name_strategy> {
-    using type = pandaproxy::schema_registry::subject_name_strategy;
-
-    static constexpr auto acceptable_values = std::to_array(
-      {to_string_view(type::topic_name),
-       to_string_view(type::record_name),
-       to_string_view(type::topic_record_name)});
-
-    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
-
-    static bool decode(const Node& node, type& rhs) {
-        auto value = node.as<std::string>();
-
-        if (
-          std::find(acceptable_values.begin(), acceptable_values.end(), value)
-          == acceptable_values.end()) {
-            return false;
-        }
-
-        rhs = string_switch<type>(std::string_view{value})
-                .match(to_string_view(type::topic_name), type::topic_name)
-                .match(to_string_view(type::record_name), type::record_name)
-                .match(
-                  to_string_view(type::topic_record_name),
-                  type::topic_record_name);
-
-        return true;
-    }
-};
-
-template<>
 struct convert<pandaproxy::schema_registry::schema_id_validation_mode> {
     using type = pandaproxy::schema_registry::schema_id_validation_mode;
 
@@ -539,9 +481,12 @@ template<>
 struct convert<model::fetch_read_strategy> {
     using type = model::fetch_read_strategy;
 
-    static constexpr auto acceptable_values = std::to_array(
-      {model::fetch_read_strategy_to_string(type::polling),
-       model::fetch_read_strategy_to_string(type::non_polling)});
+    static constexpr auto acceptable_values = std::to_array({
+      model::fetch_read_strategy_to_string(type::polling),
+      model::fetch_read_strategy_to_string(type::non_polling),
+      model::fetch_read_strategy_to_string(type::non_polling_with_debounce),
+      model::fetch_read_strategy_to_string(type::non_polling_with_pid),
+    });
 
     static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
 
@@ -560,7 +505,15 @@ struct convert<model::fetch_read_strategy> {
                   type::polling)
                 .match(
                   model::fetch_read_strategy_to_string(type::non_polling),
-                  type::non_polling);
+                  type::non_polling)
+                .match(
+                  model::fetch_read_strategy_to_string(
+                    type::non_polling_with_debounce),
+                  type::non_polling_with_debounce)
+                .match(
+                  model::fetch_read_strategy_to_string(
+                    type::non_polling_with_pid),
+                  type::non_polling_with_pid);
 
         return true;
     }
@@ -590,11 +543,11 @@ struct convert<model::recovery_validation_mode> {
       {"check_manifest_existence",
        "check_manifest_and_segment_metadata",
        "no_check"});
-    static Node encode(type const& rhs) {
+    static Node encode(const type& rhs) {
         Node node;
         return Node{boost::lexical_cast<std::string>(rhs)};
     }
-    static bool decode(Node const& node, type& rhs) {
+    static bool decode(const Node& node, type& rhs) {
         auto node_str = node.as<std::string>();
         if (
           std::ranges::find(acceptable_values, node_str)
@@ -602,6 +555,121 @@ struct convert<model::recovery_validation_mode> {
             return false;
         }
         rhs = boost::lexical_cast<type>(node_str);
+        return true;
+    }
+};
+
+template<>
+struct convert<config::fips_mode_flag> {
+    using type = config::fips_mode_flag;
+
+    static constexpr auto acceptable_values = std::to_array(
+      {to_string_view(type::disabled),
+       to_string_view(type::enabled),
+       to_string_view(type::permissive)});
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        if (
+          std::find(acceptable_values.begin(), acceptable_values.end(), value)
+          == acceptable_values.end()) {
+            return false;
+        }
+
+        rhs = string_switch<type>(std::string_view{value})
+                .match(to_string_view(type::disabled), type::disabled)
+                .match(to_string_view(type::enabled), type::enabled)
+                .match(to_string_view(type::permissive), type::permissive);
+
+        return true;
+    }
+};
+
+template<>
+struct convert<config::tls_version> {
+    using type = config::tls_version;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto out = string_switch<std::optional<type>>(std::string_view{value})
+                     .match(to_string_view(type::v1_0), type::v1_0)
+                     .match(to_string_view(type::v1_1), type::v1_1)
+                     .match(to_string_view(type::v1_2), type::v1_2)
+                     .match(to_string_view(type::v1_3), type::v1_3)
+                     .default_match(std::nullopt);
+        if (out.has_value()) {
+            rhs = out.value();
+        }
+        return out.has_value();
+    }
+};
+
+template<>
+struct convert<model::node_uuid> {
+    using type = model::node_uuid;
+    static Node encode(const type& rhs) {
+        return Node(ssx::sformat("{}", rhs));
+    }
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto out = [&value]() -> std::optional<model::node_uuid> {
+            try {
+                return model::node_uuid(uuid_t::from_string(value));
+            } catch (const std::runtime_error& e) {
+                return std::nullopt;
+            }
+        }();
+        if (out.has_value()) {
+            rhs = out.value();
+        }
+        return out.has_value();
+    }
+};
+
+template<>
+struct convert<config::leaders_preference> {
+    using type = config::leaders_preference;
+
+    static Node encode(const type& rhs) { return Node(fmt::to_string(rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
+        auto node_str = node.as<std::string>();
+        try {
+            rhs = config::leaders_preference::parse(node_str);
+            return true;
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    }
+};
+
+template<>
+struct convert<config::datalake_catalog_type> {
+    static Node encode(const config::datalake_catalog_type& rhs) {
+        return Node(fmt::format("{}", rhs));
+    }
+
+    static bool decode(const Node& node, config::datalake_catalog_type& rhs) {
+        static constexpr auto acceptable_values
+          = config::acceptable_datalake_catalog_types();
+        auto value = node.as<std::string>();
+        if (
+          std::find(acceptable_values.begin(), acceptable_values.end(), value)
+          == acceptable_values.end()) {
+            return false;
+        }
+
+        rhs = string_switch<config::datalake_catalog_type>(
+                std::string_view{value})
+                .match(
+                  to_string_view(config::datalake_catalog_type::rest),
+                  config::datalake_catalog_type::rest)
+                .match(
+                  to_string_view(config::datalake_catalog_type::object_storage),
+                  config::datalake_catalog_type::object_storage);
+
         return true;
     }
 };

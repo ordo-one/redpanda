@@ -22,6 +22,7 @@ rp_test(
     async_algorithm_test.cc
     event_test.cc
     work_queue_test.cc
+    when_all_test.cc
   LIBRARIES v::gtest_main v::ssx
   LABELS ssx
 )
@@ -32,6 +33,7 @@ rp_test(
   SOURCES
     abort_source_test.cc
     sharded_ptr_test.cc
+    single_sharded_test.cc
   LIBRARIES v::seastar_testing_main
   ARGS "-- -c 2"
   LABELS ssx

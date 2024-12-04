@@ -33,6 +33,15 @@
 
 namespace storage {
 
+/// \brief offset boundary type
+///
+/// indicate whether or not the offset that encodes the end of the offset
+/// range belongs to the offset range
+enum class boundary_type {
+    exclusive,
+    inclusive,
+};
+
 class disk_log_impl final : public log {
 public:
     using failure_probes = storage::log_failure_probes;
@@ -146,7 +155,8 @@ public:
 
     size_t size_bytes() const override { return _probe->partition_size(); }
     uint64_t size_bytes_after_offset(model::offset o) const override;
-    ss::future<> update_configuration(ntp_config::default_overrides) final;
+    void set_overrides(ntp_config::default_overrides) final;
+    bool notify_compaction_update() final;
 
     int64_t compaction_backlog() const final;
 
@@ -186,27 +196,54 @@ public:
     std::optional<model::offset> retention_offset(gc_config) const final;
 
     // Collects an iterable list of segments over which to perform sliding
-    // window compaction.
+    // window compaction. This can include segments which have already had their
+    // keys de-duplicated in every segment between the start of the log and
+    // themselves (these are referred to as "clean" segments). These segments
+    // would be no-ops to include in sliding window compaction, but they are
+    // included in the range anyways in order to allow for timely tombstone
+    // record removal via self-compaction, and to ensure that this function
+    // returns a contiguous range of segments. It is up to the caller to filter
+    // out these already cleanly-compacted segments.
     segment_set find_sliding_range(
       const compaction_config& cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
 
-    void set_last_compaction_window_start_offset(model::offset o) {
+    void
+    set_last_compaction_window_start_offset(std::optional<model::offset> o) {
         _last_compaction_window_start_offset = o;
+    }
+
+    const std::optional<model::offset>&
+    get_last_compaction_window_start_offset() const {
+        return _last_compaction_window_start_offset;
     }
 
     readers_cache& readers() { return *_readers_cache; }
 
     storage_resources& resources();
 
+    // Performs self-compaction on the earliest segment possible, and then
+    // attempts to perform compaction on adjacent segments.
     ss::future<> adjacent_merge_compact(
-      compaction_config, std::optional<model::offset> = std::nullopt);
+      compaction_config,
+      std::optional<model::offset> new_start_offset = std::nullopt);
 
     ss::future<bool> sliding_window_compact(
       const compaction_config& cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
 
     const auto& compaction_ratio() const { return _compaction_ratio; }
+
+    static ss::future<> copy_kvstore_state(
+      model::ntp,
+      storage::kvstore& source_kvs,
+      ss::shard_id target_shard,
+      ss::sharded<storage::api>&);
+
+    static ss::future<>
+    remove_kvstore_state(const model::ntp&, storage::kvstore&);
+
+    size_t max_segment_size() const;
 
 private:
     friend class disk_log_appender; // for multi-term appends
@@ -218,7 +255,7 @@ private:
       ss::lw_shared_ptr<segment> s,
       std::optional<segment_index::entry> index_entry,
       model::offset target,
-      model::boundary_type boundary,
+      boundary_type boundary,
       ss::io_priority_class priority);
 
     ss::future<model::record_batch_reader>
@@ -233,11 +270,38 @@ private:
     // Returns if the update actually took place.
     ss::future<bool> update_start_offset(model::offset o);
 
-    ss::future<compaction_result> compact_adjacent_segments(
+    // Finds a range of adjacent segments that can be compacted together.
+    // A valid segment range consists of segments with the same raft term, and a
+    // combined size less than max_compacted_segment_size.
+    //
+    // Returns std::nullopt if a valid range of two segments could not be found.
+    // Otherwise, a pair of iterators to the segments.
+    std::optional<std::pair<segment_set::iterator, segment_set::iterator>>
+    find_adjacent_compaction_range(const compaction_config& cfg);
+
+    // Requests compaction of adjacent segments per the max_collectible_offset
+    // in the compaction_config.
+    //
+    // Returns std::nullopt if an adjacent pair could not be found for adjacent
+    // compaction, or a compaction_result. This result should also have its
+    // did_compact() function checked to verify whether adjacent segment
+    // compaction actually occurred.
+    ss::future<std::optional<compaction_result>>
+    compact_adjacent_segments(storage::compaction_config cfg);
+
+    // Performs compaction of adjacent segments. This pair of segments is
+    // physically combined to replace the first segment. The resulting combined
+    // segment is then self-compacted, and the redundant second segment is
+    // permanently removed.
+    // Currently, only two adjacent segments can be compacted at a time (i.e,
+    // there must be, and are only, two segments in the range).
+    //
+    // Returns a compaction_result indicating whether or not compaction was
+    // executed, and the total size of the segments before and after the
+    // operation.
+    ss::future<compaction_result> do_compact_adjacent_segments(
       std::pair<segment_set::iterator, segment_set::iterator>,
       storage::compaction_config cfg);
-    std::optional<std::pair<segment_set::iterator, segment_set::iterator>>
-    find_compaction_range(const compaction_config&);
 
     ss::future<std::optional<model::offset>> do_gc(gc_config);
     ss::future<> do_compact(
@@ -312,7 +376,6 @@ private:
     size_t get_log_truncation_counter() const noexcept override;
 
 private:
-    size_t max_segment_size() const;
     // Computes the segment size based on the latest max_segment_size
     // configuration. This takes into consideration any segment size
     // overrides since the last time it was called.
@@ -369,8 +432,15 @@ private:
     size_t _suffix_truncation_indicator{0};
 
     std::optional<model::offset> _cloud_gc_offset;
+
+    // The offset at which the last window compaction finished, above which keys
+    // have been fully deduplicated. The next round of window compaction
+    // can skip segments above this offset, if no new segments have been created
+    // since last window compaction.
     std::optional<model::offset> _last_compaction_window_start_offset;
+
     size_t _reclaimable_size_bytes{0};
+    bool _compaction_enabled;
 };
 
 } // namespace storage

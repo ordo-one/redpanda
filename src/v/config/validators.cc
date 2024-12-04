@@ -15,6 +15,7 @@
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "model/validation.h"
+#include "serde/rw/chrono.h"
 #include "ssx/sformat.h"
 #include "utils/inet_address_wrapper.h"
 
@@ -119,7 +120,7 @@ validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
     // Validate results
     for (const auto& m : mechanisms) {
         if (absl::c_none_of(
-              supported, [&m](auto const& s) { return s == m; })) {
+              supported, [&m](const auto& s) { return s == m; })) {
             return ssx::sformat("'{}' is not a supported SASL mechanism", m);
         }
     }
@@ -134,7 +135,7 @@ validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms) {
     // Validate results
     for (const auto& m : mechanisms) {
         if (absl::c_none_of(
-              supported, [&m](auto const& s) { return s == m; })) {
+              supported, [&m](const auto& s) { return s == m; })) {
             return ssx::sformat(
               "'{}' is not a supported HTTP authentication mechanism", m);
         }
@@ -230,4 +231,56 @@ validate_audit_excluded_topics(const std::vector<ss::sstring>& vs) {
 
     return std::nullopt;
 }
+
+std::optional<ss::sstring>
+validate_api_endpoint(const std::optional<ss::sstring>& os) {
+    if (auto non_empty_string_opt = validate_non_empty_string_opt(os);
+        non_empty_string_opt.has_value()) {
+        return non_empty_string_opt;
+    }
+
+    if (
+      os.has_value()
+      && (os.value().starts_with("http://") || os.value().starts_with("https://"))) {
+        return "String starting with URL protocol is not valid";
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ss::sstring> validate_tombstone_retention_ms(
+  const std::optional<std::chrono::milliseconds>& ms) {
+    if (ms.has_value()) {
+        // For simplicity's sake, cloud storage enable/read/write permissions
+        // cannot be enabled at the same time as tombstone_retention_ms at the
+        // cluster level, to avoid the case in which redpanda refuses to create
+        // new, misconfigured topics due to cluster defaults
+        const auto& cloud_storage_enabled
+          = config::shard_local_cfg().cloud_storage_enabled;
+        const auto& cloud_storage_remote_write
+          = config::shard_local_cfg().cloud_storage_enable_remote_write;
+        const auto& cloud_storage_remote_read
+          = config::shard_local_cfg().cloud_storage_enable_remote_read;
+        if (
+          cloud_storage_enabled() || cloud_storage_remote_write()
+          || cloud_storage_remote_read()) {
+            return fmt::format(
+              "cannot set {} if any of ({}, {}, {}) are enabled at the cluster "
+              "level",
+              config::shard_local_cfg().tombstone_retention_ms.name(),
+              cloud_storage_enabled.name(),
+              cloud_storage_remote_write.name(),
+              cloud_storage_remote_read.name());
+        }
+
+        if (ms.value() < 1ms || ms.value() > serde::max_serializable_ms) {
+            return fmt::format(
+              "tombstone_retention_ms should be in range: [1, {}]",
+              serde::max_serializable_ms);
+        }
+    }
+
+    return std::nullopt;
+}
+
 }; // namespace config

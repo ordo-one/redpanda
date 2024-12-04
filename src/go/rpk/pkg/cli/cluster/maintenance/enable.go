@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -47,7 +48,7 @@ node exists that is already in maintenance mode then an error will be returned.
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			b, err := client.Broker(cmd.Context(), nodeID)
@@ -60,7 +61,7 @@ node exists that is already in maintenance mode then an error will be returned.
 			}
 
 			err = client.EnableMaintenanceMode(cmd.Context(), nodeID)
-			var he *adminapi.HTTPResponseError
+			var he *rpadmin.HTTPResponseError
 			if errors.As(err, &he) {
 				if he.Response.StatusCode == 404 {
 					body, bodyErr := he.DecodeGenericErrorBody()

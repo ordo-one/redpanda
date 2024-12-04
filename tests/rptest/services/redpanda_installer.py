@@ -26,7 +26,8 @@ from ducktape.utils.util import wait_until
 VERSION_RE = re.compile(".*v(\\d+)\\.(\\d+)\\.(\\d+).*")
 # strict variant of VERSION_RE that only matches "vX.Y.Z" strings
 STRICT_VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-RELEASES_CACHE_FILE = "/tmp/redpanda_releases.json"
+RELEASES_CACHE_FILE_PARENT = "/tmp/ducktape_cache"
+RELEASES_CACHE_FILE = f"{RELEASES_CACHE_FILE_PARENT}/redpanda_releases.json"
 RELEASES_CACHE_FILE_TTL = timedelta(minutes=30)
 
 # environment variable to pass to ducktape the list of released versions.
@@ -326,6 +327,7 @@ class RedpandaInstaller:
     def _released_versions_json(self):
         def get_cached_data():
             try:
+                os.makedirs(RELEASES_CACHE_FILE_PARENT, exist_ok=True)
                 st = os.stat(RELEASES_CACHE_FILE)
                 mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
                 if datetime.now(
@@ -689,7 +691,7 @@ class RedpandaInstaller:
         version_root = self.root_for_version(version)
 
         tgz = "redpanda.tar.gz"
-        cmd = f"curl -fsSL {self._version_package_url(version)} --retry 3 --retry-connrefused --retry-delay 2 --create-dir -o {version_root}/{tgz} && gunzip -c {version_root}/{tgz} | tar -xf - -C {version_root} && rm {version_root}/{tgz}"
+        cmd = f"curl -vfsSL {self._version_package_url(version)} --retry 3 --retry-connrefused --retry-delay 2 --create-dir -o {version_root}/{tgz} && echo 'curl finished successfully' && gunzip -c {version_root}/{tgz} | tar -xf - -C {version_root} && echo 'tarball extraction finished successfully' && rm {version_root}/{tgz} && echo 'tarball cleanup finished successfully'"
         return node.account.ssh_capture(cmd)
 
     def reset_current_install(self, nodes):

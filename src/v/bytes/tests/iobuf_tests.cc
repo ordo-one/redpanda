@@ -15,7 +15,7 @@
 #include "bytes/random.h"
 #include "bytes/scattered_message.h"
 #include "bytes/streambuf.h"
-#include "bytes/tests/utils.h"
+#include "utils.h"
 
 #include <seastar/core/memory.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -26,6 +26,7 @@
 #include <boost/test/unit_test.hpp>
 #include <fmt/format.h>
 
+#include <compare>
 #include <cstdint>
 #include <iterator>
 #include <span>
@@ -42,6 +43,30 @@ SEASTAR_THREAD_TEST_CASE(test_copy_equal) {
 
     auto copy = buf.copy();
     BOOST_CHECK_EQUAL(buf, copy);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_lt) {
+    BOOST_CHECK_LT(iobuf::from(""), iobuf::from("cat"));
+    BOOST_CHECK_LT(iobuf::from("cat"), iobuf::from("dog"));
+    BOOST_CHECK_LT(iobuf::from("cat"), iobuf::from("catastrophe"));
+    BOOST_CHECK_EQUAL(false, iobuf::from("cat") < iobuf::from("cat"));
+    BOOST_CHECK_EQUAL(false, iobuf{} < iobuf{});
+    BOOST_CHECK(std::strong_ordering::equal == (iobuf{} <=> iobuf{}));
+    BOOST_CHECK(
+      (std::string_view("cat") <=> "catastrophe")
+      == (iobuf::from("cat") <=> iobuf::from("catastrophe")));
+    BOOST_CHECK(
+      (std::string_view("catastrophe") <=> "cat")
+      == (iobuf::from("catastrophe") <=> iobuf::from("cat")));
+    BOOST_CHECK(
+      (std::string_view("catastrophe") <=> "dog")
+      == (iobuf::from("catastrophe") <=> iobuf::from("dog")));
+    BOOST_CHECK(
+      (std::string_view("dog") <=> "cat")
+      == (iobuf::from("dog") <=> iobuf::from("cat")));
+    BOOST_CHECK(
+      (std::string_view("dog") <=> "cat")
+      == (iobuf::from("dog") <=> iobuf::from("cat")));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_appended_data_is_retained) {
@@ -134,7 +159,7 @@ SEASTAR_THREAD_TEST_CASE(test_empty_istream) {
 
     BOOST_CHECK_THROW(in.consume_type<char>(), std::out_of_range);
 
-    bytes b = ss::uninitialized_string<bytes>(10);
+    bytes b(bytes::initialized_later{}, 10);
     BOOST_CHECK_THROW(in.consume_to(1, b.begin()), std::out_of_range);
     in.consume_to(0, b.begin());
 }
@@ -618,7 +643,7 @@ SEASTAR_THREAD_TEST_CASE(test_iobuf_input_stream_from_trimmed_iobuf) {
     buf.prepend(ss::temporary_buffer<char>(100));
     buf.trim_front(10);
     auto stream = make_iobuf_input_stream(std::move(buf));
-    auto res = stream.read().get0();
+    auto res = stream.read().get();
     BOOST_TEST(res.size() == 90);
 }
 

@@ -2,6 +2,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 add_compile_options(-Wall)
+add_compile_definitions(FMT_DEPRECATED_OSTREAM)
 
 #
 # When enabled clang-tidy will be invoked along side the compiler, and
@@ -14,8 +15,10 @@ if(REDPANDA_RUN_CLANG_TIDY)
     if(NOT CLANG_TIDY_COMMAND)
         message(FATAL_ERROR "Could not find clang-tidy program")
     endif()
+    # IMPORTANT: Sync these with `WarningsAsErrors` field in `.clang-tidy`!
     set(clang_tidy_checks
         -*
+        cppcoreguidelines-avoid-capturing-lambda-coroutines
         bugprone-use-after-move
         bugprone-assert-side-effect
         bugprone-assignment-in-if-condition
@@ -103,10 +106,12 @@ add_subdirectory(wasm)
 add_subdirectory(transform)
 add_subdirectory(net)
 add_subdirectory(rpc)
+add_subdirectory(debug_bundle)
 
 # libraries
 add_subdirectory(test_utils)
 add_subdirectory(finjector)
+add_subdirectory(iceberg)
 add_subdirectory(utils)
 add_subdirectory(metrics)
 add_subdirectory(model)
@@ -120,7 +125,6 @@ add_subdirectory(kafka)
 add_subdirectory(reflection)
 add_subdirectory(pandaproxy)
 add_subdirectory(cloud_storage_clients)
-add_subdirectory(archival)
 add_subdirectory(security)
 add_subdirectory(serde)
 add_subdirectory(cloud_storage)
@@ -128,6 +132,10 @@ add_subdirectory(compat)
 add_subdirectory(rp_util)
 add_subdirectory(resource_mgmt)
 add_subdirectory(migrations)
+add_subdirectory(datalake)
+add_subdirectory(cloud_io)
+add_subdirectory(cloud_topics)
+add_subdirectory(schema)
 
 option(ENABLE_GIT_VERSION "Build with Git metadata" OFF)
 
@@ -166,11 +174,11 @@ else()
   set(GIT_CLEAN_DIRTY "-dev")
 endif()
 
-configure_file(version.cc.in version.cc @ONLY)
+configure_file(version/version.cc.in version/version.cc @ONLY)
 v_cc_library(
   NAME version
-  HDRS version.h
-  SRCS "${CMAKE_CURRENT_BINARY_DIR}/version.cc"
+  HDRS version/version.h
+  SRCS "${CMAKE_CURRENT_BINARY_DIR}/version/version.cc"
 )
 
 # main executables

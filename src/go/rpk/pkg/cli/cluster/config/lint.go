@@ -51,13 +51,14 @@ Deprecated content includes properties which were set via redpanda.yaml
 in earlier versions of redpanda, but are now managed via Redpanda's
 central configuration store (and via 'rpk cluster config edit').
 `,
-		Run: func(cmd *cobra.Command, propertyNames []string) {
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			cfg, err := p.Load(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			p := cfg.VirtualProfile()
 			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			schema, err := client.ClusterConfigSchema(cmd.Context())

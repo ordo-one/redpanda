@@ -8,11 +8,11 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_file.h"
 #include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/types.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/cloud_metadata/key_utils.h"
 #include "cluster/cloud_metadata/manifest_downloads.h"
@@ -47,7 +47,8 @@ class cluster_metadata_uploader_fixture
 public:
     cluster_metadata_uploader_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{}, httpd_port_number())
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number())
       , raft0(app.partition_manager.local().get(model::controller_ntp)->raft())
       , controller_stm(app.controller->get_controller_stm().local())
       , remote(app.cloud_storage_api.local())
@@ -154,7 +155,9 @@ FIXTURE_TEST(
     m.metadata_id = cluster_metadata_id(10);
 
     // Upload a manifest and check that we download it.
-    auto up_res = remote.upload_manifest(bucket, m, retry_node).get();
+    auto up_res
+      = remote.upload_manifest(bucket, m, m.get_manifest_path(), retry_node)
+          .get();
     BOOST_REQUIRE_EQUAL(up_res, cloud_storage::upload_result::success);
     down_res = uploader.download_highest_manifest_or_create(retry_node).get();
     BOOST_REQUIRE(down_res.has_value());
@@ -163,7 +166,9 @@ FIXTURE_TEST(
     // If we upload a manifest with a lower metadata ID, the higher one should
     // be downloaded.
     m.metadata_id = cluster_metadata_id(9);
-    up_res = remote.upload_manifest(bucket, m, retry_node).get();
+    up_res = remote
+               .upload_manifest(bucket, m, m.get_manifest_path(), retry_node)
+               .get();
     m.metadata_id = cluster_metadata_id(10);
     BOOST_REQUIRE_EQUAL(up_res, cloud_storage::upload_result::success);
     down_res = uploader.download_highest_manifest_or_create(retry_node).get();
@@ -348,7 +353,7 @@ FIXTURE_TEST(
 
     auto upload_in_term
       = uploader.upload_until_term_change().handle_exception_type(
-        [](seastar::abort_requested_exception const& e) { std::ignore = e; });
+        [](const seastar::abort_requested_exception& e) { std::ignore = e; });
     // Wait for some valid metadata to show up.
     cluster::cloud_metadata::cluster_metadata_manifest manifest;
     RPTEST_REQUIRE_EVENTUALLY(5s, [this, &manifest] {

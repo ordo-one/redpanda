@@ -13,6 +13,7 @@
 
 #include "base/units.h"
 #include "cluster/commands.h"
+#include "cluster/data_migrated_resources.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/members_table.h"
 #include "cluster/node_status_table.h"
@@ -24,12 +25,14 @@
 #include "cluster/topic_updates_dispatcher.h"
 #include "cluster/types.h"
 #include "container/fragmented_vector.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "random/generators.h"
 #include "test_utils/fixture.h"
 
 #include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 
 #include <chrono>
@@ -60,11 +63,21 @@ struct controller_workers {
 public:
     controller_workers()
       : dispatcher(allocator, table, leaders, state) {
-        table.start().get();
+        migrated_resources.start().get();
+        table
+          .start(ss::sharded_parameter(
+            [this] { return std::ref(migrated_resources.local()); }))
+          .get();
         members.start_single().get();
+        features.start().get();
+        features
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
         allocator
           .start_single(
             std::ref(members),
+            std::ref(features),
             config::mock_binding<std::optional<size_t>>(std::nullopt),
             config::mock_binding<std::optional<int32_t>>(std::nullopt),
             config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
@@ -99,8 +112,7 @@ public:
         cluster::topic_configuration cfg(
           test_ns, model::topic(topic), partitions, replication_factor);
 
-        cluster::allocation_request req(
-          cfg.tp_ns, cluster::partition_allocation_domains::common);
+        cluster::allocation_request req(cfg.tp_ns);
         req.partitions.reserve(partitions);
         for (auto p = 0; p < partitions; ++p) {
             req.partitions.emplace_back(
@@ -144,16 +156,21 @@ public:
         node_status_table.stop().get();
         table.stop().get();
         allocator.stop().get();
+        features.stop().get();
         members.stop().get();
+        migrated_resources.stop().get();
     }
 
     ss::sharded<cluster::members_table> members;
+    ss::sharded<features::feature_table> features;
     ss::sharded<cluster::partition_allocator> allocator;
     ss::sharded<cluster::topic_table> table;
     ss::sharded<cluster::partition_leaders_table> leaders;
     ss::sharded<cluster::partition_balancer_state> state;
     ss::sharded<cluster::node_status_table> node_status_table;
     cluster::topic_updates_dispatcher dispatcher;
+    ss::sharded<cluster::data_migrations::migrated_resources>
+      migrated_resources;
 };
 
 struct partition_balancer_planner_fixture {
@@ -202,7 +219,9 @@ struct partition_balancer_planner_fixture {
           replication_factor);
 
         ss::chunked_fifo<cluster::partition_assignment> assignments;
-        for (model::partition_id::type i = 0; i < partition_nodes.size(); ++i) {
+        for (model::partition_id::type i = 0;
+             i < static_cast<int>(partition_nodes.size());
+             ++i) {
             const auto& nodes = partition_nodes[i];
             BOOST_REQUIRE_EQUAL(nodes.size(), replication_factor);
             std::vector<model::broker_shard> replicas;
@@ -315,7 +334,7 @@ struct partition_balancer_planner_fixture {
     populate_node_status_table(std::set<size_t> unavailable_nodes = {}) {
         std::vector<cluster::node_status> status_updates;
         status_updates.reserve(last_node_idx + 1);
-        for (size_t i = 0; i < last_node_idx; ++i) {
+        for (int i = 0; i < last_node_idx; ++i) {
             auto last_seen = raft::clock_type::now();
             if (unavailable_nodes.contains(i)) {
                 last_seen = last_seen - node_unavailable_timeout;
@@ -341,7 +360,7 @@ struct partition_balancer_planner_fixture {
         for (const auto& topic : workers.table.local().topics_map()) {
             cluster::topic_status ts;
             ts.tp_ns = topic.second.get_configuration().tp_ns;
-            for (size_t i = 0;
+            for (int i = 0;
                  i < topic.second.get_configuration().partition_count;
                  ++i) {
                 cluster::partition_status ps;
@@ -352,7 +371,6 @@ struct partition_balancer_planner_fixture {
             topics.push_back(ts);
         }
         for (int i = 0; i < last_node_idx; ++i) {
-            cluster::node_health_report node_report;
             storage::disk node_disk{
               .free = not_full_node_free_size, .total = node_size};
             if (full_nodes.contains(i)) {
@@ -360,18 +378,22 @@ struct partition_balancer_planner_fixture {
             } else if (nearly_full_nodes.contains(i)) {
                 node_disk.free = nearly_full_node_free_size;
             }
-            node_report.id = model::node_id(i);
-            node_report.local_state.log_data_size = {
+            cluster::node::local_state local_state;
+            local_state.log_data_size = {
               .data_target_size = node_disk.total,
               .data_current_size = node_disk.total - node_disk.free,
               .data_reclaimable_size = 0};
-            node_report.local_state.set_disk(node_disk);
+            local_state.set_disk(node_disk);
+            chunked_vector<cluster::topic_status> node_topics;
             if (i == 0) {
-                node_report.topics = topics.copy();
+                node_topics = topics.copy();
             }
             health_report.node_reports.emplace_back(
               ss::make_lw_shared<cluster::node_health_report>(
-                std::move(node_report)));
+                model::node_id(i),
+                local_state,
+                std::move(node_topics),
+                std::nullopt));
         }
 
         return health_report;

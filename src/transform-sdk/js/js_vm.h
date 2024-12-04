@@ -140,6 +140,10 @@ public:
      */
     static value array_buffer(JSContext* ctx, std::span<uint8_t> data);
 
+    /** Create a typed array buffer value (copy) */
+    static std::expected<value, exception>
+    array_buffer_copy(JSContext* ctx, std::span<uint8_t> data);
+
     /**
      * Create an array buffer value (view - no copies).
      *
@@ -149,6 +153,10 @@ public:
      *
      */
     static value uint8_array(JSContext* ctx, std::span<uint8_t> data);
+
+    /** Create a typed uint8 array value (copy) */
+    static std::expected<value, exception>
+    uint8_array_copy(JSContext* ctx, std::span<uint8_t> data);
 
     /**
      * Free the underlying memory to an array buffer.
@@ -196,6 +204,8 @@ public:
     [[nodiscard]] bool is_number() const;
     /** Is this value an exception? */
     [[nodiscard]] bool is_exception() const;
+    /** Is this value an error? */
+    [[nodiscard]] bool is_error() const;
     /** Is this value a function? */
     [[nodiscard]] bool is_function() const;
     /** Is this value a string? */
@@ -215,6 +225,9 @@ public:
 
     /** Get the number from the object. */
     [[nodiscard]] double as_number() const;
+
+    /** Get an integer from the object. Rounding. */
+    [[nodiscard]] int32_t as_integer() const;
 
     /**
      * Return a reference to the raw JSValue without incrementing the ref
@@ -301,6 +314,52 @@ struct exception {
     static exception make(JSContext* ctx, std::string_view message);
 };
 
+struct object_export_data {
+    std::vector<std::unique_ptr<std::string>> property_names;
+    std::vector<std::unique_ptr<std::string>> str_values;
+    std::vector<JSCFunctionListEntry> properties;
+};
+
+/**
+ * A builder of exportable objects.
+ *
+ * Allows building up singleton JavaScript objects for export in a
+ * native module. Currently supports only primitive types and strings,
+ * but could be extended to support native functions or subobjects as well.
+ *
+ * One use case is for constructing an 'enum', which JS doesn't natively
+ * natively support. An enum defined in TypeScript would be transpiled
+ * to a JavaScript object; this interface allows us to place such an enum in
+ * our typings without having to rely on the TS compiler to generate the
+ * corresponding object in plain JS.
+ *
+ */
+class object_builder {
+public:
+    /**
+     * Create an object for module export
+     */
+    explicit object_builder() = default;
+    object_builder(const object_builder&) = delete;
+    object_builder& operator=(const object_builder&) = delete;
+    object_builder(object_builder&&) = default;
+    object_builder& operator=(object_builder&&) = default;
+    ~object_builder() = default;
+
+    object_builder& add_string(std::string key, std::string);
+    object_builder& add_i32(std::string key, int32_t);
+    object_builder& add_i64(std::string key, int64_t);
+    object_builder& add_f64(std::string key, double);
+
+    std::expected<object_export_data, exception> build(JSContext* ctx);
+
+private:
+    using native_value = std::variant<std::string, int32_t, int64_t, double>;
+    object_builder& add_native_value(std::string, native_value);
+
+    std::unordered_map<std::string, native_value> _properties;
+};
+
 /**
  * A builder of native modules.
  *
@@ -327,6 +386,8 @@ public:
      */
     module_builder& add_function(std::string name, native_function);
 
+    module_builder& add_object(std::string name, object_builder obj);
+
     /** Build this module and make it available in this context. */
     std::expected<std::monostate, exception> build(JSContext* ctx);
 
@@ -334,6 +395,7 @@ private:
     std::string _name;
 
     std::unordered_map<std::string, native_function> _exports;
+    std::unordered_map<std::string, object_builder> _objects;
 };
 
 /**
@@ -415,8 +477,14 @@ private:
         native_function func;
     };
 
+    struct named_object_data {
+        std::unique_ptr<std::string> name;
+        object_export_data data;
+    };
+
     struct context_state {
         std::vector<named_native_function> named_functions;
+        std::vector<named_object_data> named_objects;
         // For each module, the functions that are defined for it.
         std::unordered_map<JSModuleDef*, std::vector<JSCFunctionListEntry>>
           module_functions;

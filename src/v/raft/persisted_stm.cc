@@ -10,16 +10,11 @@
 #include "raft/persisted_stm.h"
 
 #include "bytes/iostream.h"
-#include "cluster/types.h"
 #include "raft/consensus.h"
-#include "raft/errc.h"
-#include "raft/offset_monitor.h"
 #include "raft/state_machine_base.h"
-#include "raft/types.h"
 #include "ssx/sformat.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
-#include "storage/record_batch_builder.h"
 #include "storage/snapshot.h"
 
 #include <seastar/core/abort_source.hh>
@@ -57,50 +52,11 @@ stm_snapshot_key(const ss::sstring& snapshot_name, const model::ntp& ntp) {
     return ssx::sformat("{}/{}", snapshot_name, ntp);
 }
 
-ss::future<> do_move_persistent_stm_state(
-  ss::sstring snapshot_name,
-  model::ntp ntp,
-  ss::shard_id source_shard,
-  ss::shard_id target_shard,
-  ss::sharded<storage::api>& api) {
-    using state_ptr = std::unique_ptr<iobuf>;
-    using state_fptr = ss::foreign_ptr<state_ptr>;
-
-    const auto key_as_str = stm_snapshot_key(snapshot_name, ntp);
-    bytes key;
-    key.append(
-      reinterpret_cast<const uint8_t*>(key_as_str.begin()), key_as_str.size());
-
-    state_fptr snapshot = co_await api.invoke_on(
-      source_shard, [key](storage::api& api) {
-          const auto ks = storage::kvstore::key_space::stms;
-          auto snapshot_data = api.kvs().get(ks, key);
-          auto snapshot_ptr = !snapshot_data ? nullptr
-                                             : std::make_unique<iobuf>(
-                                               std::move(*snapshot_data));
-          return ss::make_foreign<state_ptr>(std::move(snapshot_ptr));
-      });
-
-    if (snapshot) {
-        co_await api.invoke_on(
-          target_shard,
-          [key, snapshot = std::move(snapshot)](storage::api& api) {
-              const auto ks = storage::kvstore::key_space::stms;
-              return api.kvs().put(ks, key, snapshot->copy());
-          });
-
-        co_await api.invoke_on(source_shard, [key](storage::api& api) {
-            const auto ks = storage::kvstore::key_space::stms;
-            return api.kvs().remove(ks, key);
-        });
-    }
-}
-
 } // namespace
 
-template<supported_stm_snapshot T>
+template<typename BaseT, supported_stm_snapshot T>
 template<typename... Args>
-persisted_stm<T>::persisted_stm(
+persisted_stm_base<BaseT, T>::persisted_stm_base(
   ss::sstring snapshot_mgr_name,
   ss::logger& logger,
   raft::consensus* c,
@@ -110,19 +66,25 @@ persisted_stm<T>::persisted_stm(
   , _snapshot_backend(snapshot_mgr_name, _log, c, std::forward<Args>(args)...) {
 }
 
-template<supported_stm_snapshot T>
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::apply(
+  const model::record_batch& b, const ssx::semaphore_units&) {
+    return do_apply(b);
+}
+
+template<typename BaseT, supported_stm_snapshot T>
 ss::future<std::optional<stm_snapshot>>
-persisted_stm<T>::load_local_snapshot() {
+persisted_stm_base<BaseT, T>::load_local_snapshot() {
     return _snapshot_backend.load_snapshot();
 }
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::stop() {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::stop() {
     co_await raft::state_machine_base::stop();
     co_await _gate.close();
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::remove_persistent_state() {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::remove_persistent_state() {
     return _snapshot_backend.remove_persistent_state();
 }
 
@@ -259,11 +221,7 @@ kvstore_backed_stm_snapshot::kvstore_backed_stm_snapshot(
   , _kvstore(kvstore) {}
 
 bytes kvstore_backed_stm_snapshot::snapshot_key() const {
-    bytes k;
-    k.append(
-      reinterpret_cast<const uint8_t*>(_snapshot_key.begin()),
-      _snapshot_key.size());
-    return k;
+    return bytes::from_string(_snapshot_key);
 }
 
 const ss::sstring& kvstore_backed_stm_snapshot::name() { return _name; }
@@ -330,41 +288,42 @@ size_t kvstore_backed_stm_snapshot::get_snapshot_size() const {
     return 0;
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::wait_for_snapshot_hydrated() {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::wait_for_snapshot_hydrated() {
     return _on_snapshot_hydrated.wait([this] { return _snapshot_hydrated; });
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::do_write_local_snapshot() {
-    auto snapshot = co_await take_local_snapshot();
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::do_write_local_snapshot() {
+    auto u = co_await BaseT::_apply_lock.get_units();
+    auto snapshot = co_await take_local_snapshot(std::move(u));
     auto offset = snapshot.header.offset;
 
     co_await _snapshot_backend.persist_local_snapshot(std::move(snapshot));
     _last_snapshot_offset = std::max(_last_snapshot_offset, offset);
 }
 
-template<supported_stm_snapshot T>
-void persisted_stm<T>::write_local_snapshot_in_background() {
+template<typename BaseT, supported_stm_snapshot T>
+void persisted_stm_base<BaseT, T>::write_local_snapshot_in_background() {
     ssx::spawn_with_gate(_gate, [this] { return write_local_snapshot(); });
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::write_local_snapshot() {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::write_local_snapshot() {
     return _op_lock.with([this]() {
         return wait_for_snapshot_hydrated().then(
           [this] { return do_write_local_snapshot(); });
     });
 }
 
-template<supported_stm_snapshot T>
-uint64_t persisted_stm<T>::get_local_snapshot_size() const {
+template<typename BaseT, supported_stm_snapshot T>
+uint64_t persisted_stm_base<BaseT, T>::get_local_snapshot_size() const {
     return _snapshot_backend.get_snapshot_size();
 }
 
-template<supported_stm_snapshot T>
-ss::future<>
-persisted_stm<T>::ensure_local_snapshot_exists(model::offset target_offset) {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::ensure_local_snapshot_exists(
+  model::offset target_offset) {
     vlog(
       _log.debug,
       "ensure snapshot_exists with target offset: {}",
@@ -374,35 +333,35 @@ persisted_stm<T>::ensure_local_snapshot_exists(model::offset target_offset) {
             if (target_offset <= _last_snapshot_offset) {
                 return ss::now();
             }
-            return wait(target_offset, model::no_timeout)
+            return BaseT::wait(target_offset, model::no_timeout)
               .then([this, target_offset]() {
                   vassert(
-                    target_offset < next(),
+                    target_offset < BaseT::next(),
                     "[{} ({})]  after we waited for target_offset ({}) "
                     "next ({}) must be greater",
                     _raft->ntp(),
                     name(),
                     target_offset,
-                    next());
+                    BaseT::next());
                   return do_write_local_snapshot();
               });
         });
     });
 }
 
-template<supported_stm_snapshot T>
-model::offset persisted_stm<T>::max_collectible_offset() {
+template<typename BaseT, supported_stm_snapshot T>
+model::offset persisted_stm_base<BaseT, T>::max_collectible_offset() {
     return model::offset::max();
 }
 
-template<supported_stm_snapshot T>
+template<typename BaseT, supported_stm_snapshot T>
 ss::future<fragmented_vector<model::tx_range>>
-persisted_stm<T>::aborted_tx_ranges(model::offset, model::offset) {
+persisted_stm_base<BaseT, T>::aborted_tx_ranges(model::offset, model::offset) {
     return ss::make_ready_future<fragmented_vector<model::tx_range>>();
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::wait_offset_committed(
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::wait_offset_committed(
   model::timeout_clock::duration timeout,
   model::offset offset,
   model::term_id term) {
@@ -413,8 +372,8 @@ ss::future<> persisted_stm<T>::wait_offset_committed(
     return _raft->commit_index_updated().wait(timeout, stop_cond);
 }
 
-template<supported_stm_snapshot T>
-ss::future<bool> persisted_stm<T>::do_sync(
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<bool> persisted_stm_base<BaseT, T>::do_sync(
   model::timeout_clock::duration timeout,
   model::offset offset,
   model::term_id term) {
@@ -449,7 +408,7 @@ ss::future<bool> persisted_stm<T>::do_sync(
 
     if (_raft->term() == term) {
         try {
-            co_await wait(offset, model::timeout_clock::now() + timeout);
+            co_await BaseT::wait(offset, model::timeout_clock::now() + timeout);
         } catch (const ss::broken_condition_variable&) {
             co_return false;
         } catch (const ss::gate_closed_exception&) {
@@ -486,21 +445,21 @@ ss::future<bool> persisted_stm<T>::do_sync(
     co_return false;
 }
 
-template<supported_stm_snapshot T>
+template<typename BaseT, supported_stm_snapshot T>
 ss::future<bool>
-persisted_stm<T>::sync(model::timeout_clock::duration timeout) {
+persisted_stm_base<BaseT, T>::sync(model::timeout_clock::duration timeout) {
     auto term = _raft->term();
     if (!_raft->is_leader()) {
-        co_return false;
+        return ss::make_ready_future<bool>(false);
     }
     if (_insync_term == term) {
-        co_return true;
+        return ss::make_ready_future<bool>(true);
     }
     if (_is_catching_up) {
         auto deadline = model::timeout_clock::now() + timeout;
         auto sync_waiter = ss::make_lw_shared<expiring_promise<bool>>();
         _sync_waiters.push_back(sync_waiter);
-        co_return co_await sync_waiter->get_future_with_timeout(
+        return sync_waiter->get_future_with_timeout(
           deadline, [] { return false; });
     }
     _is_catching_up = true;
@@ -526,22 +485,24 @@ persisted_stm<T>::sync(model::timeout_clock::duration timeout) {
         // of the term yet.
         sync_offset = log_offsets.dirty_offset;
     }
-    auto is_synced = co_await do_sync(timeout, sync_offset, term);
 
-    _is_catching_up = false;
-    for (auto& sync_waiter : _sync_waiters) {
-        sync_waiter->set_value(is_synced);
-    }
-    _sync_waiters.clear();
-    co_return is_synced;
+    return do_sync(timeout, sync_offset, term).then([this](bool is_synced) {
+        _is_catching_up = false;
+        for (auto& sync_waiter : _sync_waiters) {
+            sync_waiter->set_value(is_synced);
+        }
+        _sync_waiters.clear();
+
+        return is_synced;
+    });
 }
 
-template<supported_stm_snapshot T>
-ss::future<bool> persisted_stm<T>::wait_no_throw(
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<bool> persisted_stm_base<BaseT, T>::wait_no_throw(
   model::offset offset,
   model::timeout_clock::time_point deadline,
-  std::optional<std::reference_wrapper<ss::abort_source>> as) noexcept {
-    return wait(offset, deadline, as)
+  std::optional<std::reference_wrapper<ss::abort_source>> as) const noexcept {
+    return BaseT::wait(offset, deadline, as)
       .then([] { return true; })
       .handle_exception_type([](const ss::abort_requested_exception&) {
           // Shutting down
@@ -563,8 +524,8 @@ ss::future<bool> persisted_stm<T>::wait_no_throw(
         });
 }
 
-template<supported_stm_snapshot T>
-ss::future<> persisted_stm<T>::start() {
+template<typename BaseT, supported_stm_snapshot T>
+ss::future<> persisted_stm_base<BaseT, T>::start() {
     if (_raft->dirty_offset() == model::offset{}) {
         co_await _snapshot_backend.perform_initial_cleanup();
     }
@@ -593,7 +554,7 @@ ss::future<> persisted_stm<T>::start() {
               next_offset);
             co_await apply_local_snapshot(
               snapshot.header, std::move(snapshot.data));
-            set_next(next_offset);
+            BaseT::set_next(next_offset);
             _last_snapshot_offset = snapshot.header.offset;
         } else {
             // This can happen on an out-of-date replica that re-joins the group
@@ -614,33 +575,65 @@ ss::future<> persisted_stm<T>::start() {
     _on_snapshot_hydrated.broadcast();
 }
 
-template class persisted_stm<file_backed_stm_snapshot>;
-template class persisted_stm<kvstore_backed_stm_snapshot>;
+template class persisted_stm_base<state_machine_base, file_backed_stm_snapshot>;
+template class persisted_stm_base<
+  state_machine_base,
+  kvstore_backed_stm_snapshot>;
 
-template persisted_stm<file_backed_stm_snapshot>::persisted_stm(
-  ss::sstring, seastar::logger&, raft::consensus*);
+template class persisted_stm_base<
+  no_at_offset_snapshot_stm_base,
+  file_backed_stm_snapshot>;
+template class persisted_stm_base<
+  no_at_offset_snapshot_stm_base,
+  kvstore_backed_stm_snapshot>;
 
-template persisted_stm<kvstore_backed_stm_snapshot>::persisted_stm(
-  ss::sstring, seastar::logger&, raft::consensus*, storage::kvstore&);
+template persisted_stm_base<state_machine_base, file_backed_stm_snapshot>::
+  persisted_stm_base(ss::sstring, seastar::logger&, raft::consensus*);
 
-ss::future<> move_persistent_stm_state(
-  model::ntp ntp,
-  ss::shard_id source_shard,
-  ss::shard_id target_shard,
-  ss::sharded<storage::api>& api) {
-    static const std::vector<ss::sstring> stm_snapshot_names{
-      cluster::archival_stm_snapshot,
-      cluster::tm_stm_snapshot,
-      cluster::id_allocator_snapshot,
-      cluster::rm_stm_snapshot};
+template persisted_stm_base<state_machine_base, kvstore_backed_stm_snapshot>::
+  persisted_stm_base(
+    ss::sstring, seastar::logger&, raft::consensus*, storage::kvstore&);
 
-    return ss::parallel_for_each(
-      stm_snapshot_names,
-      [ntp = std::move(ntp), source_shard, target_shard, &api](
-        const ss::sstring& snapshot_name) {
-          return do_move_persistent_stm_state(
-            snapshot_name, ntp, source_shard, target_shard, api);
-      });
+template persisted_stm_base<
+  no_at_offset_snapshot_stm_base,
+  file_backed_stm_snapshot>::
+  persisted_stm_base(ss::sstring, seastar::logger&, raft::consensus*);
+
+template persisted_stm_base<
+  no_at_offset_snapshot_stm_base,
+  kvstore_backed_stm_snapshot>::
+  persisted_stm_base(
+    ss::sstring, seastar::logger&, raft::consensus*, storage::kvstore&);
+ss::sstring kvstore_backed_stm_snapshot::snapshot_key(
+  const ss::sstring& snapshot_name, const model::ntp& ntp) {
+    return stm_snapshot_key(snapshot_name, ntp);
 }
 
+ss::future<> do_copy_persistent_stm_state(
+  ss::sstring snapshot_name,
+  model::ntp ntp,
+  storage::kvstore& source_kvs,
+  ss::shard_id target_shard,
+  ss::sharded<storage::api>& api) {
+    const auto key_as_str = raft::kvstore_backed_stm_snapshot::snapshot_key(
+      snapshot_name, ntp);
+    auto key = bytes::from_string(key_as_str);
+
+    auto snapshot = source_kvs.get(storage::kvstore::key_space::stms, key);
+    if (snapshot) {
+        co_await api.invoke_on(
+          target_shard, [key, &snapshot](storage::api& api) {
+              return api.kvs().put(
+                storage::kvstore::key_space::stms, key, snapshot->copy());
+          });
+    }
+}
+
+ss::future<> do_remove_persistent_stm_state(
+  ss::sstring snapshot_name, model::ntp ntp, storage::kvstore& kvs) {
+    const auto key_as_str = raft::kvstore_backed_stm_snapshot::snapshot_key(
+      snapshot_name, ntp);
+    auto key = bytes::from_string(key_as_str);
+    co_await kvs.remove(storage::kvstore::key_space::stms, key);
+}
 } // namespace raft

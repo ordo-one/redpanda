@@ -38,7 +38,6 @@
 #include <boost/optional/optional.hpp>
 #include <boost/outcome/detail/value_storage.hpp>
 #include <boost/system/system_error.hpp>
-#include <gnutls/gnutls.h>
 
 #include <chrono>
 #include <exception>
@@ -79,7 +78,7 @@ void cli_opts(boost::program_options::options_description_easy_init opt) {
 
     opt(
       "url_style",
-      po::value<std::string>()->default_value("virtual_host"),
+      po::value<std::string>()->default_value(""),
       "aws addressing style");
 
     opt(
@@ -138,7 +137,7 @@ template<>
 struct fmt::formatter<
   cloud_storage_clients::client::delete_objects_result::key_reason>
   : public fmt::formatter<std::string_view> {
-    auto format(auto const& kr, auto& ctx) const {
+    auto format(const auto& kr, auto& ctx) const {
         return formatter<std::string_view>::format(
           fmt::format(R"kr(key:"{}" reason:"{}")kr", kr.key, kr.reason), ctx);
     }
@@ -150,11 +149,28 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
     auto secret_key = cloud_roles::private_key_str(
       m["secretkey"].as<std::string>());
     auto region = cloud_roles::aws_region_name(m["region"].as<std::string>());
+    auto url_style =
+      [&]() -> std::optional<cloud_storage_clients::s3_url_style> {
+        const auto url_style_str = m["url_style"].as<std::string>();
+        if (url_style_str == "virtual_host") {
+            return cloud_storage_clients::s3_url_style::virtual_host;
+        } else if (url_style_str == "path") {
+            return cloud_storage_clients::s3_url_style::path;
+        } else {
+            return std::nullopt;
+        }
+    }();
+
+    auto bucket_name = cloud_storage_clients::bucket_name(
+      m["bucket"].as<std::string>());
     cloud_storage_clients::s3_configuration client_cfg
       = cloud_storage_clients::s3_configuration::make_configuration(
           access_key,
           secret_key,
           region,
+          bucket_name,
+          url_style,
+          false,
           cloud_storage_clients::default_overrides{
             .endpoint =
               [&]() -> std::optional<cloud_storage_clients::endpoint_url> {
@@ -170,20 +186,12 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
                 }
                 return std::nullopt;
             }(),
-            .url_style = [&]() -> cloud_storage_clients::s3_url_style {
-                if (m["url_style"].as<std::string>() == "virtual_host") {
-                    return cloud_storage_clients::s3_url_style::virtual_host;
-                } else {
-                    return cloud_storage_clients::s3_url_style::path;
-                }
-            }(),
             .disable_tls = m.contains("disable-tls") > 0,
           })
-          .get0();
+          .get();
     vlog(test_log.info, "connecting to {}", client_cfg.server_addr);
     return test_conf{
-      .bucket = cloud_storage_clients::bucket_name(
-        m["bucket"].as<std::string>()),
+      .bucket = bucket_name,
       .objects =
         [&] {
             auto keys = m["object"].as<std::vector<std::string>>();
@@ -192,7 +200,7 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
               keys.begin(),
               keys.end(),
               std::back_inserter(out),
-              [](auto const& ks) {
+              [](const auto& ks) {
                   return cloud_storage_clients::object_key(ks);
               });
             return out;
@@ -208,8 +216,8 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
 
 static std::pair<ss::input_stream<char>, uint64_t>
 get_input_file_as_stream(const std::filesystem::path& path) {
-    auto file = ss::open_file_dma(path.native(), ss::open_flags::ro).get0();
-    auto size = file.size().get0();
+    auto file = ss::open_file_dma(path.native(), ss::open_flags::ro).get();
+    auto size = file.size().get();
     return std::make_pair(ss::make_file_input_stream(std::move(file), 0), size);
 }
 
@@ -235,8 +243,8 @@ static ss::output_stream<char>
 get_output_file_as_stream(const std::filesystem::path& path) {
     auto file = ss::open_file_dma(
                   path.native(), ss::open_flags::rw | ss::open_flags::create)
-                  .get0();
-    return ss::make_file_output_stream(std::move(file)).get0();
+                  .get();
+    return ss::make_file_output_stream(std::move(file)).get();
 }
 
 int main(int args, char** argv, char** env) {
@@ -269,7 +277,7 @@ int main(int args, char** argv, char** env) {
                                                 lcfg.bucket,
                                                 lcfg.objects.front(),
                                                 http::default_connect_timeout)
-                                              .get0();
+                                              .get();
                         if (result) {
                             auto resp = result.value()->as_input_stream();
                             vlog(test_log.info, "response: OK");
@@ -296,7 +304,7 @@ int main(int args, char** argv, char** env) {
                                                 payload_size,
                                                 std::move(payload),
                                                 http::default_connect_timeout)
-                                              .get0();
+                                              .get();
 
                         if (!result) {
                             vlog(
@@ -306,8 +314,7 @@ int main(int args, char** argv, char** env) {
                         }
                     } else if (lcfg.list_with_prefix) {
                         vlog(test_log.info, "listing objects");
-                        const auto result
-                          = cli.list_objects(lcfg.bucket).get0();
+                        const auto result = cli.list_objects(lcfg.bucket).get();
 
                         if (result) {
                             const auto& val = result.value();

@@ -14,6 +14,7 @@ compression            | utilities supporting compression/decompression of many 
 config                 | Redpanda cluster level and node level configuration options |
 container              | Generic Redpanda specific containers and data structures |
 crypto                 | Middleware library used to perform cryptographic operations |
+datalake               | Writing Redpanda data to Iceberg |
 features               | Cluster feature flags for rolling upgrades |
 finjector              | Failure injector framework for testing and correctness |
 hashing                | hashing utility adaptors often used in cryptography or checksumming |
@@ -34,6 +35,7 @@ reflection             | C++ static reflection and type traversal utils |
 resource_mgmt          | CPU, Disk and IO management |
 rp_util                | CLI utility for Redpanda |
 rpc                    | Remote procedure call protocol for internal cluster communication |
+schema                 | High-level interface for interacting with schemas and the schema registry |
 security               | Authentication and authorization in Redpanda |
 serde                  | Serialization framework |
 ssx                    | Custom extensions for seastar |

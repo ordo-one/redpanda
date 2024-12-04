@@ -12,18 +12,16 @@
 
 #include "base/outcome.h"
 #include "cloud_storage_clients/types.h"
-#include "utils/named_type.h"
+#include "model/fundamental.h"
+#include "model/metadata.h"
+#include "utils/retry_chain_node.h"
 
 #include <seastar/core/sharded.hh>
 
-#include <type_traits>
 #include <variant>
-
-class retry_chain_node;
 
 namespace cloud_storage {
 class cloud_storage_api;
-enum class upload_result;
 } // namespace cloud_storage
 
 namespace cloud_storage::inventory {
@@ -36,6 +34,7 @@ enum class error_outcome {
     manifest_download_failed,
     manifest_files_parse_failed,
     manifest_deserialization_failed,
+    no_reports_found,
 };
 
 struct error_outcome_category final : public std::error_category {
@@ -44,21 +43,24 @@ struct error_outcome_category final : public std::error_category {
     }
 
     std::string message(int c) const final {
+        using enum error_outcome;
         switch (static_cast<error_outcome>(c)) {
-        case error_outcome::success:
+        case success:
             return "Success";
-        case error_outcome::failed:
+        case failed:
             return "Failed";
-        case error_outcome::create_inv_cfg_failed:
+        case create_inv_cfg_failed:
             return "Failed to create inventory configuration";
-        case error_outcome::failed_to_check_inv_status:
+        case failed_to_check_inv_status:
             return "Failed to check inventory configuration status";
-        case error_outcome::manifest_download_failed:
+        case manifest_download_failed:
             return "Failed to download manifest";
-        case error_outcome::manifest_files_parse_failed:
+        case manifest_files_parse_failed:
             return "Failed to extract files object from manifest";
-        case error_outcome::manifest_deserialization_failed:
+        case manifest_deserialization_failed:
             return "Failed to parse manifest to JSON";
+        case no_reports_found:
+            return "No reports found";
         default:
             return fmt::format("Unknown outcome ({})", c);
         }
@@ -138,6 +140,8 @@ public:
     virtual ss::future<op_result<report_metadata>> fetch_latest_report_metadata(
       cloud_storage::cloud_storage_api&, retry_chain_node&) const noexcept
       = 0;
+
+    virtual cloud_storage_clients::bucket_name bucket() const = 0;
 };
 
 template<typename T>
@@ -145,6 +149,9 @@ concept vendor_ops_provider = std::is_base_of_v<base_ops, T>;
 
 template<vendor_ops_provider... Ts>
 using inv_ops_variant = std::variant<Ts...>;
+
+bool
+  validate_backend_supported_for_inventory_scrub(model::cloud_storage_backend);
 
 } // namespace cloud_storage::inventory
 

@@ -15,6 +15,7 @@
 #include "base/vassert.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sharded.hh>
@@ -23,6 +24,8 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/node_hash_set.h>
+
+#include <optional>
 
 namespace cluster {
 class allocation_node;
@@ -219,14 +222,13 @@ struct allocation_units {
 
 private:
     friend class partition_allocator;
-    allocation_units(allocation_state&, partition_allocation_domain);
+    allocation_units(allocation_state&);
 
 private:
     ss::chunked_fifo<partition_assignment> _assignments;
     chunked_vector<model::broker_shard> _added_replicas;
     // keep the pointer to make this type movable
     ss::weak_ptr<allocation_state> _state;
-    partition_allocation_domain _domain;
     // oncore checker to ensure destruction happens on the same core
     [[no_unique_address]] oncore _oncore;
 };
@@ -278,10 +280,7 @@ private:
 
     // construct an object from an original assignment
     allocated_partition(
-      model::ntp,
-      std::vector<model::broker_shard>,
-      partition_allocation_domain,
-      allocation_state&);
+      model::ntp, std::vector<model::broker_shard>, allocation_state&);
 
     struct previous_replica {
         model::broker_shard bs;
@@ -301,7 +300,6 @@ private:
     replicas_t _replicas;
     std::optional<absl::flat_hash_map<model::node_id, uint32_t>>
       _original_node2shard;
-    partition_allocation_domain _domain;
     ss::weak_ptr<allocation_state> _state;
     // oncore checker to ensure destruction happens on the same core
     [[no_unique_address]] oncore _oncore;
@@ -348,10 +346,8 @@ using node2count_t = absl::flat_hash_map<model::node_id, size_t>;
 
 struct allocation_request {
     allocation_request() = delete;
-    explicit allocation_request(
-      model::topic_namespace nt, const partition_allocation_domain domain_)
-      : _nt(std::move(nt))
-      , domain(domain_) {}
+    explicit allocation_request(model::topic_namespace nt)
+      : _nt(std::move(nt)) {}
     allocation_request(const allocation_request&) = delete;
     allocation_request(allocation_request&&) = default;
     allocation_request& operator=(const allocation_request&) = delete;
@@ -360,12 +356,47 @@ struct allocation_request {
 
     model::topic_namespace _nt;
     ss::chunked_fifo<partition_constraints> partitions;
-    partition_allocation_domain domain;
     // if present, new partitions will be allocated using topic-aware counts
     // objective.
     std::optional<node2count_t> existing_replica_counts;
 
     friend std::ostream& operator<<(std::ostream&, const allocation_request&);
+};
+
+/**
+ * The simple_allocation_request represents a simplified allocation_request
+ * that doesn't allow for partition-specific requirements. The memory required
+ * for a simple_allocation_request objects does not scale with the number of
+ * requested partitions.
+ */
+struct simple_allocation_request {
+    simple_allocation_request() = delete;
+    simple_allocation_request(const simple_allocation_request&) = delete;
+    simple_allocation_request(simple_allocation_request&&) = default;
+    simple_allocation_request& operator=(const simple_allocation_request&)
+      = delete;
+    simple_allocation_request& operator=(simple_allocation_request&&) = default;
+    ~simple_allocation_request() = default;
+
+    simple_allocation_request(
+      model::topic_namespace tp_ns,
+      int32_t additional_partitions,
+      int16_t replication_factor,
+      std::optional<node2count_t> existing_replac_counts = std::nullopt)
+      : tp_ns{std::move(tp_ns)}
+      , additional_partitions{additional_partitions}
+      , replication_factor{replication_factor}
+      , existing_replica_counts{std::move(existing_replac_counts)} {}
+
+    model::topic_namespace tp_ns;
+    int32_t additional_partitions{0};
+    int16_t replication_factor{0};
+    // if present, new partitions will be allocated using topic-aware counts
+    // objective.
+    std::optional<node2count_t> existing_replica_counts;
+
+    friend std::ostream&
+    operator<<(std::ostream&, const simple_allocation_request&);
 };
 
 } // namespace cluster

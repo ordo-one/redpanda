@@ -50,12 +50,10 @@ To print the schema, use the '--print-schema' flag.
 		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			f := p.Formatter
-			var helpFormat any
-			helpFormat = []subjectSchema{}
-			if printSchema {
-				helpFormat = ""
+			if printSchema && f.Kind != "text" {
+				out.Die("--print-schema cannot be used along with --format %v", f.Kind)
 			}
-			if h, ok := f.Help(helpFormat); ok {
+			if h, ok := f.Help([]subjectSchema{}); ok {
 				out.Exit(h)
 			}
 			p, err := p.LoadVirtualProfile(fs)
@@ -134,10 +132,10 @@ To print the schema, use the '--print-schema' flag.
 
 	cmd.Flags().StringVar(&sversion, "schema-version", "", "Schema version to lookup (latest, 0, 1...); subject required")
 	cmd.Flags().IntVar(&id, "id", 0, "ID to lookup schemas usages of; subject optional")
-	cmd.Flags().StringVar(&schemaFile, "schema", "", "Schema file to check existence of, must be .avro or .proto; subject required")
+	cmd.Flags().StringVar(&schemaFile, "schema", "", "Schema file to check existence of, must be .avro, .json or .proto; subject required")
 	cmd.Flags().StringVar(&schemaType, "type", "", fmt.Sprintf("Schema type of the file used to lookup (%v); overrides schema file extension", strings.Join(supportedTypes, ",")))
 	cmd.Flags().BoolVar(&deleted, "deleted", false, "If true, also return deleted schemas")
-	cmd.Flags().BoolVar(&printSchema, "print-schema", false, "If true, print the schema JSON")
+	cmd.Flags().BoolVar(&printSchema, "print-schema", false, "Prints the schema in JSON format")
 
 	cmd.RegisterFlagCompletionFunc("type", validTypes())
 	return cmd

@@ -125,12 +125,29 @@ class Struct:
   {{ field }}
     {%- endfor %}
 {%- endfor %}
+
+    auto serde_fields() {
+        return std::tie(
+{% for generation in s._field_generations %}
+    {%- for field in generation %}
+        {{ field._name}}{{ ", " if not loop.last else "" }}
+    {%- endfor %}
+        {{ ", " if not loop.last else "" }}
+{%- endfor %}
+        );
+    }
 };
 """).render(s=self)
 
 
 FILE_TEMPLATE = """#include "serde/envelope.h"
-#include "serde/serde.h"
+#include "serde/rw/vector.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/sstring.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
 
 template<typename... T>
 struct type_list {};

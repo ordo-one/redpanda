@@ -13,6 +13,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
@@ -23,7 +25,7 @@ import (
 	"github.com/twmb/types"
 )
 
-type roleACl struct {
+type roleACL struct {
 	Principal           string `json:"principal,omitempty" yaml:"principal,omitempty"`
 	Host                string `json:"host,omitempty" yaml:"host,omitempty"`
 	ResourceType        string `json:"resource_type,omitempty" yaml:"resource_type,omitempty"`
@@ -34,8 +36,8 @@ type roleACl struct {
 }
 
 type describeResponse struct {
-	Permissions []roleACl             `json:"permissions" yaml:"permissions"`
-	Members     []adminapi.RoleMember `json:"members" yaml:"members"`
+	Permissions []roleACL            `json:"permissions" yaml:"permissions"`
+	Members     []rpadmin.RoleMember `json:"members" yaml:"members"`
 }
 
 func describeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -63,6 +65,7 @@ Print only the members of role 'red'
 Print only the ACL associated to the role 'red'
   rpk security role describe red --print-permissions
 `,
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			f := p.Formatter
 			if h, ok := f.Help(describeResponse{}); ok {
@@ -75,7 +78,7 @@ Print only the ACL associated to the role 'red'
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitServerlessAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
@@ -94,7 +97,7 @@ Print only the ACL associated to the role 'red'
 	return cmd
 }
 
-func describeAndPrintRole(ctx context.Context, admCl *adminapi.AdminAPI, kafkaAdmCl *kadm.Client, f config.OutFormatter, roleName string, permissions, principals bool) error {
+func describeAndPrintRole(ctx context.Context, admCl *rpadmin.AdminAPI, kafkaAdmCl *kadm.Client, f config.OutFormatter, roleName string, permissions, principals bool) error {
 	// Get ACLs that belong to RedpandaRole:<roleName>
 	principal := rolePrefix + roleName
 	b := kadm.NewACLs().
@@ -116,13 +119,13 @@ func describeAndPrintRole(ctx context.Context, admCl *adminapi.AdminAPI, kafkaAd
 		return fmt.Errorf("unable to retrieve role members of role %q: %v", roleName, err)
 	}
 	// Do this to avoid printing `null` in --format json
-	members := []adminapi.RoleMember{}
+	members := []rpadmin.RoleMember{}
 	if r.Members != nil {
 		members = r.Members
 	}
 	described := describeResponse{
 		Members:     members,
-		Permissions: describedToRoleAcl(results),
+		Permissions: describedToRoleACL(results),
 	}
 
 	// Print according to format
@@ -171,11 +174,11 @@ func describeAndPrintRole(ctx context.Context, admCl *adminapi.AdminAPI, kafkaAd
 	return nil
 }
 
-func describedToRoleAcl(results kadm.DescribeACLsResults) []roleACl {
-	ret := []roleACl{}
+func describedToRoleACL(results kadm.DescribeACLsResults) []roleACL {
+	ret := []roleACL{}
 	for _, f := range results {
 		for _, d := range f.Described {
-			ret = append(ret, roleACl{
+			ret = append(ret, roleACL{
 				Principal:           d.Principal,
 				Host:                d.Host,
 				ResourceType:        d.Type.String(),

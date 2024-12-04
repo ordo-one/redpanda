@@ -15,7 +15,7 @@
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "ssx/sformat.h"
-#include "tristate.h"
+#include "utils/tristate.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -33,6 +33,9 @@ public:
     // is handled during adl/serde decode).
     static constexpr bool default_remote_delete{true};
     static constexpr bool legacy_remote_delete{false};
+    static constexpr model::iceberg_mode default_iceberg_mode
+      = model::iceberg_mode::disabled;
+    static constexpr bool default_cloud_topic_enabled{false};
 
     static constexpr std::chrono::milliseconds read_replica_retention{3600000};
 
@@ -76,6 +79,12 @@ public:
 
         std::optional<std::chrono::milliseconds> flush_ms;
         std::optional<size_t> flush_bytes;
+        model::iceberg_mode iceberg_mode{default_iceberg_mode};
+        bool cloud_topic_enabled{default_cloud_topic_enabled};
+
+        // Should not be enabled at the same time as any other tiered storage
+        // properties.
+        tristate<std::chrono::milliseconds> tombstone_retention_ms;
 
         friend std::ostream&
         operator<<(std::ostream&, const default_overrides&);
@@ -90,10 +99,10 @@ public:
       ss::sstring base_dir,
       std::unique_ptr<default_overrides> overrides) noexcept
       : ntp_config(
-        std::move(n),
-        std::move(base_dir),
-        std::move(overrides),
-        model::revision_id(0)) {}
+          std::move(n),
+          std::move(base_dir),
+          std::move(overrides),
+          model::revision_id(0)) {}
 
     ntp_config(
       model::ntp n,
@@ -109,21 +118,25 @@ public:
       model::ntp n,
       ss::sstring base_dir,
       std::unique_ptr<default_overrides> overrides,
-      model::revision_id id,
-      model::initial_revision_id initial_id) noexcept
+      model::revision_id rev,
+      model::revision_id topic_rev,
+      model::initial_revision_id remote_rev) noexcept
       : _ntp(std::move(n))
       , _base_dir(std::move(base_dir))
       , _overrides(std::move(overrides))
-      , _revision_id(id)
-      , _initial_rev(initial_id) {}
+      , _revision_id(rev)
+      , _topic_rev(topic_rev)
+      , _remote_rev(remote_rev) {}
 
     const model::ntp& ntp() const { return _ntp; }
     model::ntp& ntp() { return _ntp; }
 
     model::revision_id get_revision() const { return _revision_id; }
 
-    model::initial_revision_id get_initial_revision() const {
-        return _initial_rev;
+    model::revision_id get_topic_revision() const { return _topic_rev; }
+
+    model::initial_revision_id get_remote_revision() const {
+        return _remote_rev;
     }
 
     const ss::sstring& base_directory() const { return _base_dir; }
@@ -134,24 +147,20 @@ public:
 
     bool has_overrides() const { return _overrides != nullptr; }
 
-    bool is_compacted() const {
-        if (_overrides && _overrides->cleanup_policy_bitflags) {
-            return (_overrides->cleanup_policy_bitflags.value()
-                    & model::cleanup_policy_bitflags::compaction)
-                   == model::cleanup_policy_bitflags::compaction;
+    bool has_compacted_override() const {
+        auto cp_override = cleanup_policy_override();
+        if (!cp_override) {
+            return false;
         }
-        return false;
+        return model::is_compaction_enabled(cp_override.value());
+    }
+
+    bool is_compacted() const {
+        return model::is_compaction_enabled(cleanup_policy());
     }
 
     bool is_collectable() const {
-        // has no overrides
-        if (!_overrides || !_overrides->cleanup_policy_bitflags) {
-            return true;
-        }
-        // check if deletion bitflag is set
-        return (_overrides->cleanup_policy_bitflags.value()
-                & model::cleanup_policy_bitflags::deletion)
-               == model::cleanup_policy_bitflags::deletion;
+        return model::is_deletion_enabled(cleanup_policy());
     }
 
     ss::sstring work_directory() const {
@@ -292,6 +301,70 @@ public:
                           : cluster_default;
     }
 
+    std::optional<std::chrono::milliseconds> tombstone_retention_ms() const {
+        if (is_read_replica_mode_enabled()) {
+            // RRR sanity check.
+            return std::nullopt;
+        }
+        auto& cluster_default
+          = config::shard_local_cfg().tombstone_retention_ms();
+        if (_overrides) {
+            // Tombstone deletion should not be enabled at the same time as
+            // tiered storage.
+            if (
+              _overrides->shadow_indexing_mode.has_value()
+              && _overrides->shadow_indexing_mode.value()
+                   != model::shadow_indexing_mode::disabled) {
+                return std::nullopt;
+            }
+            // If the tristate is disabled, return nullopt.
+            if (_overrides->tombstone_retention_ms.is_disabled()) {
+                return std::nullopt;
+            }
+            // If the tristate has a value, use it.
+            if (_overrides->tombstone_retention_ms.has_optional_value()) {
+                return _overrides->tombstone_retention_ms.value();
+            }
+
+            // If the tristate holds an empty optional, fall back to cluster
+            // default.
+            return cluster_default;
+        }
+        // Fall back to cluster default, since _overrides being nullptr signals
+        // that remote.read and remote.write is disabled for this topic.
+        return cluster_default;
+    }
+
+    std::optional<model::cleanup_policy_bitflags>
+    cleanup_policy_override() const {
+        return _overrides ? _overrides->cleanup_policy_bitflags : std::nullopt;
+    }
+
+    model::cleanup_policy_bitflags cleanup_policy() const {
+        const auto& cluster_default
+          = config::shard_local_cfg().log_cleanup_policy();
+        return cleanup_policy_override().value_or(cluster_default);
+    }
+
+    model::iceberg_mode iceberg_mode() const {
+        if (!config::shard_local_cfg().iceberg_enabled) {
+            return model::iceberg_mode::disabled;
+        }
+        return _overrides ? _overrides->iceberg_mode : default_iceberg_mode;
+    }
+
+    bool iceberg_enabled() const {
+        return iceberg_mode() != model::iceberg_mode::disabled;
+    }
+
+    bool cloud_topic_enabled() const {
+        if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+            return false;
+        }
+        return _overrides ? _overrides->cloud_topic_enabled
+                          : default_cloud_topic_enabled;
+    }
+
 private:
     model::ntp _ntp;
     /// \brief currently this is the basedir. In the future
@@ -301,19 +374,18 @@ private:
 
     std::unique_ptr<default_overrides> _overrides;
 
-    /**
-     * A number indicating an id of the NTP in case it was created more
-     * than once (i.e. created, deleted and then created again)
-     */
+    /// Revision of the command that resulted in this partition appearing on
+    /// this node (i.e. it will changed if the partition replica is moved back
+    /// and forth from/to the node, as well as if the topic is re-created). It
+    /// is used in constructing the local directory path.
     model::revision_id _revision_id{0};
 
-    /**
-     * A number indicating an initial revision of the NTP. The revision
-     * of the NTP might change when the partition is moved between the
-     * nodes. The initial revision is the revision_id that was assigned
-     * to the topic when it was created.
-     */
-    model::initial_revision_id _initial_rev{0};
+    /// Revision of the topic creation command.
+    model::revision_id _topic_rev;
+
+    /// This revision is used to construct cloud storage paths. It differs from
+    /// _topic_revision in case of recovered topics or read replicas.
+    model::initial_revision_id _remote_rev{0};
 
     // in storage/types.cc
     friend std::ostream& operator<<(std::ostream&, const ntp_config&);

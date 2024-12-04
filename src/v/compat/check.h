@@ -17,7 +17,10 @@
 #include "json/writer.h"
 #include "reflection/adl.h"
 #include "reflection/async_adl.h"
-#include "serde/serde.h"
+#include "serde/async.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/sstring.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -189,10 +192,10 @@ template<typename T>
 T decode_adl_or_serde(compat_binary test) {
     if (test.name == "adl") {
         iobuf_parser in(std::move(test.data));
-        return reflection::async_adl<T>{}.from(in).get0();
+        return reflection::async_adl<T>{}.from(in).get();
     } else if (test.name == "serde") {
         iobuf_parser in(std::move(test.data));
-        return serde::read_async<T>(in).get0();
+        return serde::read_async<T>(in).get();
     } else {
         vassert(false, "unknown type {}", test.name);
     }
@@ -202,7 +205,7 @@ template<typename T>
 T decode_serde_only(compat_binary test) {
     vassert(test.name == "serde", "Non serde type encountered {}", test.name);
     iobuf_parser in(std::move(test.data));
-    return serde::read_async<T>(in).get0();
+    return serde::read_async<T>(in).get();
 }
 
 template<typename T>

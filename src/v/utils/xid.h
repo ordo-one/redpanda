@@ -28,7 +28,7 @@
  */
 class invalid_xid final : public std::exception {
 public:
-    explicit invalid_xid(const ss::sstring&);
+    explicit invalid_xid(std::string_view);
     const char* what() const noexcept final { return _msg.c_str(); }
 
 private:
@@ -72,14 +72,14 @@ public:
      *
      * @return an xid decoded from the string provided
      */
-    static xid from_string(const ss::sstring&);
+    static xid from_string(std::string_view);
 
     friend bool operator==(const xid&, const xid&) = default;
 
     friend std::istream& operator>>(std::istream&, xid&);
 
     friend void
-    read_nested(iobuf_parser& in, xid& id, size_t const bytes_left_limit);
+    read_nested(iobuf_parser& in, xid& id, const size_t bytes_left_limit);
 
     friend void write(iobuf& out, xid id);
 

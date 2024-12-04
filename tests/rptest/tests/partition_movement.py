@@ -17,6 +17,11 @@ from ducktape.utils.util import wait_until
 
 
 class PartitionMovementMixin():
+
+    # Use in assignments sent to redpanda when node-local core assignment
+    # is enabled, to test that the actual value is ignored.
+    INVALID_CORE = 12121212
+
     @staticmethod
     def _random_partition(metadata):
         topic = random.choice(metadata)
@@ -24,16 +29,17 @@ class PartitionMovementMixin():
         return topic.name, partition.id
 
     @staticmethod
-    def _choose_replacement(admin, assignments, allow_no_ops=True):
+    def _choose_replacement(admin, assignments, allow_no_ops):
         """
         Does not produce assignments that contain duplicate nodes. This is a
         limitation in redpanda raft implementation.
         """
         replication_factor = len(assignments)
         node_ids = lambda x: set([a["node_id"] for a in x])
+        orig_node_ids = node_ids(assignments)
 
         assert replication_factor >= 1
-        assert len(node_ids(assignments)) == replication_factor
+        assert len(orig_node_ids) == replication_factor
 
         # remove random assignment(s). we allow no changes to be made to
         # exercise the code paths responsible for dealing with no-ops.
@@ -51,8 +57,10 @@ class PartitionMovementMixin():
             node_id = broker["node_id"]
             if node_id in node_ids(assignments):
                 continue
-            core = random.randint(0, broker["num_cores"] - 1)
-            replacement = dict(node_id=node_id, core=core)
+            replacement = dict(node_id=node_id)
+            if node_id in orig_node_ids:
+                replacement["core"] = \
+                    random.randint(0, broker["num_cores"] - 1)
             if not allow_no_ops and replacement in selected:
                 continue
             assignments.append(replacement)
@@ -61,7 +69,7 @@ class PartitionMovementMixin():
         return selected, replacements
 
     @staticmethod
-    def _get_assignments(admin, topic, partition):
+    def _get_node_assignments(admin, topic, partition):
         def try_get_partitions():
             try:
                 res = admin.get_partitions(topic, partition)
@@ -75,21 +83,29 @@ class PartitionMovementMixin():
                                 timeout_sec=30,
                                 backoff_sec=1)
 
-        def normalize(a):
-            return dict(node_id=a["node_id"], core=a["core"])
-
-        return [normalize(a) for a in res["replicas"]]
+        return [dict(node_id=a["node_id"]) for a in res["replicas"]]
 
     @staticmethod
     def _equal_assignments(r0, r1):
-        def to_tuple(a):
-            return a["node_id"], a["core"]
+        # Core in an assignment can be unknown (None). In this case it is
+        # considered equal to any core value in the other assignment.
+        def node2core(assignments):
+            return dict((a["node_id"], a.get("core")) for a in assignments)
 
-        r0 = [to_tuple(a) for a in r0]
-        r1 = [to_tuple(a) for a in r1]
-        return set(r0) == set(r1)
+        left_n2c = node2core(r0)
+        right_n2c = node2core(r1)
 
-    def _get_current_partitions(self, admin, topic, partition_id):
+        if set(left_n2c.keys()) != set(right_n2c.keys()):
+            return False
+
+        for n, c in left_n2c.items():
+            rc = right_n2c[n]
+            if c != rc and c is not None and rc is not None:
+                return False
+
+        return True
+
+    def _get_current_node_cores(self, admin, topic, partition_id):
         def keep(p):
             return p["ns"] == "kafka" and p["topic"] == topic and p[
                 "partition_id"] == partition_id
@@ -109,28 +125,34 @@ class PartitionMovementMixin():
                       retry_codes=[404, 503, 504],
                       retries_amount=10)
 
-        def status_done():
+        def node_assignments_converged():
             results = []
             for n in self.redpanda._started:
                 info = admin.get_partitions(topic, partition, node=n)
+                node_assignments = [{
+                    "node_id": r["node_id"]
+                } for r in info["replicas"]]
                 self.logger.info(
-                    f"current assignments for {topic}-{partition}: {info}")
-                converged = self._equal_assignments(info["replicas"],
+                    f"node assignments for {topic}/{partition}: {node_assignments}, "
+                    f"partition status: {info['status']}")
+                converged = self._equal_assignments(node_assignments,
                                                     assignments)
                 results.append(converged and info["status"] == "done")
 
             return all(results)
 
         # wait until redpanda reports complete
-        wait_until(status_done, timeout_sec=timeout_sec, backoff_sec=2)
+        wait_until(node_assignments_converged,
+                   timeout_sec=timeout_sec,
+                   backoff_sec=2)
 
-        def derived_done():
-            info = self._get_current_partitions(admin, topic, partition)
+        def cores_converged():
+            info = self._get_current_node_cores(admin, topic, partition)
             self.logger.info(
-                f"derived assignments for {topic}-{partition}: {info}")
+                f"current core placement for {topic}/{partition}: {info}")
             return self._equal_assignments(info, assignments)
 
-        wait_until(derived_done, timeout_sec=timeout_sec, backoff_sec=2)
+        wait_until(cores_converged, timeout_sec=timeout_sec, backoff_sec=2)
 
     def _wait_post_cancel(self, topic, partition, prev_assignments,
                           new_assignment, timeout_sec):
@@ -148,21 +170,26 @@ class PartitionMovementMixin():
 
         result_configuration = admin.wait_stable_configuration(
             topic=topic, partition=partition, timeout_s=timeout_sec)
+        # don't check core placement as x-core moves can't be cancelled if
+        # node-local core assignment is enabled (only assigned anew).
+        cur_replicas = [{
+            "node_id": r.node_id
+        } for r in result_configuration.replicas]
 
-        movement_cancelled = self._equal_assignments(
-            result_configuration.replicas, prev_assignments)
+        self.logger.info(
+            f"current replicas for {topic}/{partition}: {cur_replicas}")
+        movement_cancelled = self._equal_assignments(cur_replicas,
+                                                     prev_assignments)
 
         # Can happen if movement was already in un revertable state
         movement_finished = False
         if new_assignment is not None:
             movement_finished = self._equal_assignments(
-                result_configuration.replicas, new_assignment)
+                cur_replicas, new_assignment)
 
         assert movement_cancelled or movement_finished
 
     def _do_move_and_verify(self, topic, partition, timeout_sec):
-        admin = Admin(self.redpanda)
-
         _, new_assignment = self._dispatch_random_partition_move(
             topic=topic, partition=partition)
 
@@ -179,14 +206,11 @@ class PartitionMovementMixin():
         # and redpanda debug builds it may take a very long time
         timeout_sec = 360 if topic == "__consumer_offsets" else 90
 
-        self.logger.info(f"selected topic-partition: {topic}-{partition}")
+        self.logger.info(f"selected topic-partition: {topic}/{partition}")
 
         self._do_move_and_verify(topic, partition, timeout_sec)
 
-    def _replace_replica_set(self,
-                             assignments,
-                             allow_no_ops=True,
-                             x_core_only=False):
+    def _replace_replica_set(self, assignments, allow_no_ops, x_core_only):
         """
          replaces random number of replicas in `assignments` list of replicas
         
@@ -212,6 +236,29 @@ class PartitionMovementMixin():
 
         return selected, replacements
 
+    def _set_partition_assignments(self,
+                                   topic,
+                                   partition,
+                                   assignments,
+                                   admin=None):
+        self.logger.info(
+            f"setting assignments for {topic}/{partition}: {assignments}")
+
+        if admin is None:
+            admin = Admin(self.redpanda)
+
+        admin.set_partition_replicas(topic, partition,
+                                     [{
+                                         "node_id": a["node_id"],
+                                         "core": self.INVALID_CORE,
+                                     } for a in assignments])
+
+        for assignment in assignments:
+            if "core" in assignment:
+                admin.set_partition_replica_core(topic, partition,
+                                                 assignment["node_id"],
+                                                 assignment["core"])
+
     def _dispatch_random_partition_move(self,
                                         topic,
                                         partition,
@@ -224,7 +271,7 @@ class PartitionMovementMixin():
         :param x_core_only: when true assignment nodes will not be changed, only cores
         """
         admin = Admin(self.redpanda)
-        assignments = self._get_assignments(admin, topic, partition)
+        assignments = self._get_node_assignments(admin, topic, partition)
         prev_assignments = assignments.copy()
 
         self.logger.info(
@@ -237,10 +284,11 @@ class PartitionMovementMixin():
         self.logger.info(
             f"chose {len(selected)} replacements for {topic}/{partition}: {selected} -> {replacements}"
         )
-        self.logger.info(
-            f"new assignments for {topic}/{partition}: {assignments}")
 
-        admin.set_partition_replicas(topic, partition, assignments)
+        self._set_partition_assignments(topic,
+                                        partition,
+                                        assignments,
+                                        admin=admin)
 
         return prev_assignments, assignments
 

@@ -15,7 +15,7 @@
 #include "bytes/iostream.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller_stm.h"
-#include "cluster/fwd.h"
+#include "cluster/feature_manager.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/logger.h"
@@ -24,6 +24,8 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/validators.h"
+#include "features/enterprise_features.h"
+#include "features/feature_table.h"
 #include "hashing/secure.h"
 #include "json/stringbuffer.h"
 #include "json/writer.h"
@@ -42,7 +44,9 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/tls.hh>
+#include <seastar/util/defer.hh>
 
 #include <absl/algorithm/container.h>
 #include <absl/container/node_hash_map.h>
@@ -52,8 +56,37 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/core.h>
+#include <sys/socket.h>
 
+#include <climits>
+#include <netdb.h>
 #include <stdexcept>
+
+namespace {
+ss::sstring get_hostname() {
+    std::array<char, HOST_NAME_MAX> hostname{};
+    if (::gethostname(hostname.data(), hostname.size()) != 0) {
+        return {};
+    }
+
+    return hostname.data();
+}
+
+ss::sstring get_domainname() {
+    std::array<char, HOST_NAME_MAX> domainname{};
+    if (::getdomainname(domainname.data(), domainname.size()) != 0) {
+        return {};
+    }
+
+    return domainname.data();
+}
+
+ss::future<std::vector<ss::sstring>> get_fqdns(std::string_view hostname) {
+    ss::net::dns_resolver resolver;
+    auto hostent = co_await resolver.get_host_by_name(hostname.data());
+    co_return hostent.names;
+}
+} // namespace
 
 namespace cluster {
 
@@ -113,6 +146,7 @@ metrics_reporter::metrics_reporter(
   ss::sharded<features::feature_table>& feature_table,
   ss::sharded<security::role_store>& role_store,
   ss::sharded<plugin_table>* pt,
+  ss::sharded<feature_manager>* fm,
   ss::sharded<ss::abort_source>& as)
   : _raft0(std::move(raft0))
   , _cluster_info(controller_stm.local().get_metrics_reporter_cluster_info())
@@ -124,6 +158,7 @@ metrics_reporter::metrics_reporter(
   , _feature_table(feature_table)
   , _role_store(role_store)
   , _plugin_table(pt)
+  , _feature_manager(fm)
   , _as(as)
   , _logger(logger, "metrics-reporter") {}
 
@@ -214,6 +249,14 @@ metrics_reporter::build_metrics_snapshot() {
         }
 
         metrics.uptime_ms = report->local_state.uptime / 1ms;
+        auto& advertised_listeners
+          = nm->get().broker.kafka_advertised_listeners();
+        metrics.advertised_listeners.reserve(advertised_listeners.size());
+        std::transform(
+          advertised_listeners.begin(),
+          advertised_listeners.end(),
+          std::back_inserter(metrics.advertised_listeners),
+          [](const model::broker_endpoint& ep) { return ep.address; });
     }
     auto& topics = _topics.local().topics_map();
     snapshot.topic_count = 0;
@@ -240,12 +283,17 @@ metrics_reporter::build_metrics_snapshot() {
     snapshot.original_logical_version
       = _feature_table.local().get_original_version();
 
-    snapshot.has_kafka_gssapi = absl::c_any_of(
-      config::shard_local_cfg().sasl_mechanisms(),
-      [](auto const& mech) { return mech == "GSSAPI"; });
+    auto feature_report = co_await _feature_manager->invoke_on(
+      cluster::feature_manager::backend_shard,
+      [](const cluster::feature_manager& fm) {
+          return fm.report_enterprise_features();
+      });
 
-    snapshot.has_oidc = config::oidc_is_enabled_kafka()
-                        || config::oidc_is_enabled_http();
+    snapshot.has_kafka_gssapi = feature_report.test(
+      features::license_required_feature::gssapi);
+
+    snapshot.has_oidc = feature_report.test(
+      features::license_required_feature::oidc);
 
     snapshot.rbac_role_count = _role_store.local().size();
 
@@ -261,6 +309,16 @@ metrics_reporter::build_metrics_snapshot() {
     if (license.has_value()) {
         snapshot.id_hash = license->checksum;
     }
+
+    snapshot.has_valid_license = license.has_value()
+                                 && !license.value().is_expired();
+    snapshot.has_enterprise_features = feature_report.any();
+
+    snapshot.enterprise_features.emplace(std::move(feature_report));
+
+    snapshot.host_name = get_hostname();
+    snapshot.domain_name = get_domainname();
+    snapshot.fqdns = co_await get_fqdns(snapshot.host_name);
 
     co_return snapshot;
 }
@@ -300,10 +358,14 @@ ss::future<> metrics_reporter::try_initialize_cluster_info() {
 
     auto& first_cfg = batches.front();
 
+    _cluster_info.creation_timestamp = first_cfg.header().first_timestamp;
+    co_await _feature_table.invoke_on_all([&](features::feature_table& ft) {
+        ft.set_builtin_trial_license(_cluster_info.creation_timestamp);
+    });
+
     auto data_bytes = iobuf_to_bytes(first_cfg.data());
     hash_sha256 sha256;
     sha256.update(data_bytes);
-    _cluster_info.creation_timestamp = first_cfg.header().first_timestamp;
     // use timestamps of first two batches in raft-0 log.
     for (int i = 0; i < 2; ++i) {
         sha256.update(iobuf_to_bytes(
@@ -374,6 +436,8 @@ ss::future<http::client> metrics_reporter::make_http_client() {
     if (_address.protocol == "https") {
         ss::tls::credentials_builder builder;
         builder.set_client_auth(ss::tls::client_auth::NONE);
+        builder.set_minimum_tls_version(
+          config::from_config(config::shard_local_cfg().tls_min_version()));
         auto ca_file = co_await net::find_ca_file();
         if (ca_file) {
             vlog(
@@ -394,6 +458,21 @@ ss::future<http::client> metrics_reporter::make_http_client() {
         client_configuration.tls_sni_hostname = _address.host;
     }
     co_return http::client(client_configuration, _as.local());
+}
+
+ss::future<>
+metrics_reporter::do_send_metrics(http::client& client, iobuf body) {
+    auto timeout = config::shard_local_cfg().metrics_reporter_tick_interval();
+    auto res = co_await client.get_connected(timeout, _logger);
+    // skip sending metrics, unable to connect
+    if (res != http::reconnect_result_t::connected) {
+        vlog(
+          _logger.trace, "unable to send metrics report, connection timeout");
+        co_return;
+    }
+    auto resp_stream = co_await client.post(
+      _address.path, std::move(body), http::content_type::json, timeout);
+    co_await resp_stream->prefetch_headers();
 }
 
 ss::future<> metrics_reporter::do_report_metrics() {
@@ -451,22 +530,10 @@ ss::future<> metrics_reporter::do_report_metrics() {
     }
     auto out = serialize_metrics_snapshot(snapshot.value());
     try {
-        // prepare http client
-        auto client = co_await make_http_client();
-        auto timeout
-          = config::shard_local_cfg().metrics_reporter_tick_interval();
-        auto res = co_await client.get_connected(timeout, _logger);
-        // skip sending metrics, unable to connect
-        if (res != http::reconnect_result_t::connected) {
-            vlog(
-              _logger.trace,
-              "unable to send metrics report, connection timeout");
-            co_return;
-        }
-        auto resp_stream = co_await client.post(
-          _address.path, std::move(out), http::content_type::json, timeout);
-        co_await resp_stream->prefetch_headers();
-        co_await resp_stream->shutdown();
+        co_await http::with_client(
+          co_await make_http_client(), [this, &out](http::client& client) {
+              return do_send_metrics(client, std::move(out));
+          });
         _last_success = ss::lowres_clock::now();
     } catch (...) {
         vlog(
@@ -527,6 +594,30 @@ void rjson_serialize(
     w.Key("id_hash");
     w.String(snapshot.id_hash);
 
+    w.Key("has_valid_license");
+    w.Bool(snapshot.has_valid_license);
+
+    w.Key("has_enterprise_features");
+    w.Bool(snapshot.has_enterprise_features);
+
+    if (snapshot.enterprise_features.has_value()) {
+        w.Key("enterprise_features");
+        w.StartArray();
+        for (const auto& f : snapshot.enterprise_features.value().enabled()) {
+            w.String(fmt::format("{}", f));
+        }
+        w.EndArray();
+    }
+
+    w.Key("hostname");
+    w.String(snapshot.host_name);
+
+    w.Key("domainname");
+    w.String(snapshot.domain_name);
+
+    w.Key("fqdns");
+    rjson_serialize(w, snapshot.fqdns);
+
     w.EndObject();
 }
 
@@ -563,6 +654,8 @@ void rjson_serialize(
         rjson_serialize(w, d);
     }
     w.EndArray();
+    w.Key("kafka_advertised_listeners");
+    rjson_serialize(w, nm.advertised_listeners);
 
     w.EndObject();
 }

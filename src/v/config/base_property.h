@@ -106,6 +106,7 @@ public:
     virtual void set_value(std::any) = 0;
     virtual void reset() = 0;
     virtual bool is_default() const = 0;
+    virtual bool is_hidden() const = 0;
 
     /**
      * Helper for logging string-ized values of a property, e.g.
@@ -116,7 +117,7 @@ public:
      * redacted if secret.
      */
     template<typename U>
-    std::string_view format_raw(U const& in) {
+    std::string_view format_raw(const U& in) {
         if (is_secret() && !in.empty()) {
             return secret_placeholder;
         } else {
@@ -136,6 +137,14 @@ public:
      * to this property.
      */
     virtual std::optional<validation_error> validate(YAML::Node) const = 0;
+
+    /**
+     * Check whether a proposed new value is restricted before it has been
+     * assigned. Rejection logic should be accounted for at the call site.
+     */
+    virtual std::optional<validation_error>
+      check_restricted(YAML::Node) const = 0;
+
     virtual base_property& operator=(const base_property&) = 0;
     virtual ~base_property() noexcept = default;
 

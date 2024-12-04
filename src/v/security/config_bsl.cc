@@ -9,7 +9,8 @@
  * by the Apache License, Version 2.0
  */
 
-#include "security/mtls.h"
+#include "security/config.h"
+#include "security/mtls_rule.h"
 
 #include <boost/algorithm/string/case_conv.hpp>
 
@@ -29,7 +30,7 @@ std::regex make_regex(std::string_view sv) {
 }
 
 bool regex_search(
-  std::string_view msg, std::cmatch& match, std::regex const& regex) {
+  std::string_view msg, std::cmatch& match, const std::regex& regex) {
     return std::regex_search(
       msg.begin(),
       msg.end(),
@@ -39,7 +40,7 @@ bool regex_search(
 }
 
 bool regex_match(
-  std::string_view msg, std::cmatch& match, std::regex const& regex) {
+  std::string_view msg, std::cmatch& match, const std::regex& regex) {
     return std::regex_match(
       msg.begin(),
       msg.end(),
@@ -67,9 +68,11 @@ parse_rules(std::optional<std::vector<ss::sstring>> unparsed_rules) {
     static const std::regex rule_parser = make_regex(rule_pattern);
 
     std::string rules
-      = unparsed_rules.has_value() ? fmt::format(
-          "{}", fmt::join(unparsed_rules->begin(), unparsed_rules->end(), ","))
-                                   : "DEFAULT";
+      = unparsed_rules.has_value()
+          ? fmt::format(
+              "{}",
+              fmt::join(unparsed_rules->begin(), unparsed_rules->end(), ","))
+          : "DEFAULT";
 
     std::vector<rule> result;
     std::cmatch rules_match;
@@ -105,18 +108,6 @@ parse_rules(std::optional<std::vector<ss::sstring>> unparsed_rules) {
 }
 
 } // namespace detail
-
-rule::rule(
-  std::string_view pattern,
-  std::optional<std::string_view> replacement,
-  make_lower to_lower,
-  make_upper to_upper)
-  : _regex{detail::make_regex(pattern)}
-  , _pattern{pattern}
-  , _replacement{replacement}
-  , _is_default{false}
-  , _to_lower{to_lower}
-  , _to_upper{to_upper} {}
 
 std::optional<ss::sstring> rule::apply(std::string_view dn) const {
     if (_is_default) {

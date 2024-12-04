@@ -169,14 +169,15 @@ void configuration_manager::add_configuration(
     }
 }
 
-ss::future<>
-configuration_manager::add(std::vector<offset_configuration> configurations) {
+ss::future<> configuration_manager::add(
+  chunked_vector<offset_configuration> configurations) {
     return _lock.with([this,
                        configurations = std::move(configurations)]() mutable {
         for (auto& co : configurations) {
             // handling backward compatibility i.e. revisionless configurations
             co.cfg.maybe_set_initial_revision(_initial_revision);
 
+            reset_override(co.cfg.revision_id());
             add_configuration(co.offset, std::move(co.cfg));
             _highest_known_offset = std::max(_highest_known_offset, co.offset);
         }
@@ -211,8 +212,29 @@ const group_configuration& configuration_manager::get_latest() const {
     vassert(
       !_configurations.empty(),
       "Configuration manager should always have at least one configuration");
+    if (_configuration_force_override) [[unlikely]] {
+        return *_configuration_force_override;
+    }
+
     return _configurations.rbegin()->second.cfg;
 }
+
+void configuration_manager::set_override(group_configuration cfg) {
+    vlog(_ctxlog.info, "Setting configuration override to {}", cfg);
+    _configuration_force_override = std::make_unique<group_configuration>(
+      std::move(cfg));
+}
+
+void configuration_manager::reset_override(
+  model::revision_id added_configuration_revision) {
+    if (
+      _configuration_force_override
+      && _configuration_force_override->revision_id()
+           <= added_configuration_revision) [[unlikely]] {
+        vlog(_ctxlog.info, "Resetting configuration override");
+        _configuration_force_override.reset();
+    }
+};
 
 model::offset configuration_manager::get_latest_offset() const {
     vassert(

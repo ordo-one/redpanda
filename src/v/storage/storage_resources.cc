@@ -11,10 +11,13 @@
 
 #include "storage_resources.h"
 
+#include "base/seastarx.h"
 #include "base/vlog.h"
 #include "config/configuration.h"
 #include "storage/chunk_cache.h"
 #include "storage/logger.h"
+
+#include <seastar/core/smp.hh>
 
 namespace {
 uint64_t per_shard_target_replay_bytes(uint64_t global_target_replay_bytes) {
@@ -74,17 +77,17 @@ storage_resources::storage_resources(
 // but otherwise do not want to override anything.
 storage_resources::storage_resources(config::binding<size_t> falloc_step)
   : storage_resources(
-    std::move(falloc_step),
-    config::shard_local_cfg().storage_target_replay_bytes.bind(),
-    config::shard_local_cfg().storage_max_concurrent_replay.bind(),
-    config::shard_local_cfg().storage_compaction_index_memory.bind()) {}
+      std::move(falloc_step),
+      config::shard_local_cfg().storage_target_replay_bytes.bind(),
+      config::shard_local_cfg().storage_max_concurrent_replay.bind(),
+      config::shard_local_cfg().storage_compaction_index_memory.bind()) {}
 
 storage_resources::storage_resources()
   : storage_resources(
-    config::shard_local_cfg().segment_fallocation_step.bind(),
-    config::shard_local_cfg().storage_target_replay_bytes.bind(),
-    config::shard_local_cfg().storage_max_concurrent_replay.bind(),
-    config::shard_local_cfg().storage_compaction_index_memory.bind()) {}
+      config::shard_local_cfg().segment_fallocation_step.bind(),
+      config::shard_local_cfg().storage_target_replay_bytes.bind(),
+      config::shard_local_cfg().storage_max_concurrent_replay.bind(),
+      config::shard_local_cfg().storage_compaction_index_memory.bind()) {}
 
 void storage_resources::update_allowance(uint64_t total, uint64_t free) {
     // TODO: also take as an input the disk consumption of the SI cache:
@@ -95,7 +98,6 @@ void storage_resources::update_allowance(uint64_t total, uint64_t free) {
         total -= config::shard_local_cfg().cloud_storage_cache_size();
     }
 
-    _space_allowance = total;
     _space_allowance_free = std::min(free, total);
 
     _falloc_step = calc_falloc_step();
@@ -133,10 +135,6 @@ size_t storage_resources::calc_falloc_step() {
         return step;
     }
 
-    // Initial disk stats read happens very early in startup, we should
-    // never be called before that.
-    vassert(_space_allowance > 0, "Called before disk stats init");
-
     // Pessimistic assumption that each shard may use _at most_ the
     // disk space divided by the shard count.  If allocation of partitions
     // is uneven, this may lead to us underestimasting how much space
@@ -161,7 +159,7 @@ size_t storage_resources::calc_falloc_step() {
     }
 
     vlog(
-      stlog.debug,
+      rslog.debug,
       "calc_falloc_step: step {} (max {})",
       step,
       _segment_fallocation_step());
@@ -193,7 +191,7 @@ storage_resources::get_falloc_step(std::optional<uint64_t> segment_size_hint) {
 bool storage_resources::offset_translator_take_bytes(
   int32_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "offset_translator_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -206,7 +204,7 @@ bool storage_resources::offset_translator_take_bytes(
 bool storage_resources::configuration_manager_take_bytes(
   size_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "configuration_manager_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -219,7 +217,7 @@ bool storage_resources::configuration_manager_take_bytes(
 bool storage_resources::stm_take_bytes(
   size_t bytes, ssx::semaphore_units& units) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "stm_take_bytes {} += {} (current {})",
       units.count(),
       bytes,
@@ -243,7 +241,7 @@ bool storage_resources::filter_checkpoints(
 adjustable_semaphore::take_result
 storage_resources::compaction_index_take_bytes(size_t bytes) {
     vlog(
-      stlog.trace,
+      rslog.trace,
       "compaction_index_take_bytes {} (current {})",
       bytes,
       _compaction_index_bytes.current());

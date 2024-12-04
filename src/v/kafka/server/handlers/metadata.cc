@@ -19,12 +19,10 @@
 #include "kafka/protocol/schemata/metadata_response.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/fwd.h"
-#include "kafka/server/handlers/details/isolated_node_utils.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
@@ -40,6 +38,10 @@
 #include <iterator>
 #include <type_traits>
 
+namespace {
+using is_node_isolated_or_decommissioned
+  = ss::bool_class<struct is_node_isolated_or_decommissioned_tag>;
+}
 namespace kafka {
 
 static constexpr model::node_id no_leader(-1);
@@ -126,7 +128,7 @@ metadata_response::topic make_topic_response_from_topic_metadata(
     const bool is_user_topic = model::is_user_topic(tp_ns);
     const auto* disabled_set = md_cache.get_topic_disabled_set(tp_ns);
 
-    for (const auto& p_as : tp_md.get_assignments()) {
+    for (const auto& [_, p_as] : tp_md.get_assignments()) {
         std::vector<model::node_id> replicas{};
         replicas.reserve(p_as.replicas.size());
         // current replica set
@@ -250,18 +252,17 @@ static metadata_response::topic make_topic_response(
   metadata_request& rq,
   const cluster::topic_metadata& md,
   const is_node_isolated_or_decommissioned is_node_isolated) {
-    int32_t auth_operations = 0;
+    auto res = make_topic_response_from_topic_metadata(
+      ctx.metadata_cache(), md, is_node_isolated, ctx.recovery_mode_enabled());
+
     /**
      * if requested include topic authorized operations
      */
     if (rq.data.include_topic_authorized_operations) {
-        auth_operations = details::to_bit_field(
+        res.topic_authorized_operations = details::to_bit_field(
           details::authorized_operations(ctx, md.get_configuration().tp_ns.tp));
     }
 
-    auto res = make_topic_response_from_topic_metadata(
-      ctx.metadata_cache(), md, is_node_isolated, ctx.recovery_mode_enabled());
-    res.topic_authorized_operations = auth_operations;
     return res;
 }
 
@@ -511,7 +512,8 @@ static ss::future<metadata_response> fill_info_about_brokers_and_controller_id(
 template<>
 ss::future<response_ptr> metadata_handler::handle(
   request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
-    auto isolated_or_decommissioned = node_isolated_or_decommissioned(ctx);
+    is_node_isolated_or_decommissioned isolated_or_decommissioned{
+      ctx.metadata_cache().is_node_isolated()};
 
     auto reply = co_await fill_info_about_brokers_and_controller_id(
       ctx, isolated_or_decommissioned);
@@ -621,6 +623,7 @@ metadata_memory_estimator(size_t request_size, connection_context& conn_ctx) {
     // generally ~8000 bytes). Finally, we add max_frag_bytes to account for the
     // worse-cast overshoot during vector re-allocation.
     return default_memory_estimate(request_size) + size_estimate
-           + large_fragment_vector<metadata_response_partition>::max_frag_bytes;
+           + large_fragment_vector<
+             metadata_response_partition>::max_frag_bytes();
 }
 } // namespace kafka

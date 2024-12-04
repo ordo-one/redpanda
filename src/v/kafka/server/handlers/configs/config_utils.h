@@ -21,7 +21,6 @@
 #include "kafka/protocol/fwd.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -35,6 +34,7 @@
 
 #include <absl/container/node_hash_set.h>
 
+#include <algorithm>
 #include <optional>
 
 namespace kafka {
@@ -253,16 +253,48 @@ ss::future<chunked_vector<R>> do_alter_topics_configuration(
     for (auto& res : update_results) {
         responses.push_back(R{
           .error_code = map_topic_error_code(res.ec),
+          .error_message = res.error_message.value_or(
+            make_error_code(res.ec).message()),
           .resource_type = static_cast<int8_t>(config_resource_type::topic),
           .resource_name = res.tp_ns.tp(),
         });
     }
+
+    // Group-by error code, value is list of topic names as strings
+    absl::flat_hash_map<cluster::errc, std::vector<model::topic_namespace_view>>
+      err_map;
+    for (const auto& result : update_results) {
+        auto [itr, _] = err_map.try_emplace(
+          result.ec, std::vector<model::topic_namespace_view>());
+        itr->second.emplace_back(result.tp_ns);
+    }
+
+    // Log success case
+    auto found = err_map.find(cluster::errc::success);
+    if (found != err_map.end()) {
+        vlog(
+          klog.info,
+          "Altered topic properties of topic(s) {{{}}} successfully",
+          fmt::join(found->second, ", "));
+        err_map.erase(found);
+    }
+
+    // Log topics that had not successfully been created at warn level
+    for (const auto& err : err_map) {
+        vlog(
+          klog.warn,
+          "Failed to alter topic properties of topic(s) {{{}}} error_code "
+          "observed: {}",
+          fmt::join(err.second, ", "),
+          err.first);
+    }
+
     co_return responses;
 }
 
 template<typename T, typename R>
 ss::future<chunked_vector<R>> unsupported_broker_configuration(
-  chunked_vector<T> resources, std::string_view const msg) {
+  chunked_vector<T> resources, const std::string_view msg) {
     chunked_vector<R> responses;
     responses.reserve(resources.size());
     std::transform(
@@ -291,6 +323,21 @@ private:
 template<typename T>
 struct noop_validator {
     std::optional<ss::sstring> operator()(const ss::sstring&, const T&) {
+        return std::nullopt;
+    }
+};
+
+struct noop_bool_validator {
+    std::optional<ss::sstring>
+    operator()(model::topic_namespace_view, const ss::sstring&, bool) {
+        return std::nullopt;
+    }
+};
+
+template<typename T>
+struct noop_validator_with_tn {
+    std::optional<ss::sstring>
+    operator()(model::topic_namespace_view, const ss::sstring&, const T&) {
         return std::nullopt;
     }
 };
@@ -419,6 +466,44 @@ struct flush_bytes_validator {
     }
 };
 
+struct iceberg_config_validator {
+    std::optional<ss::sstring> operator()(
+      model::topic_namespace_view tns,
+      const ss::sstring&,
+      const model::iceberg_mode& value) {
+        if (!model::is_user_topic(tns)) {
+            return fmt::format(
+              "Iceberg configuration cannot be altered on non user topics");
+        }
+        if (
+          !config::shard_local_cfg().iceberg_enabled()
+          && value != model::iceberg_mode::disabled) {
+            return fmt::format(
+              "Iceberg disabled in the cluster configuration, enable it by "
+              "setting: {}",
+              config::shard_local_cfg().iceberg_enabled.name());
+        }
+        return std::nullopt;
+    }
+};
+
+struct delete_retention_ms_validator {
+    std::optional<ss::sstring> operator()(
+      const ss::sstring&,
+      const tristate<std::chrono::milliseconds>& maybe_value) {
+        if (maybe_value.has_optional_value()) {
+            const auto& value = maybe_value.value();
+            if (value < 1ms || value > serde::max_serializable_ms) {
+                return fmt::format(
+                  "delete.retention.ms value invalid, expected to be in range "
+                  "[1, {}]",
+                  serde::max_serializable_ms);
+            }
+        }
+        return std::nullopt;
+    }
+};
+
 template<typename T, typename... ValidatorTypes>
 requires requires(
   model::topic_namespace_view tns,
@@ -448,18 +533,28 @@ using replication_factor_validator = config_validator_list<
   replication_factor_must_be_odd,
   replication_factor_must_be_greater_or_equal_to_minimum>;
 
-template<typename T, typename Validator = noop_validator<T>>
-requires requires(const T& value, const ss::sstring& str, Validator validator) {
-    { boost::lexical_cast<T>(str) } -> std::convertible_to<T>;
+template<
+  typename T,
+  typename Validator = noop_validator_with_tn<T>,
+  typename ParseFunc = decltype(boost::lexical_cast<T, ss::sstring>)>
+requires requires(
+  model::topic_namespace_view tn,
+  const T& value,
+  const ss::sstring& str,
+  Validator validator,
+  ParseFunc parse) {
+    { parse(str) } -> std::convertible_to<T>;
     {
-        validator(str, value)
+        validator(tn, str, value)
     } -> std::convertible_to<std::optional<ss::sstring>>;
 }
-void parse_and_set_optional(
-  cluster::property_update<std::optional<T>>& property,
+void parse_and_set_property(
+  model::topic_namespace_view tn,
+  cluster::property_update<T>& property,
   const std::optional<ss::sstring>& value,
   config_resource_operation op,
-  Validator validator = noop_validator<T>{}) {
+  Validator validator = noop_validator<T>{},
+  ParseFunc parse = boost::lexical_cast<T, ss::sstring>) {
     // remove property value
     if (op == config_resource_operation::remove) {
         property.op = cluster::incremental_update_operation::remove;
@@ -469,13 +564,55 @@ void parse_and_set_optional(
     if (op == config_resource_operation::set && value) {
         property.op = cluster::incremental_update_operation::set;
         try {
-            auto v = boost::lexical_cast<T>(*value);
+            auto v = parse(*value);
+            auto v_error = validator(tn, *value, v);
+            if (v_error) {
+                throw validation_error(*v_error);
+            }
+            property.value = std::move(v);
+        } catch (const std::runtime_error&) {
+            throw boost::bad_lexical_cast();
+        }
+        return;
+    }
+}
+
+template<
+  typename T,
+  typename Validator = noop_validator<T>,
+  typename ParseFunc = decltype(boost::lexical_cast<T, ss::sstring>)>
+requires requires(
+  const T& value,
+  const ss::sstring& str,
+  Validator validator,
+  ParseFunc parse) {
+    { parse(str) } -> std::convertible_to<T>;
+    {
+        validator(str, value)
+    } -> std::convertible_to<std::optional<ss::sstring>>;
+}
+void parse_and_set_optional(
+  cluster::property_update<std::optional<T>>& property,
+  const std::optional<ss::sstring>& value,
+  config_resource_operation op,
+  Validator validator = noop_validator<T>{},
+  ParseFunc parse = boost::lexical_cast<T, ss::sstring>) {
+    // remove property value
+    if (op == config_resource_operation::remove) {
+        property.op = cluster::incremental_update_operation::remove;
+        return;
+    }
+    // set property value if preset, otherwise do nothing
+    if (op == config_resource_operation::set && value) {
+        property.op = cluster::incremental_update_operation::set;
+        try {
+            auto v = parse(*value);
             auto v_error = validator(*value, v);
             if (v_error) {
                 throw validation_error(*v_error);
             }
             property.value = std::move(v);
-        } catch (std::runtime_error const&) {
+        } catch (const std::runtime_error&) {
             throw boost::bad_lexical_cast();
         }
         return;
@@ -520,7 +657,7 @@ inline void parse_and_set_optional_duration(
                 throw validation_error(*v_error);
             }
             property.value = std::move(v);
-        } catch (std::runtime_error const&) {
+        } catch (const std::runtime_error&) {
             throw boost::bad_lexical_cast();
         }
         return;
@@ -542,7 +679,7 @@ inline void parse_and_set_optional_bool_alpha(
             property.value = string_switch<bool>(*value)
                                .match("true", true)
                                .match("false", false);
-        } catch (std::runtime_error const&) {
+        } catch (const std::runtime_error&) {
             // Our callers expect this exception type on malformed values
             throw boost::bad_lexical_cast();
         }
@@ -551,11 +688,23 @@ inline void parse_and_set_optional_bool_alpha(
     }
 }
 
+template<typename Validator = noop_bool_validator>
+requires requires(
+  model::topic_namespace_view tn,
+  const ss::sstring& str,
+  Validator validator,
+  bool val) {
+    {
+        validator(tn, str, val)
+    } -> std::convertible_to<std::optional<ss::sstring>>;
+}
 inline void parse_and_set_bool(
+  model::topic_namespace_view tn,
   cluster::property_update<bool>& property,
   const std::optional<ss::sstring>& value,
   config_resource_operation op,
-  bool default_value) {
+  bool default_value,
+  Validator validator = noop_bool_validator{}) {
     // A remove on a concrete (non-nullable) property is a reset to default,
     // as is an assignment to nullopt.
     if (
@@ -568,10 +717,22 @@ inline void parse_and_set_bool(
 
     if (op == config_resource_operation::set && value) {
         try {
-            property.value = string_switch<bool>(*value)
+            // Ignore case.
+            auto str_value = std::move(*value);
+            std::transform(
+              str_value.begin(),
+              str_value.end(),
+              str_value.begin(),
+              [](const auto& c) { return std::tolower(c); });
+
+            property.value = string_switch<bool>(str_value)
                                .match("true", true)
                                .match("false", false);
-        } catch (std::runtime_error) {
+            auto v_error = validator(tn, str_value, property.value);
+            if (v_error) {
+                throw validation_error{*v_error};
+            }
+        } catch (const std::runtime_error&) {
             // Our callers expect this exception type on malformed values
             throw boost::bad_lexical_cast();
         }
@@ -580,11 +741,18 @@ inline void parse_and_set_bool(
     }
 }
 
-template<typename T>
+template<typename T, typename Validator = noop_validator<tristate<T>>>
+requires requires(
+  const tristate<T>& value, const ss::sstring& str, Validator validator) {
+    {
+        validator(str, value)
+    } -> std::convertible_to<std::optional<ss::sstring>>;
+}
 void parse_and_set_tristate(
   cluster::property_update<tristate<T>>& property,
   const std::optional<ss::sstring>& value,
-  config_resource_operation op) {
+  config_resource_operation op,
+  Validator validator = noop_validator<tristate<T>>{}) {
     // remove property value
     if (op == config_resource_operation::remove) {
         property.op = cluster::incremental_update_operation::remove;
@@ -597,6 +765,11 @@ void parse_and_set_tristate(
             property.value = tristate<T>{};
         } else {
             property.value = tristate<T>(std::make_optional<T>(parsed));
+        }
+
+        auto v_error = validator(*value, property.value);
+        if (v_error) {
+            throw validation_error(*v_error);
         }
 
         property.op = cluster::incremental_update_operation::set;
@@ -648,7 +821,7 @@ public:
 
     ///\brief Parse a topic property from the supplied cfg.
     template<typename C>
-    bool operator()(C const& cfg, kafka::config_resource_operation op) {
+    bool operator()(const C& cfg, kafka::config_resource_operation op) {
         using property_t = std::variant<
           decltype(&props.record_key_schema_id_validation),
           decltype(&props.record_key_subject_name_strategy)>;
@@ -700,7 +873,7 @@ private:
     ///\brief Parse and set a boolean from 'true' or 'false'.
     static void apply(
       cluster::property_update<std::optional<bool>>& prop,
-      std::optional<ss::sstring> const& value,
+      const std::optional<ss::sstring>& value,
       kafka::config_resource_operation op) {
         kafka::parse_and_set_optional_bool_alpha(prop, value, op);
     }
@@ -708,7 +881,7 @@ private:
     static void apply(
       cluster::property_update<std::optional<
         pandaproxy::schema_registry::subject_name_strategy>>& prop,
-      std::optional<ss::sstring> const& value,
+      const std::optional<ss::sstring>& value,
       kafka::config_resource_operation op) {
         kafka::parse_and_set_optional(prop, value, op);
     }

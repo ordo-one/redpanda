@@ -9,13 +9,13 @@
 
 #include "cluster/partition_probe.h"
 
-#include "archival/archival_metadata_stm.h"
+#include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/partition.h"
 #include "config/configuration.h"
 #include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/metadata.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
-#include "prometheus/prometheus_sanitize.h"
 
 #include <seastar/core/metrics.hh>
 
@@ -167,6 +167,35 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
       {},
       {sm::shard_label, partition_label});
 
+    if (model::is_user_topic(_partition.ntp())) {
+        _metrics.add_group(
+          cluster_metrics_name,
+          {
+            sm::make_gauge(
+              "iceberg_offsets_pending_translation",
+              [this] {
+                  return _partition.log()->config().iceberg_enabled()
+                           ? _iceberg_translation_offset_lag
+                           : metric_feature_disabled_state;
+              },
+              sm::description("Total number of offsets that are pending "
+                              "translation to iceberg."),
+              labels),
+            sm::make_gauge(
+              "iceberg_offsets_pending_commit",
+              [this] {
+                  return _partition.log()->config().iceberg_enabled()
+                           ? _iceberg_commit_offset_lag
+                           : metric_feature_disabled_state;
+              },
+              sm::description("Total number of offsets that are pending "
+                              "commit to iceberg catalog."),
+              labels),
+          },
+          {},
+          {sm::shard_label, partition_label});
+    }
+
     if (
       config::shard_local_cfg().enable_schema_id_validation()
       != pandaproxy::schema_registry::schema_id_validation_mode::none) {
@@ -221,7 +250,7 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
 
               try {
                   return _partition.log()->from_log_offset(log_offset);
-              } catch (std::runtime_error& e) {
+              } catch (const std::runtime_error& e) {
                   // Offset translation will throw if nothing was committed
                   // to the partition or if the offset is outside the
                   // translation range for any other reason.

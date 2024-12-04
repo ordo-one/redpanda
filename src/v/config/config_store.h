@@ -57,7 +57,7 @@ public:
       const std::set<std::string_view> ignore_missing = {}) {
         error_map_t errors;
 
-        for (auto const& [name, property] : _properties) {
+        for (const auto& [name, property] : _properties) {
             if (property->is_required() == required::no) {
                 continue;
             }
@@ -68,7 +68,7 @@ public:
             }
         }
 
-        for (auto const& node : root_node) {
+        for (const auto& node : root_node) {
             auto name = node.first.as<ss::sstring>();
             auto* prop = [&]() -> base_property* {
                 auto found = _properties.find(name);
@@ -100,11 +100,11 @@ public:
                 }
                 prop->set_value(node.second);
                 ok = true;
-            } catch (YAML::InvalidNode const& e) {
+            } catch (const YAML::InvalidNode& e) {
                 errors[name] = fmt::format("Invalid syntax: {}", e);
-            } catch (YAML::ParserException const& e) {
+            } catch (const YAML::ParserException& e) {
                 errors[name] = fmt::format("Invalid syntax: {}", e);
-            } catch (YAML::BadConversion const& e) {
+            } catch (const YAML::BadConversion& e) {
                 errors[name] = fmt::format("Invalid value: {}", e);
             }
 
@@ -122,7 +122,7 @@ public:
 
     template<typename Func>
     void for_each(Func&& f) const {
-        for (auto const& [_, property] : _properties) {
+        for (const auto& [_, property] : _properties) {
             f(*property);
         }
     }
@@ -140,7 +140,7 @@ public:
         w.StartObject();
 
         for (const auto& [name, property] : _properties) {
-            if (property->get_visibility() == visibility::deprecated) {
+            if (property->is_hidden()) {
                 continue;
             }
 
@@ -155,11 +155,25 @@ public:
         w.EndObject();
     }
 
+    // Write a single key out to json::Writer.
+    void to_json_single_key(
+      json::Writer<json::StringBuffer>& w,
+      redact_secrets redact,
+      std::string_view key) {
+        // Whether key was either an original property name or an
+        // alias, we will obtain the original property here.
+        const auto& property = get(key);
+        w.StartObject();
+        w.Key(key.data(), key.size());
+        property.to_json(w, redact);
+        w.EndObject();
+    }
+
     void to_json_for_metrics(json::Writer<json::StringBuffer>& w) {
         w.StartObject();
 
         for (const auto& [name, property] : _properties) {
-            if (property->get_visibility() == visibility::deprecated) {
+            if (property->is_hidden()) {
                 continue;
             }
 

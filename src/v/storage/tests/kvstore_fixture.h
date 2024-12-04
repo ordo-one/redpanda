@@ -23,7 +23,7 @@ class kvstore_test_fixture {
 public:
     kvstore_test_fixture()
       : _test_dir(
-        ssx::sformat("kvstore_test_{}", random_generators::get_int(4000)))
+          ssx::sformat("kvstore_test_{}", random_generators::get_int(4000)))
       , _kv_config(prepare_store().get()) {
         _feature_table.start().get();
         _feature_table
@@ -34,7 +34,7 @@ public:
 
     std::unique_ptr<storage::kvstore> make_kvstore() {
         return std::make_unique<storage::kvstore>(
-          _kv_config, resources, _feature_table);
+          _kv_config, ss::this_shard_id(), resources, _feature_table);
     }
 
     ~kvstore_test_fixture() {

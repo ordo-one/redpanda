@@ -10,7 +10,8 @@
 
 #include "container/fragmented_vector.h"
 #include "hashing/secure.h"
-#include "storage/compacted_index.h"
+#include "model/fundamental.h"
+#include "storage/compaction.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/core/future.hh>
@@ -174,7 +175,8 @@ private:
 
     /**
      * hash the compaction key. this helper will catch exceptions and reset the
-     * hashing object which is reused to avoid reinitialization of gnutls state.
+     * hashing object which is reused to avoid reinitialization of OpenSSL
+     * state.
      */
     hash_type::digest_type hash_key(const compaction_key&) const;
 

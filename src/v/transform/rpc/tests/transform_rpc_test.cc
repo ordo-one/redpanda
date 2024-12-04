@@ -15,7 +15,7 @@
 #include "config/mock_property.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "kafka/server/partition_proxy.h"
+#include "kafka/data/partition_proxy.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
@@ -37,7 +37,6 @@
 #include "test_utils/test.h"
 #include "transform/rpc/client.h"
 #include "transform/rpc/deps.h"
-#include "transform/rpc/logger.h"
 #include "transform/rpc/serde.h"
 #include "transform/rpc/service.h"
 #include "utils/unresolved_address.h"
@@ -556,6 +555,9 @@ private:
         sync_effective_start(model::timeout_clock::duration) final {
             throw std::runtime_error("unimplemented");
         }
+        model::offset local_start_offset() const final {
+            throw std::runtime_error("unimplemented");
+        }
         model::offset start_offset() const final {
             throw std::runtime_error("unimplemented");
         }
@@ -665,7 +667,7 @@ private:
     fake_offset_tracker* _offset_tracker;
     int _errors_to_inject = 0;
     ss::chunked_fifo<produced_batch> _produced_batches;
-    model::ntp_flat_map_type<ss::shard_id> _shard_locations;
+    model::ntp_map_type<ss::shard_id> _shard_locations;
 };
 
 constexpr uint16_t test_server_port = 8080;
@@ -719,7 +721,8 @@ public:
           .get();
 
         net::server_configuration scfg("transform_test_rpc_server");
-        scfg.addrs.emplace_back(ss::socket_address(test_server_port));
+        scfg.addrs.emplace_back(
+          ss::socket_address(ss::ipv4_addr("127.0.0.1", test_server_port)));
         scfg.max_service_memory_per_core = 1_GiB;
         scfg.disable_metrics = net::metrics_disabled::yes;
         scfg.disable_public_metrics = net::public_metrics_disabled::yes;
@@ -754,7 +757,7 @@ public:
           .get();
         _conn_cache.start(std::ref(_as), std::nullopt).get();
         ::rpc::transport_configuration tcfg(
-          net::unresolved_address("localhost", test_server_port));
+          net::unresolved_address("127.0.0.1", test_server_port));
         tcfg.disable_metrics = net::metrics_disabled::yes;
         _conn_cache.local()
           .emplace(
@@ -1006,7 +1009,7 @@ TEST_P(TransformRpcTest, WasmBinaryCrud) {
 TEST_P(TransformRpcTest, TestTransformOffsetRPCs) {
     constexpr size_t num_partitions = 3;
     create_topic(model::transform_offsets_nt, num_partitions);
-    for (int i = 0; i < num_partitions; ++i) {
+    for (size_t i = 0; i < num_partitions; ++i) {
         model::ntp ntp(
           model::kafka_internal_namespace,
           model::transform_offsets_topic,
@@ -1016,18 +1019,20 @@ TEST_P(TransformRpcTest, TestTransformOffsetRPCs) {
     constexpr size_t num_transforms = 10;
     constexpr size_t num_src_partitions = 25;
 
-    for (int i = 0; i < num_transforms; i++) {
+    for (size_t i = 0; i < num_transforms; i++) {
         auto request_key = model::transform_offsets_key{};
-        request_key.id = model::transform_id{i};
+        request_key.id = model::transform_id{
+          static_cast<model::transform_id::type>(i)};
         request_key.output_topic = model::output_topic_index{0};
         set_errors_to_inject(random_generators::get_int(0, 2));
-        for (int32_t j = 0; j < num_src_partitions; j++) {
-            request_key.partition = model::partition_id{j};
+        for (size_t j = 0; j < num_src_partitions; j++) {
+            request_key.partition = model::partition_id{
+              static_cast<model::partition_id::type>(j)};
             auto read_result = client()->offset_fetch(request_key).get();
             ASSERT_TRUE(!read_result.has_error());
             ASSERT_EQ(read_result.value(), std::nullopt);
             auto request_val = model::transform_offsets_value{
-              .offset = kafka::offset{j}};
+              .offset = kafka::offset{static_cast<kafka::offset::type>(j)}};
             auto coordinator = client()->find_coordinator(request_key).get();
             ASSERT_TRUE(coordinator.has_value());
             auto result = client()
@@ -1043,8 +1048,8 @@ TEST_P(TransformRpcTest, TestTransformOffsetRPCs) {
     }
     auto offsets = client()->list_committed_offsets().get().value();
     EXPECT_EQ(offsets.size(), num_transforms * num_src_partitions);
-    for (int i = 0; i < num_transforms; ++i) {
-        for (int32_t j = 0; j < num_src_partitions; ++j) {
+    for (size_t i = 0; i < num_transforms; ++i) {
+        for (size_t j = 0; j < num_src_partitions; ++j) {
             model::transform_offsets_key key;
             key.id = model::transform_id(i);
             key.partition = model::partition_id(j);
@@ -1059,8 +1064,8 @@ TEST_P(TransformRpcTest, TestTransformOffsetRPCs) {
     EXPECT_EQ(ec, cluster::errc::success);
     offsets = client()->list_committed_offsets().get().value();
     EXPECT_EQ(offsets.size(), (num_transforms - 1) * num_src_partitions);
-    for (int i = 0; i < num_transforms; ++i) {
-        for (int32_t j = 0; j < num_src_partitions; ++j) {
+    for (size_t i = 0; i < num_transforms; ++i) {
+        for (size_t j = 0; j < num_src_partitions; ++j) {
             model::transform_offsets_key key;
             key.id = model::transform_id(i);
             key.partition = model::partition_id(j);

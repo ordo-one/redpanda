@@ -12,9 +12,11 @@
 #pragma once
 
 #include "cluster/bootstrap_backend.h"
+#include "cluster/client_quota_backend.h"
 #include "cluster/cluster_recovery_manager.h"
 #include "cluster/config_manager.h"
 #include "cluster/controller_log_limiter.h"
+#include "cluster/data_migration_table.h"
 #include "cluster/feature_backend.h"
 #include "cluster/plugin_backend.h"
 #include "cluster/security_manager.h"
@@ -37,17 +39,19 @@ class controller_stm final
       feature_backend,
       bootstrap_backend,
       plugin_backend,
-      cluster_recovery_manager> {
+      cluster_recovery_manager,
+      client_quota::backend,
+      data_migrations::migrations_table> {
 public:
     template<typename... Args>
     controller_stm(
       limiter_configuration limiter_conf,
-      const ss::sharded<features::feature_table>& feature_table,
+      ss::sharded<features::feature_table>& feature_table,
       config::binding<std::chrono::seconds>&& snapshot_max_age,
       Args&&... stm_args)
       : mux_state_machine(std::forward<Args>(stm_args)...)
       , _limiter(std::move(limiter_conf))
-      , _feature_table(feature_table.local())
+      , _feature_table(feature_table)
       , _snapshot_max_age(std::move(snapshot_max_age))
       , _snapshot_debounce_timer([this] { snapshot_timer_callback(); }) {}
 
@@ -67,6 +71,7 @@ public:
         return _limiter.throttle<Cmd>();
     }
 
+    void shutdown_apply_loop();
     ss::future<> shutdown();
 
     virtual ss::future<> stop() final;
@@ -87,7 +92,7 @@ private:
 
 private:
     controller_log_limiter _limiter;
-    const features::feature_table& _feature_table;
+    ss::sharded<features::feature_table>& _feature_table;
     config::binding<std::chrono::seconds> _snapshot_max_age;
 
     metrics_reporter_cluster_info _metrics_reporter_cluster_info;
@@ -95,6 +100,6 @@ private:
     ss::timer<ss::lowres_clock> _snapshot_debounce_timer;
 };
 
-static constexpr ss::shard_id controller_stm_shard = 0;
+inline constexpr ss::shard_id controller_stm_shard = 0;
 
 } // namespace cluster

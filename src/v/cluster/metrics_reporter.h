@@ -14,11 +14,13 @@
 #include "cluster/fwd.h"
 #include "cluster/plugin_table.h"
 #include "cluster/types.h"
+#include "features/enterprise_features.h"
 #include "features/fwd.h"
 #include "http/client.h"
 #include "model/metadata.h"
 #include "security/fwd.h"
 #include "utils/prefix_logger.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
@@ -34,7 +36,7 @@ namespace details {
 struct address {
     ss::sstring protocol;
     ss::sstring host;
-    uint16_t port;
+    uint16_t port{0};
     ss::sstring path;
 };
 
@@ -45,40 +47,50 @@ address parse_url(const ss::sstring&);
 class metrics_reporter {
 public:
     struct node_disk_space {
-        uint64_t free;
-        uint64_t total;
+        uint64_t free{0};
+        uint64_t total{0};
     };
 
     struct node_metrics {
         model::node_id id;
-        uint32_t cpu_count;
-        bool is_alive;
+        uint32_t cpu_count{0};
+        bool is_alive{false};
         ss::sstring version;
         cluster_version logical_version{invalid_version};
         std::vector<node_disk_space> disks;
-        uint64_t uptime_ms;
+        uint64_t uptime_ms{0};
+        std::vector<net::unresolved_address> advertised_listeners;
     };
 
     struct metrics_snapshot {
         static constexpr int16_t version = 1;
 
         ss::sstring cluster_uuid;
-        uint64_t cluster_creation_epoch;
-        uint32_t topic_count;
-        uint32_t partition_count;
+        uint64_t cluster_creation_epoch{0};
+        uint32_t topic_count{0};
+        uint32_t partition_count{0};
 
         cluster_version active_logical_version{invalid_version};
         cluster_version original_logical_version{invalid_version};
 
         std::vector<node_metrics> nodes;
-        bool has_kafka_gssapi;
-        bool has_oidc;
-        uint32_t rbac_role_count;
-        uint32_t data_transforms_count;
+        bool has_kafka_gssapi{false};
+        bool has_oidc{false};
+        uint32_t rbac_role_count{0};
+        uint32_t data_transforms_count{0};
 
         static constexpr int64_t max_size_for_rp_env = 80;
         ss::sstring redpanda_environment;
         ss::sstring id_hash;
+
+        bool has_enterprise_features{false};
+        bool has_valid_license{false};
+
+        std::optional<features::enterprise_feature_report> enterprise_features;
+
+        ss::sstring host_name;
+        ss::sstring domain_name;
+        std::vector<ss::sstring> fqdns;
     };
     static constexpr ss::shard_id shard = 0;
 
@@ -92,6 +104,7 @@ public:
       ss::sharded<features::feature_table>&,
       ss::sharded<security::role_store>& role_store,
       ss::sharded<plugin_table>*,
+      ss::sharded<feature_manager>*,
       ss::sharded<ss::abort_source>&);
 
     ss::future<> start();
@@ -103,6 +116,7 @@ private:
     ss::future<result<metrics_snapshot>> build_metrics_snapshot();
 
     ss::future<http::client> make_http_client();
+    ss::future<> do_send_metrics(http::client&, iobuf body);
     ss::future<> try_initialize_cluster_info();
     ss::future<> propagate_cluster_id();
 
@@ -116,6 +130,7 @@ private:
     ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<security::role_store>& _role_store;
     ss::sharded<plugin_table>* _plugin_table;
+    ss::sharded<feature_manager>* _feature_manager;
     ss::sharded<ss::abort_source>& _as;
     prefix_logger _logger;
     ss::timer<> _tick_timer;

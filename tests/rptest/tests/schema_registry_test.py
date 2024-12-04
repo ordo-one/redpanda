@@ -10,15 +10,16 @@
 from enum import Enum
 import http.client
 import json
-from typing import Optional
+from typing import Literal, NamedTuple, Optional
 import uuid
 import re
+import urllib.parse
 import requests
 import time
 import random
 import socket
 
-from confluent_kafka.schema_registry import topic_subject_name_strategy, record_subject_name_strategy, topic_record_subject_name_strategy
+from confluent_kafka.schema_registry import SchemaRegistryClient, topic_subject_name_strategy, record_subject_name_strategy, topic_record_subject_name_strategy, Schema, SchemaRegistryError, SchemaReference
 from confluent_kafka.serialization import (MessageField, SerializationContext)
 from ducktape.mark import parametrize, matrix
 from ducktape.services.background_thread import BackgroundThreadService
@@ -37,7 +38,8 @@ from rptest.services.serde_client import SerdeClient
 from rptest.tests.cluster_config_test import wait_for_version_status_sync
 from rptest.tests.pandaproxy_test import User, PandaProxyTLSProvider
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.util import inject_remote_script, search_logs_with_timeout
+from rptest.util import expect_exception, inject_remote_script, search_logs_with_timeout
+from rptest.utils.mode_checks import skip_fips_mode
 
 
 class SchemaIdValidationMode(str, Enum):
@@ -75,6 +77,8 @@ HTTP_POST_HEADERS = {
     "Content-Type": "application/vnd.schemaregistry.v1+json"
 }
 
+HTTP_DELETE_HEADERS = {"Accept": "application/vnd.schemaregistry.v1+json"}
+
 schema1_def = '{"type":"record","name":"myrecord","fields":[{"name":"f1","type":"string"}]}'
 # Schema 2 is only backwards compatible
 schema2_def = '{"type":"record","name":"myrecord","fields":[{"name":"f1","type":["null","string"]},{"name":"f2","type":"string","default":"foo"}]}'
@@ -98,12 +102,277 @@ message Test2 {
   Simple id =  1;
 }"""
 
+well_known_proto_def = """
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+message Test3 {
+  google.protobuf.Timestamp timestamp = 1;
+}"""
+
+json_number_schema_def = '{"type":"number"}'
+
+validation_schemas = dict(
+    proto3="""
+syntax = "proto3";
+
+message myrecord {
+  message Msg1 {
+    int32 f1 = 1;
+  }
+  Msg1 m1 = 1;
+  Msg1 m2 = 2;
+}
+""",
+    proto3_incompat="""
+syntax = "proto3";
+
+message myrecord {
+  // MESSAGE_REMOVED
+  message Msg1d {
+    int32 f1 = 1;
+  }
+  // FIELD_NAMED_TYPE_CHANGED
+  Msg1d m1 = 1;
+}
+""",
+    proto2="""
+syntax = "proto2";
+
+message myrecord {
+  message Msg1 {
+    required int32 f1 = 1;
+  }
+  required Msg1 m1 = 1;
+  required Msg1 m2 = 2;
+}
+""",
+    proto2_incompat="""
+syntax = "proto2";
+
+message myrecord {
+  // MESSAGE_REMOVED
+  message Msg1d {
+    required int32 f1 = 1;
+  }
+  // FIELD_NAMED_TYPE_CHANGED
+  required Msg1d m1 = 1;
+}
+""",
+    avro="""
+{
+    "type": "record",
+    "name": "myrecord",
+    "fields": [
+        {
+            "name": "f1",
+            "type": "string"
+        },
+        {
+            "name": "enumF",
+            "type": {
+                "name": "ABorC",
+                "type": "enum",
+                "symbols": ["a", "b", "c"]
+            }
+        }
+    ]
+}
+""",
+    avro_incompat="""
+{
+    "type": "record",
+    "name": "myrecord",
+    "fields": [
+        {
+            "name": "f1",
+            "type": "int"
+        },
+        {
+            "name": "enumF",
+            "type": {
+                "name": "ABorC",
+                "type": "enum",
+                "symbols": ["a"]
+            }
+        }
+    ]
+}
+""",
+    json=r'{"type": "number"}',
+    json_incompat=r'{"type": "number", "multipleOf": 20}',
+)
+
 log_config = LoggingConfig('info',
                            logger_levels={
                                'security': 'trace',
                                'pandaproxy': 'trace',
                                'kafka/client': 'trace'
                            })
+
+
+class TestCompatDataset(NamedTuple):
+    type: SchemaType
+    schema_base: str
+    schema_backward_compatible: str
+    schema_not_backward_compatible: str
+
+
+def get_compat_dataset(type: SchemaType) -> TestCompatDataset:
+    if type == SchemaType.AVRO:
+        return TestCompatDataset(type=SchemaType.AVRO,
+                                 schema_base=schema1_def,
+                                 schema_backward_compatible=schema2_def,
+                                 schema_not_backward_compatible=schema3_def)
+    if type == SchemaType.JSON:
+        return TestCompatDataset(
+            type=SchemaType.JSON,
+            schema_base="""
+{
+  "type": "object",
+  "properties": {
+    "aaaa": {"type": "integer"},
+    "bbbb": {"type": "boolean"}
+  },
+  "additionalProperties": false,
+  "required": ["aaaa", "bbbb"]
+}
+""",
+            schema_backward_compatible="""
+{
+  "type": "object",
+  "properties": {
+    "aaaa": {"type": "number"}
+  },
+  "additionalProperties": {"type": "boolean"},
+  "required": ["aaaa"]
+}
+""",
+            schema_not_backward_compatible="""
+{
+  "type": "object",
+  "properties": {
+    "aaaa": {"type": "string"}
+  },
+  "additionalProperties": {"type": "boolean"},
+  "required": ["aaaa"]
+}
+""",
+        )
+    assert False, f"Unsupported schema {type=}"
+
+
+class TestNormalizeDataset(NamedTuple):
+    type: SchemaType
+    schema_base: str
+    schema_canonical: str
+    schema_normalized: str
+
+
+def get_normalize_dataset(type: SchemaType) -> TestNormalizeDataset:
+    if type == SchemaType.AVRO:
+        return TestNormalizeDataset(type=SchemaType.AVRO,
+                                    schema_base="""{
+  "name": "myrecord",
+  "type": "record",
+  "fields": [
+    {
+      "name": "nested",
+      "type": {
+        "type": "array",
+        "items": {
+          "fields": [
+            {
+              "type": "string",
+              "name": "f1"
+            }
+          ],
+          "name": "nested_item",
+          "type": "record"
+        }
+      }
+    }
+  ]
+}""",
+                                    schema_canonical=re.sub(
+                                        r"[\n\t\s]*", "", """{
+  "type": "record",
+  "name": "myrecord",
+  "fields": [
+    {
+      "name": "nested",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "nested_item",
+          "fields": [
+            {
+              "name": "f1",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}"""),
+                                    schema_normalized=re.sub(
+                                        r"[\n\t\s]*", "", """{
+  "type": "record",
+  "name": "myrecord",
+  "fields": [
+    {
+      "name": "nested",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "nested_item",
+          "fields": [
+            {
+              "name": "f1",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}"""))
+    if type == SchemaType.JSON:
+        return TestNormalizeDataset(
+            type=SchemaType.JSON,
+            schema_base="""{
+  "type": "object",
+  "properties": {
+    "aaaa": {"type": "number"}
+  },
+  "additionalProperties": {"type": "boolean"},
+  "required": ["aaaa"]
+}
+""",
+            schema_canonical=re.sub(
+                r"[\n\t\s]*", "", """{
+  "type": "object",
+  "properties": {
+    "aaaa": {"type": "number"}
+  },
+  "additionalProperties": {"type": "boolean"},
+  "required": ["aaaa"]
+}"""),
+            schema_normalized=re.sub(
+                r"[\n\t\s]*", "", """{
+  "additionalProperties": {"type": "boolean"},
+  "properties": {
+    "aaaa": {"type": "number"}
+  },
+  "required": ["aaaa"],
+  "type": "object"
+}"""),
+        )
+    assert False, f"Unsupported schema {type=}"
 
 
 class SchemaRegistryEndpoints(RedpandaTest):
@@ -113,10 +382,11 @@ class SchemaRegistryEndpoints(RedpandaTest):
     def __init__(self,
                  context,
                  schema_registry_config=SchemaRegistryConfig(),
-                 **kwargs):
+                 num_brokers=3,
+                 **kwargs) -> None:
         super(SchemaRegistryEndpoints, self).__init__(
             context,
-            num_brokers=3,
+            num_brokers=num_brokers,
             extra_rp_conf={"auto_create_topics_enabled": False},
             resource_settings=ResourceSettings(num_cpus=1),
             log_config=log_config,
@@ -301,7 +571,7 @@ class SchemaRegistryEndpoints(RedpandaTest):
 
     def _delete_config_subject(self,
                                subject,
-                               headers=HTTP_POST_HEADERS,
+                               headers=HTTP_DELETE_HEADERS,
                                **kwargs):
         return self._request("DELETE",
                              f"config/{subject}",
@@ -347,7 +617,7 @@ class SchemaRegistryEndpoints(RedpandaTest):
 
     def _delete_mode_subject(self,
                              subject,
-                             headers=HTTP_POST_HEADERS,
+                             headers=HTTP_DELETE_HEADERS,
                              **kwargs):
         return self._request("DELETE",
                              f"mode/{subject}",
@@ -390,9 +660,19 @@ class SchemaRegistryEndpoints(RedpandaTest):
             headers=headers,
             **kwargs)
 
-    def _get_subjects(self, deleted=False, headers=HTTP_GET_HEADERS, **kwargs):
+    def _get_subjects(self,
+                      deleted=False,
+                      subject_prefix=None,
+                      headers=HTTP_GET_HEADERS,
+                      **kwargs):
+        params = {}
+        if deleted:
+            params['deleted'] = 'true'
+        if subject_prefix:
+            params['subjectPrefix'] = subject_prefix
         return self._request("GET",
-                             f"subjects{'?deleted=true' if deleted else ''}",
+                             "subjects",
+                             params=params,
                              headers=headers,
                              **kwargs)
 
@@ -400,24 +680,35 @@ class SchemaRegistryEndpoints(RedpandaTest):
                                subject,
                                data,
                                deleted=False,
+                               normalize=False,
                                headers=HTTP_POST_HEADERS,
                                **kwargs):
-        return self._request(
-            "POST",
-            f"subjects/{subject}{'?deleted=true' if deleted else ''}",
-            headers=headers,
-            data=data,
-            **kwargs)
+        params = {}
+        if (deleted):
+            params['deleted'] = 'true'
+        if (normalize):
+            params['normalize'] = 'true'
+        return self._request("POST",
+                             f"subjects/{subject}",
+                             headers=headers,
+                             data=data,
+                             params=params,
+                             **kwargs)
 
     def _post_subjects_subject_versions(self,
                                         subject,
                                         data,
+                                        normalize=False,
                                         headers=HTTP_POST_HEADERS,
                                         **kwargs):
+        params = {}
+        if (normalize):
+            params['normalize'] = 'true'
         return self._request("POST",
                              f"subjects/{subject}/versions",
                              headers=headers,
                              data=data,
+                             params=params,
                              **kwargs)
 
     def _get_subjects_subject_versions_version(self,
@@ -471,7 +762,7 @@ class SchemaRegistryEndpoints(RedpandaTest):
                                 subject,
                                 version,
                                 permanent=False,
-                                headers=HTTP_GET_HEADERS,
+                                headers=HTTP_DELETE_HEADERS,
                                 **kwargs):
         return self._request(
             "DELETE",
@@ -484,10 +775,16 @@ class SchemaRegistryEndpoints(RedpandaTest):
                                             version,
                                             data,
                                             headers=HTTP_POST_HEADERS,
+                                            verbose: bool | None = None,
                                             **kwargs):
+        params = {}
+        if verbose is not None:
+            params['verbose'] = verbose
+
         return self._request(
             "POST",
             f"compatibility/subjects/{subject}/versions/{version}",
+            params=params,
             headers=headers,
             data=data,
             **kwargs)
@@ -515,7 +812,7 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
         result_raw = self._get_schemas_types()
         assert result_raw.status_code == requests.codes.ok
         result = result_raw.json()
-        assert set(result) == {"PROTOBUF", "AVRO"}
+        assert set(result) == {"JSON", "PROTOBUF", "AVRO"}
 
     @cluster(num_nodes=3)
     def test_get_schema_id_versions(self):
@@ -777,6 +1074,19 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
         result = result_raw.json()
         # assert result["schema"] == json.dumps(schema_def)
 
+        self.logger.debug(
+            "Post schema 1 with escape chars in the subject name")
+        name = f"{topic}%25252fkey"
+        name_quoted = urllib.parse.quote(name)
+        result_raw = self._post_subjects_subject_versions(subject=name_quoted,
+                                                          data=schema_1_data)
+        self.logger.warn(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        result_raw = self._get_subjects_subject_versions(subject=name_quoted)
+        assert result_raw.status_code == requests.codes.ok
+        subjs = self._get_subjects().json()
+        assert name in subjs, f"Expected '{name}' in subjects response, got {json.dumps(subjs, indent=1)}"
+
     @cluster(num_nodes=3)
     def test_post_subjects_subject_versions_version_many(self):
         """
@@ -794,6 +1104,34 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
             self.logger.debug(result_raw)
             assert result_raw.status_code == requests.codes.ok
             assert result_raw.json()["id"] == 1
+
+    @cluster(num_nodes=3)
+    def test_post_subjects_subject_versions_metadata_ruleset(self):
+        """
+        Verify posting a schema with metatada and ruleSet
+        These are not supported, but if they're null, we let it pass.
+        """
+
+        topic = create_topic_names(1)[0]
+
+        self.logger.debug("Dump the schema with null metadata and ruleSet")
+        schema_1_data = json.dumps({
+            "schema": schema1_def,
+            "metadata": None,
+            "ruleSet": None
+        })
+
+        self.logger.debug("Posting schema as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Retrieving schema")
+        result_raw = self._post_subjects_subject(subject=f"{topic}-key",
+                                                 data=schema_1_data)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
 
     @cluster(num_nodes=3)
     def test_post_subjects_subject(self):
@@ -1030,17 +1368,74 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
         )["message"] == f"Subject 'foo-key' not found.", f"{json.dumps(result_raw.json(), indent=1)}"
 
     @cluster(num_nodes=3)
-    def test_post_compatibility_subject_version(self):
+    @parametrize(dataset_type=SchemaType.AVRO)
+    @parametrize(dataset_type=SchemaType.JSON)
+    def test_normalize(self, dataset_type: SchemaType):
+        dataset = get_normalize_dataset(dataset_type)
+        self.logger.debug(f"testing with {dataset=}")
+
+        topics = create_topic_names(2)[0]
+        canonical_topic = topics[0]
+        normalize_topic = topics[1]
+
+        base_schema = json.dumps({
+            "schema": dataset.schema_base,
+            "schemaType": str(dataset.type)
+        })
+
+        self.logger.debug(
+            f"Register a schema against a subject - not normalized")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{canonical_topic}-key",
+            data=base_schema,
+            normalize=False)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        v1_id = result_raw.json()["id"]
+
+        self.logger.debug(f"Checking that the returned schema is canonical")
+        result_raw = self._get_schemas_ids_id(id=v1_id)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()['schema'] == dataset.schema_canonical
+
+        self.logger.debug(f"Register a schema against a subject - normalized")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{normalize_topic}-key", data=base_schema, normalize=True)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        v1_id = result_raw.json()["id"]
+
+        self.logger.debug(f"Checking that the returned schema is normalized")
+        result_raw = self._get_schemas_ids_id(id=v1_id)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()['schema'] == dataset.schema_normalized
+
+    @cluster(num_nodes=3)
+    @parametrize(dataset_type=SchemaType.AVRO)
+    @parametrize(dataset_type=SchemaType.JSON)
+    def test_post_compatibility_subject_version(self,
+                                                dataset_type: SchemaType):
         """
         Verify compatibility
         """
+        dataset = get_compat_dataset(dataset_type)
+        self.logger.debug(f"testing with {dataset=}")
 
         topic = create_topic_names(1)[0]
 
         self.logger.debug(f"Register a schema against a subject")
-        schema_1_data = json.dumps({"schema": schema1_def})
-        schema_2_data = json.dumps({"schema": schema2_def})
-        schema_3_data = json.dumps({"schema": schema3_def})
+        schema_1_data = json.dumps({
+            "schema": dataset.schema_base,
+            "schemaType": str(dataset.type)
+        })
+        schema_2_data = json.dumps({
+            "schema": dataset.schema_backward_compatible,
+            "schemaType": str(dataset.type)
+        })
+        schema_3_data = json.dumps({
+            "schema": dataset.schema_not_backward_compatible,
+            "schemaType": str(dataset.type)
+        })
 
         self.logger.debug("Posting schema 1 as a subject key")
         result_raw = self._post_subjects_subject_versions(
@@ -1060,6 +1455,7 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
             subject=f"{topic}-key", version=1, data=schema_2_data)
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json()["is_compatible"] == True
+        assert result_raw.json().get("messages", None) == None
 
         self.logger.debug("Set subject config - BACKWARD")
         result_raw = self._set_config_subject(
@@ -1072,14 +1468,31 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
             subject=f"{topic}-key", version=1, data=schema_2_data)
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json()["is_compatible"] == True
+        assert result_raw.json().get("messages", None) == None
 
-        self.logger.debug("Check compatibility backward, no default")
+        self.logger.debug("Check compatibility backward, no default, verbose")
         result_raw = self._post_compatibility_subject_version(
-            subject=f"{topic}-key", version=1, data=schema_3_data)
+            subject=f"{topic}-key",
+            version=1,
+            data=schema_3_data,
+            verbose=True)
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json()["is_compatible"] == False
 
+        self.logger.debug(
+            "Check compatibility backward, no default, not verbose")
+        result_raw = self._post_compatibility_subject_version(
+            subject=f"{topic}-key",
+            version=1,
+            data=schema_3_data,
+            verbose=False)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()["is_compatible"] == False
+        assert result_raw.json().get("messages", None) == None, \
+                f"Expected no messages, got {result_raw.json()['messages']}"
+
         self.logger.debug("Posting incompatible schema 3 as a subject key")
+
         result_raw = self._post_subjects_subject_versions(
             subject=f"{topic}-key", data=schema_3_data)
         assert result_raw.status_code == requests.codes.conflict
@@ -1103,11 +1516,134 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
                                                   version=1)
         assert result_raw.status_code == requests.codes.ok
 
-        self.logger.debug("Posting schema 1 again, expect same version")
+        self.logger.debug("Posting schema 1 again, expect incompatible")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data)
+        assert result_raw.status_code == requests.codes.conflict
+
+        self.logger.debug("Set subject config - NONE")
+        result_raw = self._set_config_subject(subject=f"{topic}-key",
+                                              data=json.dumps(
+                                                  {"compatibility": "NONE"}))
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Posting schema 1 again, expect same id")
         result_raw = self._post_subjects_subject_versions(
             subject=f"{topic}-key", data=schema_1_data)
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json()["id"] == v1_id
+
+    @cluster(num_nodes=3)
+    def test_post_compatibility_subject_version_transitive_order(self):
+        """
+        Verify the compatibility message shows the latest failing schema
+        """
+
+        topic = create_topic_names(1)[0]
+
+        schema_1_data = json.dumps({"schema": schema1_def})
+        schema_2_data = json.dumps({"schema": schema2_def})
+        schema_3_data = json.dumps({"schema": schema3_def})
+
+        self.logger.debug("Posting schema 1 as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data)
+        self.logger.debug(f"{result_raw=}")
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Set subject config - BACKWARD_TRANSITIVE")
+        result_raw = self._set_config_subject(
+            subject=f"{topic}-key",
+            data=json.dumps({"compatibility": "BACKWARD_TRANSITIVE"}))
+        self.logger.debug(f"{result_raw=}")
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Posting schema 2 (compatible with schema 1)")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_2_data)
+        self.logger.debug(result_raw, result_raw.json())
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug(
+            "Check compatibility schema 3 (incompatible with both schema 1 and 2) with verbose=True"
+        )
+        result_raw = self._post_compatibility_subject_version(
+            subject=f"{topic}-key",
+            version=1,
+            data=schema_3_data,
+            verbose=True)
+        self.logger.debug(result_raw, result_raw.json())
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()["is_compatible"] == False
+
+        messages = result_raw.json().get("messages", [])
+        assert not any(schema1_def in m for m in messages), \
+            f"Expected schema 3 to be compared against schema 2 only (not schema 1)"
+        assert any(schema2_def in m for m in messages), \
+            f"Expected schema 3 to be compared against schema 2 only (not schema 1)"
+
+    @cluster(num_nodes=3)
+    @parametrize(schemas=("avro", "avro_incompat", "AVRO"))
+    @parametrize(schemas=("proto3", "proto3_incompat", "PROTOBUF"))
+    @parametrize(schemas=("proto2", "proto2_incompat", "PROTOBUF"))
+    @parametrize(schemas=("json", "json_incompat", "JSON"))
+    def test_compatibility_messages(self, schemas):
+        """
+        Verify compatibility messages
+        """
+
+        topic = create_topic_names(1)[0]
+
+        self.logger.debug(f"Register a schema against a subject")
+        schema_data = json.dumps({
+            "schema": validation_schemas[schemas[0]],
+            "schemaType": schemas[2],
+        })
+        incompatible_data = json.dumps({
+            "schema": validation_schemas[schemas[1]],
+            "schemaType": schemas[2],
+        })
+
+        super_username, super_password, _ = self.redpanda.SUPERUSER_CREDENTIALS
+
+        self.logger.debug("Posting schema as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_data)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        v1_id = result_raw.json()["id"]
+
+        self.logger.debug("Set subject config - BACKWARD")
+        result_raw = self._set_config_subject(
+            subject=f"{topic}-key",
+            data=json.dumps({"compatibility": "BACKWARD"}))
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Check compatibility full")
+        result_raw = self._post_compatibility_subject_version(
+            subject=f"{topic}-key",
+            version=1,
+            data=incompatible_data,
+            verbose=True)
+
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()["is_compatible"] == False
+        msgs = result_raw.json()["messages"]
+        for message in ["oldSchemaVersion", "oldSchema", "compatibility"]:
+            assert any(
+                message in m for m in msgs
+            ), f"Expected to find an instance of '{message}', got {msgs}"
+
+        self.logger.debug(
+            "Check post incompatible schema error message (expect verbose messages)"
+        )
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=incompatible_data)
+
+        assert result_raw.status_code == 409
+        msg = result_raw.json()["message"]
+        for message in ["oldSchemaVersion", "oldSchema", "compatibility"]:
+            assert message in msg, f"Expected to find an instance of '{message}', got {msgs}"
 
     @cluster(num_nodes=3)
     def test_delete_subject(self):
@@ -1481,6 +2017,40 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
         assert result_raw.status_code == requests.codes.not_found
         assert result_raw.json()["error_code"] == 40402
 
+    @cluster(num_nodes=3)
+    def test_json(self):
+        """
+        Verify basic json functionality
+        """
+
+        self.logger.info("Posting number as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject="simple",
+            data=json.dumps({
+                "schema": json_number_schema_def,
+                "schemaType": "JSON"
+            }))
+        self.logger.info(result_raw)
+        self.logger.info(result_raw.content)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json()["id"] == 1
+
+        result_raw = self._request("GET",
+                                   f"subjects/simple/versions/1/schema",
+                                   headers=HTTP_GET_HEADERS)
+        self.logger.info(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.text.strip() == json_number_schema_def.strip()
+
+        result_raw = self._request("GET",
+                                   f"schemas/ids/1",
+                                   headers=HTTP_GET_HEADERS)
+        self.logger.info(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        result = result_raw.json()
+        assert result["schemaType"] == "JSON"
+        assert result["schema"].strip() == json_number_schema_def.strip()
+
     @cluster(num_nodes=4)
     @parametrize(protocol=SchemaType.AVRO, client_type=SerdeClientType.Python)
     @parametrize(protocol=SchemaType.AVRO, client_type=SerdeClientType.Java)
@@ -1531,7 +2101,7 @@ class SchemaRegistryTestMethods(SchemaRegistryEndpoints):
             assert schema.json()["schemaType"] == protocol.name
 
     @cluster(num_nodes=4)
-    @matrix(protocol=[SchemaType.AVRO, SchemaType.PROTOBUF],
+    @matrix(protocol=[SchemaType.AVRO, SchemaType.PROTOBUF, SchemaType.JSON],
             client_type=[SerdeClientType.Python],
             validate_schema_id=[True],
             subject_name_strategy=list(TopicSpec.SubjectNameStrategyCompat),
@@ -2167,7 +2737,7 @@ class SchemaRegistryBasicAuthTest(SchemaRegistryEndpoints):
         result_raw = self._get_schemas_types(auth=self.super_auth)
         assert result_raw.status_code == requests.codes.ok
         result = result_raw.json()
-        assert set(result) == {"PROTOBUF", "AVRO"}
+        assert set(result) == {"JSON", "PROTOBUF", "AVRO"}
 
     @cluster(num_nodes=3)
     def test_get_schema_id_versions(self):
@@ -2198,6 +2768,45 @@ class SchemaRegistryBasicAuthTest(SchemaRegistryEndpoints):
                                                        auth=self.super_auth)
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json() == [{"subject": subject, "version": 1}]
+
+    @cluster(num_nodes=3)
+    def test_get_subjects(self):
+        """
+        Verify getting subjects
+        """
+        self._init_users()
+
+        topics = ['a', 'aa', 'b', 'ab', 'bb']
+
+        schema_1_data = json.dumps({"schema": schema1_def})
+
+        self.logger.debug("Posting schemas 1 as subject keys")
+
+        def post(topic):
+            result_raw = self._post_subjects_subject_versions(
+                subject=f"{topic}-key",
+                data=schema_1_data,
+                auth=self.super_auth)
+            self.logger.debug(result_raw)
+            assert result_raw.status_code == requests.codes.ok
+
+        for t in topics:
+            post(t)
+
+        def get_subjects(prefix: Optional[str]):
+            result_raw = self._get_subjects(subject_prefix=prefix,
+                                            auth=self.super_auth)
+            assert result_raw.status_code == requests.codes.ok
+
+            return result_raw.json()
+
+        assert len(get_subjects(prefix=None)) == 5
+        assert len(get_subjects(prefix="")) == 5
+        assert len(get_subjects(prefix="a")) == 3
+        assert len(get_subjects(prefix="aa")) == 1
+        assert len(get_subjects(prefix="aaa")) == 0
+        assert len(get_subjects(prefix="b")) == 2
+        assert len(get_subjects(prefix="bb")) == 1
 
     @cluster(num_nodes=3)
     def test_post_subjects_subject_versions(self):
@@ -2245,6 +2854,14 @@ class SchemaRegistryBasicAuthTest(SchemaRegistryEndpoints):
 
         result_raw = self._get_subjects_subject_versions_version(
             subject=f"{topic}-key", version="latest", auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok
+        result = result_raw.json()
+        assert result["subject"] == f"{topic}-key"
+        assert result["version"] == 1
+
+        self.logger.debug("Get latest (-1) schema version for subject key")
+        result_raw = self._get_subjects_subject_versions_version(
+            subject=f"{topic}-key", version="-1", auth=self.super_auth)
         assert result_raw.status_code == requests.codes.ok
         result = result_raw.json()
         assert result["subject"] == f"{topic}-key"
@@ -2647,6 +3264,167 @@ class SchemaRegistryBasicAuthTest(SchemaRegistryEndpoints):
         assert result_raw.status_code == requests.codes.ok
         assert result_raw.json() == [2]
 
+    @cluster(num_nodes=3)
+    def test_delete_subject_bug(self):
+        topic = 'foo'
+        self.logger.debug(f"Register a schema against a subject")
+        schema_1_data = json.dumps({"schema": schema1_def})
+
+        self.logger.debug("Posting schema 1 as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug(f"Register a schema against a subject")
+        schema_2_data = json.dumps({"schema": schema2_def})
+
+        self.logger.debug("Posting schema 2 as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_2_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Soft delete subject 1 version 1")
+        result_raw = self._delete_subject_version(subject=f"{topic}-key",
+                                                  version=1,
+                                                  auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == 1, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Soft delete subject 1 version 2")
+        result_raw = self._delete_subject_version(subject=f"{topic}-key",
+                                                  version=2,
+                                                  auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == 2, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Posting schema 1 - again - as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json() == {'id': 1}, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Get subject versions")
+        result_raw = self._get_subjects_subject_versions(
+            subject=f"{topic}-key", auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == [3], f"Json: {result_raw.json()}"
+
+        self.logger.debug("Posting schema 2 - again - as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_2_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.json() == {'id': 2}, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Get subject versions")
+        result_raw = self._get_subjects_subject_versions(
+            subject=f"{topic}-key", auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == [3, 4], f"Json: {result_raw.json()}"
+
+    @cluster(num_nodes=3)
+    def test_delete_subject_last_clears_config(self):
+        topic = 'foo'
+
+        self.logger.debug("Set subject config - NONE")
+        result_raw = self._set_config_subject(subject=f"{topic}-key",
+                                              data=json.dumps(
+                                                  {"compatibility": "NONE"}),
+                                              auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug(f"Register a schema against a subject")
+        schema_1_data = json.dumps({"schema": schema1_def})
+        schema_3_data = json.dumps({"schema": schema3_def})
+
+        self.logger.debug("Posting schema 1 as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug("Get subject config - should be overriden")
+        result_raw = self._get_config_subject(subject=f"{topic}-key",
+                                              auth=self.super_auth)
+        assert result_raw.json()["compatibilityLevel"] == "NONE"
+
+        self.logger.debug("Soft delete subject 1 version 1")
+        result_raw = self._delete_subject_version(subject=f"{topic}-key",
+                                                  version=1,
+                                                  auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == 1, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Get subject config - should fail")
+        result_raw = self._get_config_subject(subject=f"{topic}-key",
+                                              auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.not_found
+        assert result_raw.json()["error_code"] == 40408
+
+        self.logger.debug("Posting schema 1 as a subject key")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_1_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok
+
+        self.logger.debug(
+            "Posting incompatible schema 3 as a subject key - expect conflict")
+        result_raw = self._post_subjects_subject_versions(
+            subject=f"{topic}-key", data=schema_3_data, auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.conflict
+
+        self.logger.debug("Get subject config - should fail")
+        result_raw = self._get_config_subject(subject=f"{topic}-key",
+                                              auth=self.super_auth)
+        assert result_raw.status_code == requests.codes.not_found
+        assert result_raw.json()["error_code"] == 40408
+
+    @cluster(num_nodes=3)
+    def test_hard_delete_subject_deletes_schema(self):
+        subject = "example_topic-key"
+        schema_1_data = json.dumps({"schema": schema1_def})
+
+        self.logger.debug("Posting schema 1 as a subject key")
+        result_raw = self._post_subjects_subject_versions(subject=subject,
+                                                          data=schema_1_data,
+                                                          auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+        assert result_raw.json() == {'id': 1}, f"Json: {result_raw.json()}"
+
+        self.logger.debug("Soft delete subject")
+        result_raw = self._delete_subject(subject=subject,
+                                          permanent=False,
+                                          auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+
+        self.logger.debug("Then hard delete subject")
+        result_raw = self._delete_subject(subject=subject,
+                                          permanent=True,
+                                          auth=self.super_auth)
+        self.logger.debug(result_raw)
+        assert result_raw.status_code == requests.codes.ok, f'Code: {result_raw.status_code}'
+
+        def schema_no_longer_present():
+            self.logger.debug("Sending get schema 1")
+            result_raw = self._get_schemas_ids_id(id=1, auth=self.super_auth)
+            self.logger.debug(result_raw)
+            assert result_raw.status_code == requests.codes.not_found, f'Code: {result_raw.status_code}'
+            assert result_raw.json()["error_code"] == 40403, \
+                f"Json: {result_raw.json()}"
+            return True
+
+        self.logger.debug("Wait until get schema 1 now eventually fails")
+        wait_until(schema_no_longer_present,
+                   timeout_sec=30,
+                   retry_on_exc=True,
+                   err_msg="Failed to delete schema 1 in time")
+
 
 class SchemaRegistryTest(SchemaRegistryTestMethods):
     """
@@ -2778,7 +3556,7 @@ class SchemaRegistryMTLSTest(SchemaRegistryMTLSBase):
                   self.admin_user.certificate.key))
         assert result_raw.status_code == requests.codes.ok
         result = result_raw.json()
-        assert set(result) == {"PROTOBUF", "AVRO"}
+        assert set(result) == {"JSON", "PROTOBUF", "AVRO"}
 
 
 class SchemaRegistryMTLSAndBasicAuthTest(SchemaRegistryMTLSBase):
@@ -2799,7 +3577,7 @@ class SchemaRegistryMTLSAndBasicAuthTest(SchemaRegistryMTLSBase):
                   self.admin_user.certificate.key))
         assert result_raw.status_code == requests.codes.ok
         result = result_raw.json()
-        assert set(result) == {"PROTOBUF", "AVRO"}
+        assert set(result) == {"JSON", "PROTOBUF", "AVRO"}
 
 
 class SchemaValidationEnableWithoutSchemaRegistry(RedpandaTest):
@@ -3062,11 +3840,8 @@ class SchemaRegistryLicenseTest(RedpandaTest):
                              **kwargs)
         self.redpanda.set_environment({
             '__REDPANDA_LICENSE_CHECK_INTERVAL_SEC':
-            f'{self.LICENSE_CHECK_INTERVAL_SEC}'
+            f'{self.LICENSE_CHECK_INTERVAL_SEC}',
         })
-
-    def _has_license_nag(self):
-        return self.redpanda.search_log_any("Enterprise feature(s).*")
 
     def _license_nag_is_set(self):
         return self.redpanda.search_log_all(
@@ -3074,6 +3849,7 @@ class SchemaRegistryLicenseTest(RedpandaTest):
         )
 
     @cluster(num_nodes=3)
+    @skip_fips_mode  # See NOTE below
     @parametrize(mode=SchemaIdValidationMode.REDPANDA)
     @parametrize(mode=SchemaIdValidationMode.COMPAT)
     def test_license_nag(self, mode):
@@ -3083,12 +3859,434 @@ class SchemaRegistryLicenseTest(RedpandaTest):
 
         self.logger.debug("Ensuring no license nag")
         time.sleep(self.LICENSE_CHECK_INTERVAL_SEC * 2)
-        assert not self._has_license_nag()
+        # NOTE: This assertion will FAIL if running in FIPS mode because
+        # being in FIPS mode will trigger the license nag
+        assert not self.redpanda.has_license_nag()
 
         self.logger.debug("Setting cluster config")
         self.redpanda.set_cluster_config({"enable_schema_id_validation": mode})
 
+        self.redpanda.set_environment(
+            {'__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE': '1'})
+        self.redpanda.rolling_restart_nodes(self.redpanda.nodes,
+                                            use_maintenance_mode=False)
+
+        wait_until(self._license_nag_is_set,
+                   timeout_sec=30,
+                   err_msg="Failed to set license nag internal")
+
         self.logger.debug("Waiting for license nag")
-        wait_until(self._has_license_nag,
+        wait_until(self.redpanda.has_license_nag,
                    timeout_sec=self.LICENSE_CHECK_INTERVAL_SEC * 2,
                    err_msg="License nag failed to appear")
+
+
+class SchemaRegistryConfluentClient(SchemaRegistryEndpoints):
+    """
+    Test schema registry with the confluent python client
+    """
+    def __init__(self, context, **kwargs):
+        super(SchemaRegistryConfluentClient, self).__init__(context, **kwargs)
+
+        self.sr_client = SchemaRegistryClient({'url': self._base_uri()})
+
+    @cluster(num_nodes=3)
+    @matrix(normalize_schemas=[True, False])
+    def test_register_get_lookup_schema(self, normalize_schemas):
+        """
+        Verify that the register, get and lookup schema methods work
+        """
+
+        test_subject = "topic_1-key"
+        schema1 = Schema(schema1_def, "AVRO")
+
+        result = self.sr_client.register_schema(
+            test_subject, schema1, normalize_schemas=normalize_schemas)
+        assert result == 1, f"Result: {result}"
+
+        result = self.sr_client.get_schema(1)
+        assert result == schema1, f"Result: {result}"
+
+        result = self.sr_client.lookup_schema(
+            test_subject, schema1, normalize_schemas=normalize_schemas)
+        assert result.schema_id == 1, f"Result: {result}"
+
+        # TODO: we currently always normalize schemas. Once redpanda supports
+        # the normize flag, this test should pass
+        # with expect_exception(SchemaRegistryError, lambda e: True):
+        #     self.sr_client.lookup_schema(
+        #         test_subject, schema1, normalize_schemas=not normalize_schemas)
+
+    @cluster(num_nodes=3)
+    def test_versions(self):
+        """
+        Verify that the version endpoints work with the confluent client
+        """
+
+        test_subject = "topic_1-key"
+        schema1 = Schema(schema1_def, "AVRO")
+        schema2 = Schema(schema2_def, "AVRO")
+
+        result = self.sr_client.register_schema(test_subject, schema1)
+        assert result == 1, f"Result: {result}"
+
+        result = self.sr_client.get_latest_version(test_subject)
+        assert result.schema_id == 1, f"Result: {result}"
+
+        result = self.sr_client.register_schema(test_subject, schema2)
+        assert result == 2, f"Result: {result}"
+
+        result = self.sr_client.get_latest_version(test_subject)
+        assert result.schema_id == 2, f"Result: {result}"
+
+        result = self.sr_client.get_version(test_subject, 1)
+        assert result.schema == schema1, f"Result: {result}"
+
+        result = self.sr_client.get_version(test_subject, 2)
+        assert result.schema == schema2, f"Result: {result}"
+
+        result = self.sr_client.get_versions(test_subject)
+        assert result == [1, 2], f"Result: {result}"
+
+        result = self.sr_client.delete_version(test_subject, 2)
+        assert result == 2, f"Result: {result}"
+
+        result = self.sr_client.get_latest_version(test_subject)
+        assert result.schema_id == 1, f"Result: {result}"
+
+        result = self.sr_client.get_versions(test_subject)
+        assert result == [1], f"Result: {result}"
+
+        with expect_exception(SchemaRegistryError, lambda e: True):
+            self.sr_client.get_version(test_subject, 2)
+
+    @cluster(num_nodes=3)
+    def test_set_get_compatibility(self):
+        """
+        Verify that setting and getting the compatibility level works with the confluent client
+        """
+
+        levels = [
+            "BACKWARD", "BACKWARD_TRANSITIVE", "FORWARD", "FORWARD_TRANSITIVE",
+            "FULL", "FULL_TRANSITIVE", "NONE"
+        ]
+
+        for level in levels:
+            result = self.sr_client.set_compatibility(level=level)
+            assert result['compatibility'] == level, f"Result: {result}"
+
+            result = self.sr_client.get_compatibility()
+            assert result == level, f"Result: {result}"
+
+            test_subject = "topic_1-key"
+            schema1 = Schema(schema1_def, "AVRO")
+
+            result = self.sr_client.register_schema(test_subject, schema1)
+            assert result == 1, f"Result: {result}"
+
+            result = self.sr_client.set_compatibility(test_subject,
+                                                      level=level)
+            assert result['compatibility'] == level, f"Result: {result}"
+
+            result = self.sr_client.get_compatibility(test_subject)
+            assert result == level, f"Result: {result}"
+
+    @cluster(num_nodes=3)
+    @matrix(permanent=[True, False])
+    def test_delete_subject(self, permanent):
+        """
+        Verify that soft and hard deleting a subject works with the confluent client
+        """
+
+        test_subject = "topic_1-key"
+        schema1 = Schema(schema1_def, "AVRO")
+
+        result = self.sr_client.register_schema(test_subject, schema1)
+        assert result == 1, f"Result: {result}"
+
+        result = self.sr_client.get_schema(1)
+        assert result == schema1, f"Result: {result}"
+
+        result = self.sr_client.delete_subject(test_subject,
+                                               permanent=permanent)
+        assert result == [1], f"Result: {result}"
+
+        result = self.sr_client.get_subjects()
+        assert len(result) == 0, f"Result: {result}"
+
+    @cluster(num_nodes=3)
+    def test_test_compatible(self):
+        """
+        Verify that the test_compatible method of the confluent client works
+        """
+
+        test_subject = "topic_1-key"
+        schema1 = Schema(schema1_def, "AVRO")
+        schema2 = Schema(schema2_def, "AVRO")
+        schema3 = Schema(schema3_def, "AVRO")
+
+        result = self.sr_client.register_schema(test_subject, schema1)
+        assert result == 1, f"Result: {result}"
+
+        result = self.sr_client.test_compatibility(test_subject, schema2)
+        assert result == True, f"Result: {result}"
+
+        result = self.sr_client.test_compatibility(test_subject, schema3)
+        assert result == False, f"Result: {result}"
+
+    @cluster(num_nodes=3)
+    def test_references(self):
+        """
+        Verify that reference handling works with the confluent client
+        """
+
+        simple_subject = "topic_1-key"
+        simple_schema = Schema(simple_proto_def, "PROTOBUF")
+
+        result = self.sr_client.register_schema(simple_subject, simple_schema)
+        assert result == 1, f"Result: {result}"
+
+        imported_subject = "topic_2-key"
+        imported_schema = Schema(
+            imported_proto_def,
+            "PROTOBUF",
+            references=[SchemaReference("simple", simple_subject, 1)])
+
+        result = self.sr_client.register_schema(imported_subject,
+                                                imported_schema)
+        assert result == 2, f"Result: {result}"
+
+        well_known_subject = "topic_3-key"
+        well_known_schema = Schema(well_known_proto_def, "PROTOBUF")
+
+        result = self.sr_client.register_schema(well_known_subject,
+                                                well_known_schema)
+        assert result == 3, f"Result: {result}"
+
+        result = self.sr_client.get_schema(1)
+        assert result == simple_schema, f"Result: {result}"
+
+        result = self.sr_client.get_schema(2)
+        assert result == imported_schema, f"Result: {result}"
+
+        result = self.sr_client.get_schema(3)
+        assert result == well_known_schema, f"Result: {result}"
+
+
+# dataset for SchemaRegistryCompatibilityModes: schemas is a list of 3 schemas compatible for `mode`, `antimode` is a suitable mode that will make the compat check for schemas fail
+CompatDataset = NamedTuple("CompatDataset", [("schemas", list[str]),
+                                             ("antimode", str | None)])
+
+
+class SchemaRegistryCompatibilityModes(SchemaRegistryEndpoints):
+    def __init__(self, test_context, **kwargs):
+        super().__init__(test_context, num_brokers=1, **kwargs)
+        self._sr_client = SchemaRegistryClient({'url': self._base_uri()})
+        self._topic = "test-topic"
+
+    def _register_schema(self,
+                         schema: str,
+                         type: str,
+                         mode: None | str,
+                         expect_invalid_schema=False):
+        """
+        utility to register a `schema` of `type` with compatibility set to `mode`.
+        if `expect_invalid_schema` is True, then a SchemaRegistryError is expected, for schema incompatibility
+        """
+        if mode is not None:
+            self._sr_client.set_compatibility(subject_name=self._topic,
+                                              level=mode)
+        try:
+            self._sr_client.register_schema(subject_name=self._topic,
+                                            schema=Schema(schema_str=schema,
+                                                          schema_type=type))
+            assert not expect_invalid_schema, "expected invalid schema"
+        except SchemaRegistryError as e:
+            assert expect_invalid_schema, f"{schema=} was expected valid, got {e=}"
+            assert e.error_code == 409, f"expected SchemaRegistryError 409/'Schema being registered is incompatible with an earlier schema [...]',  got {e=}"
+
+    @staticmethod
+    def _get_dataset_for_schema_type_mode(schema_type: str,
+                                          mode: str) -> CompatDataset:
+        if schema_type == "JSON":
+            if mode == "NONE":
+                # some non-compatible schemas
+                return CompatDataset(schemas=[
+                    json.dumps({"type": "integer"}),
+                    json.dumps({"type": "boolean"}),
+                    json.dumps({"type": "array"}),
+                ],
+                                     antimode="BACKWARD")
+
+            if mode == "FULL" or "FULL_TRANSITIVE":
+                # full or full transitive requires that schemas are backward and forward compatible, basically can change only the non-functional parts
+                return CompatDataset(schemas=[
+                    json.dumps({
+                        "$id": "id-1",
+                        "type": "integer",
+                    }),
+                    json.dumps({
+                        "$id": "id-2",
+                        "type": "integer",
+                    }),
+                    json.dumps({
+                        "$id": "id-3",
+                        "type": "integer",
+                    }),
+                ],
+                                     antimode=None)
+
+            # a series backward-transitive-compatibles schemas, each one more relaxed than the one before
+            json_schema_set = [
+                json.dumps({
+                    "type": "integer",
+                    "minimum": 10,
+                }),
+                json.dumps({
+                    "type": "integer",
+                    "minimum": 5,
+                }),
+                json.dumps({
+                    "type": "number",
+                    "minimum": 5,
+                })
+            ]
+            if mode == "BACKWARD" or mode == "BACKWARD_TRANSITIVE":
+                return CompatDataset(schemas=json_schema_set,
+                                     antimode="FORWARD")
+            elif mode == "FORWARD" or mode == "FORWARD_TRANSITIVE":
+                # forward can use the reversed json_schema_set
+                return CompatDataset(schemas=list(reversed(json_schema_set)),
+                                     antimode="BACKWARD")
+
+        elif schema_type == "AVRO":
+            if mode == "NONE":
+                return CompatDataset(schemas=[
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "string"
+                        }]
+                    }),
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "int"
+                        }]
+                    }),
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "null"
+                        }]
+                    }),
+                ],
+                                     antimode="BACKWARD")
+
+            if mode == "FULL" or mode == "FULL_TRANSITIVE":
+                return CompatDataset(schemas=[
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "doc": "doc1",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "string"
+                        }]
+                    }),
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "doc": "doc2",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "string"
+                        }]
+                    }),
+                    json.dumps({
+                        "type": "record",
+                        "name": "myrecord",
+                        "doc": "doc3",
+                        "fields": [{
+                            "name": "f1",
+                            "type": "string"
+                        }]
+                    }),
+                ],
+                                     antimode=None)
+
+            # a series backward-transitive-compatibles schemas
+            avro_schema_set = [
+                json.dumps({
+                    "type": "record",
+                    "name": "myrecord",
+                    "fields": [{
+                        "name": "f1",
+                        "type": "string"
+                    }]
+                }),
+                json.dumps({
+                    "type":
+                    "record",
+                    "name":
+                    "myrecord",
+                    "fields": [{
+                        "name": "f1",
+                        "type": ["null", "string"]
+                    }]
+                }),
+                json.dumps({
+                    "type":
+                    "record",
+                    "name":
+                    "myrecord",
+                    "fields": [{
+                        "name": "f1",
+                        "type": ["int", "null", "string"]
+                    }]
+                }),
+            ]
+            if mode == "BACKWARD" or mode == "BACKWARD_TRANSITIVE":
+                return CompatDataset(schemas=avro_schema_set,
+                                     antimode='FORWARD')
+            elif mode == "FORWARD" or mode == "FORWARD_TRANSITIVE":
+                # forward can use the reversed json_schema_set
+                return CompatDataset(schemas=list(reversed(avro_schema_set)),
+                                     antimode='BACKWARD')
+        assert False, f"not implemented for {schema_type=} and {mode=}"
+
+    @cluster(num_nodes=1)
+    @matrix(schema_type=["JSON", "AVRO"],
+            mode=[
+                "BACKWARD", "BACKWARD_TRANSITIVE", "FORWARD",
+                "FORWARD_TRANSITIVE", "NONE", "FULL", "FULL_TRANSITIVE"
+            ])
+    def test_compatible_schemas(self, schema_type: str, mode: str):
+        """
+        register a base schema, and then for each remaining schema, checks that it's rejects with compatibility=`antimode` and accepted with compatibility=`mode`
+        e.g: mode=BACKWARD, antimode=FORWARD, schemas is a list where schemas[N+1] is backward compatible with schemas[N]
+        """
+        schemas, antimode = SchemaRegistryCompatibilityModes._get_dataset_for_schema_type_mode(
+            schema_type, mode)
+
+        self.logger.debug(f"register base {schemas[0]=}")
+        self._register_schema(schema=schemas[0], type=schema_type, mode=None)
+
+        for s in schemas[1:]:
+            if antimode is not None:
+                self.logger.debug(
+                    f"try register schema={s} with {antimode} compatibility and expect an exception"
+                )
+                self._register_schema(schema=s,
+                                      type=schema_type,
+                                      mode=antimode,
+                                      expect_invalid_schema=True)
+
+            self.logger.debug(f"register schema={s} with {mode} compatibility")
+            self._register_schema(schema=s, type=schema_type, mode=mode)

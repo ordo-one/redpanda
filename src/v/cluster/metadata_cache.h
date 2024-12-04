@@ -56,6 +56,7 @@ public:
     using with_leaders = ss::bool_class<struct with_leaders_tag>;
     metadata_cache(
       ss::sharded<topic_table>&,
+      ss::sharded<data_migrations::migrated_resources>&,
       ss::sharded<members_table>&,
       ss::sharded<partition_leaders_table>&,
       ss::sharded<health_monitor_frontend>&);
@@ -122,6 +123,10 @@ public:
     std::optional<model::rack_id> get_node_rack_id(model::node_id) const;
 
     bool should_reject_writes() const;
+
+    /// Check whether migrations block topic writes/reads
+    bool should_reject_reads(model::topic_namespace_view) const;
+    bool should_reject_writes(model::topic_namespace_view) const;
 
     bool contains(model::topic_namespace_view, model::partition_id) const;
     bool contains(model::topic_namespace_view) const;
@@ -197,6 +202,8 @@ public:
     bool get_default_record_value_schema_id_validation() const;
     pandaproxy::schema_registry::subject_name_strategy
     get_default_record_value_subject_name_strategy() const;
+    std::optional<std::chrono::milliseconds>
+    get_default_delete_retention_ms() const;
 
     topic_properties get_default_properties() const;
     std::optional<partition_assignment>
@@ -215,6 +222,7 @@ public:
 
 private:
     ss::sharded<topic_table>& _topics_state;
+    ss::sharded<data_migrations::migrated_resources>& _migrated_resources;
     ss::sharded<members_table>& _members_table;
     ss::sharded<partition_leaders_table>& _leaders;
     ss::sharded<health_monitor_frontend>& _health_monitor;

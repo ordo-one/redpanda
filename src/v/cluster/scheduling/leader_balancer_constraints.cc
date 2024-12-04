@@ -15,19 +15,19 @@
 
 namespace cluster::leader_balancer_types {
 
-even_topic_distributon_constraint::even_topic_distributon_constraint(
-  group_id_to_topic_revision_t group_to_topic_rev,
-  shard_index si,
+even_topic_distribution_constraint::even_topic_distribution_constraint(
+  const group_id_to_topic_id& group_to_topic_id,
+  const shard_index& si,
   const muted_index& mi)
-  : _si(std::move(si))
+  : _si(si)
   , _mi(mi)
-  , _group_to_topic_rev(std::move(group_to_topic_rev)) {
+  , _group_to_topic_id(group_to_topic_id) {
     rebuild_indexes();
     calc_topic_skew();
     calculate_error();
 }
 
-void even_topic_distributon_constraint::update_index(const reassignment& r) {
+void even_topic_distribution_constraint::update_index(const reassignment& r) {
     // _topic_partition_index, _topic_replica_index, and _topic_opt_leaders
     // will not change from moving leadership. They will only change if the
     // replicas themselves are moved. Hence no need to update them here.
@@ -41,42 +41,28 @@ void even_topic_distributon_constraint::update_index(const reassignment& r) {
     skew = adjusted_error(skew, topic_id, r.from, r.to);
     _error += skew;
 
-    // Update _topic_node_index
-    _topic_node_index.at(topic_id).at(r.from.node_id) -= 1;
-    _topic_node_index.at(topic_id).at(r.to.node_id) += 1;
-
-    // Update _si
-
-    _si.update_index(r);
+    // Update _topic_shard_index
+    _topic_shard_index.at(topic_id).at(r.from) -= 1;
+    _topic_shard_index.at(topic_id).at(r.to) += 1;
 }
 
-std::optional<reassignment>
-even_topic_distributon_constraint::recommended_reassignment() {
-    // This method is deprecated and is ony used in `leader_balancer_greedy`
-    // which doesn't use the `even_topic_distributon_constraint`. Hence there is
-    // no need to implement it here. Once the greedy balancer has been removed
-    // this should be removed as well.
-    vassert(false, "not implemented");
-}
-
-void even_topic_distributon_constraint::rebuild_indexes() {
-    _topic_node_index.clear();
+void even_topic_distribution_constraint::rebuild_indexes() {
+    _topic_shard_index.clear();
     _topic_replica_index.clear();
     _topic_partition_index.clear();
 
     for (const auto& broker_shard : si().shards()) {
         for (const auto& group_p : broker_shard.second) {
             auto topic_id = group_to_topic_id().at(group_p.first);
-            const auto& node_id = broker_shard.first.node_id;
 
-            _topic_node_index[topic_id][node_id] += 1;
+            _topic_shard_index[topic_id][broker_shard.first] += 1;
             _topic_partition_index[topic_id] += 1;
 
             // Some of the replicas may not have leadership. So add
-            // all replica nodes here.
+            // all replica shards here.
             for (const auto& replica_bs : group_p.second) {
-                _topic_replica_index[topic_id].insert(replica_bs.node_id);
-                _topic_node_index[topic_id].try_emplace(replica_bs.node_id);
+                _topic_replica_index[topic_id].insert(replica_bs);
+                _topic_shard_index[topic_id].try_emplace(replica_bs);
             }
         }
     }
@@ -86,20 +72,20 @@ void even_topic_distributon_constraint::rebuild_indexes() {
  *  Used to calculate the initial values for the error this constraint
  *  is trying to minimize. The goal here is to calculate a per topic
  *  error(or skew) where the error is zero if the leaders of a topic's
- *  partitions are evenly distributed on every node. And where the error
+ *  partitions are evenly distributed on every shard. And where the error
  *  grows to +infinity the more skewed the leadership assignment is to a
- *  subset of nodes. The equations used can be summarized as;
+ *  subset of shards. The equations used can be summarized as;
  *
- *  skew[topic_i] = SUM(leaders[node_i, topic_i] - opt[topic_i])^2
- *  opt[topic_i]  = total_partitions[topic_i] / total_nodes[topic_i]
- *  where total_nodes is the number of nodes a topic has replicas on.
+ *  skew[topic_i] = SUM(leaders[shard_i, topic_i] - opt[topic_i])^2
+ *  opt[topic_i]  = total_partitions[topic_i] / total_shards[topic_i]
+ *  where total_shards is the number of shards a topic has replicas on.
  *        total_partitions is the number of partitions the topic has.
  */
-void even_topic_distributon_constraint::calc_topic_skew() {
+void even_topic_distribution_constraint::calc_topic_skew() {
     _topic_skew.clear();
     _topic_opt_leaders.clear();
 
-    for (const auto& topic : _topic_node_index) {
+    for (const auto& topic : _topic_shard_index) {
         auto topic_partitions = static_cast<double>(
           _topic_partition_index.at(topic.first));
         auto topic_replicas = static_cast<double>(
@@ -111,8 +97,8 @@ void even_topic_distributon_constraint::calc_topic_skew() {
         auto& skew = _topic_skew[topic.first];
         skew = 0;
 
-        for (const auto& node : topic.second) {
-            auto leaders = static_cast<double>(node.second);
+        for (const auto& shard : topic.second) {
+            auto leaders = static_cast<double>(shard.second);
 
             skew += pow(leaders - opt_leaders, 2);
         }
@@ -122,104 +108,40 @@ void even_topic_distributon_constraint::calc_topic_skew() {
 /*
  * Compute new error for the given reassignment.
  */
-double even_topic_distributon_constraint::adjusted_error(
+double even_topic_distribution_constraint::adjusted_error(
   double current_error,
   const topic_id_t& topic_id,
   const model::broker_shard& from,
   const model::broker_shard& to) const {
-    // Moving leadership between shards on the same node doesn't change
-    // error for this constraint.
-    if (from.node_id == to.node_id) {
-        return current_error;
-    }
-
     auto opt_leaders = _topic_opt_leaders.at(topic_id);
 
-    const auto& topic_leaders = _topic_node_index.at(topic_id);
+    const auto& topic_leaders = _topic_shard_index.at(topic_id);
 
-    double from_node_leaders = 0;
-    const auto from_it = topic_leaders.find(from.node_id);
+    double from_shard_leaders = 0;
+    const auto from_it = topic_leaders.find(from);
     if (from_it != topic_leaders.cend()) {
-        from_node_leaders = static_cast<double>(from_it->second);
+        from_shard_leaders = static_cast<double>(from_it->second);
     } else {
-        // If there are no leaders for the topic on the from node
+        // If there are no leaders for the topic on the from shard
         // then there is nothing to move and no change to the error.
         return current_error;
     }
 
-    double to_node_leaders = 0;
-    const auto to_it = topic_leaders.find(to.node_id);
+    double to_shard_leaders = 0;
+    const auto to_it = topic_leaders.find(to);
     if (to_it != topic_leaders.cend()) {
-        to_node_leaders = static_cast<double>(to_it->second);
+        to_shard_leaders = static_cast<double>(to_it->second);
     }
 
     // Subtract old weights
-    current_error -= pow(from_node_leaders - opt_leaders, 2);
-    current_error -= pow(to_node_leaders - opt_leaders, 2);
+    current_error -= pow(from_shard_leaders - opt_leaders, 2);
+    current_error -= pow(to_shard_leaders - opt_leaders, 2);
 
     // Add new weights
-    current_error += pow((from_node_leaders - 1) - opt_leaders, 2);
-    current_error += pow((to_node_leaders + 1) - opt_leaders, 2);
+    current_error += pow((from_shard_leaders - 1) - opt_leaders, 2);
+    current_error += pow((to_shard_leaders + 1) - opt_leaders, 2);
 
     return current_error;
-}
-
-std::optional<reassignment>
-even_shard_load_constraint::recommended_reassignment() {
-    auto [load, load_map] = build_load_indexes();
-    const auto curr_error = error();
-
-    // Consider each group from high load core, and record the reassignment
-    // involving the lowest load "to" core.
-    for (const auto& from : boost::adaptors::reverse(load)) {
-        if (mi().muted_nodes().contains(from->first.node_id)) {
-            continue;
-        }
-
-        constexpr size_t load_unset = std::numeric_limits<size_t>::max();
-        size_t lowest_load = load_unset;
-        reassignment lowest_reassign{};
-
-        // Consider each group from high load core, and record the
-        // reassignment involving the lowest load "to" core.
-        for (const auto& group : from->second) {
-            if (mi().muted_groups().contains(
-                  static_cast<uint64_t>(group.first))) {
-                continue;
-            }
-
-            // iterate over all the replicas and look for the lowest load
-            // shard in the replica list
-            for (const auto& to_shard : group.second) {
-                auto load = load_map.at(to_shard);
-                if (likely(load >= lowest_load)) {
-                    // there is no point in evaluating this move, it is
-                    // worse than the best one we've found so far.
-                    continue;
-                }
-
-                if (mi().muted_nodes().contains(to_shard.node_id)) {
-                    continue;
-                }
-
-                lowest_load = load;
-                lowest_reassign = {group.first, from->first, to_shard};
-            }
-        }
-
-        if (lowest_load != load_unset) {
-            // We found a possible reassignment while looking at the current
-            // "from" shard, and while it is the best possible reassignment
-            // found it may not improve the error
-            auto new_error = adjusted_error(
-              curr_error, lowest_reassign.from, lowest_reassign.to);
-            if (new_error + error_jitter < curr_error) {
-                return lowest_reassign;
-            }
-        }
-    }
-
-    return std::nullopt;
 }
 
 double even_shard_load_constraint::adjusted_error(
@@ -297,6 +219,38 @@ std::vector<shard_load> even_shard_load_constraint::stats() const {
           return shard_load{e->first, static_cast<size_t>(e->second.size())};
       });
     return ret;
+}
+
+double pinning_constraint::evaluate_internal(const reassignment& r) {
+    int diff = 0;
+
+    const leaders_preference* preference = &_preference_idx.default_preference;
+
+    topic_id_t topic_id = _group2topic.get().at(r.group);
+    auto pref_it = _preference_idx.topic2preference.find(topic_id);
+    if (pref_it != _preference_idx.topic2preference.end()) {
+        preference = &pref_it->second;
+    }
+
+    if (preference->racks.empty()) {
+        return diff;
+    }
+
+    auto from_it = _preference_idx.node2rack.find(r.from.node_id);
+    if (
+      from_it != _preference_idx.node2rack.end()
+      && preference->racks.contains(from_it->second)) {
+        diff -= 1;
+    }
+
+    auto to_it = _preference_idx.node2rack.find(r.to.node_id);
+    if (
+      to_it != _preference_idx.node2rack.end()
+      && preference->racks.contains(to_it->second)) {
+        diff += 1;
+    }
+
+    return diff;
 }
 
 } // namespace cluster::leader_balancer_types

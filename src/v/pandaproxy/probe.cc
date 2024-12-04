@@ -11,7 +11,7 @@
 
 #include "config/configuration.h"
 #include "metrics/metrics.h"
-#include "prometheus/prometheus_sanitize.h"
+#include "metrics/prometheus_sanitize.h"
 #include "ssx/sformat.h"
 
 #include <seastar/core/metrics.hh>
@@ -50,7 +50,7 @@ void probe::setup_metrics() {
             return _request_metrics.hist().internal_histogram_logform();
         })},
       {},
-      {sm::shard_label, operation_label});
+      {sm::shard_label});
 }
 
 void probe::setup_public_metrics() {

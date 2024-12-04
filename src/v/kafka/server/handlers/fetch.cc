@@ -10,12 +10,15 @@
 #include "kafka/server/handlers/fetch.h"
 
 #include "base/likely.h"
+#include "base/vlog.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
 #include "config/configuration.h"
 #include "container/fragmented_vector.h"
-#include "kafka/latency_probe.h"
+#include "features/enterprise_feature_messages.h"
+#include "kafka/data/partition_proxy.h"
+#include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
@@ -25,9 +28,10 @@
 #include "kafka/server/handlers/fetch/fetch_plan_executor.h"
 #include "kafka/server/handlers/fetch/fetch_planner.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
-#include "kafka/server/partition_proxy.h"
-#include "kafka/server/replicated_partition.h"
+#include "kafka/server/latency_probe.h"
+#include "kafka/server/read_distribution_probe.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/record_utils.h"
 #include "model/timeout_clock.h"
@@ -43,7 +47,7 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/when_any.hh>
+#include <seastar/core/timer.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/log.hh>
 
@@ -110,6 +114,7 @@ static ss::future<read_result> read_from_partition(
     std::exception_ptr e;
     std::unique_ptr<iobuf> data;
     std::vector<cluster::tx::tx_range> aborted_transactions;
+    std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     try {
         auto result = co_await rdr.reader.consume(
           kafka_batch_serializer(), deadline ? *deadline : model::no_timeout);
@@ -120,7 +125,19 @@ static ss::future<read_result> read_from_partition(
             part.probe().add_bytes_fetched_from_follower(data->size_bytes());
         }
 
-        if (result.first_tx_batch_offset && result.record_count > 0) {
+        if (data->size_bytes() > 0) {
+            auto curr_timestamp = model::timestamp::now();
+            if (curr_timestamp >= result.first_timestamp) {
+                delta_from_tip_ms = std::chrono::milliseconds{
+                  curr_timestamp() - result.first_timestamp()};
+            }
+        }
+        // Only return aborted transactions range if consumer is using
+        // read_committed isolation level and there are tx batches in the
+        // response
+        if (
+          config.isolation_level == model::isolation_level::read_committed
+          && result.first_tx_batch_offset && result.record_count > 0) {
             // Reader should live at least until this point to hold on to the
             // segment locks so that prefix truncation doesn't happen.
             aborted_transactions = co_await part.aborted_transactions(
@@ -157,6 +174,7 @@ static ss::future<read_result> read_from_partition(
           start_o,
           hw,
           lso.value(),
+          delta_from_tip_ms,
           std::move(aborted_transactions));
     }
 
@@ -165,6 +183,7 @@ static ss::future<read_result> read_from_partition(
       start_o,
       hw,
       lso.value(),
+      delta_from_tip_ms,
       std::move(aborted_transactions));
 }
 
@@ -535,6 +554,7 @@ static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
   cluster::partition_manager& cluster_pm,
   const replica_selector& replica_selector,
   std::vector<ntp_fetch_config> ntp_fetch_configs,
+  read_distribution_probe& read_probe,
   bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
   const size_t bytes_left,
@@ -592,6 +612,10 @@ static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
     size_t total_size = 0;
     for (const auto& r : results) {
         total_size += r.data_size_bytes();
+        if (r.delta_from_tip_ms.has_value()) {
+            read_probe.add_read_event_delta_from_tip(
+              r.delta_from_tip_ms.value());
+        }
     }
     vlog(
       klog.trace,
@@ -647,6 +671,7 @@ handle_shard_fetch(ss::shard_id shard, op_context& octx, shard_fetch fetch) {
               mgr,
               octx.rctx.server().local().get_replica_selector(),
               std::move(configs),
+              octx.rctx.server().local().read_probe(),
               foreign_read,
               octx.deadline,
               octx.bytes_left,
@@ -803,6 +828,7 @@ private:
           _ctx.mgr,
           _ctx.srv.get_replica_selector(),
           std::move(requests),
+          _ctx.srv.read_probe(),
           _ctx.foreign_read,
           _ctx.deadline,
           _ctx.bytes_left,
@@ -987,14 +1013,45 @@ private:
 class nonpolling_fetch_plan_executor final : public fetch_plan_executor::impl {
 public:
     nonpolling_fetch_plan_executor()
-      : _last_result_size(ss::smp::count, 0) {}
+      : _last_result_size(ss::smp::count, 0)
+      , _fetch_timeout{[this] { _has_progress.signal(); }} {}
 
     /**
      * Executes the supplied `plan` until `octx.should_stop_fetch` returns true.
      */
     ss::future<> execute_plan(op_context& octx, fetch_plan plan) final {
-        start_worker_aborts(plan);
+        auto fetch_read_strategy
+          = config::shard_local_cfg().fetch_read_strategy();
+        if (
+          fetch_read_strategy
+          == model::fetch_read_strategy::non_polling_with_debounce) {
+            co_await ss::sleep(std::min(
+              config::shard_local_cfg().fetch_reads_debounce_timeout(),
+              octx.request.data.max_wait_ms));
+        }
+        // Ensure both fetch debounce and the fetch scheduling group are enabled
+        // before trying to apply any delay.
+        if (
+          fetch_read_strategy
+            == model::fetch_read_strategy::non_polling_with_pid
+          && config::shard_local_cfg().use_fetch_scheduler_group()) {
+            auto& pid = octx.rctx.server().local().pid_controller();
+            auto delay = pid.current_delay();
+            if (delay > 0s) {
+                // Avoid unneeded scheduling points in cases where delay is
+                // zero.
+                co_await ss::sleep(
+                  std::min(delay, octx.request.data.max_wait_ms));
+            }
+        }
 
+        if (!initialize_progress_conditions(octx)) {
+            // if the progress conditions were unable to be initialized then
+            // either the fetch has been aborted or the deadline was reached.
+            co_return;
+        }
+
+        start_worker_aborts(plan);
         co_await handle_exceptions(do_execute_plan(octx, std::move(plan)));
 
         // Send abort signal to workers and wait for all workers to end before
@@ -1023,7 +1080,7 @@ private:
         }
 
         for (;;) {
-            co_await progress_conditions(octx);
+            co_await wait_for_progress();
 
             if (octx.should_stop_fetch() || _thrown_exception) {
                 co_return;
@@ -1068,44 +1125,42 @@ private:
     }
 
     /**
-     * Determines if the should_stop_fetch() condition should be checked again.
+     * Sets _has_progress to be signaled if;
+     * - octx.deadline has been reached.
+     * - _as has been aborted.
+     * returns true if this was successful
+     *         false otherwise
+     */
+    bool initialize_progress_conditions(op_context& octx) {
+        // A connection can close and stop the sharded abort source before we
+        // can subscribe to it. So we check here if that is the case and return
+        // if so.
+        if (!octx.rctx.abort_source().local_is_initialized()) {
+            return false;
+        }
+
+        _fetch_abort_sub = octx.rctx.abort_source().subscribe(
+          [this]() noexcept { _has_progress.signal(); });
+
+        if (!_fetch_abort_sub) {
+            return false;
+        }
+
+        if (octx.deadline) {
+            _fetch_timeout.arm(octx.deadline.value());
+        }
+
+        return true;
+    }
+
+    /**
+     * Waits until the should_stop_fetch() condition should be checked again.
      * The return future is set if;
      * - octx.deadline has been reached.
      * - _as has been aborted.
      * - one of the shard workers has returned results.
      */
-    ss::future<> progress_conditions(op_context& octx) {
-        ss::promise<> timeout_pr, abort_pr;
-
-        // A connection can close and stop the sharded abort source before we
-        // can subscribe to it. So we check here if that is the case and return
-        // if so.
-        if (!octx.rctx.abort_source().local_is_initialized()) {
-            co_return;
-        }
-
-        auto abort_sub_opt = octx.rctx.abort_source().subscribe(
-          [&abort_pr]() noexcept { abort_pr.set_value(); });
-
-        if (!abort_sub_opt) {
-            abort_pr.set_value();
-        }
-
-        ss::timer<model::timeout_clock> s{
-          [&timeout_pr] { timeout_pr.set_value(); }};
-
-        if (octx.deadline) {
-            s.arm(octx.deadline.value());
-        }
-
-        // Ignoring any exceptions from these futures is fine since they are
-        // only used to signal the coordinator that it should check if the fetch
-        // request should end or not.
-        co_await ss::when_any(
-          ignore_exceptions(_has_completed_shard_fetches.wait()),
-          ignore_exceptions(timeout_pr.get_future()),
-          ignore_exceptions(abort_pr.get_future()));
-    }
+    ss::future<> wait_for_progress() { return _has_progress.wait(); }
 
     /*
      * `start_shard_fetch_worker` executes on the coordinator shard. It builds
@@ -1172,7 +1227,7 @@ private:
 
         _last_result_size[fetch.shard] = results.total_size;
         _completed_shard_fetches.push_back(std::move(fetch));
-        _has_completed_shard_fetches.signal();
+        _has_progress.signal();
     }
 
     static ss::future<> ignore_exceptions(ss::future<> fut) {
@@ -1203,13 +1258,15 @@ private:
 
     ss::gate _workers_gate;
     std::unordered_map<ss::shard_id, ss::abort_source> _worker_aborts;
-    ss::condition_variable _has_completed_shard_fetches;
+    ss::condition_variable _has_progress;
     std::vector<shard_fetch> _completed_shard_fetches;
     std::vector<size_t> _last_result_size;
     // If any child task throws an exception this holds on to the exception
     // until all child tasks have been stopped and its safe to rethrow the
     // exception.
     std::exception_ptr _thrown_exception;
+    ss::optimized_optional<ss::abort_source::subscription> _fetch_abort_sub;
+    ss::timer<model::timeout_clock> _fetch_timeout;
 };
 
 size_t op_context::fetch_partition_count() const {
@@ -1258,10 +1315,7 @@ class simple_fetch_planner final : public fetch_planner::impl {
 
         plan.reserve_from_partition_count(octx.fetch_partition_count());
 
-        const auto client_address = fmt::format(
-          "{}:{}",
-          octx.rctx.connection()->client_host(),
-          octx.rctx.connection()->client_port());
+        const auto client_address = octx.rctx.connection()->local_address();
 
         /**
          * group fetch requests by shard
@@ -1298,13 +1352,43 @@ class simple_fetch_planner final : public fetch_planner::impl {
                   return;
               }
 
-              auto& tp = fp.topic_partition;
-
-              if (unlikely(octx.rctx.metadata_cache().is_disabled(
-                    tp.as_tn_view(), tp.get_partition()))) {
+              /**
+               * in sanction mode (without an enterprise license), the audit log
+               * topic is not consumable
+               */
+              if (unlikely(
+                    octx.rctx.feature_table().local().should_sanction()
+                    && fp.topic_partition.get_topic()
+                         == model::kafka_audit_logging_topic)) {
+                  thread_local static ss::logger::rate_limit rate(1s);
+                  vloglr(
+                    klog,
+                    ss::log_level::warn,
+                    rate,
+                    "{}",
+                    features::enterprise_error_message::audit_log_fetch());
                   resp_it->set(make_partition_response_error(
                     fp.topic_partition.get_partition(),
-                    error_code::replica_not_available));
+                    error_code::unknown_server_error));
+                  ++resp_it;
+                  return;
+              }
+
+              auto& tp = fp.topic_partition;
+              auto tn_view = tp.as_tn_view();
+              const auto& metadata_cache = octx.rctx.metadata_cache();
+              auto partition_id = tp.get_partition();
+
+              if (unlikely(metadata_cache.is_disabled(tn_view, partition_id))) {
+                  resp_it->set(make_partition_response_error(
+                    partition_id, error_code::replica_not_available));
+                  ++resp_it;
+                  return;
+              }
+
+              if (unlikely(metadata_cache.should_reject_reads(tn_view))) {
+                  resp_it->set(make_partition_response_error(
+                    partition_id, error_code::invalid_topic_exception));
                   ++resp_it;
                   return;
               }
@@ -1321,11 +1405,10 @@ class simple_fetch_planner final : public fetch_planner::impl {
                    * return not_leader_for_partition error to force metadata
                    * update.
                    */
-                  auto ec = octx.rctx.metadata_cache().contains(tp.to_ntp())
+                  auto ec = metadata_cache.contains(tp.to_ntp())
                               ? error_code::not_leader_for_partition
                               : error_code::unknown_topic_or_partition;
-                  resp_it->set(make_partition_response_error(
-                    fp.topic_partition.get_partition(), ec));
+                  resp_it->set(make_partition_response_error(partition_id, ec));
                   ++resp_it;
                   return;
               }
@@ -1352,7 +1435,7 @@ class simple_fetch_planner final : public fetch_planner::impl {
                 .read_from_follower = octx.request.has_rack_id(),
                 .consumer_rack_id = octx.request.has_rack_id()
                                       ? std::make_optional(
-                                        octx.request.data.rack_id)
+                                          octx.request.data.rack_id)
                                       : std::nullopt,
                 .abort_source = octx.rctx.abort_source(),
                 .client_address = model::client_address_t{client_address},
@@ -1427,7 +1510,9 @@ ss::future<> do_fetch(op_context& octx) {
               [&octx] { return fetch_topic_partitions(octx); });
         });
     } break;
-    case model::fetch_read_strategy::non_polling: {
+    case model::fetch_read_strategy::non_polling:
+    case model::fetch_read_strategy::non_polling_with_pid:
+    case model::fetch_read_strategy::non_polling_with_debounce: {
         auto planner = make_fetch_planner<simple_fetch_planner>();
         auto fetch_plan = planner.create_plan(octx);
 
@@ -1440,6 +1525,10 @@ ss::future<> do_fetch(op_context& octx) {
     }
 }
 } // namespace
+
+namespace testing {
+ss::future<> do_fetch(op_context& octx) { return ::kafka::do_fetch(octx); }
+} // namespace testing
 
 template<>
 ss::future<response_ptr>
@@ -1766,7 +1855,7 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
             continue;
         }
 
-        auto const node_it = _md_cache.nodes().find(replica.id);
+        const auto node_it = _md_cache.nodes().find(replica.id);
         /**
          * Skip nodes which are in maintenance mode or we do not have
          * information about them
@@ -1797,7 +1886,7 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
 }
 
 std::ostream& operator<<(std::ostream& o, const consumer_info& ci) {
-    fmt::print(o, "rack_id: {}, fetch_offset: {}", ci);
+    fmt::print(o, "rack_id: {}, fetch_offset: {}", ci.rack_id, ci.fetch_offset);
     return o;
 }
 } // namespace kafka

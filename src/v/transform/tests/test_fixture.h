@@ -17,7 +17,7 @@
 #include "model/transform.h"
 #include "ssx/semaphore.h"
 #include "transform/io.h"
-#include "wasm/api.h"
+#include "wasm/engine.h"
 #include "wasm/transform_probe.h"
 
 #include <seastar/core/chunked_fifo.hh>
@@ -77,8 +77,9 @@ public:
     ss::future<> start() override;
     ss::future<> stop() override;
     kafka::offset latest_offset() override;
-    ss::future<kafka::offset>
+    ss::future<std::optional<kafka::offset>>
     offset_at_timestamp(model::timestamp, ss::abort_source*) override;
+    kafka::offset start_offset() const override;
     ss::future<model::record_batch_reader>
     read_batch(kafka::offset offset, ss::abort_source* as) override;
 

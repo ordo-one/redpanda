@@ -23,7 +23,7 @@ feature_table_snapshot feature_table_snapshot::from(const feature_table& ft) {
     fts.states.reserve(feature_schema.size());
 
     fts.version = ft.get_active_version();
-    fts.license = ft.get_license();
+    fts.license = ft.get_configured_license();
     for (const auto& state : ft._feature_state) {
         auto& name = state.spec.name;
         fts.states.push_back(feature_state_snapshot{
@@ -49,7 +49,7 @@ void feature_table_snapshot::apply(feature_table& ft) const {
         auto snap_state_iter = std::find_if(
           states.begin(),
           states.end(),
-          [&spec](feature_state_snapshot const& s) {
+          [&spec](const feature_state_snapshot& s) {
               return s.name == spec.name;
           });
         if (snap_state_iter == states.end()) {

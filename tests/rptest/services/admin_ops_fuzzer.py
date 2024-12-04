@@ -6,6 +6,7 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
+from abc import ABC, abstractmethod
 from enum import Enum, auto, unique
 import json
 import random
@@ -45,12 +46,13 @@ class OperationCtx:
 
 
 # Base class for operation
-class Operation():
+class Operation(ABC):
+    @abstractmethod
     def execute(self, ctx) -> bool:
-        return False
+        ...
 
     def validate(self, ctx) -> bool:
-        pass
+        ...
 
 
 def random_string(length):
@@ -266,11 +268,6 @@ class AddPartitionsOperation(Operation):
             n = ctx.redpanda.get_node_by_id(b['node_id'])
             if n not in ctx.redpanda.started_nodes():
                 continue
-            node_version = int_tuple(
-                VERSION_RE.findall(ctx.redpanda.get_version(n))[0])
-            # do not query nodes with redpanda version prior to v23.1.x
-            if node_version[0] < 23:
-                return None
             try:
                 partitions = ctx.admin().get_partitions(node=n,
                                                         topic=self.topic)
@@ -763,9 +760,10 @@ class AdminOperationsFuzzer():
                     f"Operation: {op_type}, retries left: {self.retries-retry}/{self.retries}",
                     exc_info=True)
                 sleep(self.retries_interval)
+        assert error  # will always be set but type checker can't figure it out
         raise error
 
-    def make_random_operation(self) -> Operation:
+    def make_random_operation(self):
         op = random.choice(self.allowed_operations)
         actions = {
             RedpandaAdminOperation.CREATE_TOPIC:

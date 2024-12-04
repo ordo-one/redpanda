@@ -21,7 +21,7 @@
 #include "storage/fwd.h"
 #include "storage/key_offset_map.h"
 #include "storage/scoped_file_tracker.h"
-#include "tristate.h"
+#include "utils/tristate.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file.hh> //io_priority
@@ -78,7 +78,11 @@ struct disk
 
 // Helps to identify transactional stms in the registered list of stms.
 // Avoids an ugly dynamic cast to the base class.
-enum class stm_type : int8_t { transactional = 0, non_transactional = 1 };
+enum class stm_type : int8_t {
+    user_topic_transactional = 0,
+    non_transactional = 1,
+    consumer_offsets_transactional = 2
+};
 
 class snapshotable_stm {
 public:
@@ -139,7 +143,9 @@ public:
 class stm_manager {
 public:
     void add_stm(ss::shared_ptr<snapshotable_stm> stm) {
-        if (stm->type() == stm_type::transactional) {
+        if (
+          stm->type() == stm_type::user_topic_transactional
+          || stm->type() == stm_type::consumer_offsets_transactional) {
             vassert(!_tx_stm, "Multiple transactional stms not allowed.");
             _tx_stm = stm;
         }
@@ -185,7 +191,16 @@ public:
         return _stms;
     }
 
-    bool has_tx_stm() { return _tx_stm.get(); }
+    std::optional<storage::stm_type> transactional_stm_type() const {
+        if (_tx_stm) {
+            return _tx_stm->type();
+        }
+        return std::nullopt;
+    }
+
+    const ss::shared_ptr<snapshotable_stm> transactional_stm() const {
+        return _tx_stm;
+    }
 
 private:
     ss::shared_ptr<snapshotable_stm> _tx_stm;
@@ -421,18 +436,23 @@ struct log_reader_config {
       opt_abort_source_t as = std::nullopt,
       opt_client_address_t client_addr = std::nullopt)
       : log_reader_config(
-        start_offset,
-        max_offset,
-        0,
-        std::numeric_limits<size_t>::max(),
-        prio,
-        std::nullopt,
-        std::nullopt,
-        as,
-        std::move(client_addr)) {}
+          start_offset,
+          max_offset,
+          0,
+          std::numeric_limits<size_t>::max(),
+          prio,
+          std::nullopt,
+          std::nullopt,
+          as,
+          std::move(client_addr)) {}
 
     friend std::ostream& operator<<(std::ostream& o, const log_reader_config&);
 };
+
+// Empty, invalid reader config which is sometimes useful as a placeholder
+// since log_reader_config doesn't have a default constructor.
+static const log_reader_config empty_reader_config{
+  {}, {}, ss::default_priority_class()};
 
 struct gc_config {
     gc_config(model::timestamp upper, std::optional<size_t> max_bytes_in_log)
@@ -450,6 +470,7 @@ struct gc_config {
 struct compaction_config {
     compaction_config(
       model::offset max_collect_offset,
+      std::optional<std::chrono::milliseconds> tombstone_ret_ms,
       ss::io_priority_class p,
       ss::abort_source& as,
       std::optional<ntp_sanitizer_config> san_cfg = std::nullopt,
@@ -457,6 +478,7 @@ struct compaction_config {
       hash_key_offset_map* key_map = nullptr,
       scoped_file_tracker::set_t* to_clean = nullptr)
       : max_collectible_offset(max_collect_offset)
+      , tombstone_retention_ms(tombstone_ret_ms)
       , iopc(p)
       , sanitizer_config(std::move(san_cfg))
       , key_offset_map_max_keys(max_keys)
@@ -467,6 +489,19 @@ struct compaction_config {
     // Cannot delete or compact past this offset (i.e. for unresolved txn
     // records): that is, only offsets <= this may be compacted.
     model::offset max_collectible_offset;
+
+    // The retention time for tombstones. Tombstone removal occurs only for
+    // "clean" compacted segments past the tombstone deletion horizon timestamp,
+    // which is a segment's clean_compact_timestamp + tombstone_retention_ms.
+    // This means tombstones take at least two rounds of compaction to remove a
+    // tombstone: at least one pass to make a segment clean, and another pass
+    // some time after tombstone_retention_ms to remove tombstones.
+    //
+    // Tombstone removal is only supported for topics with remote writes
+    // disabled. As a result, this field will only have a value for compaction
+    // ran on non-archival topics.
+    std::optional<std::chrono::milliseconds> tombstone_retention_ms;
+
     // priority for all IO in compaction
     ss::io_priority_class iopc;
     // use proxy fileops with assertions and/or failure injection
@@ -499,12 +534,19 @@ struct housekeeping_config {
       model::timestamp upper,
       std::optional<size_t> max_bytes_in_log,
       model::offset max_collect_offset,
+      std::optional<std::chrono::milliseconds> tombstone_retention_ms,
       ss::io_priority_class p,
       ss::abort_source& as,
       std::optional<ntp_sanitizer_config> san_cfg = std::nullopt,
       hash_key_offset_map* key_map = nullptr)
       : compact(
-        max_collect_offset, p, as, std::move(san_cfg), std::nullopt, key_map)
+          max_collect_offset,
+          tombstone_retention_ms,
+          p,
+          as,
+          std::move(san_cfg),
+          std::nullopt,
+          key_map)
       , gc(upper, max_bytes_in_log) {}
 
     compaction_config compact;

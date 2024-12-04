@@ -13,12 +13,43 @@
 
 #include "base/vassert.h"
 #include "cluster/logger.h"
-#include "cluster/rm_stm_types.h"
 
 namespace cluster::tx {
 
+std::ostream& operator<<(std::ostream& os, request_state state) {
+    switch (state) {
+    case request_state::initialized:
+        return os << "initialized";
+    case request_state::in_progress:
+        return os << "in_progress";
+    case request_state::completed:
+        return os << "completed";
+    }
+}
+
 result_promise_t::future_type request::result() const {
     return _result.get_shared_future();
+}
+
+void request::set_value(request_result_t::value_type value) {
+    if (_state != request_state::completed) {
+        _result.set_value(value);
+        _state = request_state::completed;
+    }
+}
+
+void request::set_error(request_result_t::error_type error) {
+    // This is idempotent as different fibers can mark the result error
+    // at different times in some edge cases.
+    if (_state != request_state::completed) {
+        _result.set_value(error);
+        _state = request_state::completed;
+        return;
+    }
+    vassert(
+      _result.available() && result().get().has_error(),
+      "Invalid result state, expected to be available and errored out: {}",
+      *this);
 }
 
 bool request::operator==(const request& other) const {
@@ -33,8 +64,8 @@ bool request::operator==(const request& other) const {
         compare = compare && _result.failed() == other._result.failed();
         if (compare && !_result.failed()) {
             // both requests succeeded. compare results.
-            auto res = _result.get_shared_future().get0();
-            auto res_other = other._result.get_shared_future().get0();
+            auto res = _result.get_shared_future().get();
+            auto res_other = other._result.get_shared_future().get();
             compare = compare && res.has_error() == res_other.has_error();
             if (compare) {
                 if (res.has_error()) {
@@ -91,6 +122,16 @@ std::optional<request_ptr> requests::last_request() const {
     return std::nullopt;
 }
 
+void requests::reset(request_result_t::error_type error) {
+    for (auto& request : _inflight_requests) {
+        if (!request->has_completed()) {
+            request->set_error(error);
+        }
+    }
+    _inflight_requests.clear();
+    _finished_requests.clear();
+}
+
 bool requests::is_valid_sequence(seq_t incoming) const {
     auto last_req = last_request();
     return
@@ -107,27 +148,12 @@ result<request_ptr> requests::try_emplace(
     if (reset_sequences) {
         // reset all the sequence tracking state, avoids any sequence
         // checks for sequence tracking.
-        while (!_inflight_requests.empty()) {
-            if (!_inflight_requests.front()->has_completed()) {
-                _inflight_requests.front()->set_value(errc::timeout);
-            }
-            _inflight_requests.pop_front();
-        }
-        _finished_requests.clear();
+        reset(errc::timeout);
     } else {
         // gc and fail any inflight requests from old terms
         // these are guaranteed to be failed because of sync() guarantees
         // prior to this request.
-        while (!_inflight_requests.empty()
-               && _inflight_requests.front()->_term < current) {
-            if (!_inflight_requests.front()->has_completed()) {
-                // Here we know for sure the term change, these in flight
-                // requests are going to fail anyway, mark them so.
-                _inflight_requests.front()->set_value(errc::timeout);
-            }
-            _inflight_requests.pop_front();
-        }
-
+        gc_requests_from_older_terms(current);
         // check if an existing request matches
         auto match_it = std::find_if(
           _finished_requests.begin(),
@@ -153,28 +179,31 @@ result<request_ptr> requests::try_emplace(
         if (match_it != _inflight_requests.end()) {
             return *match_it;
         }
-
         if (!is_valid_sequence(first)) {
-            vlog(
-              clusterlog.trace,
-              "out of order sequence for request range [{}, {}], term: {}",
-              first,
-              last,
-              current);
-            return errc::sequence_out_of_order;
+            return cluster::errc::sequence_out_of_order;
         }
     }
 
     // All invariants satisfied, enqueue the request.
     _inflight_requests.emplace_back(
       ss::make_lw_shared<request>(first, last, current, result_promise_t{}));
+    // if there are more than max cached requests inflight start dropping the
+    // oldest of them
+    while (_inflight_requests.size() > requests_cached_max
+           && _inflight_requests.front()->has_completed()) {
+        _inflight_requests.pop_front();
+        // clear finished requests as the producer will not be interested in
+        // them anymore
+        if (!_finished_requests.empty()) {
+            _finished_requests.clear();
+        }
+    }
 
     return _inflight_requests.back();
 }
 
-bool requests::stm_apply(
-  const model::batch_identity& bid, kafka::offset offset) {
-    bool relink_producer = false;
+void requests::stm_apply(
+  const model::batch_identity& bid, model::term_id term, kafka::offset offset) {
     auto first = bid.first_seq;
     auto last = bid.last_seq;
     if (!_inflight_requests.empty()) {
@@ -183,13 +212,8 @@ bool requests::stm_apply(
             // Promote the request from in_flight -> finished.
             _inflight_requests.pop_front();
         }
-    } else {
-        // on leaders, producer state is relinked with the manager as a part
-        // of run_with_lock. On followers this happens as their stms catch up
-        // with the committed changes. This branch is taken only when the stm is
-        // applying changes from a different leader thus prompting a relink.
-        relink_producer = true;
     }
+    gc_requests_from_older_terms(term);
     result_promise_t ready{};
     ready.set_value(kafka_result{.last_offset = offset});
     _finished_requests.emplace_back(ss::make_lw_shared<request>(
@@ -198,32 +222,42 @@ bool requests::stm_apply(
     while (_finished_requests.size() > requests_cached_max) {
         _finished_requests.pop_front();
     }
-    return relink_producer;
 }
 
-void requests::shutdown() {
-    for (auto& request : _inflight_requests) {
-        if (!request->has_completed()) {
-            request->_result.set_value(errc::shutting_down);
+void requests::gc_requests_from_older_terms(model::term_id current_term) {
+    while (!_inflight_requests.empty()
+           && _inflight_requests.front()->_term < current_term) {
+        if (!_inflight_requests.front()->has_completed()) {
+            // Here we know for sure the term change, these in flight
+            // requests are going to fail anyway, mark them so.
+            _inflight_requests.front()->set_error(errc::timeout);
         }
+        _inflight_requests.pop_front();
     }
-    _inflight_requests.clear();
-    _finished_requests.clear();
 }
+
+void requests::shutdown() { reset(cluster::errc::shutting_down); }
 
 producer_state::producer_state(
+  prefix_logger& logger,
   ss::noncopyable_function<void()> post_eviction_hook,
   producer_state_snapshot snapshot) noexcept
-  : _id(snapshot._id)
-  , _group(snapshot._group)
+  : _logger(logger)
+  , _id(snapshot.id)
+  , _group(snapshot.group)
   , _post_eviction_hook(std::move(post_eviction_hook)) {
+    if (snapshot.transaction_state) {
+        _transaction_state
+          = std::make_unique<producer_partition_transaction_state>(
+            snapshot.transaction_state.value());
+    }
     // Hydrate from snapshot.
-    for (auto& req : snapshot._finished_requests) {
+    for (auto& req : snapshot.finished_requests) {
         result_promise_t ready{};
-        ready.set_value(kafka_result{req._last_offset});
+        ready.set_value(kafka_result{req.last_offset});
         _requests._finished_requests.push_back(ss::make_lw_shared<request>(
-          req._first_sequence,
-          req._last_sequence,
+          req.first_sequence,
+          req.last_sequence,
           model::term_id{-1},
           std::move(ready)));
     }
@@ -231,7 +265,20 @@ producer_state::producer_state(
 
 bool producer_state::operator==(const producer_state& other) const {
     return _id == other._id && _group == other._group
-           && _requests == other._requests;
+           && _requests == other._requests
+           && _transaction_state == other._transaction_state;
+}
+
+std::ostream& operator<<(std::ostream& o, const request& request) {
+    fmt::print(
+      o,
+      "{{ first: {}, last: {}, term: {}, result_available: {}, state: {} }}",
+      request._first_sequence,
+      request._last_sequence,
+      request._term,
+      request._result.available(),
+      request._state);
+    return o;
 }
 
 std::ostream& operator<<(std::ostream& o, const requests& requests) {
@@ -247,11 +294,18 @@ std::ostream& operator<<(std::ostream& o, const producer_state& state) {
     fmt::print(
       o,
       "{{ id: {}, group: {}, requests: {}, "
-      "ms_since_last_update: {} }}",
+      "ms_since_last_update: {}, evicted: {}, ",
       state._id,
       state._group,
       state._requests,
-      state.ms_since_last_update());
+      state.ms_since_last_update(),
+      state._evicted);
+    if (state._transaction_state) {
+        fmt::print(o, "transaction_state: {}", *state._transaction_state);
+    } else {
+        fmt::print(o, "transaction_state: {{ null }}");
+    }
+    fmt::print(o, "}}");
     return o;
 }
 
@@ -261,49 +315,173 @@ void producer_state::shutdown_input() {
 }
 
 bool producer_state::can_evict() {
-    // oplock is taken, do not allow producer state to be evicted
-    if (!_op_lock.ready() || _evicted) {
+    if (
+      // Check if already evicted
+      _evicted
+      // Check if an operation is in progress using this producer
+      || !_op_lock.ready()
+      // Check if there are operations pending state machine sync
+      || !_requests._inflight_requests.empty()
+      //  Check if there are any open transactions on this producer.
+      || has_transaction_in_progress()) {
+        vlog(_logger.debug, "[{}] cannot evict producer.", *this);
         return false;
     }
-
-    vlog(clusterlog.debug, "evicting producer: {}", *this);
+    vlog(_logger.debug, "[{}] evicting producer", *this);
     _evicted = true;
     shutdown_input();
     return true;
+}
+
+void producer_state::reset_with_new_epoch(model::producer_epoch new_epoch) {
+    vassert(
+      new_epoch > _id.get_epoch(),
+      "Invalid epoch bump to {} for producer {}",
+      new_epoch,
+      *this);
+    vassert(
+      !_transaction_state,
+      "Invalid epoch bump to {} for a non idempotent producer: {}",
+      new_epoch,
+      *this);
+    vlog(_logger.info, "[{}] Reseting epoch to {}", *this, new_epoch);
+    _requests.reset(errc::timeout);
+    _id = model::producer_identity(_id.id, new_epoch);
 }
 
 result<request_ptr> producer_state::try_emplace_request(
   const model::batch_identity& bid, model::term_id current_term, bool reset) {
     if (bid.first_seq > bid.last_seq) {
         // malformed batch
-        return errc::invalid_request;
+        return cluster::errc::invalid_request;
     }
     vlog(
-      clusterlog.trace,
-      "new request from producer: {}, batch meta: {}, term: {}, "
+      _logger.trace,
+      "[{}] new request, batch meta: {}, term: {}, "
       "reset: {}, request_state: {}",
       *this,
       bid,
       current_term,
       reset,
       _requests);
-    return _requests.try_emplace(
+    auto result = _requests.try_emplace(
       bid.first_seq, bid.last_seq, current_term, reset);
+
+    if (unlikely(result.has_error())) {
+        vlog(
+          _logger.warn,
+          "[{}] error {} processing request {}, term: {}, reset: {}",
+          *this,
+          result.error(),
+          bid,
+          current_term,
+          reset);
+    }
+    return result;
 }
 
-bool producer_state::update(
-  const model::batch_identity& bid, kafka::offset offset) {
-    if (_evicted) {
-        return false;
+void producer_state::apply_data(
+  const model::record_batch_header& header, kafka::offset offset) {
+    auto bid = model::batch_identity::from(header);
+    if (!bid.is_idempotent() || _evicted) {
+        return;
     }
-    bool relink_producer = _requests.stm_apply(bid, offset);
+    if (!bid.is_transactional && bid.pid.epoch > _id.epoch) {
+        reset_with_new_epoch(bid.pid.epoch);
+    }
+    _requests.stm_apply(bid, header.ctx.term, offset);
+    if (bid.is_transactional) {
+        if (!_transaction_state) {
+            // possible if begin batch got truncated.
+            _transaction_state
+              = std::make_unique<producer_partition_transaction_state>(
+                producer_partition_transaction_state{
+                  .first = header.base_offset,
+                  .last = header.last_offset(),
+                  .sequence = model::tx_seq{-1},
+                  .timeout = std::nullopt,
+                  .coordinator_partition = model::partition_id{-1},
+                  .status = partition_transaction_status::ongoing});
+        } else {
+            _transaction_state->last = header.last_offset();
+            _transaction_state->status = partition_transaction_status::ongoing;
+        }
+    }
     vlog(
-      clusterlog.trace,
-      "applied stm update for pid: {}, batch meta: {}, relink_producer: {}",
+      _logger.trace,
+      "[{}] applied stm update, batch meta: {}, term: {}",
       *this,
       bid,
-      relink_producer);
-    return relink_producer;
+      header.ctx.term);
+}
+
+void producer_state::apply_transaction_begin(
+  const model::record_batch_header& header,
+  const fence_batch_data& parsed_batch) {
+    const auto& pid = parsed_batch.bid.pid;
+    if (pid.epoch < _id.epoch) {
+        vlog(
+          _logger.error,
+          "[{}] Epoch downgrade to {}, ignoring batch {}",
+          *this,
+          pid,
+          header);
+        return;
+    }
+    if (has_transaction_in_progress() || _active_transaction_hook.is_linked()) {
+        // We have checks in place in the stm so this does not happen. If it
+        // still does it could be a bug or the log has been truncated and some
+        // entries disappeared. We log and move on to make forward progress.
+        vlog(
+          _logger.error,
+          "[{}] Encountered a begin batch {} while transaction already in "
+          "progress, overriding transaction state to make forward progress. "
+          "This can have unintended consequences. Hook state: {}",
+          *this,
+          header,
+          _active_transaction_hook.is_linked());
+    }
+    _id = pid;
+    _transaction_state = std::make_unique<producer_partition_transaction_state>(
+      producer_partition_transaction_state{
+        .first = header.base_offset,
+        .last = header.last_offset(),
+        .sequence = parsed_batch.tx_seq.value_or(model::tx_seq{0}),
+        .timeout = parsed_batch.transaction_timeout_ms,
+        .coordinator_partition = parsed_batch.tm,
+        .status = partition_transaction_status::initialized,
+      });
+}
+
+std::optional<model::tx_range>
+producer_state::apply_transaction_end(model::control_record_type crt) {
+    if (
+      crt != model::control_record_type::tx_abort
+      && crt != model::control_record_type::tx_commit) {
+        return std::nullopt;
+    }
+
+    if (!_transaction_state) {
+        vlog(
+          _logger.debug,
+          "[{}] Ignoring end transaction: {} as there is no "
+          "transaction in progress, log may have been truncated?",
+          *this,
+          crt);
+        return std::nullopt;
+    }
+
+    vlog(_logger.trace, "[{}] Applying transaction end batch: {}", *this, crt);
+    if (crt == model::control_record_type::tx_commit) {
+        _transaction_state->status = partition_transaction_status::committed;
+    } else if (crt == model::control_record_type::tx_abort) {
+        _transaction_state->status = partition_transaction_status::aborted;
+    } else {
+        vlog(_logger.error, "Ignoring invalid control batch type: {}", crt);
+        return std::nullopt;
+    }
+    return model::tx_range{
+      id(), _transaction_state->first, _transaction_state->last};
 }
 
 std::optional<seq_t> producer_state::last_sequence_number() const {
@@ -314,32 +492,76 @@ std::optional<seq_t> producer_state::last_sequence_number() const {
     return maybe_ptr.value()->_last_sequence;
 }
 
+bool producer_state::has_transaction_in_progress() const {
+    return _transaction_state ? _transaction_state->is_in_progress() : false;
+}
+
+bool producer_state::has_transaction_expired() const {
+    if (!has_transaction_in_progress()) {
+        // nothing to expire.
+        return false;
+    }
+    return _force_transaction_expiry
+           || ms_since_last_update() > _transaction_state->timeout_ms();
+}
+
 producer_state_snapshot
 producer_state::snapshot(kafka::offset log_start_offset) const {
     producer_state_snapshot snapshot;
-    snapshot._id = _id;
-    snapshot._group = _group;
-    snapshot._ms_since_last_update = ms_since_last_update();
-    snapshot._finished_requests.reserve(_requests._finished_requests.size());
+    snapshot.id = _id;
+    snapshot.group = _group;
+    snapshot.ms_since_last_update = ms_since_last_update();
+    snapshot.finished_requests.reserve(_requests._finished_requests.size());
     for (auto& req : _requests._finished_requests) {
-        vassert(
-          req->has_completed(),
-          "_finished_requests has unresolved promise: {}, range:[{}, {}]",
-          *this,
-          req->_first_sequence,
-          req->_last_sequence);
+        if (!req->has_completed()) {
+            vlog(
+              _logger.error,
+              "[{}] Ignoring unresolved finished request {} during snapshot",
+              *this,
+              *req);
+            continue;
+        }
         auto kafka_offset
           = req->_result.get_shared_future().get().value().last_offset;
         // offsets older than log start are no longer interesting.
         if (kafka_offset >= log_start_offset) {
-            snapshot._finished_requests.push_back(
-              producer_state_snapshot::finished_request{
-                ._first_sequence = req->_first_sequence,
-                ._last_sequence = req->_last_sequence,
-                ._last_offset = kafka_offset});
+            snapshot.finished_requests.emplace_back(
+              req->_first_sequence, req->_last_sequence, kafka_offset);
         }
     }
+    if (_transaction_state) {
+        snapshot.transaction_state = *_transaction_state;
+    }
     return snapshot;
+}
+
+std::optional<model::tx_seq> producer_state::get_transaction_sequence() const {
+    if (has_transaction_in_progress()) {
+        return _transaction_state->sequence;
+    }
+    return std::nullopt;
+}
+
+std::optional<model::offset>
+producer_state::get_current_tx_start_offset() const {
+    if (has_transaction_in_progress()) {
+        return _transaction_state->first;
+    }
+    return std::nullopt;
+}
+
+std::optional<expiration_info> producer_state::get_expiration_info() const {
+    if (!has_transaction_in_progress()) {
+        return std::nullopt;
+    }
+    auto duration = std::chrono::duration_cast<clock_type::duration>(
+      ms_since_last_update());
+    auto timeout = std::chrono::duration_cast<clock_type::duration>(
+      _transaction_state->timeout_ms());
+    return expiration_info{
+      .timeout = timeout,
+      .last_update = tx::clock_type::now() - duration,
+      .is_expiration_requested = has_transaction_expired()};
 }
 
 } // namespace cluster::tx

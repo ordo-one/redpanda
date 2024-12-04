@@ -144,7 +144,8 @@ diskcheck::run_configured_benchmarks(ss::file& file) {
     auto write_metrics = co_await do_run_benchmark<read_or_write::write>(file);
     auto result = write_metrics.to_st_result();
     result.name = _opts.name;
-    result.info = "write run";
+    result.info = fmt::format(
+      "write run (iodepth: {}, dsync: {})", _opts.parallelism, _opts.dsync);
     result.test_type = "disk";
     if (_cancelled) {
         result.warning = "Run was manually cancelled";
@@ -169,6 +170,7 @@ template<diskcheck::read_or_write mode>
 ss::future<metrics> diskcheck::do_run_benchmark(ss::file& file) {
     auto irange = boost::irange<uint16_t>(0, _opts.parallelism);
     auto start = ss::lowres_clock::now();
+    auto start_highres = ss::lowres_system_clock::now();
     static const auto five_seconds_us = 500000;
     metrics m{five_seconds_us};
     ss::timer<ss::lowres_clock> timer;
@@ -184,7 +186,9 @@ ss::future<metrics> diskcheck::do_run_benchmark(ss::file& file) {
         vlog(clusterlog.debug, "Benchmark completed (duration reached)");
     }
     timer.cancel();
-    m.set_total_time(ss::lowres_clock::now() - start);
+    auto end = ss::lowres_system_clock::now();
+    m.set_start_end_time(start_highres, end);
+    m.set_total_time(end - start_highres);
     _last_pos = 0;
     co_return m;
 }

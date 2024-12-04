@@ -96,7 +96,7 @@ class TopicRecreateTest(RedpandaTest):
         rpk = RpkTool(self.redpanda)
 
         def topic_is_healthy():
-            if not swarm.is_alive(swarm.nodes[0]):
+            if not swarm.is_alive():
                 swarm.stop()
                 swarm.start()
             partitions = rpk.describe_topic(spec.name)
@@ -369,6 +369,32 @@ class CreateTopicsTest(RedpandaTest):
             "Topic {kafka-topic3} has a replication factor")
         assert num_found == 0, f'Expected to find 0 messages about topic-3, but found {num_found}'
 
+    @cluster(num_nodes=3)
+    def test_invalid_boolean_property(self):
+        """
+        Validates that an invalid boolean property results in an invalid configuration response.
+        """
+        rpk = RpkTool(self.redpanda)
+        with expect_exception(RpkException,
+                              lambda e: 'Configuration is invalid' in str(e)):
+            rpk.create_topic('topic-1',
+                             config={'redpanda.remote.read': 'affirmative'})
+
+    @cluster(num_nodes=3)
+    def test_case_insensitive_boolean_property(self):
+        """
+        Validates that boolean properties are case insensitive.
+        """
+        rpk = RpkTool(self.redpanda)
+        rpk.create_topic('topic-1',
+                         config={
+                             'redpanda.remote.read': 'tRuE',
+                             'redpanda.remote.write': 'FALSE'
+                         })
+        cfg = rpk.describe_topic_configs('topic-1')
+        assert cfg['redpanda.remote.read'][0] == 'true'
+        assert cfg['redpanda.remote.write'][0] == 'false'
+
 
 class CreateTopicsResponseTest(RedpandaTest):
     SUCCESS_EC = 0
@@ -622,10 +648,12 @@ class CreateSITopicsTest(RedpandaTest):
             "false", "DYNAMIC_TOPIC_CONFIG")
 
     @cluster(num_nodes=1)
-    def topic_alter_config_test(self):
+    @matrix(incremental=[True, False])
+    def topic_alter_config_test(self, incremental):
         """
-        Intentionally use the legacy (deprecated in Kafka 2.3.0) AlterConfig
-        admin RPC, to check it works with our custom topic properties
+        Intentionally use either the legacy (deprecated in Kafka 2.3.0) AlterConfig
+        admin RPC or the new IncrementalAlterConfig API, to check that both work
+        with our custom topic properties
         """
         rpk = RpkTool(self.redpanda)
         topic = topic_name()
@@ -644,22 +672,43 @@ class CreateSITopicsTest(RedpandaTest):
             'initial.retention.local.target.ms': '123456'
         }
 
-        for k, v in examples.items():
-            kcl.alter_topic_config({k: v}, incremental=False, topic=topic)
-
-        # 'cleanup.policy' is defaulted to 'delete' upon topic creation.
-        # AlterConfigs handling should preserve this default, unless explicitly
-        # overriden.
+        kcl.alter_topic_config(examples, incremental=incremental, topic=topic)
         topic_config = rpk.describe_topic_configs(topic)
-        value, src = topic_config["cleanup.policy"]
-        assert value == "delete" and src == "DEFAULT_CONFIG"
+        value, src = topic_config["retention.local.target.bytes"]
+        assert value == "123456" and src == "DYNAMIC_TOPIC_CONFIG"
 
-        kcl.alter_topic_config({"cleanup.policy": "compact"},
-                               incremental=False,
+        kcl.alter_topic_config({"retention.local.target.bytes": "999999"},
+                               incremental=incremental,
                                topic=topic)
         topic_config = rpk.describe_topic_configs(topic)
-        value, src = topic_config["cleanup.policy"]
-        assert value == "compact" and src == "DYNAMIC_TOPIC_CONFIG"
+        value, src = topic_config["retention.local.target.bytes"]
+        assert value == "999999" and src == "DYNAMIC_TOPIC_CONFIG"
+
+        # All non-specified configs should revert to their default with incremental=False
+        for k, _ in examples.items():
+            if k != "retention.local.target.bytes":
+                # With the old alter configs API (incremental=False), all the other configs should revert to their default
+                # With the new incremental alter configs API, all the other configs should be unchanged
+                expected_src = "DYNAMIC_TOPIC_CONFIG" if incremental else "DEFAULT_CONFIG"
+
+                # The shadow_indexing properties ('redpanda.remote.(read|write|delete)')
+                # are special "sticky" topic properties that are always set as a
+                # topic-level override. To co-operate with kafka terraform providers, these
+                # configs show up as "DEFAULT_CONFIG" when they are set to the same value
+                # as their cluster-level default.
+                #
+                # See: https://github.com/redpanda-data/redpanda/issues/7451
+                hiding_configs = [
+                    'redpanda.remote.delete',
+                    'redpanda.remote.write',
+                    'redpanda.remote.read',
+                ]
+                if k in hiding_configs:
+                    expected_src = "DEFAULT_CONFIG"
+
+                value, src = topic_config[k]
+                assert src == expected_src, \
+                    f"[incremental={incremental}] Unexpected describe result for {k}: value={value}, src={src}"
 
         # As a control, confirm that if we did pass an invalid property, we would have got an error
         with expect_exception(RuntimeError, lambda e: "invalid" in str(e)):
@@ -780,7 +829,7 @@ class CreateTopicReplicaDistributionTest(RedpandaTest):
     @cluster(num_nodes=5)
     def test_topic_aware_distribution(self):
         """
-        Test that replicas for newly created topic are distributed evenly, 
+        Test that replicas for newly created topic are distributed evenly,
         even though there is an imbalance in existing replica distribution.
         """
 

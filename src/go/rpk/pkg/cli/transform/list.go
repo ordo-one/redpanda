@@ -17,7 +17,9 @@ import (
 	"os"
 	"strings"
 
-	dataplanev1alpha1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha1"
+	"github.com/redpanda-data/common-go/rpadmin"
+
+	dataplanev1alpha2 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha2"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -29,19 +31,21 @@ import (
 
 type (
 	detailedTransformMetadata struct {
-		Name         string                              `json:"name" yaml:"name"`
-		InputTopic   string                              `json:"input_topic" yaml:"input_topic"`
-		OutputTopics []string                            `json:"output_topics" yaml:"output_topics"`
-		Environment  map[string]string                   `json:"environment" yaml:"environment"`
-		Status       []adminapi.PartitionTransformStatus `json:"status" yaml:"status"`
+		Name            string                             `json:"name" yaml:"name"`
+		InputTopic      string                             `json:"input_topic" yaml:"input_topic"`
+		OutputTopics    []string                           `json:"output_topics" yaml:"output_topics"`
+		Environment     map[string]string                  `json:"environment" yaml:"environment"`
+		Status          []rpadmin.PartitionTransformStatus `json:"status" yaml:"status"`
+		CompressionMode string                             `json:"compression" yaml:"compression"`
 	}
 	summarizedTransformMetadata struct {
-		Name         string            `json:"name" yaml:"name"`
-		InputTopic   string            `json:"input_topic" yaml:"input_topic"`
-		OutputTopics []string          `json:"output_topics" yaml:"output_topics"`
-		Environment  map[string]string `json:"environment" yaml:"environment"`
-		Running      string            `json:"running" yaml:"running"`
-		Lag          int               `json:"lag" yaml:"lag"`
+		Name            string            `json:"name" yaml:"name"`
+		InputTopic      string            `json:"input_topic" yaml:"input_topic"`
+		OutputTopics    []string          `json:"output_topics" yaml:"output_topics"`
+		Environment     map[string]string `json:"environment" yaml:"environment"`
+		Running         string            `json:"running" yaml:"running"`
+		Lag             int               `json:"lag" yaml:"lag"`
+		CompressionMode string            `json:"compression" yaml:"compression"`
 	}
 )
 
@@ -63,7 +67,7 @@ The --detailed flag (-d) opts in to printing extra per-processor information.
 `,
 		Aliases: []string{"ls"},
 		Args:    cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			f := p.Formatter
 			if detailed {
 				if h, ok := f.Help([]detailedTransformMetadata{}); ok {
@@ -79,7 +83,7 @@ The --detailed flag (-d) opts in to printing extra per-processor information.
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitServerlessAdmin(p)
 
-			var l []adminapi.TransformMetadata
+			var l []rpadmin.TransformMetadata
 			if p.FromCloud && !p.CloudCluster.IsServerless() {
 				url, err := p.CloudCluster.CheckClusterURL()
 				out.MaybeDie(err, "unable to get cluster information: %v", err)
@@ -87,11 +91,11 @@ The --detailed flag (-d) opts in to printing extra per-processor information.
 				cl, err := publicapi.NewDataPlaneClientSet(url, p.CurrentAuth().AuthToken)
 				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
 
-				res, err := cl.Transform.ListTransforms(cmd.Context(), connect.NewRequest(&dataplanev1alpha1.ListTransformsRequest{}))
+				res, err := cl.Transform.ListTransforms(cmd.Context(), connect.NewRequest(&dataplanev1alpha2.ListTransformsRequest{}))
 				out.MaybeDie(err, "unable to list transforms from Cloud: %v", err)
 				l = dataplaneToAdminTransformMetadata(res.Msg.Transforms)
 			} else {
-				api, err := adminapi.NewClient(fs, p)
+				api, err := adminapi.NewClient(cmd.Context(), fs, p)
 				out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
 				l, err = api.ListWasmTransforms(cmd.Context())
@@ -112,7 +116,7 @@ The --detailed flag (-d) opts in to printing extra per-processor information.
 	return cmd
 }
 
-func makeEnvMap(env []adminapi.EnvironmentVariable) map[string]string {
+func makeEnvMap(env []rpadmin.EnvironmentVariable) map[string]string {
 	out := make(map[string]string)
 	for _, entry := range env {
 		out[entry.Key] = entry.Value
@@ -120,7 +124,7 @@ func makeEnvMap(env []adminapi.EnvironmentVariable) map[string]string {
 	return out
 }
 
-func summarizedView(metadata []adminapi.TransformMetadata) (resp []summarizedTransformMetadata) {
+func summarizedView(metadata []rpadmin.TransformMetadata) (resp []summarizedTransformMetadata) {
 	resp = make([]summarizedTransformMetadata, 0, len(metadata))
 	for _, meta := range metadata {
 		total := len(meta.Status)
@@ -133,12 +137,13 @@ func summarizedView(metadata []adminapi.TransformMetadata) (resp []summarizedTra
 			lag += v.Lag
 		}
 		resp = append(resp, summarizedTransformMetadata{
-			Name:         meta.Name,
-			InputTopic:   meta.InputTopic,
-			OutputTopics: meta.OutputTopics,
-			Environment:  makeEnvMap(meta.Environment),
-			Running:      fmt.Sprintf("%d / %d", running, total),
-			Lag:          lag,
+			Name:            meta.Name,
+			InputTopic:      meta.InputTopic,
+			OutputTopics:    meta.OutputTopics,
+			Environment:     makeEnvMap(meta.Environment),
+			Running:         fmt.Sprintf("%d / %d", running, total),
+			Lag:             lag,
+			CompressionMode: meta.CompressionMode,
 		})
 	}
 	return
@@ -157,15 +162,16 @@ func printSummary(f config.OutFormatter, s []summarizedTransformMetadata, w io.W
 	}
 }
 
-func detailView(metadata []adminapi.TransformMetadata) (resp []detailedTransformMetadata) {
+func detailView(metadata []rpadmin.TransformMetadata) (resp []detailedTransformMetadata) {
 	resp = make([]detailedTransformMetadata, 0, len(metadata))
 	for _, meta := range metadata {
 		resp = append(resp, detailedTransformMetadata{
-			Name:         meta.Name,
-			InputTopic:   meta.InputTopic,
-			OutputTopics: meta.OutputTopics,
-			Environment:  makeEnvMap(meta.Environment),
-			Status:       meta.Status,
+			Name:            meta.Name,
+			InputTopic:      meta.InputTopic,
+			OutputTopics:    meta.OutputTopics,
+			Environment:     makeEnvMap(meta.Environment),
+			Status:          meta.Status,
+			CompressionMode: meta.CompressionMode,
 		})
 	}
 	return
@@ -192,17 +198,17 @@ func printDetailed(f config.OutFormatter, d []detailedTransformMetadata, w io.Wr
 	}
 }
 
-func dataplaneToAdminTransformMetadata(transforms []*dataplanev1alpha1.TransformMetadata) []adminapi.TransformMetadata {
-	var transformMetadata []adminapi.TransformMetadata
+func dataplaneToAdminTransformMetadata(transforms []*dataplanev1alpha2.TransformMetadata) []rpadmin.TransformMetadata {
+	var transformMetadata []rpadmin.TransformMetadata
 	for _, t := range transforms {
 		var (
-			status []adminapi.PartitionTransformStatus
-			envs   []adminapi.EnvironmentVariable
+			status []rpadmin.PartitionTransformStatus
+			envs   []rpadmin.EnvironmentVariable
 		)
 		if t != nil {
 			for _, s := range t.Statuses {
 				if s != nil {
-					status = append(status, adminapi.PartitionTransformStatus{
+					status = append(status, rpadmin.PartitionTransformStatus{
 						NodeID:    int(s.BrokerId),
 						Partition: int(s.PartitionId),
 						Status:    strings.TrimPrefix(s.Status.String(), "PARTITION_STATUS_"),
@@ -212,13 +218,13 @@ func dataplaneToAdminTransformMetadata(transforms []*dataplanev1alpha1.Transform
 			}
 			for _, e := range t.EnvironmentVariables {
 				if e != nil {
-					envs = append(envs, adminapi.EnvironmentVariable{
+					envs = append(envs, rpadmin.EnvironmentVariable{
 						Key:   e.Key,
 						Value: e.Value,
 					})
 				}
 			}
-			transformMetadata = append(transformMetadata, adminapi.TransformMetadata{
+			transformMetadata = append(transformMetadata, rpadmin.TransformMetadata{
 				Name:         t.Name,
 				InputTopic:   t.InputTopicName,
 				OutputTopics: t.OutputTopicNames,

@@ -20,7 +20,8 @@
 #include "config/configuration.h"
 #include "features/feature_table.h"
 #include "io.h"
-#include "kafka/server/partition_proxy.h"
+#include "kafka/data/partition_proxy.h"
+#include "kafka/utils/txn_reader.h"
 #include "logger.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
@@ -38,9 +39,8 @@
 #include "transform_logger.h"
 #include "transform_manager.h"
 #include "transform_processor.h"
-#include "txn_reader.h"
-#include "wasm/api.h"
 #include "wasm/cache.h"
+#include "wasm/engine.h"
 #include "wasm/errc.h"
 
 #include <seastar/core/circular_buffer.hh>
@@ -147,7 +147,7 @@ public:
         return model::offset_cast(model::prev_offset(result.value()));
     }
 
-    ss::future<kafka::offset>
+    ss::future<std::optional<kafka::offset>>
     offset_at_timestamp(model::timestamp ts, ss::abort_source* as) final {
         auto result = co_await _partition.timequery(storage::timequery_config(
           _partition.start_offset(),
@@ -158,9 +158,14 @@ public:
           /*as=*/*as,
           /*client_addr=*/std::nullopt));
         if (!result.has_value()) {
-            co_return kafka::offset::min();
+            co_return std::nullopt;
         }
         co_return model::offset_cast(result->offset);
+    }
+
+    kafka::offset start_offset() const final {
+        auto result = _partition.start_offset();
+        return model::offset_cast(result);
     }
 
     ss::future<model::record_batch_reader>
@@ -217,9 +222,9 @@ public:
         // all readers it makes, as this takes a pointer to a member.
         //
         // This is documented as part of the contract for the source interface.
-        auto tracker = aborted_transaction_tracker::create_default(
+        auto tracker = kafka::aborted_transaction_tracker::create_default(
           &_partition, std::move(translater.ot_state));
-        co_return model::make_record_batch_reader<read_committed_reader>(
+        co_return model::make_record_batch_reader<kafka::read_committed_reader>(
           std::move(tracker), std::move(translater.reader));
     }
 
@@ -666,7 +671,13 @@ ss::future<std::error_code> service::deploy_transform(
     if (!_feature_table->local().is_active(
           features::feature::wasm_transforms)) {
         co_return cluster::make_error_code(cluster::errc::feature_disabled);
+    } else if (
+      !_feature_table->local().is_active(
+        features::feature::transforms_specify_offset)
+      && !meta.offset_options.is_legacy_compat()) {
+        co_return cluster::make_error_code(cluster::errc::feature_disabled);
     }
+
     auto _ = _gate.hold();
     try {
         co_await _runtime->validate(model::share_wasm_binary(binary));
@@ -693,14 +704,22 @@ ss::future<std::error_code> service::deploy_transform(
     auto [key, offset] = result.value();
     meta.uuid = key;
     meta.source_ptr = offset;
-    meta.offset_options = model::transform_offset_options{
-      // Set the transform to start processing new records starting now,
-      // this is the default expectations for developers, as once deploy
-      // completes, they should be able to produce without waiting for the
-      // vm to start. If we start from the end of the log, then records produced
-      // between now and the vm start would be skipped.
-      .position = model::new_timestamp(),
-    };
+
+    // Use latest_offset as a sentinel value during user-driven deploy. We won't
+    // expose this option through the API anyway, and already-serialized
+    // transform metadata (i.e. legacy deployments) won't traverse this code.
+    // Otherwise, respect whatever offset was specifified in the request.
+    if (std::holds_alternative<model::transform_offset_options::latest_offset>(
+          meta.offset_options.position)) {
+        meta.offset_options = model::transform_offset_options{
+          // Set the transform to start processing new records starting now,
+          // this is the default expectations for developers, as once deploy
+          // completes, they should be able to produce without waiting for the
+          // vm to start. If we start from the end of the log, then records
+          // produced between now and the vm start would be skipped.
+          .position = model::new_timestamp(),
+        };
+    }
     vlog(
       tlog.debug,
       "stored wasm binary for transform {} at offset {}",
@@ -816,7 +835,28 @@ service::compute_node_local_report() {
 model::cluster_transform_report service::compute_default_report() {
     using state = model::transform_report::processor::state;
     model::cluster_transform_report report;
-    // Mark all transforms in an unknown state if they don't get an update
+
+    // Mark all partitions for each transform in an unknown or inactive state if
+    // they don't get an update.
+    //
+    // This pattern arises from the way we model state in transform_manager.
+    // Namely, when the plugin_table reports an update to some transform, the
+    // manager responds by removing ALL processors associated with that
+    // transform ID from the processor_table, irrespective of the exact details
+    // of the update, susequently restarting those processors in all but two
+    // cases:
+    //   a. The ID no longer exists in the plugin table (i.e. the transform
+    //      has been removed from the system)
+    //   b. The transform is "paused"
+    // If either (a) or (b) is true (i.e. processors were NOT restarted), the
+    // report entries below will not get an update, and the processor entries
+    // in the final report carry the "default" status noted below.
+    //
+    // Therefore, since, by design, the processor_table does not contain any
+    // entries for a paused transform at rest and this is only reflected in
+    // the _absence_ of processor entries in the cluster-wide report, we must
+    // account for the "paused"ness of each transform in the default report,
+    // below.
     for (auto [id, transform] : _plugin_frontend->local().all_transforms()) {
         auto cfg = _topic_table->local().get_topic_cfg(transform.input_topic);
         if (!cfg) {
@@ -828,7 +868,7 @@ model::cluster_transform_report service::compute_default_report() {
               transform,
               {
                 .id = model::partition_id(i),
-                .status = state::unknown,
+                .status = transform.paused ? state::inactive : state::unknown,
                 .node = _self,
                 .lag = 0,
               });
@@ -888,6 +928,34 @@ ss::future<std::error_code> service::garbage_collect_committed_offsets() {
     }
     co_return co_await _rpc_client->local().delete_committed_offsets(
       std::move(ids));
+}
+
+ss::future<std::error_code> service::patch_transform_metadata(
+  model::transform_name name, model::transform_metadata_patch patch) {
+    if (!_feature_table->local().is_active(
+          features::feature::wasm_transforms)) {
+        co_return cluster::make_error_code(cluster::errc::feature_disabled);
+    }
+    auto _ = _gate.hold();
+    auto transform = _plugin_frontend->local().lookup_transform(name);
+    if (!transform.has_value()) {
+        co_return cluster::make_error_code(
+          cluster::errc::transform_does_not_exist);
+    }
+
+    transform->paused = patch.paused.value_or(transform->paused);
+    if (patch.env.has_value()) {
+        std::exchange(transform->environment, std::move(patch.env).value());
+    }
+    transform->compression_mode = patch.compression_mode.value_or(
+      transform->compression_mode);
+
+    cluster::errc ec = co_await _plugin_frontend->local().upsert_transform(
+      transform.value(), model::timeout_clock::now() + metadata_timeout);
+
+    vlog(tlog.info, "patching transform metadata {}", transform.value());
+
+    co_return cluster::make_error_code(ec);
 }
 
 } // namespace transform

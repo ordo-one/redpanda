@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -42,7 +44,7 @@ cluster is unreachable), use the hidden --force flag.
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			if !force {
@@ -50,7 +52,7 @@ cluster is unreachable), use the hidden --force flag.
 				out.MaybeDie(err, "unable to get broker list: %v; to bypass the node version check re-run this with --force; see this command's help text for more details", err)
 
 				var (
-					b             adminapi.Broker
+					b             rpadmin.Broker
 					found, anyOld bool
 				)
 				for _, br := range brokers {
@@ -60,7 +62,7 @@ cluster is unreachable), use the hidden --force flag.
 						}
 						version, err := redpanda.VersionFromString(br.Version)
 						out.MaybeDie(err, "unable to get broker %d version: %v; to bypass the node version check re-run this with --force; see this command's help text for more details", br.NodeID, err)
-						isOld := version.Less(redpanda.Version{Year: 23, Feature: 1, Patch: 1})
+						isOld := version.Less(redpanda.Version{Major: 23, Feature: 1, Patch: 1})
 
 						anyOld = anyOld || isOld
 						b, found = br, true

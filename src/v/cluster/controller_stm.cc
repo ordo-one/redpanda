@@ -14,6 +14,7 @@
 #include "base/vlog.h"
 #include "bytes/iostream.h"
 #include "cluster/controller_snapshot.h"
+#include "cluster/data_migration_table.h"
 #include "cluster/logger.h"
 #include "cluster/members_manager.h"
 
@@ -22,7 +23,8 @@
 namespace cluster {
 
 ss::future<> controller_stm::on_batch_applied() {
-    if (!_feature_table.is_active(features::feature::controller_snapshots)) {
+    if (!_feature_table.local().is_active(
+          features::feature::controller_snapshots)) {
         co_return;
     }
     if (_gate.is_closed()) {
@@ -36,6 +38,7 @@ ss::future<> controller_stm::on_batch_applied() {
         _snapshot_debounce_timer.arm(_snapshot_max_age());
     };
 }
+void controller_stm::shutdown_apply_loop() { _as.request_abort(); }
 
 ss::future<> controller_stm::shutdown() {
     _snapshot_debounce_timer.cancel();
@@ -105,7 +108,8 @@ ss::future<std::optional<iobuf>>
 controller_stm::maybe_make_snapshot(ssx::semaphore_units apply_mtx_holder) {
     auto started_at = ss::steady_clock_type::now();
 
-    if (!_feature_table.is_active(features::feature::controller_snapshots)) {
+    if (!_feature_table.local().is_active(
+          features::feature::controller_snapshots)) {
         vlog(clusterlog.warn, "skipping snapshotting, feature not enabled");
         co_return std::nullopt;
     }
@@ -178,7 +182,11 @@ ss::future<> controller_stm::apply_snapshot(
           std::get<plugin_backend&>(_state).apply_snapshot(offset, snapshot),
           std::get<cluster_recovery_manager&>(_state).apply_snapshot(
             offset, snapshot),
-          std::get<security_manager&>(_state).apply_snapshot(offset, snapshot));
+          std::get<security_manager&>(_state).apply_snapshot(offset, snapshot),
+          std::get<client_quota::backend&>(_state).apply_snapshot(
+            offset, snapshot),
+          std::get<data_migrations::migrations_table&>(_state).apply_snapshot(
+            offset, snapshot));
 
     } catch (const seastar::abort_requested_exception&) {
     } catch (const seastar::gate_closed_exception&) {
@@ -195,6 +203,10 @@ ss::future<> controller_stm::apply_snapshot(
     }
 
     _metrics_reporter_cluster_info = snapshot.metrics_reporter.cluster_info;
+    co_await _feature_table.invoke_on_all([&](features::feature_table& ft) {
+        ft.set_builtin_trial_license(
+          _metrics_reporter_cluster_info.creation_timestamp);
+    });
 }
 
 } // namespace cluster

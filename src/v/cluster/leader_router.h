@@ -9,6 +9,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "base/vformat.h"
 #include "cluster/logger.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_leaders_table.h"
@@ -16,7 +17,6 @@
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
 #include "rpc/connection_cache.h"
-#include "vformat.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -267,7 +267,7 @@ leader_router<req_t, resp_t, handler_t>::find_shard_and_process(
         while (!_as.abort_requested() && !shard && 0 < retries--) {
             try {
                 co_await sleep_abortable(delay_ms, _as);
-            } catch (ss::sleep_aborted&) {
+            } catch (const ss::sleep_aborted&) {
                 break;
             }
             shard = _shard_table.local().shard_for(ntp);

@@ -42,10 +42,11 @@ FIXTURE_TEST(test_simple_token_request, fixture) {
     ss::abort_source as;
 
     auto cl = cloud_roles::gcp_refresh_impl{address(), region, as};
-    auto resp = cl.fetch_credentials().get0();
+    auto resp = cl.fetch_credentials().get();
     BOOST_REQUIRE(std::holds_alternative<iobuf>(resp));
     BOOST_REQUIRE_EQUAL(
-      iobuf_to_bytes(std::get<iobuf>(resp)), cloud_role_tests::gcp_oauth_token);
+      iobuf_to_bytes(std::get<iobuf>(resp)),
+      bytes::from_string(cloud_role_tests::gcp_oauth_token));
     BOOST_REQUIRE(has_call(cloud_role_tests::gcp_url));
 }
 
@@ -54,7 +55,7 @@ FIXTURE_TEST(test_bad_response_handling, fixture) {
     ss::abort_source as;
 
     auto cl = cloud_roles::gcp_refresh_impl{address(), region, as};
-    auto resp = cl.fetch_credentials().get0();
+    auto resp = cl.fetch_credentials().get();
     BOOST_REQUIRE(std::holds_alternative<cloud_roles::api_request_error>(resp));
     auto error = std::get<cloud_roles::api_request_error>(resp);
     BOOST_REQUIRE_EQUAL(
@@ -70,7 +71,7 @@ FIXTURE_TEST(test_gateway_down, fixture) {
     ss::abort_source as;
 
     auto cl = cloud_roles::gcp_refresh_impl{address(), region, as};
-    auto resp = cl.fetch_credentials().get0();
+    auto resp = cl.fetch_credentials().get();
     BOOST_REQUIRE(std::holds_alternative<cloud_roles::api_request_error>(resp));
     auto error = std::get<cloud_roles::api_request_error>(resp);
     BOOST_REQUIRE_EQUAL(
@@ -89,7 +90,7 @@ FIXTURE_TEST(test_aws_role_fetch_on_startup, fixture) {
     ss::abort_source as;
 
     auto cl = cloud_roles::aws_refresh_impl{address(), region, as};
-    auto resp = cl.fetch_credentials().get0();
+    auto resp = cl.fetch_credentials().get();
     // assert that calls are made in order:
     // 1. to find the role
     // 2. to get token
@@ -98,7 +99,8 @@ FIXTURE_TEST(test_aws_role_fetch_on_startup, fixture) {
 
     BOOST_REQUIRE(std::holds_alternative<iobuf>(resp));
     BOOST_REQUIRE_EQUAL(
-      iobuf_to_bytes(std::get<iobuf>(resp)), cloud_role_tests::aws_creds);
+      iobuf_to_bytes(std::get<iobuf>(resp)),
+      bytes::from_string(cloud_role_tests::aws_creds));
 }
 
 FIXTURE_TEST(test_sts_credentials_fetch, fixture) {
@@ -116,17 +118,17 @@ FIXTURE_TEST(test_sts_credentials_fetch, fixture) {
     auto token_f = ss::open_file_dma(
                      cloud_role_tests::token_file,
                      ss::open_flags::create | ss::open_flags::rw)
-                     .get0();
+                     .get();
 
     ss::sstring token{"token"};
-    auto wrote = token_f.dma_write(0, token.data(), token.size()).get0();
+    auto wrote = token_f.dma_write(0, token.data(), token.size()).get();
     BOOST_REQUIRE_EQUAL(wrote, token.size());
 
     auto cl = cloud_roles::aws_sts_refresh_impl{address(), region, as};
-    auto resp = cl.fetch_credentials().get0();
+    auto resp = cl.fetch_credentials().get();
 
-    token_f.close().get0();
-    ss::remove_file(cloud_role_tests::token_file).get0();
+    token_f.close().get();
+    ss::remove_file(cloud_role_tests::token_file).get();
     BOOST_REQUIRE(std::holds_alternative<iobuf>(resp));
     BOOST_REQUIRE_EQUAL(std::get<iobuf>(resp), cloud_role_tests::sts_creds);
 
@@ -138,7 +140,7 @@ FIXTURE_TEST(test_sts_credentials_fetch, fixture) {
 
 class cloud_roles::aks_test_helper {
 public:
-    static auto get_address(azure_aks_refresh_impl const& aks) {
+    static auto get_address(const azure_aks_refresh_impl& aks) {
         return aks.address();
     }
 };

@@ -7,19 +7,19 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "bytes/iobuf_parser.h"
 #include "bytes/random.h"
 #include "random/generators.h"
 #include "utils/base64.h"
 
 #include <boost/test/unit_test.hpp>
-#include <cryptopp/base64.h>
 
 BOOST_AUTO_TEST_CASE(bytes_type) {
-    auto encdec = [](const bytes& input, const auto expected) {
-        auto encoded = bytes_to_base64(input);
+    auto encdec = [](std::string_view input, std::string_view expected) {
+        auto encoded = bytes_to_base64(bytes::from_string(input));
         BOOST_REQUIRE_EQUAL(encoded, expected);
         auto decoded = base64_to_bytes(encoded);
-        BOOST_REQUIRE_EQUAL(decoded, input);
+        BOOST_REQUIRE_EQUAL(decoded, bytes::from_string(input));
     };
 
     encdec("", "");
@@ -35,9 +35,9 @@ BOOST_AUTO_TEST_CASE(iobuf_type) {
         BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(input));
     };
 
-    encdec(bytes_to_iobuf(""), "");
-    encdec(bytes_to_iobuf("this is a string"), "dGhpcyBpcyBhIHN0cmluZw==");
-    encdec(bytes_to_iobuf("a"), "YQ==");
+    encdec(iobuf::from(""), "");
+    encdec(iobuf::from("this is a string"), "dGhpcyBpcyBhIHN0cmluZw==");
+    encdec(iobuf::from("a"), "YQ==");
 
     // test with multiple iobuf fragments
     iobuf buf;
@@ -51,10 +51,24 @@ BOOST_AUTO_TEST_CASE(iobuf_type) {
     BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(buf));
 }
 
+BOOST_AUTO_TEST_CASE(test_base64_to_iobuf) {
+    const std::string_view a_string = "dGhpcyBpcyBhIHN0cmluZw==";
+    iobuf buf;
+    const size_t half = a_string.size() / 2;
+    buf.append_fragments(iobuf::from(a_string.substr(0, half)));
+    buf.append_fragments(iobuf::from(a_string.substr(half)));
+    BOOST_REQUIRE_EQUAL(std::distance(buf.begin(), buf.end()), 2);
+
+    auto decoded = base64_to_iobuf(buf);
+    iobuf_parser p{std::move(decoded)};
+    auto decoded_str = p.read_string(p.bytes_left());
+    BOOST_REQUIRE_EQUAL(decoded_str, "this is a string");
+}
+
 BOOST_AUTO_TEST_CASE(base64_url_decode_test_basic) {
-    auto dec = [](std::string_view input, const bytes& expected) {
+    auto dec = [](std::string_view input, std::string_view expected) {
         auto decoded = base64url_to_bytes(input);
-        BOOST_REQUIRE_EQUAL(decoded, expected);
+        BOOST_REQUIRE_EQUAL(decoded, bytes::from_string(expected));
     };
 
     dec("UmVkcGFuZGEgUm9ja3M", "Redpanda Rocks");
@@ -81,41 +95,15 @@ BOOST_AUTO_TEST_CASE(base64_url_decode_test_basic) {
       "IoT data streams, or managing event-driven microservices, Redpanda has "
       "you covered.");
 
-    dec("", "");
     dec("YQ", "a");
     dec("YWI", "ab");
     dec("YWJj", "abc");
-    dec("A", "");
-}
-
-BOOST_AUTO_TEST_CASE(base64_url_decode_test_random) {
-    const std::array<size_t, 5> test_sizes = {1, 10, 128, 256, 512};
-    auto dec = [](std::string_view input, const bytes& expected) {
-        auto decoded = base64url_to_bytes(input);
-        BOOST_REQUIRE_EQUAL(decoded, expected);
-    };
-
-    auto enc = [](const bytes& msg) {
-        CryptoPP::Base64URLEncoder encoder;
-        encoder.Put(msg.data(), msg.size());
-        encoder.MessageEnd();
-        auto size = encoder.MaxRetrievable();
-        BOOST_REQUIRE_NE(size, 0);
-        ss::sstring encoded(ss::sstring::initialized_later{}, size);
-        encoder.Get(
-          reinterpret_cast<CryptoPP::byte*>(encoded.data()), encoded.size());
-        return encoded;
-    };
-
-    for (auto s : test_sizes) {
-        auto val = random_generators::get_bytes(s);
-        auto encoded = enc(val);
-        dec(encoded, val);
-    }
+    dec("", "");
 }
 
 BOOST_AUTO_TEST_CASE(base64_url_decode_invalid_character) {
     const std::string invalid_encode = "abc+/";
     BOOST_REQUIRE_THROW(
       base64url_to_bytes(invalid_encode), base64_url_decoder_exception);
+    BOOST_REQUIRE_THROW(base64url_to_bytes("A"), base64_url_decoder_exception);
 }

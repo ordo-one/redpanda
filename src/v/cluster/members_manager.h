@@ -149,7 +149,7 @@ public:
     // controller command to register the requested node UUID, responding with
     // a newly assigned node ID.
     ss::future<result<join_node_reply>>
-    handle_join_request(join_node_request const r);
+    handle_join_request(const join_node_request r);
 
     // Applies a committed record batch, specializing handling based on the
     // batch type.
@@ -176,7 +176,8 @@ public:
 
     // Initialize `_id_by_uuid` and brokers list. Should be called once only
     // when bootstrapping a cluster.
-    ss::future<> set_initial_state(std::vector<model::broker>, uuid_map_t);
+    ss::future<>
+      set_initial_state(std::vector<model::broker>, uuid_map_t, model::offset);
 
     // Returns a reference to a map containing mapping between node ids and node
     // uuids. Node UUID is node globally unique identifier which has an id
@@ -213,7 +214,7 @@ private:
     bool try_register_node_id(const model::node_id&, const model::node_uuid&);
 
     ss::future<result<join_node_reply>> dispatch_join_to_seed_server(
-      seed_iterator it, join_node_request const& req);
+      seed_iterator it, const join_node_request& req);
     ss::future<result<join_node_reply>> dispatch_join_to_remote(
       const config::seed_server&, join_node_request&& req);
 
@@ -249,11 +250,6 @@ private:
     ss::future<std::error_code> update_node(model::broker);
 
     ss::future<join_node_reply> make_join_node_success_reply(model::node_id id);
-
-    bool command_based_membership_active() const {
-        return _feature_table.local().is_active(
-          features::feature::membership_change_controller_cmds);
-    }
 
     struct members_snapshot
       : serde::envelope<

@@ -7,7 +7,12 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "serde/serde.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/map.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/uuid.h"
+#include "serde/rw/vector.h"
 #include "utils/named_type.h"
 #include "utils/uuid.h"
 
@@ -23,6 +28,17 @@ SEASTAR_THREAD_TEST_CASE(test_uuid_create) {
     auto uuid1 = uuid_t::create();
     auto uuid2 = uuid_t::create();
     BOOST_REQUIRE_NE(uuid1, uuid2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_uuid_default_construct) {
+    auto uuid = uuid_t{};
+    BOOST_REQUIRE_EQUAL(
+      uuid, uuid_t::from_string("00000000-0000-0000-0000-000000000000"));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_lt) {
+    BOOST_REQUIRE_LT(
+      uuid_t{}, uuid_t::from_string("00000000-0000-0000-0000-000000000001"));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_named_uuid_type) {
@@ -55,6 +71,8 @@ struct uuid_struct
     std::optional<uuid_t> opt2;
     std::vector<uuid_t> vec;
     std::vector<std::optional<uuid_t>> opt_vec;
+
+    auto serde_fields() { return std::tie(single, opt1, opt2, vec, opt_vec); }
 };
 
 template<typename map_t>
@@ -110,7 +128,7 @@ SEASTAR_THREAD_TEST_CASE(complex_uuid_types_test) {
     BOOST_CHECK(us.opt2 == r.opt2);
     BOOST_CHECK_EQUAL(us.vec, r.vec);
     BOOST_CHECK_EQUAL(us.opt_vec.size(), r.opt_vec.size());
-    for (int i = 0; i < us.opt_vec.size(); ++i) {
+    for (size_t i = 0; i < us.opt_vec.size(); ++i) {
         BOOST_CHECK(us.opt_vec[i] == r.opt_vec[i]);
     }
 

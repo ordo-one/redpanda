@@ -9,15 +9,16 @@
  */
 
 #include "base/units.h"
-#include "bytes/bytes.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "cache_test_fixture.h"
 #include "cloud_storage/access_time_tracker.h"
 #include "cloud_storage/cache_service.h"
 #include "random/generators.h"
-#include "ssx/sformat.h"
 #include "test_utils/fixture.h"
+#include "test_utils/iostream.h"
+#include "test_utils/scoped_config.h"
+#include "utils/directory_walker.h"
 #include "utils/file_io.h"
 #include "utils/human.h"
 
@@ -30,7 +31,9 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 
 using namespace cloud_storage;
@@ -61,6 +64,22 @@ FIXTURE_TEST(get_after_put, cache_test_fixture) {
       std::string_view(read_buf.get(), read_buf.size()), data_string);
     BOOST_CHECK(!stream.read().get().get());
     stream.close().get();
+}
+
+FIXTURE_TEST(stremaing_get_after_put, cache_test_fixture) {
+    auto data_string = create_data_string('a', 1_MiB + 1_KiB);
+    put_into_cache(data_string, KEY);
+
+    auto stream
+      = sharded_cache.local().get(KEY, seastar::default_priority_class()).get();
+    BOOST_REQUIRE(stream);
+    BOOST_CHECK_EQUAL(stream->size, data_string.length());
+
+    auto read_buf = stream->body.read_exactly(data_string.length()).get();
+    BOOST_CHECK_EQUAL(
+      std::string_view(read_buf.get(), read_buf.size()), data_string);
+    BOOST_CHECK(!stream->body.read().get().get());
+    stream->body.close().get();
 }
 
 FIXTURE_TEST(put_rewrites_file, cache_test_fixture) {
@@ -330,7 +349,7 @@ SEASTAR_THREAD_TEST_CASE(test_access_time_tracker) {
       make_ts(1653000009),
     };
 
-    std::vector<std::string_view> names = {
+    std::vector<ss::sstring> names = {
       "key0",
       "key1",
       "key2",
@@ -344,20 +363,23 @@ SEASTAR_THREAD_TEST_CASE(test_access_time_tracker) {
     };
 
     for (int i = 0; i < 10; i++) {
-        cm.add_timestamp(names[i], timestamps[i]);
+        cm.add(names[i], timestamps[i], i);
     }
 
-    for (int i = 0; i < 10; i++) {
-        auto ts = cm.estimate_timestamp(names[i]);
-        BOOST_REQUIRE(ts.value() >= timestamps[i]);
+    for (unsigned i = 0; i < 10; i++) {
+        auto ts = cm.get(names[i]);
+        BOOST_REQUIRE(ts.has_value());
+        BOOST_REQUIRE(ts->time_point() == timestamps[i]);
+        BOOST_REQUIRE(ts->size == i);
     }
 }
 
-static access_time_tracker serde_roundtrip(access_time_tracker& t) {
+static access_time_tracker serde_roundtrip(
+  access_time_tracker& t, tracker_version version = tracker_version::v2) {
     // Round trip
     iobuf serialized;
     auto out_stream = make_iobuf_ref_output_stream(serialized);
-    t.write(out_stream).get();
+    t.write(out_stream, version).get();
     out_stream.flush().get();
 
     access_time_tracker out;
@@ -391,7 +413,7 @@ SEASTAR_THREAD_TEST_CASE(test_access_time_tracker_serializer) {
       make_ts(0xbeefed09),
     };
 
-    std::vector<std::string_view> names = {
+    std::vector<ss::sstring> names = {
       "key0",
       "key1",
       "key2",
@@ -405,15 +427,16 @@ SEASTAR_THREAD_TEST_CASE(test_access_time_tracker_serializer) {
     };
 
     for (int i = 0; i < 10; i++) {
-        in.add_timestamp(names[i], timestamps[i]);
+        in.add(names[i], timestamps[i], i);
     }
 
     auto out = serde_roundtrip(in);
 
-    for (int i = 0; i < timestamps.size(); i++) {
-        auto ts = out.estimate_timestamp(names[i]);
+    for (unsigned i = 0; i < timestamps.size(); i++) {
+        auto ts = out.get(names[i]);
         BOOST_REQUIRE(ts.has_value());
-        BOOST_REQUIRE(ts.value() >= timestamps[i]);
+        BOOST_REQUIRE(ts->time_point() == timestamps[i]);
+        BOOST_REQUIRE(ts->size == i);
     }
 }
 
@@ -424,11 +447,59 @@ SEASTAR_THREAD_TEST_CASE(test_access_time_tracker_serializer_large) {
     // to verify the chunking code works properly;
     uint32_t item_count = 7777;
     for (uint32_t i = 0; i < item_count; i++) {
-        in.add_timestamp(fmt::format("key{:08x}", i), make_ts(i));
+        in.add(fmt::format("key{:08x}", i), make_ts(i), i);
     }
 
     auto out = serde_roundtrip(in);
     BOOST_REQUIRE_EQUAL(out.size(), item_count);
+    for (size_t i = 0; i < item_count; ++i) {
+        const auto entry = in.get(fmt::format("key{:08x}", i));
+        BOOST_REQUIRE(entry.has_value());
+        BOOST_REQUIRE_EQUAL(entry->size, i);
+        BOOST_REQUIRE_EQUAL(entry->atime_sec, i);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_access_time_tracker_read_skipped_on_old_version) {
+    access_time_tracker in;
+    in.add("key", make_ts(0), 0);
+    auto out = serde_roundtrip(in, tracker_version::v1);
+    BOOST_REQUIRE_EQUAL(out.size(), 0);
+}
+
+ss::future<size_t> count_files(ss::sstring dirname) {
+    directory_walker walker;
+    size_t count = 0;
+    co_await walker.walk(
+      dirname,
+      [dirname, &count](const ss::directory_entry& entry) -> ss::future<> {
+          if (entry.type == ss::directory_entry_type::directory) {
+              return count_files(fmt::format("{}/{}", dirname, entry.name))
+                .then([&count](size_t sub_count) { count += sub_count; });
+          } else {
+              ++count;
+              return ss::now();
+          }
+      });
+
+    co_return count;
+}
+
+FIXTURE_TEST(test_clean_up_on_stream_exception, cache_test_fixture) {
+    auto s = tests::make_throwing_stream(ss::abort_requested_exception());
+    auto reservation = sharded_cache.local().reserve_space(1, 1).get();
+    BOOST_CHECK_THROW(
+      sharded_cache.local().put(KEY, s, reservation).get(),
+      ss::abort_requested_exception);
+    vlog(test_log.info, "Put failed as expected");
+
+    BOOST_CHECK_EQUAL(sharded_cache.local().get_usage_bytes(), 0);
+    BOOST_CHECK_EQUAL(sharded_cache.local().get_usage_objects(), 0);
+
+    vlog(test_log.info, "Counting files in cache directory");
+    BOOST_CHECK_EQUAL(count_files(CACHE_DIR.native()).get(), 0);
+
+    vlog(test_log.info, "Test passed");
 }
 
 /**
@@ -461,6 +532,7 @@ FIXTURE_TEST(test_clean_up_on_start, cache_test_fixture) {
     BOOST_CHECK(!ss::file_exists((CACHE_DIR / tmp_key).native()).get());
     BOOST_CHECK(!ss::file_exists(empty_dir_path.native()).get());
     BOOST_CHECK(ss::file_exists(populated_dir_path.native()).get());
+    BOOST_CHECK_EQUAL(get_object_count(), 2);
 }
 
 /**
@@ -546,6 +618,10 @@ FIXTURE_TEST(test_log_segment_cleanup, cache_test_fixture) {
 }
 
 FIXTURE_TEST(test_cache_carryover_trim, cache_test_fixture) {
+    scoped_config cfg;
+    cfg.get("cloud_storage_cache_trim_carryover_bytes")
+      .set_value(uint32_t{256_KiB});
+
     std::string write_buf(1_MiB, ' ');
     random_generators::fill_buffer_randomchars(
       write_buf.data(), write_buf.size());
@@ -620,4 +696,132 @@ FIXTURE_TEST(test_cache_carryover_trim, cache_test_fixture) {
       after_objects);
     BOOST_REQUIRE_EQUAL(after_bytes, 0);
     BOOST_REQUIRE_EQUAL(after_objects, 0);
+}
+
+FIXTURE_TEST(bucketing_works_with_old_objects, cache_test_fixture) {
+    auto data_string = create_data_string('a', 1_KiB);
+    const std::filesystem::path key1{"80000001/a/b/c/d/file1.txt"};
+    const std::filesystem::path key2{"80000002/a/b/c/d/file2.txt"};
+    const std::filesystem::path key2_rehashed{"2/a/b/c/d/file2.txt"};
+    put_into_cache(data_string, key1);
+
+    scoped_config cfg;
+    cfg.get("cloud_storage_cache_num_buckets").set_value((uint32_t)16);
+    // Now key2 should be mapped to "2/a/b/c/d/file2.txt"
+
+    ss::sleep(1s).get();
+    put_into_cache(data_string, key2);
+
+    BOOST_CHECK(ss::file_exists((CACHE_DIR / key1).native()).get());
+    BOOST_CHECK(!ss::file_exists((CACHE_DIR / key2).native()).get());
+    BOOST_CHECK(ss::file_exists((CACHE_DIR / key2_rehashed).native()).get());
+
+    // check that GET works
+    auto r1 = sharded_cache.local().get(key1).get();
+    auto r2 = sharded_cache.local().get(key2).get();
+    BOOST_CHECK(r1.has_value());
+    BOOST_CHECK(r2.has_value());
+
+    // check is_cached
+    BOOST_CHECK(
+      sharded_cache.local().is_cached(key1).get()
+      == cache_element_status::available);
+    BOOST_CHECK(
+      sharded_cache.local().is_cached(key2).get()
+      == cache_element_status::available);
+
+    // check cache invalidation
+    sharded_cache.local().invalidate(key1).get();
+    sharded_cache.local().invalidate(key2).get();
+    BOOST_CHECK(!ss::file_exists((CACHE_DIR / key1).native()).get());
+    BOOST_CHECK(!ss::file_exists((CACHE_DIR / key2).native()).get());
+    BOOST_CHECK(!ss::file_exists((CACHE_DIR / key2_rehashed).native()).get());
+}
+
+FIXTURE_TEST(test_background_maybe_trim, cache_test_fixture) {
+    std::string write_buf(1_KiB, ' ');
+    random_generators::fill_buffer_randomchars(
+      write_buf.data(), write_buf.size());
+    size_t num_objects = 100;
+    std::vector<std::filesystem::path> object_keys;
+    for (unsigned i = 0; i < num_objects; i++) {
+        object_keys.emplace_back(fmt::format("test_{}.log.1", i));
+        std::ofstream segment{CACHE_DIR / object_keys.back()};
+        segment.write(
+          write_buf.data(), static_cast<std::streamsize>(write_buf.size()));
+        segment.flush();
+    }
+
+    // Account all files in the cache (100 MiB).
+    clean_up_at_start().get();
+    BOOST_REQUIRE_EQUAL(get_object_count(), 100);
+
+    for (const auto& key : object_keys) {
+        // Touch every object so they have access times assigned to them
+        auto item = sharded_cache.local().get(key).get();
+        item->body.close().get();
+    }
+    BOOST_REQUIRE_EQUAL(get_object_count(), 100);
+
+    set_trim_thresholds(100.0, 50.0, 100);
+
+    // Do a put which should trigger a background trim and reduce the
+    // object count to 40, followed by a put that will increase it to 41.
+    auto data_string = create_data_string('a', 1_KiB);
+    put_into_cache(data_string, KEY);
+    wait_for_trim();
+
+    // 41 because we set a trigger of 50. That means that trim is triggered at
+    // 50%, but the low water mark adjusts this by an additional 80%, 50% * 80%
+    // = 40%. +1 for the object we just added.
+    BOOST_REQUIRE_EQUAL(get_object_count(), 41);
+}
+
+FIXTURE_TEST(test_tracker_sync_only_remove, cache_test_fixture) {
+    put_into_cache(create_data_string('a', 1_KiB), KEY);
+    auto& cache = sharded_cache.local();
+    cache.get(KEY).get();
+
+    const auto full_key_path = CACHE_DIR / KEY;
+
+    const auto& t = tracker();
+    BOOST_REQUIRE_EQUAL(t.size(), 1);
+
+    {
+        const auto entry = t.get(full_key_path.native());
+        BOOST_REQUIRE(entry.has_value());
+        BOOST_REQUIRE_EQUAL(entry->size, 1_KiB);
+        BOOST_REQUIRE_EQUAL(cache.get_usage_bytes(), 1_KiB);
+        BOOST_REQUIRE_EQUAL(cache.get_usage_objects(), 1);
+    }
+
+    ss::remove_file(full_key_path.native()).get();
+
+    {
+        const auto entry = t.get(full_key_path.native());
+        BOOST_REQUIRE(entry.has_value());
+        BOOST_REQUIRE_EQUAL(entry->size, 1_KiB);
+        BOOST_REQUIRE_EQUAL(cache.get_usage_bytes(), 1_KiB);
+        BOOST_REQUIRE_EQUAL(cache.get_usage_objects(), 1);
+    }
+
+    sync_tracker();
+
+    BOOST_REQUIRE_EQUAL(t.size(), 0);
+    BOOST_REQUIRE(!t.get(full_key_path.native()).has_value());
+    BOOST_REQUIRE_EQUAL(cache.get_usage_bytes(), 0);
+    BOOST_REQUIRE_EQUAL(cache.get_usage_objects(), 0);
+}
+
+FIXTURE_TEST(test_tracker_sync_add_remove, cache_test_fixture) {
+    put_into_cache(create_data_string('a', 1_KiB), KEY);
+    auto& cache = sharded_cache.local();
+    const auto full_key_path = CACHE_DIR / KEY;
+    const auto& t = tracker();
+    BOOST_REQUIRE_EQUAL(t.size(), 0);
+    sync_tracker(access_time_tracker::add_entries_t::yes);
+    BOOST_REQUIRE_EQUAL(t.size(), 1);
+    BOOST_REQUIRE(t.get(full_key_path.native()).has_value());
+    BOOST_REQUIRE_EQUAL(cache.get_usage_bytes(), 1024);
+    BOOST_REQUIRE_EQUAL(cache.get_usage_objects(), 1);
 }

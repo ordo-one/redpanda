@@ -8,9 +8,9 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/tests/s3_imposter.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/cloud_metadata/key_utils.h"
 #include "cluster/cloud_metadata/manifest_downloads.h"
@@ -36,7 +36,8 @@ class cluster_metadata_fixture
 public:
     cluster_metadata_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{}, httpd_port_number())
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number())
       , remote(app.cloud_storage_api.local())
       , bucket(cloud_storage_clients::bucket_name("test-bucket")) {
         set_expectations_and_listen({});
@@ -76,6 +77,7 @@ FIXTURE_TEST(test_download_manifest, cluster_metadata_fixture) {
           .upload_manifest(
             cloud_storage_clients::bucket_name("test-bucket"),
             manifest,
+            manifest.get_manifest_path(),
             retry_node)
           .get();
 
@@ -112,7 +114,10 @@ FIXTURE_TEST(
     manifest.metadata_id = cluster_metadata_id(10);
     remote
       .upload_manifest(
-        cloud_storage_clients::bucket_name("test-bucket"), manifest, retry_node)
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
       .get();
 
     m_res
@@ -128,7 +133,10 @@ FIXTURE_TEST(
     // Upload a new manifest with a higher metadata ID for a new cluster.
     remote
       .upload_manifest(
-        cloud_storage_clients::bucket_name("test-bucket"), manifest, retry_node)
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
       .get();
     m_res
       = download_highest_manifest_in_bucket(remote, bucket, retry_node).get();

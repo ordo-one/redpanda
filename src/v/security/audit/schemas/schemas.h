@@ -10,7 +10,9 @@
 #pragma once
 
 #include "config/node_config.h"
+#include "reflection/type_traits.h"
 #include "security/audit/schemas/types.h"
+#include "utils/functional.h"
 
 namespace security::audit {
 
@@ -101,12 +103,12 @@ protected:
       timestamp_t time,
       T activity_id)
       : ocsf_base_event(
-        category_uid,
-        class_uid,
-        ocsf_redpanda_metadata(),
-        severity_id,
-        time,
-        activity_id) {}
+          category_uid,
+          class_uid,
+          ocsf_redpanda_metadata(),
+          severity_id,
+          time,
+          activity_id) {}
 
     template<typename T>
     ocsf_base_event(

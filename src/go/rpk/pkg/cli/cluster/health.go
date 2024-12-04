@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -43,13 +44,13 @@ following conditions are met:
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// --exit-when-healthy only makes sense with --watch, so we enable
 			// watch if --exit-when-healthy is provided.
 			watch = exit || watch
-			var lastOverview adminapi.ClusterHealthOverview
+			var lastOverview rpadmin.ClusterHealthOverview
 			for {
 				ret, err := cl.GetHealthOverview(cmd.Context())
 				out.MaybeDie(err, "unable to request cluster health: %v", err)
@@ -68,11 +69,11 @@ following conditions are met:
 	p.InstallSASLFlags(cmd)
 
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Blocks and writes out all cluster health changes")
-	cmd.Flags().BoolVarP(&exit, "exit-when-healthy", "e", false, "Exits after cluster is back in healthy state")
+	cmd.Flags().BoolVarP(&exit, "exit-when-healthy", "e", false, "Exits when the cluster is back in a healthy state")
 	return cmd
 }
 
-func printHealthOverview(hov *adminapi.ClusterHealthOverview) {
+func printHealthOverview(hov *rpadmin.ClusterHealthOverview) {
 	types.Sort(hov)
 	out.Section("CLUSTER HEALTH OVERVIEW")
 

@@ -36,6 +36,7 @@ class KgoVerifierService(Service):
     Use ctx.cluster.alloc(ClusterSpec.simple_linux(1)) to allocate node and pass it to constructor
     """
     _status_thread: Optional[StatusThread]
+    _stopped: bool
 
     def __init__(self,
                  context,
@@ -88,6 +89,7 @@ class KgoVerifierService(Service):
                 node.kgo_verifier_ports = {}
 
         self._status_thread = None
+        self._stopped = False
 
     def __del__(self):
         self._release_port()
@@ -199,7 +201,14 @@ class KgoVerifierService(Service):
     def stop_node(self, node, **kwargs):
         if self._status_thread:
             self._status_thread.stop()
+            self._status_thread.raise_on_error()
             self._status_thread = None
+            # Record that we just stopped, so that we can't wait() after.
+            # This is done inside this if statement because stop_node() is also
+            # called during the start of the service to potentially stop a previous
+            # instance of the service. Here, we know that we are stopping the service
+            # that we started because it was us who initialized the _status_thread.
+            self._stopped = True
 
         if self._pid is None:
             return
@@ -237,8 +246,9 @@ class KgoVerifierService(Service):
                 return
             except Exception as e:
                 last_error = e
-                self._redpanda.logger.warn(
+                self._redpanda.logger.warning(
                     f"{self.who_am_i()} remote call failed, {e}")
+                time.sleep(3)
         if last_error:
             raise last_error
 
@@ -247,13 +257,20 @@ class KgoVerifierService(Service):
         Wrapper to catch timeouts on wait, and send a `/print_stack` to the remote
         process in case it is experiencing a hang bug.
         """
+
+        if self._stopped:
+            raise RuntimeError(
+                f"Can't wait {self.who_am_i()}. It was already stopped."
+                f" You can either stop() a service or wait() and then stop() it"
+                f" but not the other way around.")
+
         try:
             return self._do_wait_node(node, timeout_sec)
         except:
             try:
                 self._remote(node, "print_stack")
             except Exception as e:
-                self._redpanda.logger.warn(
+                self._redpanda.logger.warning(
                     f"{self.who_am_i()} failed to print stacks during wait failure: {e}"
                 )
 
@@ -414,7 +431,7 @@ class StatusThread(threading.Thread):
                 # status read
                 return
             else:
-                self._stop_requested.wait(self.INTERVAL)
+                self._shutdown_requested.wait(self.INTERVAL)
 
     def join_with_timeout(self):
         """
@@ -436,6 +453,7 @@ class StatusThread(threading.Thread):
         """
         Drop out of poll loop as soon as possible, and join.
         """
+        self._shutdown_requested.set()
         self._stop_requested.set()
         self.join_with_timeout()
 
@@ -552,7 +570,8 @@ class KgoVerifierProducer(KgoVerifierService):
                  enable_tls=False,
                  msgs_per_producer_id=None,
                  max_buffered_records=None,
-                 tolerate_data_loss=False):
+                 tolerate_data_loss=False,
+                 tolerate_failed_produce=False):
         super(KgoVerifierProducer,
               self).__init__(context, redpanda, topic, msg_size, custom_node,
                              debug_logs, trace_logs, username, password,
@@ -570,6 +589,7 @@ class KgoVerifierProducer(KgoVerifierService):
         self._msgs_per_producer_id = msgs_per_producer_id
         self._max_buffered_records = max_buffered_records
         self._tolerate_data_loss = tolerate_data_loss
+        self._tolerate_failed_produce = tolerate_failed_produce
 
     @property
     def produce_status(self):
@@ -598,8 +618,13 @@ class KgoVerifierProducer(KgoVerifierService):
             # the same topic, or that Redpanda showed a buggy behavior with
             # idempotency: producer records should always land at the next offset
             # after the last record they wrote.
-            raise RuntimeError(
-                f"{self.who_am_i()} possible idempotency bug: {self._status}")
+            if self._tolerate_data_loss:
+                self._redpanda.logger.warning(
+                    f"{self.who_am_i()} observed data loss: {self._status}")
+            else:
+                raise RuntimeError(
+                    f"{self.who_am_i()} possible idempotency bug: {self._status}"
+                )
 
         return super().wait_node(node, timeout_sec=timeout_sec)
 
@@ -669,6 +694,9 @@ class KgoVerifierProducer(KgoVerifierService):
         if self._tolerate_data_loss:
             cmd += " --tolerate-data-loss"
 
+        if self._tolerate_failed_produce:
+            cmd += " --tolerate-failed-produce"
+
         self.spawn(cmd, node)
 
         self._status_thread = StatusThread(self, node, ProduceStatus)
@@ -716,7 +744,8 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
             producer: Optional[KgoVerifierProducer] = None,
             username: Optional[str] = None,
             password: Optional[str] = None,
-            enable_tls: Optional[bool] = False):
+            enable_tls: Optional[bool] = False,
+            use_transactions: Optional[bool] = False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
         self._max_msgs = max_msgs
@@ -725,6 +754,7 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
         self._continuous = continuous
         self._tolerate_data_loss = tolerate_data_loss
         self._producer = producer
+        self._use_transactions = use_transactions
 
     def start_node(self, node, clean=False):
         if clean:
@@ -746,6 +776,8 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
             cmd += " --continuous"
         if self._tolerate_data_loss:
             cmd += " --tolerate-data-loss"
+        if self._use_transactions:
+            cmd += " --use-transactions"
         self.spawn(cmd, node)
 
         self._status_thread = StatusThread(self, node, ConsumerStatus)
@@ -795,11 +827,13 @@ class KgoVerifierRandomConsumer(AbstractConsumer):
                  trace_logs=False,
                  username=None,
                  password=None,
-                 enable_tls=False):
+                 enable_tls=False,
+                 use_transactions: Optional[bool] = False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
         self._rand_read_msgs = rand_read_msgs
         self._parallel = parallel
+        self._use_transactions = use_transactions
 
     def start_node(self, node, clean=False):
         if clean:
@@ -812,6 +846,8 @@ class KgoVerifierRandomConsumer(AbstractConsumer):
             cmd = cmd + f' --password {self._password}'
         if self._enable_tls:
             cmd = cmd + f' --enable-tls'
+        if self._use_transactions:
+            cmd += " --use-transactions"
 
         self.spawn(cmd, node)
 
@@ -840,7 +876,8 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
                  enable_tls=False,
                  continuous=False,
                  tolerate_data_loss=False,
-                 group_name=None):
+                 group_name=None,
+                 use_transactions=False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
 
@@ -851,6 +888,7 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
         self._group_name = group_name
         self._continuous = continuous
         self._tolerate_data_loss = tolerate_data_loss
+        self._use_transactions = use_transactions
 
     def start_node(self, node, clean=False):
         if clean:
@@ -875,6 +913,8 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
             cmd += " --tolerate-data-loss"
         if self._group_name is not None:
             cmd += f" --consumer_group_name {self._group_name}"
+        if self._use_transactions:
+            cmd += " --use-transactions"
         self.spawn(cmd, node)
 
         self._status_thread = StatusThread(self, node, ConsumerStatus)
@@ -892,7 +932,8 @@ class ProduceStatus:
                  latency=None,
                  active=False,
                  failed_transactions=0,
-                 aborted_transaction_msgs=0):
+                 aborted_transaction_msgs=0,
+                 fails=0):
         self.topic = topic
         self.sent = sent
         self.acked = acked
@@ -905,7 +946,8 @@ class ProduceStatus:
         self.active = active
         self.failed_transactions = failed_transactions
         self.aborted_transaction_messages = aborted_transaction_msgs
+        self.fails = fails
 
     def __str__(self):
         l = self.latency
-        return f"ProduceStatus<{self.sent} {self.acked} {self.bad_offsets} {self.restarts} {self.failed_transactions} {self.aborted_transaction_messages} {l['p50']}/{l['p90']}/{l['p99']}>"
+        return f"ProduceStatus<{self.sent} {self.acked} {self.bad_offsets} {self.restarts} {self.failed_transactions} {self.aborted_transaction_messages} {self.fails} {l['p50']}/{l['p90']}/{l['p99']}>"

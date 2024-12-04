@@ -16,9 +16,9 @@
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
 #include "config/configuration.h"
+#include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/kafka_batch_adapter.h"
-#include "kafka/server/replicated_partition.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -43,32 +43,40 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <string_view>
 
 namespace kafka {
 
 static constexpr auto despam_interval = std::chrono::minutes(5);
 
-produce_response produce_request::make_error_response(error_code error) const {
-    produce_response response;
-
-    response.data.responses.reserve(data.topics.size());
-    for (const auto& topic : data.topics) {
-        produce_response::topic t;
+static void fill_response_with_errors(
+  produce_request::topic_cit topics_begin,
+  produce_request::topic_cit topics_end,
+  error_code error,
+  produce_response& response) {
+    size_t cnt = std::distance(topics_begin, topics_end);
+    response.data.responses.reserve(response.data.responses.size() + cnt);
+    for (const auto& topic : std::views::counted(topics_begin, cnt)) {
+        produce_response::topic& t = response.data.responses.emplace_back();
         t.name = topic.name;
 
         t.partitions.reserve(topic.partitions.size());
         for (const auto& partition : topic.partitions) {
-            t.partitions.emplace_back(produce_response::partition{
+            t.partitions.push_back(produce_response::partition{
               .partition_index = partition.partition_index,
               .error_code = error});
         }
-
-        response.data.responses.push_back(std::move(t));
     }
+}
 
+produce_response produce_request::make_error_response(error_code error) const {
+    produce_response response;
+    fill_response_with_errors(
+      data.topics.cbegin(), data.topics.cend(), error, response);
     return response;
 }
+
 produce_response produce_request::make_full_disk_response() const {
     auto resp = make_error_response(error_code::broker_not_available);
     // TODO set a field in response to signal to quota manager to throttle the
@@ -183,7 +191,7 @@ static partition_produce_stages partition_append(
           ss::future<result<raft::replicate_result>> f) {
             produce_response::partition p{.partition_index = id};
             try {
-                auto r = f.get0();
+                auto r = f.get();
                 if (r.has_value()) {
                     // have to subtract num_of_records - 1 as base_offset
                     // is inclusive
@@ -225,8 +233,8 @@ ss::future<produce_response::partition> finalize_request_with_error_code(
  * the batch, if present
  */
 static auto validate_batch_timestamps(
-  model::ntp const& ntp,
-  model::record_batch_header const& header,
+  const model::ntp& ntp,
+  const model::record_batch_header& header,
   model::timestamp_type timestamp_type,
   net::server_probe& probe) -> std::optional<model::timestamp> {
     // we compute in std::chrono::timepoints, we print in model::timestamps
@@ -734,33 +742,31 @@ produce_handler::handle(request_context ctx, ss::smp_service_group ssg) {
       [&ctx](const topic_produce_data& t) {
           return ctx.authorized(security::acl_operation::write, t.name);
       });
-
     if (!ctx.audit()) {
         return process_result_stages::single_stage(ctx.respond(
           request.make_error_response(error_code::broker_not_available)));
     }
-
-    resp.data.responses.reserve(
-      std::distance(unauthorized_it, request.data.topics.end()));
-    std::transform(
+    fill_response_with_errors(
       unauthorized_it,
-      request.data.topics.end(),
-      std::back_inserter(resp.data.responses),
-      [](const topic_produce_data& t) {
-          topic_produce_response r;
-          r.name = t.name;
-          r.partitions.reserve(t.partitions.size());
-          for (const auto& p : t.partitions) {
-              r.partitions.emplace_back(partition_produce_response{
-                .partition_index = p.partition_index,
-                .error_code = error_code::topic_authorization_failed,
-              });
-          }
-
-          return r;
-      });
-
+      request.data.topics.cend(),
+      error_code::topic_authorization_failed,
+      resp);
     request.data.topics.erase_to_end(unauthorized_it);
+
+    // Make sure to not write into migrated-from topics in their critical stages
+    auto migrated_it = std::partition(
+      request.data.topics.begin(),
+      request.data.topics.end(),
+      [&ctx](const topic_produce_data& t) {
+          return !ctx.metadata_cache().should_reject_writes(
+            model::topic_namespace_view(model::kafka_namespace, t.name));
+      });
+    fill_response_with_errors(
+      migrated_it,
+      request.data.topics.cend(),
+      error_code::invalid_topic_exception,
+      resp);
+    request.data.topics.erase_to_end(migrated_it);
 
     ss::promise<> dispatched_promise;
     auto dispatched_f = dispatched_promise.get_future();

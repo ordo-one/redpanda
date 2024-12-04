@@ -13,10 +13,9 @@
 #include "compression/internal/lz4_frame_compressor.h"
 #include "compression/lz4_decompression_buffers.h"
 #include "random/generators.h"
+#include "thirdparty/lz4/lz4.h"
 
 #include <gmock/gmock.h>
-
-#include <lz4.h>
 
 using enum compression::lz4_decompression_buffers::alloc_ctx::allocation_state;
 
@@ -117,7 +116,7 @@ void test_decompression_calls(
     auto& instance = compression::lz4_decompression_buffers_instance();
     auto compressed = blocksize.has_value()
                         ? lz4_frame_compressor::compress_with_block_size(
-                          input, blocksize.value())
+                            input, blocksize.value())
                         : lz4_frame_compressor::compress(input);
     auto uncompressed = lz4_frame_compressor::uncompress(compressed);
     EXPECT_EQ(instance.allocation_stats(), expected);

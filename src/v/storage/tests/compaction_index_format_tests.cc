@@ -23,7 +23,7 @@
 #include "storage/spill_key_index.h"
 #include "test_utils/fixture.h"
 #include "test_utils/randoms.h"
-#include "utils/tmpbuf_file.h"
+#include "test_utils/tmpbuf_file.h"
 #include "utils/vint.h"
 
 #include <boost/test/unit_test_suite.hpp>
@@ -40,11 +40,12 @@ storage::compacted_index_writer make_dummy_compacted_index(
 
 struct compacted_topic_fixture {
     storage::storage_resources resources;
+    ss::abort_source as;
 };
 
 bytes extract_record_key(bytes prefixed_key) {
     size_t sz = prefixed_key.size() - 2;
-    auto read_key = ss::uninitialized_string<bytes>(sz);
+    bytes read_key(bytes::initialized_later{}, sz);
 
     std::copy_n(prefixed_key.begin() + 2, sz, read_key.begin());
     return read_key;
@@ -131,13 +132,14 @@ FIXTURE_TEST(format_verification_roundtrip, compacted_topic_fixture) {
       storage::segment_full_path::mock("dummy name"),
       ss::file(ss::make_shared(tmpbuf_file(index_data))),
       ss::default_priority_class(),
-      32_KiB);
-    auto footer = rdr.load_footer().get0();
+      32_KiB,
+      &as);
+    auto footer = rdr.load_footer().get();
     BOOST_REQUIRE_EQUAL(footer.keys, 1);
     BOOST_REQUIRE_EQUAL(
       footer.version, storage::compacted_index::footer::current_version);
     BOOST_REQUIRE(footer.crc != 0);
-    auto vec = compaction_index_reader_to_memory(std::move(rdr)).get0();
+    auto vec = compaction_index_reader_to_memory(std::move(rdr)).get();
     BOOST_REQUIRE_EQUAL(vec.size(), 1);
     BOOST_REQUIRE_EQUAL(vec[0].offset, model::offset(42));
     BOOST_REQUIRE_EQUAL(vec[0].delta, 66);
@@ -158,13 +160,14 @@ FIXTURE_TEST(
       storage::segment_full_path::mock("dummy name"),
       ss::file(ss::make_shared(tmpbuf_file(index_data))),
       ss::default_priority_class(),
-      32_KiB);
-    auto footer = rdr.load_footer().get0();
+      32_KiB,
+      &as);
+    auto footer = rdr.load_footer().get();
     BOOST_REQUIRE_EQUAL(footer.keys, 1);
     BOOST_REQUIRE_EQUAL(
       footer.version, storage::compacted_index::footer::current_version);
     BOOST_REQUIRE(footer.crc != 0);
-    auto vec = compaction_index_reader_to_memory(std::move(rdr)).get0();
+    auto vec = compaction_index_reader_to_memory(std::move(rdr)).get();
     BOOST_REQUIRE_EQUAL(vec.size(), 1);
     BOOST_REQUIRE_EQUAL(vec[0].offset, model::offset(42));
     BOOST_REQUIRE_EQUAL(vec[0].delta, 66);
@@ -199,15 +202,16 @@ FIXTURE_TEST(key_reducer_no_truncate_filter, compacted_topic_fixture) {
       storage::segment_full_path::mock("dummy name"),
       ss::file(ss::make_shared(tmpbuf_file(index_data))),
       ss::default_priority_class(),
-      32_KiB);
+      32_KiB,
+      &as);
     auto key_bitmap = rdr
                         .consume(
                           storage::internal::compaction_key_reducer(),
                           model::no_timeout)
-                        .get0();
+                        .get();
 
     // get all keys
-    auto vec = compaction_index_reader_to_memory(rdr).get0();
+    auto vec = compaction_index_reader_to_memory(rdr).get();
     BOOST_REQUIRE_EQUAL(vec.size(), 100);
 
     info("key bitmap: {}", key_bitmap.toString());
@@ -241,7 +245,8 @@ FIXTURE_TEST(key_reducer_max_mem, compacted_topic_fixture) {
       storage::segment_full_path::mock("dummy name"),
       ss::file(ss::make_shared(tmpbuf_file(index_data))),
       ss::default_priority_class(),
-      32_KiB);
+      32_KiB,
+      &as);
 
     rdr.verify_integrity().get();
     rdr.reset();
@@ -250,7 +255,7 @@ FIXTURE_TEST(key_reducer_max_mem, compacted_topic_fixture) {
                                 storage::internal::compaction_key_reducer(
                                   1_KiB + 16),
                                 model::no_timeout)
-                              .get0();
+                              .get();
 
     /*
       There are 2 keys exactly.
@@ -269,10 +274,10 @@ FIXTURE_TEST(key_reducer_max_mem, compacted_topic_fixture) {
                                 storage::internal::compaction_key_reducer(
                                   2_KiB + 2 * entry_size * 2),
                                 model::no_timeout)
-                              .get0();
+                              .get();
 
     // get all keys
-    auto vec = compaction_index_reader_to_memory(rdr).get0();
+    auto vec = compaction_index_reader_to_memory(rdr).get();
     BOOST_REQUIRE_EQUAL(vec.size(), 100);
 
     info("small key bitmap: {}", small_mem_bitmap.toString());
@@ -308,13 +313,14 @@ FIXTURE_TEST(index_filtered_copy_tests, compacted_topic_fixture) {
       storage::segment_full_path::mock("dummy name"),
       ss::file(ss::make_shared(tmpbuf_file(index_data))),
       ss::default_priority_class(),
-      32_KiB);
+      32_KiB,
+      &as);
 
     rdr.verify_integrity().get();
     auto bitmap
-      = storage::internal::natural_index_of_entries_to_keep(rdr).get0();
+      = storage::internal::natural_index_of_entries_to_keep(rdr).get();
     {
-        auto vec = compaction_index_reader_to_memory(rdr).get0();
+        auto vec = compaction_index_reader_to_memory(rdr).get();
         BOOST_REQUIRE_EQUAL(vec.size(), 100);
     }
     info("key bitmap: {}", bitmap.toString());
@@ -339,10 +345,11 @@ FIXTURE_TEST(index_filtered_copy_tests, compacted_topic_fixture) {
           storage::segment_full_path::mock("dummy name - final "),
           ss::file(ss::make_shared(tmpbuf_file(final_data))),
           ss::default_priority_class(),
-          32_KiB);
+          32_KiB,
+          &as);
         final_rdr.verify_integrity().get();
         {
-            auto vec = compaction_index_reader_to_memory(final_rdr).get0();
+            auto vec = compaction_index_reader_to_memory(final_rdr).get();
             BOOST_REQUIRE_EQUAL(vec.size(), 2);
             BOOST_REQUIRE_EQUAL(vec[0].offset, model::offset(98));
             BOOST_REQUIRE_EQUAL(vec[1].offset, model::offset(99));
@@ -350,7 +357,7 @@ FIXTURE_TEST(index_filtered_copy_tests, compacted_topic_fixture) {
         {
             auto offset_list = storage::internal::generate_compacted_list(
                                  model::offset(0), final_rdr)
-                                 .get0();
+                                 .get();
 
             BOOST_REQUIRE(offset_list.contains(model::offset(98)));
             BOOST_REQUIRE(offset_list.contains(model::offset(99)));
@@ -441,12 +448,13 @@ verify_index_integrity(const iobuf& data) {
         fstream.write(fragment.get(), fragment.size()).get();
     }
     fstream.flush().get();
-
+    ss::abort_source as;
     auto rdr = storage::make_file_backed_compacted_reader(
       storage::segment_full_path::mock("dummy name"),
       file,
       ss::default_priority_class(),
-      32_KiB);
+      32_KiB,
+      &as);
     rdr.verify_integrity().get();
     return rdr.load_footer().get();
 }

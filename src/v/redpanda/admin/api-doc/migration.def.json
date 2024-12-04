@@ -1,0 +1,230 @@
+"namespaced_topic": {
+    "type": "object",
+    "required": [
+        "topic"
+    ],
+    "properties": {
+        "topic": {
+            "type": "string",
+            "description": "Topic name"
+        },
+        "ns": {
+            "type": "string",
+            "description": "Topic namespace. If not present it is assumed that topic is in the \"kafka\" namespace"
+        }
+    }
+},
+"mountable_topic": {
+    "type": "object",
+    "properties": {
+        "topic_location": {
+            "type": "string",
+            "description": "Unique topic location in cloud storage with the format <topic name>/<cluster_uuid>/<initial_revision>"
+        },
+        "topic": {
+            "type": "string",
+            "description": "Topic name"
+        },
+        "ns": {
+            "type": "string",
+            "description": "Topic namespace. If not present it is assumed that topic is in the \"kafka\" namespace"
+        }
+    }
+},
+"list_mountable_topics_response": {
+    "type": "object",
+    "properties": {
+        "topics": {
+            "type": "array",
+            "items": {
+                "$ref": "mountable_topic"
+            }
+        }
+    }
+},
+"outbound_migration": {
+    "type": "object",
+    "required": [
+        "migration_type"
+    ],
+    "properties": {
+        "migration_type": {
+            "type": "string",
+            "enum": [
+                "outbound"
+            ]
+        },
+        "topics": {
+            "type": "array",
+            "description": "List of migrated topics",
+            "items": {
+                "$ref": "namespaced_topic"
+            }
+        },
+        "consumer_groups": {
+            "type": "array",
+            "description": "List of migrated consumer groups",
+            "items": {
+                "type": "string"
+            }
+        },
+        "copy_to": {
+            "type": "bucket_configuration",
+            "$ref": "bucket_configuration"
+        },
+        "auto_advance": {
+            "type": "boolean",
+            "description": "If set, migration does not need manual actions to progress"
+        }
+    }
+},
+"inbound_migration": {
+    "type": "object",
+    "properties": {
+        "migration_type": {
+            "type": "string",
+            "enum": [
+                "inbound"
+            ]
+        },
+        "topics": {
+            "type": "array",
+            "items": {
+                "$ref": "inbound_topic"
+            }
+        },
+        "consumer_groups": {
+            "type": "array",
+            "description": "List of migrated consumer groups",
+            "items": {
+                "type": "string"
+            }
+        },
+        "auto_advance": {
+            "type": "boolean",
+            "description": "If set, migration does not need manual actions to progress"
+        }
+    },
+    "required": [
+        "migration_type"
+    ]
+},
+"inbound_topic": {
+    "type": "object",
+    "properties": {
+        "source_topic_reference": {
+            "description": "Name of the topic in object storage. To uniquely identify the topic, append the name with /cluster_uuid/initial_revision. ",
+            "type": "namespaced_topic",
+            "$ref": "namespaced_topic"
+        },
+        "alias": {
+            "description": "Name of the topic in the destination cluster",
+            "type": "namespaced_topic",
+            "$ref": "namespaced_topic"
+        }
+    }
+},
+"bucket_configuration": {
+    "type": "object",
+    "required": [
+        "bucket"
+    ],
+    "properties": {
+        "access_key": {
+            "type": "string"
+        },
+        "secret_key": {
+            "type": "string"
+        },
+        "region": {
+            "type": "string"
+        },
+        "bucket": {
+            "type": "string"
+        },
+        "credential_source": {
+            "type": "string",
+            "enum": [
+                "config",
+                "instance_metadata",
+                "sts"
+            ]
+        },
+        "topic_manifest_prefix": {
+            "description": "path where topic manifests should be copied",
+            "type": "string"
+        }
+    }
+},
+"outbound_migration_state": {
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "int",
+            "description": "unique identifier of migration"
+        },
+        "state": {
+            "type": "string"
+        },
+        "migration": {
+            "type": "outbound_migration",
+            "$ref": "outbound_migration"
+        },
+        "created_timestamp": {
+            "type": "long",
+            "description": "the time of creation in milliseconds since Epoch"
+        },
+        "completed_timestamp": {
+            "type": "long",
+            "description": "time at which a finished or cancelled state is reached, in ms since Epoch; absent if not yet reached"
+        }
+    }
+},
+"inbound_migration_state": {
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "int",
+            "description": "unique identifier of migration"
+        },
+        "state": {
+            "type": "string",
+            "description": "Current migration state"
+        },
+        "migration": {
+            "type": "inbound_migration",
+            "$ref": "inbound_migration"
+        },
+        "created_timestamp": {
+            "type": "long",
+            "description": "the time of creation in milliseconds since Epoch"
+        },
+        "completed_timestamp": {
+            "type": "long",
+            "description": "time at which a finished or cancelled state is reached, in ms since Epoch; absent if not yet reached"
+        }
+    }
+},
+"mount_configuration": {
+    "type": "object",
+    "required": [
+        "topics"
+    ],
+    "properties": {
+        "topics": {
+            "type": "array",
+            "items": {
+                "$ref": "inbound_topic"
+            },
+            "description": "List of topics to mount"
+        }
+    }
+},
+"migration_info": {
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "int"
+        }
+    }
+}

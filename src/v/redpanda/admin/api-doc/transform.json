@@ -46,6 +46,37 @@
       ]
     },
     {
+      "path": "/v1/transform/{name}/meta",
+      "operations": [
+        {
+          "method": "PUT",
+          "summary": "Patch transform metadata.",
+          "type": "void",
+          "nickname": "patch_transform_metadata",
+          "consumes": [
+            "application/json"
+          ],
+          "produces": [
+            "application/json"
+          ],
+          "parameters": [
+            {
+              "name": "name",
+              "in": "path",
+              "required": true,
+              "type": "string"
+            },
+            {
+              "name": "metadata",
+              "in": "body",
+              "required": true,
+              "type": "transform_metadata_patch"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "path": "/v1/transform",
       "operations": [
         {
@@ -115,6 +146,23 @@
             "type": "environment_variable"
           },
           "description": "The environment variable configuration for a transform"
+        },
+        "compression" :{
+          "type": "string",
+          "enum": [
+            "none",
+            "gzip",
+            "snappy",
+            "lz4",
+            "zstd"
+          ],
+          "required": false,
+          "description": "Output batch compression mode"
+        },
+        "offset": {
+          "type": "consume_offset",
+          "required": false,
+          "description": "Start reading from this offset"
         }
       }
     },
@@ -145,7 +193,18 @@
             "type": "environment_variable"
           },
           "description": "The environment variable configuration for a transform"
-        }
+        },
+        "compression" :{
+          "type": "string",
+          "enum": [
+            "none",
+            "gzip",
+            "snappy",
+            "lz4",
+            "zstd"
+          ],
+          "description": "Output batch compression mode"
+        } 
       }
     },
     "partition_transform_status": {
@@ -188,6 +247,25 @@
         }
       }
     },
+    "consume_offset": {
+      "id": "consume_offset",
+      "description": "The offset at which the transform will begin consuming records",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "from_start",
+            "from_end",
+            "timestamp"
+          ],
+          "required": true
+        },
+        "value": {
+          "type": "int",
+          "required": true
+        }
+      }
+    },
     "committed_offset": {
       "id": "committed_offset",
       "description": "A committed offset for a single partition and transform",
@@ -203,6 +281,37 @@
         "offset": {
           "type": "int",
           "description": "The offset within the input topic that has been committed"
+        }
+      }
+    },
+    "transform_metadata_patch": {
+      "id": "transform_metadata_patch",
+      "description": "A partial update to transform metadata. See individual field descriptions for semantics.",
+      "properties": {
+        "env": {
+          "required": false,
+          "description": "If present, overrides the transform's existing environment map, wholesale. If not present, the existing map is unchanged.",
+          "type": "array",
+          "items": {
+            "type": "environment_variable"
+          }
+        },
+        "is_paused": {
+          "required": false,
+          "description": "If present, sets the transform's 'paused' state. If not present, paused state is unchanged.",
+          "type": "boolean"
+        },
+        "compression" :{
+          "type": "string",
+          "enum": [
+            "none",
+            "gzip",
+            "snappy",
+            "lz4",
+            "zstd"
+          ],
+          "required": false,
+          "description": "Output batch compression mode"
         }
       }
     }

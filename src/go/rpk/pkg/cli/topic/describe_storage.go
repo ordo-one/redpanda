@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/docker/go-units"
 	"github.com/hashicorp/go-multierror"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
@@ -30,7 +32,7 @@ import (
 
 type Status struct {
 	Partition   int32
-	CloudStatus adminapi.CloudStorageStatus
+	CloudStatus rpadmin.CloudStorageStatus
 }
 
 const (
@@ -61,11 +63,11 @@ func newDescribeStorageCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
 			defer cl.Close()
 
-			adminCl, err := adminapi.NewClient(fs, p)
+			adminCl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			topic := args[0]
-			listed, err := cl.ListTopics(cmd.Context(), topic)
+			listed, err := cl.ListTopicsWithInternal(cmd.Context(), topic)
 			out.MaybeDie(err, "unable to list topic %q metadata: %v", topic, err)
 			listed.EachError(func(d kadm.TopicDetail) {
 				out.Die("unable to discover the partitions on topic %q: %v", d.Topic, d.Err)

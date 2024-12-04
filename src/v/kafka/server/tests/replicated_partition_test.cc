@@ -9,8 +9,8 @@
 
 #include "cluster/fwd.h"
 #include "cluster/types.h"
-#include "kafka/server/partition_proxy.h"
-#include "kafka/server/replicated_partition.h"
+#include "kafka/data/partition_proxy.h"
+#include "kafka/data/replicated_partition.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -36,7 +36,7 @@ FIXTURE_TEST(test_replicated_partition_end_offset, redpanda_thread_fixture) {
         return app.partition_manager.invoke_on(
           *shard, [&ntp](cluster::partition_manager& pm) {
               auto p = pm.get(ntp);
-              return p->get_leader_id().has_value();
+              return p->is_leader();
           });
     }).get();
 

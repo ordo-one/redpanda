@@ -102,7 +102,7 @@ constexpr int32_t SCHEMA_REGISTRY_ERROR = -2;
 
 } // namespace
 
-schema_registry_module::schema_registry_module(schema_registry* sr)
+schema_registry_module::schema_registry_module(schema::registry* sr)
   : _sr(sr) {}
 
 void schema_registry_module::check_abi_version_0() {}
@@ -198,9 +198,8 @@ ss::future<int32_t> schema_registry_module::create_subject_schema(
     ffi::reader r(buf);
     using namespace pandaproxy::schema_registry;
     try {
-        auto unparsed = read_encoded_schema_def(&r);
         *out_schema_id = co_await _sr->create_schema(
-          unparsed_schema(sub, unparsed));
+          unparsed_schema(sub, read_encoded_schema_def(&r)));
     } catch (const std::exception& ex) {
         vlog(wasm_log.warn, "error registering subject schema: {}", ex);
         co_return SCHEMA_REGISTRY_ERROR;

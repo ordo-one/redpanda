@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -71,11 +72,11 @@ func (c *clusterConfig) UnmarshalYAML(n *yaml.Node) error {
 
 func importConfig(
 	ctx context.Context,
-	client *adminapi.AdminAPI,
+	client *rpadmin.AdminAPI,
 	filename string,
-	oldConfig adminapi.Config,
-	oldConfigFull adminapi.Config,
-	schema adminapi.ConfigSchema,
+	oldConfig rpadmin.Config,
+	oldConfigFull rpadmin.Config,
+	schema rpadmin.ConfigSchema,
 	all bool,
 ) (err error) {
 	readbackBytes, err := os.ReadFile(filename)
@@ -228,7 +229,7 @@ func importConfig(
 
 	// PUT to admin API
 	result, err := client.PatchClusterConfig(ctx, upsert, remove)
-	if he := (*adminapi.HTTPResponseError)(nil); errors.As(err, &he) {
+	if he := (*rpadmin.HTTPResponseError)(nil); errors.As(err, &he) {
 		// Special case 400 (validation) errors with friendly output
 		// about which configuration properties were invalid.
 		if he.Response.StatusCode == 400 {
@@ -260,7 +261,7 @@ func importConfig(
 }
 
 func formatValidationError(
-	err error, httpErr *adminapi.HTTPResponseError,
+	err error, httpErr *rpadmin.HTTPResponseError,
 ) (string, error) {
 	// Output structured validation errors from server
 	var validationErrs map[string]string
@@ -299,12 +300,13 @@ corresponding 'export' command.  This downloads the current cluster
 configuration, calculates the difference with the YAML file, and
 updates any properties that were changed.  If a property is removed
 from the YAML file, it is reset to its default value.  `,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// GET the schema

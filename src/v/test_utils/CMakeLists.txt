@@ -6,8 +6,19 @@ v_cc_library(
 find_package(GTest)
 
 v_cc_library(
-  NAME gtest_main
-  SRCS gtest_main.cc
-  DEPS Seastar::seastar Seastar::seastar_testing GTest::gtest GTest::gmock v::bytes_random)
+  NAME gtest_utils
+  SRCS
+    gtest_utils.cc
+  DEPS Seastar::seastar Seastar::seastar_testing GTest::gtest GTest::gmock v::bytes_random
+)
 
+v_cc_library(
+  NAME gtest_main
+  SRCS
+    gtest_main.cc
+    runfiles.cc
+  DEPS v_gtest_utils)
+
+
+add_subdirectory(go/kreq-gen)
 add_subdirectory(tests)

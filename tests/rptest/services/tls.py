@@ -4,6 +4,10 @@ import collections
 import pathlib
 import subprocess
 import os
+import string
+import random
+
+from enum import Enum
 
 _ca_config_tmpl = """
 # OpenSSL CA configuration file
@@ -12,12 +16,16 @@ default_ca = local_ca
 
 [ local_ca ]
 dir              = {dir}
+certificate      = $dir/ca.crt
+private_key      = $dir/ca.key # CA private key
 database         = $dir/index.txt
 serial           = $dir/serial.txt
+crlnumber        = $dir/crlnumber.txt
 default_days     = 730
 default_md       = sha256
 copy_extensions  = copy
 unique_subject   = no
+default_crl_days = 365                   # How long before next CRL
 
 # Used to create the CA certificate.
 [ req ]
@@ -38,7 +46,7 @@ organizationName = Redpanda
 commonName       = Redpanda Test CA
 
 [ extensions ]
-keyUsage         = critical,digitalSignature,nonRepudiation,keyEncipherment,keyCertSign
+keyUsage         = critical,digitalSignature,nonRepudiation,keyEncipherment,keyCertSign,cRLSign
 basicConstraints = critical,CA:true,pathlen:1
 
 # Common policy for nodes and users.
@@ -48,12 +56,12 @@ commonName       = optional
 
 # Used to sign node certificates.
 [ signing_node_req ]
-keyUsage         = critical,digitalSignature,keyEncipherment
+keyUsage         = critical,digitalSignature,keyEncipherment,cRLSign
 extendedKeyUsage = serverAuth,clientAuth
 
 # Used to sign client certificates.
 [ signing_client_req ]
-keyUsage         = critical,digitalSignature,keyEncipherment
+keyUsage         = critical,digitalSignature,keyEncipherment,cRLSign
 extendedKeyUsage = clientAuth
 """
 
@@ -291,9 +299,14 @@ subjectKeyIdentifier    = hash
 """
 
 CertificateAuthority = collections.namedtuple("CertificateAuthority",
-                                              ["cfg", "key", "crt"])
-Certificate = collections.namedtuple("Certificate",
-                                     ["cfg", "key", "crt", "ca"])
+                                              ["cfg", "key", "crt", "crl"])
+Certificate = collections.namedtuple(
+    "Certificate", ["cfg", "key", "crt", "ca", "p12_file", "p12_password"])
+
+
+class TLSKeyType(Enum):
+    RSA = 0,
+    ECDSA = 1
 
 
 class TLSCertManager:
@@ -306,13 +319,28 @@ class TLSCertManager:
     it is common for clients to take paths to these files, it is best to keep
     the instance alive for as long as the files are in use.
     """
-    def __init__(self, logger, ca_end_date=None, cert_expiry_days=1):
+    def __init__(self,
+                 logger,
+                 ca_end_date=None,
+                 cert_expiry_days=1,
+                 key_type: typing.Optional[TLSKeyType] = None):
         self._logger = logger
         self._dir = tempfile.TemporaryDirectory()
         self._ca_end_date = ca_end_date
         self._cert_expiry_days = cert_expiry_days
+        # Before this change, all ducktape tests would use RSA based certificates
+        # In order to attempt to cover more code paths, we will randomly select
+        # between RSA and ECDSA if the key type is not specified
+        self._key_type: TLSKeyType = key_type or random.choice(
+            list(TLSKeyType))
         self._ca = self._create_ca()
-        self.certs = {}
+        self.certs: dict[str, Certificate] = {}
+
+    @staticmethod
+    def generate_password(
+            length: int,
+            choices: str = string.ascii_letters + string.digits) -> str:
+        return ''.join(random.choices(choices, k=length))
 
     def _with_dir(self, *args):
         return os.path.join(self._dir.name, *args)
@@ -320,6 +348,7 @@ class TLSCertManager:
     def _exec(self, cmd):
         self._logger.info(f"Running command: {cmd}")
         retries = 0
+        output = None
         while retries < 3:
             try:
                 output = subprocess.check_output(cmd.split(),
@@ -341,17 +370,27 @@ class TLSCertManager:
 
             retries += 1
 
-    def _create_ca(self):
+    def _generate_key(self, out: str) -> None:
+        if self._key_type == TLSKeyType.RSA:
+            self._exec(f"openssl genrsa -out {out} 2048")
+        elif self._key_type == TLSKeyType.ECDSA:
+            self._exec(
+                f"openssl ecparam -name prime256v1 -genkey -noout -out {out}")
+        else:
+            raise ValueError(f"Unknown key type: {self._key_type}")
+
+    def _create_ca(self) -> CertificateAuthority:
         cfg = self._with_dir("ca.conf")
         key = self._with_dir("ca.key")
         crt = self._with_dir("ca.crt")
         idx = self._with_dir("index.txt")
         srl = self._with_dir("serial.txt")
+        crl_srl = self._with_dir("crlnumber.txt")
 
         with open(f"{cfg}", "w") as f:
             f.write(_ca_config_tmpl.format(dir=self._dir.name))
 
-        self._exec(f"openssl genrsa -out {key} 2048")
+        self._generate_key(key)
         self._exec(f"openssl req -new -x509 -config {cfg} "
                    f"-key {key} -out {crt} -days 365 -batch")
 
@@ -361,10 +400,25 @@ class TLSCertManager:
         with open(srl, "w") as f:
             f.writelines(["01"])
 
-        return CertificateAuthority(cfg, key, crt)
+        crl = self._create_crl("ca", cfg, crl_srl)
+
+        return CertificateAuthority(cfg, key, crt, crl)
+
+    def _create_crl(self, ca: str, cfg: str, crl_srl: str) -> str:
+        if os.path.exists(crl_srl): os.remove(crl_srl)
+        with open(crl_srl, 'w') as f:
+            f.writelines(["01"])
+
+        crls = self._with_dir('crl')
+        os.makedirs(crls, exist_ok=True)
+        crl = os.path.join(crls, f"{ca}.crl")
+
+        self._exec(f"openssl ca -gencrl -config {cfg} -out {crl}")
+
+        return crl
 
     @property
-    def ca(self):
+    def ca(self) -> CertificateAuthority:
         return self._ca
 
     def create_cert(self,
@@ -372,13 +426,14 @@ class TLSCertManager:
                     *,
                     common_name: typing.Optional[str] = None,
                     name: typing.Optional[str] = None,
-                    faketime: typing.Optional[str] = '-0d'):
+                    faketime: typing.Optional[str] = '-0d') -> Certificate:
         name = name or host
 
         cfg = self._with_dir(f"{name}.conf")
         key = self._with_dir(f"{name}.key")
         csr = self._with_dir(f"{name}.csr")
         crt = self._with_dir(f"{name}.crt")
+        p12_file = self._with_dir(f"{name}.p12")
 
         with open(cfg, "w") as f:
             if common_name is None:
@@ -388,7 +443,7 @@ class TLSCertManager:
             f.write(
                 _node_config_tmpl.format(host=host, common_name=common_name))
 
-        self._exec(f"openssl genrsa -out {key} 2048")
+        self._generate_key(key)
 
         self._exec(f"openssl req -new -config {cfg} "
                    f"-key {key} -out {csr} -batch")
@@ -399,14 +454,42 @@ class TLSCertManager:
             f"-extensions signing_node_req -in {csr} -out {crt} "
             f"-days {self._cert_expiry_days} -outdir {self._dir.name} -batch")
 
-        cert = Certificate(cfg, key, crt, self.ca)
+        p12_password = self.generate_pkcs12_file(p12_file, key, crt,
+                                                 self.ca.crt)
+
+        cert = Certificate(cfg, key, crt, self.ca, p12_file, p12_password)
         self.certs[name] = cert
         return cert
 
+    def generate_pkcs12_file(self,
+                             p12_file: str,
+                             key: str,
+                             crt: str,
+                             ca: str,
+                             pw_length: int = 16) -> str:
+        """
+        Runs command to generate a new PKCS#12 file and returns the generated password
+        """
+        p12_password = self.generate_password(length=pw_length)
+        self._exec(
+            f'openssl pkcs12 -export -inkey {key} -in {crt} -certfile {ca} -passout pass:{p12_password} -out {p12_file}'
+        )
+        return p12_password
 
-# TODO(oren): Might want to add the ability to generate CRLs, though
-# I'm not sure there's an easy  way to transmit those to redpanda
-# without also causing other verification steps to fail.
+    # TODO(oren): reasons enum
+    def revoke_cert(self, crt: Certificate, reason: str = "unspecified"):
+        self._exec(
+            f"openssl ca -config {crt.ca.cfg} -revoke {crt.crt} -crl_reason {reason}"
+        )
+        crl_srl = self._with_dir("crlnumber.txt")
+        crl = self._create_crl("ca", crt.ca.cfg, crl_srl)
+        revoked = self._with_dir("revoked.txt")
+        self._exec(
+            f'openssl crl -inform PEM -text -noout -in {crl} -out {revoked}')
+        with open(revoked, 'r') as f:
+            self._logger.debug(f"\n{f.read()}")
+
+
 class TLSChainCACertManager(TLSCertManager):
     """
     Similar to TLSCertManager, but generates a chain of CAs,
@@ -424,13 +507,19 @@ class TLSChainCACertManager(TLSCertManager):
                  logger,
                  chain_len=2,
                  cert_expiry_days=1,
-                 ca_expiry_days=7):
+                 ca_expiry_days=7,
+                 key_type: typing.Optional[TLSKeyType] = None):
         assert chain_len > 0
         self._logger = logger
         self._dir = tempfile.TemporaryDirectory()
         self.cert_expiry_days = cert_expiry_days
         self.ca_expiry_days = ca_expiry_days
-        self._cas = []
+        # Before this change, all ducktape tests would use RSA based certificates
+        # In order to attempt to cover more code paths, we will randomly select
+        # between RSA and ECDSA if the key type is not specified
+        self._key_type: TLSKeyType = key_type or random.choice(
+            list(TLSKeyType))
+        self._cas: list[CertificateAuthority] = []
         self._cas.append(
             self._create_ca(
                 'root-ca',
@@ -446,9 +535,8 @@ class TLSChainCACertManager(TLSCertManager):
                     parent_cfg=self._cas[-1].cfg,
                     ext='signing_ca_ext',
                 ))
-        self._cert_chain = self._create_ca_cert_chain(
-            [ca.crt for ca in self._cas])
-        self.certs = {}
+        self._cert_chain = self._create_ca_cert_chain()
+        self.certs: dict[str, Certificate] = {}
 
     @property
     def ca(self) -> CertificateAuthority:
@@ -477,6 +565,7 @@ class TLSChainCACertManager(TLSCertManager):
         crt = os.path.join(dir, f"{ca}.crt")
         idx = os.path.join(db, f"{ca}.db")
         srl = os.path.join(db, f"{ca}.crt.srl")
+        crl_srl = os.path.join(db, f"{ca}.crl.srl")
 
         with open(f"{cfg}", "w") as f:
             f.write(tmpl.format(dir=self._dir.name, name=ca))
@@ -492,26 +581,44 @@ class TLSChainCACertManager(TLSCertManager):
         with open(srl, 'w') as f:
             f.writelines(["01"])
 
+        self._generate_key(key)
+
         self._exec(
-            f"openssl req -new -nodes -config {cfg} -out {csr} -keyout {key}")
+            f"openssl req -new -nodes -config {cfg} -out {csr} -key {key}")
         self._exec(
             f"openssl ca {'-selfsign' if selfsign else ''} -config {parent_cfg} "
             f"-in {csr} -out {crt} -extensions {ext} -days {days} -batch")
 
-        return CertificateAuthority(cfg, key, crt)
+        crl = self._create_crl(ca, cfg, crl_srl)
 
-    def _create_ca_cert_chain(self, files: list[str]) -> CertificateAuthority:
+        return CertificateAuthority(cfg, key, crt, crl)
+
+    def _create_ca_cert_chain(self) -> CertificateAuthority:
+        # First create the signing ca chain
+        ca_files = [ca.crt for ca in self._cas]
         out = self._with_dir('ca', 'signing-ca-chain.pem')
         pathlib.Path(out).touch()
         with open(out, 'w') as outfile:
-            for fname in reversed(files):
+            for fname in reversed(ca_files):
                 with open(fname, 'r') as infile:
                     outfile.write(infile.read())
 
         with open(out, 'r') as f:
             self._logger.debug(f"CA chain: {f.read()}")
 
-        return CertificateAuthority(None, None, out)
+        # Now do the same for the CRLs
+        crl_files = [ca.crl for ca in self._cas]
+        crl_out = self._with_dir('ca', 'signing-crl-chain.crl')
+        pathlib.Path(crl_out).touch()
+        with open(crl_out, 'w') as outfile:
+            for fname in reversed(crl_files):
+                with open(fname, 'r') as infile:
+                    outfile.write(infile.read())
+
+        with open(crl_out, 'r') as f:
+            self._logger.debug(f"CRL chain: {f.read()}")
+
+        return CertificateAuthority(None, None, out, crl_out)
 
     def create_cert(self,
                     host: str,
@@ -525,6 +632,7 @@ class TLSChainCACertManager(TLSCertManager):
         key = self._with_dir('certs', f"{name}.key")
         csr = self._with_dir('certs', f"{name}.csr")
         crt = self._with_dir('certs', f"{name}.crt")
+        p12_file = self._with_dir('certs', f"{name}.p12")
 
         with open(cfg, "w") as f:
             if common_name is None:
@@ -534,13 +642,17 @@ class TLSChainCACertManager(TLSCertManager):
             f.write(
                 _server_config_tmpl.format(host=host, common_name=common_name))
 
+        self._generate_key(key)
         self._exec(f"openssl req -new -nodes -config {cfg} "
-                   f"-keyout {key} -out {csr} -batch")
+                   f"-key {key} -out {csr} -batch")
         self._exec(
             f"faketime -f {faketime} openssl ca -config {self.signing_ca.cfg} -policy match_pol "
             f"-in {csr} -out {crt} -extensions server_ext -days {self.cert_expiry_days} -batch"
         )
 
-        cert = Certificate(cfg, key, crt, self.ca)
+        p12_password = self.generate_pkcs12_file(p12_file, key, crt,
+                                                 self.ca.crt)
+
+        cert = Certificate(cfg, key, crt, self.ca, p12_file, p12_password)
         self.certs[name] = cert
         return cert

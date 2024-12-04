@@ -17,7 +17,6 @@
 #include "bytes/iobuf_parser.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/logger.h"
-#include "kafka/types.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
@@ -31,6 +30,14 @@
 #include <string_view>
 
 namespace kafka {
+
+group_metadata_kv group_metadata_kv::copy() const {
+    group_metadata_kv cp{.key = key};
+    if (value) {
+        cp.value = value->copy();
+    }
+    return cp;
+}
 
 /**
  * /Kafka
@@ -434,4 +441,51 @@ std::ostream& operator<<(std::ostream& o, const offset_metadata_value& v) {
       v.expiry_timestamp);
     return o;
 }
+namespace group_tx {
+std::ostream& operator<<(std::ostream& o, const offsets_metadata& md) {
+    fmt::print(
+      o,
+      "{{group_id: {}, pid: {}, tx_seq: {}, offsets: {}}}",
+      md.group_id,
+      md.pid,
+      md.tx_seq,
+      fmt::join(md.offsets, ", "));
+    return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const partition_offset& po) {
+    fmt::print(
+      o,
+      "{{partition: {}, offset: {}, leader_epoch: {}, metadata: {}}}",
+      po.tp,
+      po.offset,
+      po.leader_epoch,
+      po.metadata);
+    return o;
+}
+std::ostream& operator<<(std::ostream& o, const fence_metadata_v0& fence) {
+    fmt::print(o, "{{group_id: {}}}", fence.group_id);
+    return o;
+}
+std::ostream& operator<<(std::ostream& o, const fence_metadata_v1& fence) {
+    fmt::print(
+      o,
+      "{{group_id: {}, tx_seq: {}, tx_timeout: {} ms}}",
+      fence.group_id,
+      fence.tx_seq,
+      fence.transaction_timeout_ms.count());
+    return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const fence_metadata& fence) {
+    fmt::print(
+      o,
+      "{{tm_partition: {},  group_id: {}, tx_seq: {}, tx_timeout: {} ms}}",
+      fence.tm_partition,
+      fence.group_id,
+      fence.tx_seq,
+      fence.transaction_timeout_ms);
+    return o;
+}
+} // namespace group_tx
 } // namespace kafka

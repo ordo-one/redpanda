@@ -767,6 +767,7 @@ class TS_Read(Expression):
             MetricBasedValidator(
                 "TS_Read",
                 "vectorized_cloud_storage_successful_downloads_total",
+                confidence_threshold=4,
                 execution_stage=TestRunStage.Consume)
         ]
 
@@ -1391,6 +1392,7 @@ class SegmentRolledByTimeout(Expression):
         return [
             LogBasedValidator("SegmentRolledByTimeout_log",
                               "segment.ms applied, new segment start offset",
+                              confidence_threshold=4,
                               execution_stage=TestRunStage.Produce),
         ]
 
@@ -1432,7 +1434,7 @@ class TestCase(dict):
         dict.__init__(self, name=name)
 
     def __str__(self):
-        return self.__name
+        return self.name
 
     def validators(self) -> List[EffectValidator]:
         """All validators which are needed to be checked by the test case"""
@@ -1452,11 +1454,23 @@ class TestCase(dict):
             if r is not None:
                 test.get_logger().info(
                     f"Result of {v.name()} is {r} with confidence {c}")
-                if r == False or c < 0.5:
+                if r is False or c < CONFIDENCE_THRESHOLD:
                     num_failed += 1
             else:
                 test.get_logger().info(f"Result of {v.name()} is None")
         assert num_failed == 0, f"{num_failed} validators failed"
+
+    @property
+    def name(self):
+        return self.__name
+
+
+def get_test_case_from_name(name):
+    tc_list = get_tiered_storage_test_cases(False)
+    for tc in tc_list:
+        if tc.name == name:
+            return tc
+    return None
 
 
 def get_tiered_storage_test_cases(fast_run=False):

@@ -11,9 +11,12 @@
 #include "security/acl.h"
 #include "security/gssapi_principal_mapper.h"
 #include "security/sasl_authentication.h"
-#include "ssx/fwd.h"
 
 #include <seastar/core/lowres_clock.hh>
+
+namespace ssx {
+class singleton_thread_worker;
+}
 
 namespace security {
 
@@ -55,7 +58,7 @@ public:
 
 private:
     friend std::ostream&
-    operator<<(std::ostream& os, gssapi_authenticator::state const s);
+    operator<<(std::ostream& os, const gssapi_authenticator::state s);
 
     ssx::singleton_thread_worker& _worker;
     security::acl_principal _principal;

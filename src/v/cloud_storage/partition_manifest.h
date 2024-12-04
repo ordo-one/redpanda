@@ -11,6 +11,7 @@
 #pragma once
 
 #include "cloud_storage/base_manifest.h"
+#include "cloud_storage/fwd.h"
 #include "cloud_storage/types.h"
 #include "container/fragmented_vector.h"
 #include "model/fundamental.h"
@@ -18,8 +19,7 @@
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "segment_meta_cstore.h"
-#include "serde/envelope.h"
-#include "serde/serde.h"
+#include "serde/rw/envelope.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/core/iostream.hh>
@@ -43,10 +43,6 @@ struct partition_manifest_path_components {
     operator<<(std::ostream& s, const partition_manifest_path_components& c);
 };
 
-/// Parse partition manifest path and return components
-std::optional<partition_manifest_path_components>
-get_partition_manifest_path_components(const std::filesystem::path& path);
-
 struct segment_name_components {
     model::offset base_offset;
     model::term_id term;
@@ -60,18 +56,8 @@ struct segment_name_components {
 std::optional<segment_name_components>
 parse_segment_name(const segment_name& name);
 
-/// Segment file name in S3
-remote_segment_path generate_remote_segment_path(
-  const model::ntp&,
-  model::initial_revision_id,
-  const segment_name&,
-  model::term_id archiver_term);
-
 /// Generate correct S3 segment name based on term and base offset
 segment_name generate_local_segment_name(model::offset o, model::term_id t);
-
-remote_manifest_path generate_partition_manifest_path(
-  const model::ntp&, model::initial_revision_id, manifest_format);
 
 // This structure can be impelenented
 // to allow access to private fields of the manifest.
@@ -104,6 +90,17 @@ public:
 
         segment_name_format sname_format{segment_name_format::v1};
 
+        auto serde_fields() {
+            return std::tie(
+              ntp_revision,
+              base_offset,
+              committed_offset,
+              archiver_term,
+              segment_term,
+              size_bytes,
+              sname_format);
+        }
+
         auto operator<=>(const lw_segment_meta&) const = default;
 
         static lw_segment_meta convert(const segment_meta& m);
@@ -120,12 +117,6 @@ public:
 
     /// Generate segment name to use in the cloud
     static segment_name generate_remote_segment_name(const value& val);
-    /// Generate segment path to use in the cloud
-    static remote_segment_path
-    generate_remote_segment_path(const model::ntp& ntp, const value& val);
-    /// Generate segment path to use locally
-    static local_segment_path
-    generate_local_segment_path(const model::ntp& ntp, const value& val);
 
     /// Create empty manifest that supposed to be updated later
     partition_manifest();
@@ -206,26 +197,11 @@ public:
         }
     }
 
-    /// Manifest object name in S3
-    std::pair<manifest_format, remote_manifest_path>
-    get_manifest_format_and_path() const override;
+    virtual remote_manifest_path
+    get_manifest_path(const remote_path_provider&) const;
 
-    remote_manifest_path get_manifest_path(manifest_format fmt) const {
-        switch (fmt) {
-        case manifest_format::json:
-            return get_legacy_manifest_format_and_path().second;
-        case manifest_format::serde:
-            return get_manifest_format_and_path().second;
-        }
-    }
-
-    remote_manifest_path get_manifest_path() const override {
-        return get_manifest_format_and_path().second;
-    }
-
-    /// Manifest object name before feature::cloud_storage_manifest_format_v2
-    std::pair<manifest_format, remote_manifest_path>
-    get_legacy_manifest_format_and_path() const;
+    static ss::sstring filename() { return "manifest.bin"; }
+    virtual ss::sstring get_manifest_filename() const { return filename(); }
 
     /// Get NTP
     const model::ntp& get_ntp() const;
@@ -275,8 +251,10 @@ public:
     /// Find the earliest segment that has max timestamp >= t
     std::optional<segment_meta> timequery(model::timestamp t) const;
 
-    remote_segment_path generate_segment_path(const segment_meta&) const;
-    remote_segment_path generate_segment_path(const lw_segment_meta&) const;
+    remote_segment_path generate_segment_path(
+      const segment_meta&, const remote_path_provider&) const;
+    remote_segment_path generate_segment_path(
+      const lw_segment_meta&, const remote_path_provider&) const;
 
     /// Return an iterator to the first addressable segment (i.e. base offset
     /// is greater than or equal to the start offset). If no such segment
@@ -295,6 +273,9 @@ public:
     // Return the tracked amount of memory associated with the segments in this
     // manifest, or 0 if the memory is not being tracked.
     size_t segments_metadata_bytes() const;
+
+    // Return very rough estimate of the size of the serialized manifest
+    size_t estimate_serialized_size() const;
 
     /// Return map that contains spillover manifests.
     /// It stores 'segment_meta' objects but the meaning of fields are
@@ -462,7 +443,7 @@ public:
     /// Serialize manifest object
     ///
     /// \return asynchronous input_stream with the serialized json
-    ss::future<serialized_data_stream> serialize() const override;
+    ss::future<iobuf> serialize_buf() const override;
 
     /// Serialize manifest object
     ///
@@ -610,6 +591,7 @@ public:
       anomalies detected);
 
 private:
+    ss::sstring display_name() const;
     std::optional<kafka::offset> compute_start_kafka_offset_local() const;
 
     void set_start_offset(model::offset start_offset);

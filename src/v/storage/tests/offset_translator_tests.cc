@@ -25,6 +25,8 @@
 
 #include <boost/test/tools/old/interface.hpp>
 
+#include <utility>
+
 using namespace std::chrono_literals; // NOLINT
 
 static model::record_batch create_batch(
@@ -46,7 +48,7 @@ static model::record_batch create_batch(
 struct base_fixture {
     base_fixture()
       : _test_dir(
-        fmt::format("test_{}", random_generators::gen_alphanum_string(6))) {
+          fmt::format("test_{}", random_generators::gen_alphanum_string(6))) {
         _feature_table.start().get();
         _feature_table
           .invoke_on_all(
@@ -420,7 +422,8 @@ struct fuzz_checker {
         } else {
             _kafka_offsets.resize(_log->offsets().dirty_offset() + 1);
             while (!_log_offsets.empty()
-                   && _log_offsets.back()() >= _kafka_offsets.size()) {
+                   && std::cmp_greater_equal(
+                     _log_offsets.back()(), _kafka_offsets.size())) {
                 _log_offsets.pop_back();
             }
         }
@@ -451,7 +454,7 @@ struct fuzz_checker {
             co_await _tr->prefix_truncate(_snapshot_offset);
         }
 
-        if (new_start_offset() < _kafka_offsets.size()) {
+        if (std::cmp_less(new_start_offset(), _kafka_offsets.size())) {
             _snapshot_delta = new_start_offset
                               - _kafka_offsets[new_start_offset];
         } else {
@@ -496,13 +499,15 @@ struct fuzz_checker {
             BOOST_REQUIRE_EQUAL(hwm_lo, _tr->state()->to_log_offset(hwm_ko));
         }
 
+        const auto n_kafka_offsets = static_cast<int64_t>(
+          _kafka_offsets.size());
         int64_t start_log_offset = model::next_offset(_snapshot_offset)();
-        if (start_log_offset >= _kafka_offsets.size()) {
+        if (start_log_offset >= n_kafka_offsets) {
             // empty log
             return;
         }
 
-        for (int64_t lo = start_log_offset; lo < _kafka_offsets.size(); ++lo) {
+        for (int64_t lo = start_log_offset; lo < n_kafka_offsets; ++lo) {
             BOOST_TEST_CONTEXT("With log offset: " << lo) {
                 BOOST_REQUIRE_EQUAL(
                   _kafka_offsets[lo],
@@ -510,8 +515,9 @@ struct fuzz_checker {
             }
         }
 
+        const auto n_log_offsets = static_cast<int64_t>(_log_offsets.size());
         int64_t start_kafka_offset = _kafka_offsets[start_log_offset];
-        for (int64_t ko = start_kafka_offset; ko < _log_offsets.size(); ++ko) {
+        for (int64_t ko = start_kafka_offset; ko < n_log_offsets; ++ko) {
             BOOST_TEST_CONTEXT("With kafka offset: " << ko) {
                 BOOST_REQUIRE_EQUAL(
                   _log_offsets[ko],
@@ -641,8 +647,11 @@ FIXTURE_TEST(test_moving_persistent_state, base_fixture) {
     // use last available shard
     auto target_shard = ss::smp::count - 1;
     // move state to target shard
-    storage::offset_translator::move_persistent_state(
-      raft::group_id(0), ss::this_shard_id(), target_shard, _api)
+    storage::offset_translator::copy_persistent_state(
+      raft::group_id(0), _api.local().kvs(), target_shard, _api)
+      .get();
+    storage::offset_translator::remove_persistent_state(
+      raft::group_id(0), _api.local().kvs())
       .get();
 
     // validate translation on target shard

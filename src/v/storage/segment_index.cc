@@ -12,7 +12,6 @@
 #include "base/vassert.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
-#include "serde/serde.h"
 #include "storage/index_state.h"
 #include "storage/logger.h"
 #include "storage/segment_utils.h"
@@ -30,24 +29,15 @@
 
 namespace storage {
 
-static inline segment_index::entry translate_index_entry(
-  const index_state& s,
-  std::tuple<uint32_t, offset_time_index, uint64_t> entry) {
-    auto [relative_offset, relative_time, filepos] = entry;
-    return segment_index::entry{
-      .offset = model::offset(relative_offset + s.base_offset()),
-      .timestamp = model::timestamp(relative_time() + s.base_timestamp()),
-      .filepos = filepos,
-    };
-}
-
 segment_index::segment_index(
   segment_full_path path,
   model::offset base,
   size_t step,
   ss::sharded<features::feature_table>& feature_table,
   std::optional<ntp_sanitizer_config> sanitizer_config,
-  std::optional<model::timestamp> broker_timestamp)
+  std::optional<model::timestamp> broker_timestamp,
+  std::optional<model::timestamp> clean_compact_timestamp,
+  bool may_have_tombstone_records)
   : _path(std::move(path))
   , _step(step)
   , _feature_table(std::ref(feature_table))
@@ -56,6 +46,8 @@ segment_index::segment_index(
   , _sanitizer_config(std::move(sanitizer_config)) {
     _state.base_offset = base;
     _state.broker_timestamp = broker_timestamp;
+    _state.clean_compact_timestamp = clean_compact_timestamp;
+    _state.may_have_tombstone_records = may_have_tombstone_records;
 }
 
 segment_index::segment_index(
@@ -87,10 +79,18 @@ ss::future<ss::file> segment_index::open() {
 }
 
 void segment_index::reset() {
+    // Persist the base offset, clean compaction timestamp, and tombstones
+    // identifier through a reset.
     auto base = _state.base_offset;
+    auto clean_compact_timestamp = _state.clean_compact_timestamp;
+    auto may_have_tombstone_records = _state.may_have_tombstone_records;
+
     _state = index_state::make_empty_index(
       storage::internal::should_apply_delta_time_offset(_feature_table));
+
     _state.base_offset = base;
+    _state.clean_compact_timestamp = clean_compact_timestamp;
+    _state.may_have_tombstone_records = may_have_tombstone_records;
 
     _acc = 0;
 }
@@ -144,117 +144,30 @@ void segment_index::maybe_track(
 
 std::optional<segment_index::entry>
 segment_index::find_nearest(model::timestamp t) {
-    if (t < _state.base_timestamp) {
-        return std::nullopt;
-    }
-    if (_state.empty()) {
-        return std::nullopt;
-    }
-
-    const auto delta = t - _state.base_timestamp;
-    const auto entry = _state.find_entry(delta);
-    if (!entry) {
-        return std::nullopt;
-    }
-
-    return translate_index_entry(_state, *entry);
+    return _state.find_nearest(t);
 }
 
 std::optional<segment_index::entry>
 segment_index::find_above_size_bytes(size_t distance) {
-    if (_state.empty()) {
-        return std::nullopt;
-    }
-    auto it = std::upper_bound(
-      std::begin(_state.position_index),
-      std::end(_state.position_index),
-      distance);
-
-    if (it == _state.position_index.end()) {
-        return std::nullopt;
-    }
-    int i = std::distance(_state.position_index.begin(), it);
-    return translate_index_entry(_state, _state.get_entry(i));
+    return _state.find_above_size_bytes(distance);
 }
 
 std::optional<segment_index::entry>
 segment_index::find_below_size_bytes(size_t distance) {
-    if (_state.empty()) {
-        return std::nullopt;
-    }
-    auto it = std::upper_bound(
-      std::begin(_state.position_index),
-      std::end(_state.position_index),
-      distance);
-
-    if (it != _state.position_index.begin()) {
-        it = std::prev(it);
-    } else {
-        return std::nullopt;
-    }
-
-    int i = std::distance(_state.position_index.begin(), it);
-    return translate_index_entry(_state, _state.get_entry(i));
+    return _state.find_below_size_bytes(distance);
 }
 
 std::optional<segment_index::entry>
 segment_index::find_nearest(model::offset o) {
-    if (o < _state.base_offset || _state.empty()) {
-        return std::nullopt;
-    }
-    const uint32_t needle = o() - _state.base_offset();
-    auto it = std::lower_bound(
-      std::begin(_state.relative_offset_index),
-      std::end(_state.relative_offset_index),
-      needle,
-      std::less<uint32_t>{});
-    if (it == _state.relative_offset_index.end()) {
-        it = std::prev(it);
-    }
-    // make it signed so it can be negative
-    int i = std::distance(_state.relative_offset_index.begin(), it);
-    do {
-        if (_state.relative_offset_index[i] <= needle) {
-            return translate_index_entry(_state, _state.get_entry(i));
-        }
-    } while (i-- > 0);
-
-    return std::nullopt;
+    return _state.find_nearest(o);
 }
 
 ss::future<> segment_index::truncate(
   model::offset new_max_offset, model::timestamp new_max_timestamp) {
-    if (new_max_offset < _state.base_offset) {
-        co_return;
+    _needs_persistence = _state.truncate(new_max_offset, new_max_timestamp);
+    if (_needs_persistence) {
+        co_await flush();
     }
-    const uint32_t i = new_max_offset() - _state.base_offset();
-    auto it = std::lower_bound(
-      std::begin(_state.relative_offset_index),
-      std::end(_state.relative_offset_index),
-      i,
-      std::less<uint32_t>{});
-
-    if (it != _state.relative_offset_index.end()) {
-        _needs_persistence = true;
-        int remove_back_elems = std::distance(
-          it, _state.relative_offset_index.end());
-        while (remove_back_elems-- > 0) {
-            _state.pop_back();
-        }
-    }
-
-    if (new_max_offset < _state.max_offset) {
-        _needs_persistence = true;
-        if (_state.empty()) {
-            _state.max_timestamp = _state.base_timestamp;
-            _state.max_offset = _state.base_offset;
-        } else {
-            _state.max_timestamp = new_max_timestamp;
-            _state.max_offset = new_max_offset;
-        }
-    }
-
-    co_return co_await flush();
 }
 
 /**
@@ -339,10 +252,6 @@ operator<<(std::ostream& o, const std::optional<segment_index::entry>& e) {
         return o << *e;
     }
     return o << "{empty segment_index::entry}";
-}
-std::ostream& operator<<(std::ostream& o, const segment_index::entry& e) {
-    return o << "{offset:" << e.offset << ", time:" << e.timestamp
-             << ", filepos:" << e.filepos << "}";
 }
 
 ss::future<size_t> segment_index::disk_usage() {

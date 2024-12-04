@@ -11,47 +11,38 @@
  */
 
 #pragma once
-
-#include "base/vassert.h"
-#include "bytes/iobuf.h"
 #include "bytes/random.h"
-#include "cluster/errc.h"
+#include "config/mock_property.h"
 #include "config/property.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "model/namespace.h"
 #include "model/timeout_clock.h"
-#include "raft/consensus.h"
+#include "raft/buffered_protocol.h"
 #include "raft/consensus_client_protocol.h"
 #include "raft/coordinated_recovery_throttle.h"
 #include "raft/errc.h"
 #include "raft/fwd.h"
-#include "raft/group_configuration.h"
 #include "raft/heartbeat_manager.h"
 #include "raft/recovery_memory_quota.h"
 #include "raft/state_machine_manager.h"
 #include "raft/types.h"
-#include "random/generators.h"
 #include "ssx/sformat.h"
 #include "storage/api.h"
 #include "test_utils/test.h"
 #include "utils/prefix_logger.h"
 
 #include <seastar/core/loop.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/util/bool_class.hh>
 
 #include <absl/container/node_hash_map.h>
 #include <boost/range/irange.hpp>
 
-#include <optional>
 #include <ranges>
 #include <system_error>
-#include <type_traits>
-
 namespace raft {
 
-static constexpr raft::group_id test_group(123);
+inline constexpr raft::group_id test_group(123);
 
 enum class msg_type {
     append_entries,
@@ -104,28 +95,25 @@ public:
     explicit in_memory_test_protocol(raft_node_map&, prefix_logger&);
 
     ss::future<result<vote_reply>>
-    vote(model::node_id, vote_request&&, rpc::client_opts) final;
+      vote(model::node_id, vote_request, rpc::client_opts) final;
 
     ss::future<result<append_entries_reply>> append_entries(
-      model::node_id,
-      append_entries_request&&,
-      rpc::client_opts,
-      bool use_all_serde_encoding) final;
+      model::node_id, append_entries_request, rpc::client_opts) final;
 
     ss::future<result<heartbeat_reply>>
-    heartbeat(model::node_id, heartbeat_request&&, rpc::client_opts) final;
+      heartbeat(model::node_id, heartbeat_request, rpc::client_opts) final;
 
     ss::future<result<heartbeat_reply_v2>> heartbeat_v2(
-      model::node_id, heartbeat_request_v2&&, rpc::client_opts) final;
+      model::node_id, heartbeat_request_v2, rpc::client_opts) final;
 
     ss::future<result<install_snapshot_reply>> install_snapshot(
-      model::node_id, install_snapshot_request&&, rpc::client_opts) final;
+      model::node_id, install_snapshot_request, rpc::client_opts) final;
 
     ss::future<result<timeout_now_reply>>
-    timeout_now(model::node_id, timeout_now_request&&, rpc::client_opts) final;
+      timeout_now(model::node_id, timeout_now_request, rpc::client_opts) final;
 
     ss::future<result<transfer_leadership_reply>> transfer_leadership(
-      model::node_id, transfer_leadership_request&&, rpc::client_opts) final;
+      model::node_id, transfer_leadership_request, rpc::client_opts) final;
 
     // TODO: move those methods out of Raft protocol.
     ss::future<> reset_backoff(model::node_id) final { co_return; }
@@ -168,7 +156,9 @@ public:
       raft_node_map& node_map,
       ss::sharded<features::feature_table>& feature_table,
       leader_update_clb_t leader_update_clb,
-      bool enable_longest_log_detection);
+      bool enable_longest_log_detection,
+      config::binding<std::chrono::milliseconds> election_timeout,
+      config::binding<std::chrono::milliseconds> heartbeat_interval);
 
     raft_node_instance(
       model::node_id id,
@@ -176,13 +166,22 @@ public:
       raft_node_map& node_map,
       ss::sharded<features::feature_table>& feature_table,
       leader_update_clb_t leader_update_clb,
-      bool enable_longest_log_detection);
+      bool enable_longest_log_detection,
+      config::binding<std::chrono::milliseconds> election_timeout,
+      config::binding<std::chrono::milliseconds> heartbeat_interval);
 
     raft_node_instance(const raft_node_instance&) = delete;
     raft_node_instance(raft_node_instance&&) noexcept = delete;
     raft_node_instance& operator=(raft_node_instance&&) = delete;
     raft_node_instance& operator=(const raft_node_instance&) = delete;
     ~raft_node_instance() = default;
+
+    ss::sstring base_directory() const { return _base_directory; }
+
+    ss::sstring work_directory() const {
+        return ssx::sformat(
+          "{}/{}_{}", base_directory(), ntp().path(), _revision);
+    }
 
     ss::lw_shared_ptr<consensus> raft() { return _raft; }
 
@@ -209,7 +208,7 @@ public:
 
     void leadership_notification_callback(leadership_status);
 
-    model::ntp ntp() {
+    model::ntp ntp() const {
         return {
           model::kafka_namespace,
           model::topic_partition(
@@ -223,7 +222,8 @@ public:
     ss::future<ss::circular_buffer<model::record_batch>>
     read_batches_in_range(model::offset min, model::offset max);
 
-    ss::future<model::offset> random_batch_base_offset(model::offset max);
+    ss::future<model::offset> random_batch_base_offset(
+      model::offset max, std::optional<model::offset> min = std::nullopt);
 
     /// \brief Sets a callback function to be invoked when the leader dispatches
     /// a message to followers.
@@ -237,15 +237,23 @@ public:
     /// dispatched.
     void on_dispatch(dispatch_callback_t);
 
+    ss::shared_ptr<in_memory_test_protocol> get_protocol() { return _protocol; }
+    ss::shared_ptr<buffered_protocol> get_buffered_protocol() {
+        return _buffered_protocol;
+    }
+
+    storage::kvstore& get_kvstore() { return _storage.local().kvs(); }
+
 private:
     model::node_id _id;
     model::revision_id _revision;
     prefix_logger _logger;
     ss::sstring _base_directory;
+    config::mock_property<size_t> _max_inflight_requests{16};
+    config::mock_property<size_t> _max_queued_bytes{1_MiB};
     ss::shared_ptr<in_memory_test_protocol> _protocol;
+    ss::shared_ptr<buffered_protocol> _buffered_protocol;
     ss::sharded<storage::api> _storage;
-    config::binding<std::chrono::milliseconds> _election_timeout
-      = config::mock_binding(500ms);
     ss::sharded<features::feature_table>& _features;
     ss::sharded<coordinated_recovery_throttle> _recovery_throttle;
     recovery_memory_quota _recovery_mem_quota;
@@ -255,12 +263,16 @@ private:
     ss::lw_shared_ptr<consensus> _raft;
     bool started = false;
     bool _enable_longest_log_detection;
+    config::binding<std::chrono::milliseconds> _election_timeout;
+    config::binding<std::chrono::milliseconds> _heartbeat_interval;
 };
 
 class raft_fixture
   : public seastar_test
   , public raft_node_map {
 public:
+    using leader_update_clb_t
+      = ss::noncopyable_function<void(model::node_id, leadership_status)>;
     raft_fixture()
       : _logger("raft-fixture") {}
     using raft_nodes_t = absl::
@@ -291,6 +303,8 @@ public:
     ss::future<model::node_id> wait_for_leader(std::chrono::milliseconds);
     ss::future<model::node_id>
       wait_for_leader(model::timeout_clock::time_point);
+    ss::future<model::node_id> wait_for_leader_change(
+      model::timeout_clock::time_point deadline, model::term_id term);
     seastar::future<> TearDownAsync() override;
     seastar::future<> SetUpAsync() override;
 
@@ -403,31 +417,9 @@ public:
 
     template<typename E>
     struct retry_policy {
-        static_assert(
-          std::is_same_v<E, raft::errc> || std::is_same_v<E, cluster::errc>);
         static E timeout_error() { return E::timeout; }
         static bool should_retry(const E& err) {
             return err == E::timeout || err == E::not_leader;
-        }
-    };
-    template<>
-    struct retry_policy<std::error_code> {
-        static std::error_code timeout_error() {
-            return raft::make_error_code(raft::errc::timeout);
-        }
-        static bool should_retry(const std::error_code& err) {
-            if (err.category() == raft::error_category()) {
-                return retry_policy<raft::errc>::should_retry(
-                  raft::errc(err.value()));
-            } else if (err.category() == cluster::error_category()) {
-                return retry_policy<cluster::errc>::should_retry(
-                  cluster::errc(err.value()));
-            } else {
-                vassert(
-                  false,
-                  "error category {} not supported",
-                  err.category().name());
-            }
         }
     };
 
@@ -469,18 +461,15 @@ public:
         };
         return ss::do_with(
           retry_state{},
-          [this, deadline, f = std::forward<Func>(f), backoff](
-            retry_state& state) mutable {
+          std::forward<Func>(f),
+          [this, deadline, backoff](
+            retry_state& state, std::remove_reference_t<Func>& f) {
               return ss::do_until(
                        [&state, deadline] {
                            return model::timeout_clock::now() > deadline
                                   || state.ready();
                        },
-                       [this,
-                        &state,
-                        f = std::forward<Func>(f),
-                        deadline,
-                        backoff]() mutable {
+                       [this, &state, &f, deadline, backoff]() {
                            vlog(
                              _logger.info,
                              "Executing action with leader, current retry: "
@@ -488,11 +477,10 @@ public:
                              state.retry);
 
                            return wait_for_leader(deadline).then(
-                             [this, f = std::forward<Func>(f), &state, backoff](
-                               model::node_id leader_id) {
+                             [this, &f, &state, backoff](
+                               model::node_id leader_id) mutable {
                                  return ss::futurize_invoke(f, node(leader_id))
-                                   .then([this, &state, backoff](
-                                           ret_t result) mutable {
+                                   .then([this, &state, backoff](ret_t result) {
                                        state.result = std::move(result);
                                        // "success"
                                        if (state.ready()) {
@@ -513,6 +501,7 @@ public:
                 .then([&state] { return state.result; });
           });
     }
+
     template<typename Func>
     auto
     retry_with_leader(model::timeout_clock::time_point deadline, Func&& f) {
@@ -530,6 +519,35 @@ public:
         _enable_longest_log_detection = value;
     }
 
+    void register_leader_callback(leader_update_clb_t clb) {
+        _leader_clb = std::move(clb);
+    }
+
+    void set_election_timeout(std::chrono::milliseconds timeout) {
+        _election_timeout.update(std::move(timeout));
+    }
+    void set_heartbeat_interval(std::chrono::milliseconds timeout) {
+        _heartbeat_interval.update(std::move(timeout));
+    }
+
+protected:
+    class raft_not_leader_exception : std::exception {};
+
+    template<std::derived_from<raft_fixture> Subclass>
+    ss::future<> test_with_leader(
+      model::timeout_clock::duration timeout,
+      ss::future<> (Subclass::*method)(raft_node_instance& leader)) {
+        co_await retry_with_leader(
+          model::timeout_clock::now() + timeout,
+          [this, method](raft_node_instance& leader) {
+              return ((static_cast<Subclass*>(this)->*method)(leader))
+                .then([] { return errc::success; })
+                .handle_exception_type([](const raft_not_leader_exception&) {
+                    return errc::not_leader;
+                });
+          });
+    }
+
 private:
     void validate_leaders();
 
@@ -540,6 +558,83 @@ private:
 
     ss::sharded<features::feature_table> _features;
     bool _enable_longest_log_detection = true;
+    std::optional<leader_update_clb_t> _leader_clb;
+    config::mock_property<std::chrono::milliseconds> _election_timeout{500ms};
+    config::mock_property<std::chrono::milliseconds> _heartbeat_interval{50ms};
+};
+
+template<class... STM>
+struct stm_raft_fixture : raft_fixture {
+    using stm_shptrs_t = std::tuple<ss::shared_ptr<STM>...>;
+
+    ss::future<> initialize_state_machines() {
+        return initialize_state_machines(3);
+    }
+
+    ss::future<> initialize_state_machines(int node_cnt) {
+        for (auto i = 0; i < node_cnt; ++i) {
+            add_node(model::node_id(i), model::revision_id(0));
+        }
+        co_await start_nodes();
+    }
+
+    ss::future<> start_node(raft_node_instance& node) {
+        co_await node.initialise(all_vnodes());
+        raft::state_machine_manager_builder builder;
+        stm_shptrs_t stm_shptrs = create_stms(builder, node);
+        co_await node.start(std::move(builder));
+        node_stms.emplace(node.get_vnode(), std::move(stm_shptrs));
+    }
+
+    ss::future<> start_nodes() {
+        co_await parallel_for_each_node(
+          [this](raft_node_instance& node) { return start_node(node); });
+    }
+
+    ss::future<> stop_and_recreate_nodes() {
+        absl::flat_hash_map<model::node_id, ss::sstring> data_directories;
+        for (auto& [id, node] : nodes()) {
+            data_directories[id]
+              = node->raft()->log()->config().base_directory();
+            node_stms.erase(node->get_vnode());
+        }
+
+        co_await ss::parallel_for_each(
+          std::views::keys(data_directories),
+          [this](model::node_id id) { return stop_node(id); });
+
+        for (auto& [id, data_dir] : data_directories) {
+            add_node(id, model::revision_id(0), std::move(data_dir));
+        }
+    }
+
+    ss::future<> restart_nodes() {
+        co_await stop_and_recreate_nodes();
+        co_await start_nodes();
+    }
+
+    // returns ss::shared_ptr<stm type>
+    template<int stm_id>
+    auto get_stm(raft_node_instance& node) {
+        return std::get<stm_id>(node_stms[node.get_vnode()]);
+    }
+
+    template<int stm_id, typename Func>
+    auto stm_retry_with_leader(std::chrono::milliseconds timeout, Func&& f) {
+        return retry_with_leader(
+          model::timeout_clock::now() + timeout,
+          [this,
+           f = std::forward<Func>(f)](raft_node_instance& leader_node) mutable {
+              auto stm = get_stm<stm_id>(leader_node);
+              return f(stm);
+          });
+    }
+
+    absl::flat_hash_map<raft::vnode, stm_shptrs_t> node_stms;
+
+    virtual stm_shptrs_t create_stms(
+      state_machine_manager_builder& builder, raft_node_instance& node)
+      = 0;
 };
 
 std::ostream& operator<<(std::ostream& o, msg_type type);

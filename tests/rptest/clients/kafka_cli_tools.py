@@ -13,7 +13,7 @@ import tempfile
 from rptest.clients.types import TopicSpec
 import json
 from ducktape.utils.util import wait_until
-from typing import Any, Optional, Sequence, cast
+from typing import Any, Optional, Sequence, cast, NamedTuple
 import os
 
 from rptest.services.keycloak import OAuthConfig
@@ -50,6 +50,13 @@ class KafkaCliToolsError(subprocess.CalledProcessError):
 
     def __str__(self):
         return self.msg
+
+
+class KafkaDeleteOffsetsResponse(NamedTuple):
+    topic: str
+    partition: int
+    new_start_offset: int
+    error_msg: str
 
 
 class KafkaCliTools:
@@ -235,7 +242,10 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         assert configs is not None, "didn't find Configs: section"
 
         def maybe_int(key: str, value: str):
-            if key in ["retention_ms", "retention_bytes", 'segment_bytes']:
+            if key in [
+                    "retention_ms", "retention_bytes", 'segment_bytes',
+                    'delete_retention_ms'
+            ]:
                 return int(value)
             return value
 
@@ -313,7 +323,8 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
                 record_size: int,
                 acks: int = -1,
                 throughput: int = -1,
-                batch_size: int = 81960):
+                batch_size: int = 81960,
+                linger_ms: int = 0):
         self._redpanda.logger.debug("Producing to topic: %s", topic)
         cmd = [self._script("kafka-producer-perf-test.sh")]
         cmd += ["--topic", topic]
@@ -322,13 +333,73 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         cmd += ["--throughput", str(throughput)]
         cmd += [
             "--producer-props",
-            "acks=%d" % acks, "client.id=ducktape",
+            "acks=%d" % acks,
+            "client.id=ducktape",
             "batch.size=%d" % batch_size,
-            "bootstrap.servers=%s" % self._redpanda.brokers()
+            "bootstrap.servers=%s" % self._redpanda.brokers(),
+            "linger.ms=%d" % linger_ms,
         ]
         if self._command_config:
             cmd += ["--producer.config", self._command_config.name]
         return self._execute(cmd, "produce")
+
+    def delete_records(self, offsets: dict[str, Any]):
+        """
+        `offsets` is of expected form e.g.:
+        {"partitions":
+         [{"topic": "topic_name",
+                    "partition": 0,
+                    "offset": 10},
+          {"topic": "topic_name",
+                    "partition": 1,
+                    "offset": 15}
+         ],
+         "version": 1
+        }
+        """
+
+        self._redpanda.logger.debug(f"Delete records with json {offsets}")
+        assert "version" in offsets
+        assert offsets["version"] == 1
+        assert "partitions" in offsets
+
+        json_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        output = None
+
+        try:
+            json.dump(offsets, json_file)
+            json_file.close()
+            args: list[str] = ["--offset-json-file", json_file.name]
+            output = self._run("kafka-delete-records.sh",
+                               args,
+                               desc="delete_records")
+        finally:
+            os.remove(json_file.name)
+
+        result_list: list[KafkaDeleteOffsetsResponse] = []
+
+        split_str = output.split('\n')
+        assert split_str[-1] == ""
+        partition_watermark_lines = split_str[2:-1]
+        for partition_watermark_line in partition_watermark_lines:
+            topic_partition_str, result_str = partition_watermark_line.strip(
+            ).split('\t')
+            topic_partition_str_split = topic_partition_str.split(
+                "partition: ")[1]
+            topic_partition_split_index = topic_partition_str_split.rfind('-')
+            topic_str = topic_partition_str_split[:topic_partition_split_index]
+            partition_str = topic_partition_str_split[
+                topic_partition_split_index:]
+            new_start_offset = -1
+            error_msg = ""
+            if "error" in result_str:
+                error_msg = result_str.split("error: ")[1]
+            elif "low_watermark" in result_str:
+                new_start_offset = int(result_str.split("low_watermark: ")[1])
+            result_list.append(
+                KafkaDeleteOffsetsResponse(topic_str, int(partition_str),
+                                           new_start_offset, error_msg))
+        return result_list
 
     def list_acls(self):
         args = ["--list"]

@@ -89,7 +89,19 @@ enum class errc : int16_t {
     topic_invalid_partitions_decreased,
     producer_ids_vcluster_limit_exceeded,
     validation_of_recovery_topic_failed,
+    replica_does_not_exist,
+    invalid_data_migration_state,
+    data_migration_not_exists,
+    data_migration_already_exists,
+    data_migration_invalid_resources,
+    data_migration_invalid_definition,
+    data_migrations_disabled,
+    resource_is_being_migrated,
+    invalid_target_node_id,
 };
+
+std::ostream& operator<<(std::ostream& o, errc err);
+
 struct errc_category final : public std::error_category {
     const char* name() const noexcept final { return "cluster::errc"; }
 
@@ -164,7 +176,7 @@ struct errc_category final : public std::error_category {
             return "Unable to perform requested topic operation ";
         case errc::no_eligible_allocation_nodes:
             return "No nodes are available to perform allocation after hard "
-                   "constrains were solved";
+                   "constraints were solved";
         case errc::allocation_error:
             return "Exception was thrown when allocating partitions ";
         case errc::partition_configuration_revision_not_updated:
@@ -259,6 +271,25 @@ struct errc_category final : public std::error_category {
             return "To many vclusters registered in producer state cache";
         case errc::validation_of_recovery_topic_failed:
             return "Validation of recovery topic failed";
+        case errc::replica_does_not_exist:
+            return "Partition replica does not exist";
+        case errc::invalid_data_migration_state:
+            return "Invalid data migration state transition requested";
+        case errc::data_migration_not_exists:
+            return "Requested data migration does not exist";
+        case errc::data_migration_already_exists:
+            return "Data migration with requested id already exists";
+        case errc::data_migration_invalid_resources:
+            return "Data migration contains resources that are not eligible";
+        case errc::data_migration_invalid_definition:
+            return "Data migration definition contains errors";
+        case errc::data_migrations_disabled:
+            return "Data migrations are disabled for this cluster";
+        case errc::resource_is_being_migrated:
+            return "Requested operation can not be executed as the resource is "
+                   "undergoing data migration";
+        case errc::invalid_target_node_id:
+            return "Request was intended for the node with different node id";
         }
         return "cluster::errc::unknown";
     }

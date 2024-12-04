@@ -12,16 +12,19 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "base/type_traits.h"
 #include "cloud_storage/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/types.h"
 #include "config/endpoint_tls_config.h"
+#include "debug_bundle/fwd.h"
 #include "finjector/stress_fiber.h"
 #include "kafka/server/fwd.h"
 #include "model/metadata.h"
 #include "pandaproxy/rest/fwd.h"
 #include "pandaproxy/schema_registry/fwd.h"
+#include "redpanda/admin/debug_bundle.h"
 #include "resource_mgmt/cpu_profiler.h"
 #include "resource_mgmt/memory_sampling.h"
 #include "rpc/connection_cache.h"
@@ -32,16 +35,15 @@
 #include "security/types.h"
 #include "storage/node.h"
 #include "transform/fwd.h"
-#include "utils/type_traits.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/http/exception.hh>
-#include <seastar/http/file_handler.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/json_path.hh>
+#include <seastar/http/request.hh>
 #include <seastar/json/json_elements.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/log.hh>
@@ -92,7 +94,8 @@ public:
       ss::sharded<security::audit::audit_log_manager>&,
       std::unique_ptr<cluster::tx_manager_migrator>&,
       ss::sharded<kafka::server>&,
-      ss::sharded<cluster::tx_gateway_frontend>&);
+      ss::sharded<cluster::tx_gateway_frontend>&,
+      ss::sharded<debug_bundle::service>&);
 
     ss::future<> start();
     ss::future<> stop();
@@ -153,7 +156,7 @@ private:
         auto auth_state = [this, &req]() -> request_auth_result {
             try {
                 return _auth.authenticate(req);
-            } catch (unauthorized_user_exception& e) {
+            } catch (const unauthorized_user_exception& e) {
                 audit_authn_failure(req, e.get_username(), e.what());
                 throw;
             } catch (const ss::httpd::base_exception& e) {
@@ -172,7 +175,7 @@ private:
                 auth_state.pass();
             } else {
                 static_assert(
-                  utils::unsupported_value<required_auth>::value,
+                  base::unsupported_value<required_auth>::value,
                   "Invalid auth_level");
             }
 
@@ -187,6 +190,8 @@ private:
 
         return auth_state;
     }
+
+    void check_license(const ss::sstring& msg) const;
 
     void log_exception(
       const ss::sstring& url,
@@ -220,7 +225,7 @@ private:
      * with an extra request_auth_state argument if peek_auth is true.
      */
     template<auth_level required_auth, bool peek_auth = false, typename F>
-    void register_route(ss::httpd::path_description const& path, F handler) {
+    void register_route(const ss::httpd::path_description& path, F handler) {
         path.set(
           _server._routes,
           [this, handler](std::unique_ptr<ss::http::request> req)
@@ -240,15 +245,15 @@ private:
                         return ss::futurize_invoke(
                                  handler, std::move(req), auth_state)
                           .handle_exception(
-                            exception_intercepter<
+                            exception_intercepter<std::remove_reference_t<
                               decltype(handler(std::move(req), auth_state)
-                                         .get0())>(url, auth_state));
+                                         .get())>>(url, auth_state));
 
                     } else {
                         return ss::futurize_invoke(handler, std::move(req))
                           .handle_exception(
-                            exception_intercepter<
-                              decltype(handler(std::move(req)).get0())>(
+                            exception_intercepter<std::remove_reference_t<
+                              decltype(handler(std::move(req)).get())>>(
                               url, auth_state));
                     }
                 });
@@ -262,7 +267,7 @@ private:
      */
     template<auth_level required_auth, bool peek_auth = false, typename F>
     void
-    register_route_sync(ss::httpd::path_description const& path, F handler) {
+    register_route_sync(const ss::httpd::path_description& path, F handler) {
         path.set(
           _server._routes,
           [this,
@@ -292,7 +297,7 @@ private:
      */
     template<auth_level required_auth, bool peek_auth = false, typename F>
     void register_route_raw_async(
-      ss::httpd::path_description const& path, F handler) {
+      const ss::httpd::path_description& path, F handler) {
         auto wrapped_handler = [this, handler](
                                  std::unique_ptr<ss::http::request> req,
                                  std::unique_ptr<ss::http::reply> rep)
@@ -309,17 +314,17 @@ private:
                 return ss::futurize_invoke(
                          handler, std::move(req), std::move(rep), auth_state)
                   .handle_exception(
-                    exception_intercepter<
+                    exception_intercepter<std::remove_reference_t<
                       decltype(handler(
                                  std::move(req), std::move(rep), auth_state)
-                                 .get0())>(url, auth_state));
+                                 .get())>>(url, auth_state));
 
             } else {
                 return ss::futurize_invoke(
                          handler, std::move(req), std::move(rep))
                   .handle_exception(
-                    exception_intercepter<
-                      decltype(handler(std::move(req), std::move(rep)).get0())>(
+                    exception_intercepter<std::remove_reference_t<
+                      decltype(handler(std::move(req), std::move(rep)).get())>>(
                       url, auth_state));
             }
         };
@@ -332,7 +337,7 @@ private:
 
     template<auth_level required_auth>
     void register_route_raw_sync(
-      ss::httpd::path_description const& path,
+      const ss::httpd::path_description& path,
       ss::httpd::handle_function handler) {
         auto handler_f = new ss::httpd::function_handler{
           [this, handler](ss::httpd::const_req req, ss::http::reply& reply) {
@@ -380,9 +385,9 @@ private:
             return ss::futurize_invoke(
                      _handler, std::move(request), std::move(reply))
               .handle_exception(
-                _server.exception_intercepter<
+                _server.exception_intercepter<std::remove_reference_t<
                   decltype(_handler(std::move(request), std::move(reply))
-                             .get0())>(url, auth_state));
+                             .get())>>(url, auth_state));
         }
 
         admin_server& _server;
@@ -391,7 +396,7 @@ private:
 
     template<auth_level required_auth>
     void register_route(
-      ss::httpd::path_description const& path, request_handler_fn handler) {
+      const ss::httpd::path_description& path, request_handler_fn handler) {
         path.set(
           _server._routes,
           new handler_impl<required_auth>{*this, std::move(handler)});
@@ -429,6 +434,9 @@ private:
     void register_shadow_indexing_routes();
     void register_wasm_transform_routes();
     void register_recovery_mode_routes();
+    void register_data_migration_routes();
+    void register_topic_routes();
+    void register_debug_bundle_routes();
 
     ss::future<ss::json::json_return_type> patch_cluster_config_handler(
       std::unique_ptr<ss::http::request>, const request_auth_result&);
@@ -480,6 +488,8 @@ private:
       put_feature_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       put_license_handler(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      get_enterprise_handler(std::unique_ptr<ss::http::request>);
 
     /// Broker routes
 
@@ -528,7 +538,12 @@ private:
     ss::future<ss::json::json_return_type>
       force_set_partition_replicas_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
+      set_partition_replica_core_handler(std::unique_ptr<ss::http::request>);
+
+    ss::future<ss::json::json_return_type>
       trigger_on_demand_rebalance_handler(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      trigger_shard_rebalance_handler(std::unique_ptr<ss::http::request>);
 
     ss::future<ss::json::json_return_type>
       get_reconfigurations_handler(std::unique_ptr<ss::http::request>);
@@ -636,14 +651,48 @@ private:
       list_committed_offsets(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       garbage_collect_committed_offsets(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      patch_transform_metadata(std::unique_ptr<ss::http::request>);
+
+    // Data migration routes
+    ss::future<std::unique_ptr<ss::http::reply>> list_data_migrations(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> get_data_migration(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> add_data_migration(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<ss::json::json_return_type>
+      execute_migration_action(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      delete_migration(std::unique_ptr<ss::http::request>);
+
+    // Topic routes
+    ss::future<std::unique_ptr<ss::http::reply>> list_mountable_topics(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<ss::json::json_return_type>
+      mount_topics(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      unmount_topics(std::unique_ptr<ss::http::request>);
+
+    // Debug Bundle routes
+    ss::future<std::unique_ptr<ss::http::reply>> post_debug_bundle(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> get_debug_bundle(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> delete_debug_bundle(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> get_debug_bundle_file(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> delete_debug_bundle_file(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
 
     ss::future<> throw_on_error(
       ss::http::request& req,
       std::error_code ec,
-      model::ntp const& ntp,
+      const model::ntp& ntp,
       model::node_id id = model::node_id{-1}) const;
     ss::future<ss::httpd::redirect_exception>
-    redirect_to_leader(ss::http::request& req, model::ntp const& ntp) const;
+    redirect_to_leader(ss::http::request& req, const model::ntp& ntp) const;
 
     ss::future<ss::json::json_return_type> cancel_node_partition_moves(
       ss::http::request& req, cluster::partition_move_direction direction);
@@ -695,6 +744,8 @@ private:
     std::unique_ptr<cluster::tx_manager_migrator>& _tx_manager_migrator;
     ss::sharded<kafka::server>& _kafka_server;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
+    ss::sharded<debug_bundle::service>& _debug_bundle_service;
+    ss::sharded<debug_bundle::file_handler> _debug_bundle_file_handler;
 
     // Value before the temporary override
     std::chrono::milliseconds _default_blocked_reactor_notify;

@@ -23,7 +23,7 @@ inline void tag_invoke(
   tag_t<read_tag>,
   iobuf_parser& in,
   ss::net::inet_address& t,
-  std::size_t const bytes_left_limit) {
+  const std::size_t bytes_left_limit) {
     bool is_ipv4 = read_nested<bool>(in, bytes_left_limit);
     auto address_buf = read_nested<iobuf>(in, bytes_left_limit);
     auto address_bytes = iobuf_to_bytes(address_buf);
@@ -41,7 +41,7 @@ inline void tag_invoke(
               sizeof(addr)));
         }
 
-        std::memcpy(&addr, address_bytes.c_str(), sizeof(addr));
+        std::memcpy(&addr, address_bytes.data(), sizeof(addr));
         t = ss::net::inet_address(addr);
     } else {
         ::in6_addr addr{};
@@ -56,7 +56,7 @@ inline void tag_invoke(
               address_bytes.size(),
               sizeof(addr)));
         }
-        std::memcpy(&addr, address_bytes.c_str(), sizeof(addr));
+        std::memcpy(&addr, address_bytes.data(), sizeof(addr));
         t = ss::net::inet_address(addr);
     }
 }

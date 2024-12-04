@@ -14,6 +14,7 @@
 #include "kafka/protocol/schemata/create_topics_request.h"
 #include "kafka/protocol/schemata/create_topics_response.h"
 #include "kafka/server/handlers/topics/types.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 
@@ -238,21 +239,21 @@ struct subject_name_strategy_validator {
         return std::all_of(
           c.configs.begin(),
           c.configs.end(),
-          [](createable_topic_config const& v) {
+          [](const createable_topic_config& v) {
               return !is_sns_config(v) || !v.value.has_value()
                      || is_valid_sns(v.value.value());
           });
     }
 
 private:
-    static bool is_sns_config(createable_topic_config const& c) {
+    static bool is_sns_config(const createable_topic_config& c) {
         static constexpr const auto config_names = {
           topic_property_record_key_subject_name_strategy,
           topic_property_record_key_subject_name_strategy_compat,
           topic_property_record_value_subject_name_strategy,
           topic_property_record_value_subject_name_strategy_compat};
         return std::any_of(
-          config_names.begin(), config_names.end(), [&c](auto const& v) {
+          config_names.begin(), config_names.end(), [&c](const auto& v) {
               return c.name == v;
           });
     }
@@ -261,6 +262,72 @@ private:
         try {
             boost::lexical_cast<
               pandaproxy::schema_registry::subject_name_strategy>(sv);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+struct iceberg_config_validator {
+    static constexpr const char* error_message
+      = "Invalid property value or Iceberg configuration disabled at cluster "
+        "level.";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_iceberg_mode;
+          });
+        if (it == c.configs.end() || !it->value.has_value()) {
+            return true;
+        }
+        model::iceberg_mode parsed_mode;
+        try {
+            parsed_mode = boost::lexical_cast<model::iceberg_mode>(
+              it->value.value());
+        } catch (...) {
+            return false;
+        }
+        // If iceberg is enabled at the cluster level, the topic can
+        // be created with any override. If it is disabled
+        // at the cluster level, it cannot be enabled with a topic
+        // override.
+        return config::shard_local_cfg().iceberg_enabled()
+               || parsed_mode == model::iceberg_mode::disabled;
+    }
+};
+
+/*
+ * it's an error to set the cloud topic property if cloud topics development
+ * feature hasn't been enabled.
+ */
+struct cloud_topic_config_validator {
+    static constexpr const char* error_message
+      = "Cloud topics property is invalid, or support for this development "
+        "feature is not enabled.";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_cloud_topic_enabled;
+          });
+        if (it == c.configs.end()) {
+            return true;
+        }
+        if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+            return false;
+        }
+        try {
+            std::ignore = string_switch<bool>(it->value.value())
+                            .match("true", true)
+                            .match("false", false);
             return true;
         } catch (...) {
             return false;
@@ -341,6 +408,41 @@ struct write_caching_configs_validator {
     static bool is_valid(const creatable_topic& c) {
         return validate_write_caching(c) && validate_flush_ms(c)
                && validate_flush_bytes(c);
+    }
+};
+
+struct delete_retention_ms_validator {
+    static constexpr const char* error_message
+      = "Unsupported delete.retention.ms configuration, cannot be enabled "
+        "at the same time as redpanda.remote.read or redpanda.remote.write.";
+    static constexpr const auto config_name
+      = topic_property_delete_retention_ms;
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        const auto config_entries = config_map(c.configs);
+        try {
+            auto delete_retention_ms
+              = get_tristate_value<std::chrono::milliseconds>(
+                config_entries, topic_property_delete_retention_ms);
+
+            auto shadow_indexing_mode = get_shadow_indexing_mode(
+              config_entries);
+            // Cannot set delete_retention_ms at the same time as any tiered
+            // storage properties.
+            if (
+              delete_retention_ms.has_optional_value()
+              && shadow_indexing_mode
+                   != model::shadow_indexing_mode::disabled) {
+                return false;
+            }
+        } catch (const boost::bad_lexical_cast&) {
+            // Caught a bad configuration exception.
+            // Return true for now- this will error out in a later stage.
+            return true;
+        }
+
+        return true;
     }
 };
 

@@ -31,11 +31,11 @@ pub enum SchemaFormat {
 }
 
 /// SchemaId is a type for the registered ID of a schema.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaId(pub i32);
 
 /// SchemaVersion is the version of a schema for a subject within the Schema Registry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaVersion(pub i32);
 
 /// Reference is a way for one schema to reference another.
@@ -188,6 +188,7 @@ pub enum SchemaRegistryError {
     DecodingError(varint::DecodeError),
     UnknownFormat(i64),
     InvalidSchema,
+    BadHeader,
 }
 
 impl std::fmt::Display for SchemaRegistryError {
@@ -204,6 +205,9 @@ impl std::fmt::Display for SchemaRegistryError {
             }
             SchemaRegistryError::InvalidSchema => {
                 write!(f, "invalid utf8 in schema")
+            }
+            SchemaRegistryError::BadHeader => {
+                write!(f, "5 byte header is missing or does not have 0 magic byte")
             }
         }
     }

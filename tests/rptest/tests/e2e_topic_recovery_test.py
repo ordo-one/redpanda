@@ -17,7 +17,6 @@ from rptest.clients.rpk import RpkTool
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer
 from rptest.utils.mode_checks import skip_debug_mode
-from ducktape.mark import ok_to_fail
 from ducktape.utils.util import wait_until
 from rptest.utils.si_utils import BucketView, NTP
 import time
@@ -288,6 +287,7 @@ class EndToEndTopicRecovery(RedpandaTest):
                                               msg_size,
                                               loop=False,
                                               nodes=[traffic_node],
+                                              use_transactions=True,
                                               debug_logs=True,
                                               trace_logs=True)
             consumer.start(clean=False)

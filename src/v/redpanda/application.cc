@@ -9,17 +9,23 @@
 
 #include "redpanda/application.h"
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/archiver_manager.h"
-#include "archival/ntp_archiver_service.h"
-#include "archival/purger.h"
-#include "archival/upload_controller.h"
-#include "archival/upload_housekeeping_service.h"
 #include "base/vlog.h"
 #include "cli_parser.h"
+#include "cloud_io/remote.h"
 #include "cloud_storage/cache_service.h"
+#include "cloud_storage/configuration.h"
+#include "cloud_storage/inventory/inv_ops.h"
+#include "cloud_storage/inventory/types.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage_clients/client_pool.h"
+#include "cloud_storage_clients/configuration.h"
+#include "cloud_topics/dl_stm/dl_stm_factory.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/archiver_manager.h"
+#include "cluster/archival/ntp_archiver_service.h"
+#include "cluster/archival/purger.h"
+#include "cluster/archival/upload_controller.h"
+#include "cluster/archival/upload_housekeeping_service.h"
 #include "cluster/bootstrap_service.h"
 #include "cluster/cloud_metadata/offsets_lookup.h"
 #include "cluster/cloud_metadata/offsets_recoverer.h"
@@ -34,12 +40,15 @@
 #include "cluster/cluster_uuid.h"
 #include "cluster/controller.h"
 #include "cluster/controller_snapshot.h"
+#include "cluster/data_migration_service_handler.h"
 #include "cluster/ephemeral_credential_frontend.h"
 #include "cluster/ephemeral_credential_service.h"
+#include "cluster/feature_manager.h"
 #include "cluster/fwd.h"
 #include "cluster/id_allocator.h"
 #include "cluster/id_allocator_frontend.h"
 #include "cluster/id_allocator_stm.h"
+#include "cluster/inventory_service.h"
 #include "cluster/log_eviction_stm.h"
 #include "cluster/members_manager.h"
 #include "cluster/members_table.h"
@@ -52,6 +61,7 @@
 #include "cluster/node_status_rpc_handler.h"
 #include "cluster/partition_balancer_rpc_handler.h"
 #include "cluster/partition_manager.h"
+#include "cluster/partition_properties_stm.h"
 #include "cluster/partition_recovery_manager.h"
 #include "cluster/producer_state_manager.h"
 #include "cluster/rm_partition_frontend.h"
@@ -60,7 +70,6 @@
 #include "cluster/self_test_rpc_handler.h"
 #include "cluster/service.h"
 #include "cluster/tm_stm.h"
-#include "cluster/tm_stm_cache_manager.h"
 #include "cluster/topic_recovery_service.h"
 #include "cluster/topic_recovery_status_frontend.h"
 #include "cluster/topic_recovery_status_rpc_handler.h"
@@ -76,7 +85,19 @@
 #include "config/endpoint_tls_config.h"
 #include "config/node_config.h"
 #include "config/seed_server.h"
+#include "config/types.h"
 #include "crypto/ossl_context_service.h"
+#include "datalake/coordinator/catalog_factory.h"
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+#include "datalake/cloud_data_io.h"
+#include "datalake/coordinator/coordinator_manager.h"
+#include "datalake/coordinator/frontend.h"
+#include "datalake/coordinator/service.h"
+#include "datalake/coordinator/state_machine.h"
+#include "datalake/datalake_manager.h"
+#include "datalake/translation/state_machine.h"
+#endif
+#include "debug_bundle/debug_bundle_service.h"
 #include "features/feature_table_snapshot.h"
 #include "features/fwd.h"
 #include "finjector/stress_fiber.h"
@@ -84,12 +105,13 @@
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/group_manager.h"
 #include "kafka/server/group_router.h"
-#include "kafka/server/queue_depth_monitor.h"
+#include "kafka/server/group_tx_tracker_stm.h"
+#include "kafka/server/queue_depth_monitor_config.h"
 #include "kafka/server/quota_manager.h"
 #include "kafka/server/rm_group_frontend.h"
-#include "kafka/server/server.h"
 #include "kafka/server/snc_quota_manager.h"
 #include "kafka/server/usage_manager.h"
+#include "metrics/prometheus_sanitize.h"
 #include "migrations/migrators.h"
 #include "migrations/rbac_migrator.h"
 #include "model/fundamental.h"
@@ -125,9 +147,10 @@
 #include "utils/file_io.h"
 #include "utils/human.h"
 #include "utils/uuid.h"
-#include "version.h"
-#include "wasm/api.h"
+#include "version/version.h"
 #include "wasm/cache.h"
+#include "wasm/engine.h"
+#include "wasm/impl.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/memory.hh>
@@ -144,6 +167,14 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
+#include <absl/log/globals.h>
+#include <fmt/format.h>
+#if __has_include(<google/protobuf/runtime_version.h>)
+#include <google/protobuf/runtime_version.h>
+#endif
+#if __has_include(<google/protobuf/stubs/logging.h>)
+#include <google/protobuf/stubs/logging.h>
+#endif
 #include <sys/resource.h>
 #include <sys/utsname.h>
 
@@ -243,15 +274,19 @@ static void set_auditing_kafka_client_defaults(
 }
 
 application::application(ss::sstring logger_name)
-  : _log(std::move(logger_name)){};
+  : _log(std::move(logger_name)) {};
 
-application::~application() = default;
+application::~application() {
+    while (!_deferred.empty()) {
+        _deferred.pop_back();
+    }
+}
 
 void application::shutdown() {
     storage.invoke_on_all(&storage::api::stop_cluster_uuid_waiters).get();
     // Stop accepting new requests.
-    if (_kafka_server.local_is_initialized()) {
-        _kafka_server.invoke_on_all(&net::server::shutdown_input).get();
+    if (_kafka_server.ref().local_is_initialized()) {
+        _kafka_server.shutdown_input().get();
     }
     if (_rpc.local_is_initialized()) {
         _rpc.invoke_on_all(&rpc::rpc_server::shutdown_input).get();
@@ -308,6 +343,9 @@ void application::shutdown() {
             &cloud_storage_clients::client_pool::shutdown_connections)
           .get();
     }
+    if (cloud_io.local_is_initialized()) {
+        cloud_io.invoke_on_all(&cloud_io::remote::request_stop).get();
+    }
 
     // Stop all partitions before destructing the subsystems (transaction
     // coordinator, etc). This interrupts ongoing replication requests,
@@ -320,8 +358,8 @@ void application::shutdown() {
 
     // Wait for all requests to finish before destructing services that may be
     // used by pending requests.
-    if (_kafka_server.local_is_initialized()) {
-        _kafka_server.invoke_on_all(&net::server::wait_for_shutdown).get();
+    if (_kafka_server.ref().local_is_initialized()) {
+        _kafka_server.wait_for_shutdown().get();
         _kafka_server.stop().get();
     }
     if (_kafka_conn_quotas.local_is_initialized()) {
@@ -348,9 +386,10 @@ static void log_system_resources(
      */
     const size_t default_reserve_memory = std::max<size_t>(
       1536_MiB, 0.07 * total_mem);
-    auto reserve = cfg.contains("reserve-memory") ? ss::parse_memory_size(
-                     cfg["reserve-memory"].as<std::string>())
-                                                  : default_reserve_memory;
+    auto reserve = cfg.contains("reserve-memory")
+                     ? ss::parse_memory_size(
+                         cfg["reserve-memory"].as<std::string>())
+                     : default_reserve_memory;
     vlog(
       log.info,
       "System resources: {{ cpus: {}, available memory: {}, reserved memory: "
@@ -397,6 +436,11 @@ int application::run(int ac, char** av) {
       "redpanda-cfg",
       po::value<std::string>(),
       ".yaml file config for redpanda");
+    app.add_options()(
+      "node-id-overrides",
+      po::value<std::vector<config::node_id_override>>()->multitoken(),
+      "Override node UUID and ID iff current UUID matches "
+      "- usage: <current UUID>:<new UUID>:<new ID>");
 
     // Validate command line args using options registered by the app and
     // seastar. Keep the resulting variables in a temporary map so they don't
@@ -416,12 +460,24 @@ int application::run(int ac, char** av) {
             std::cout << redpanda_version() << std::endl;
             return 0;
         }
+
+        if (!vm["node-id-overrides"].empty()) {
+            fmt::print(
+              std::cout,
+              "Node ID overrides: {}",
+              vm["node-id-overrides"]
+                .as<std::vector<config::node_id_override>>());
+        }
     }
     // use endl for explicit flushing
     std::cout << community_msg << std::endl;
 
-    return app.run(ac, av, [this, &app] {
+    std::string cmd_line = fmt::to_string(
+      fmt::join(std::span{av, size_t(ac)}, " "));
+
+    return app.run(ac, av, [this, &app, cmd_line = std::move(cmd_line)] {
         vlog(_log.info, "Redpanda {}", redpanda_version());
+        vlog(_log.info, "Command line: {}", cmd_line);
         struct ::utsname buf;
         ::uname(&buf);
         vlog(
@@ -523,13 +579,24 @@ void application::initialize(
     _cpu_profiler.invoke_on_all(&resources::cpu_profiler::start).get();
 
     /*
+     * Disable the logger for protobuf; some interfaces don't allow a pluggable
+     * error collector.
+     */
+#if PROTOBUF_VERSION < 5027000
+    google::protobuf::SetLogHandler(nullptr);
+#else
+    // Protobuf uses absl logging in the latest version
+    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfinity);
+#endif
+
+    /*
      * allocate per-core zstd decompression workspace and per-core
-     * async_stream_zstd workspaces. it can be several megabytes in size, so do
-     * it before memory becomes fragmented.
+     * async_stream_zstd workspaces. it can be several megabytes in size, so
+     * do it before memory becomes fragmented.
      */
     ss::smp::invoke_on_all([] {
-        // TODO: remove this when stream_zstd is replaced with async_stream_zstd
-        // in v/kafka
+        // TODO: remove this when stream_zstd is replaced with
+        // async_stream_zstd in v/kafka
         compression::stream_zstd::init_workspace(
           config::shard_local_cfg().zstd_decompress_workspace_bytes());
 
@@ -540,7 +607,7 @@ void application::initialize(
           compression::lz4_decompression_buffers::bufsize,
           compression::lz4_decompression_buffers::min_threshold,
           config::shard_local_cfg().lz4_decompress_reusable_buffers_disabled());
-    }).get0();
+    }).get();
 
     if (config::shard_local_cfg().enable_pid_file()) {
         // check that the data directory exists now, because we are about to
@@ -653,6 +720,15 @@ void application::setup_public_metrics() {
                  [] { return 1; },
                  sm::description("Redpanda build information"),
                  build_labels)
+                 .aggregate({sm::shard_label}),
+               sm::make_gauge(
+                 "fips_mode",
+                 [] {
+                     return static_cast<unsigned int>(
+                       config::node().fips_mode());
+                 },
+                 sm::description("Identifies whether or not Redpanda is "
+                                 "running in FIPS mode."))
                  .aggregate({sm::shard_label})});
         })
       .get();
@@ -692,22 +768,26 @@ void application::setup_internal_metrics() {
 
     _metrics.add_group(
       "application",
-      {
-        sm::make_gauge(
-          "uptime",
-          [] {
-              return std::chrono::duration_cast<std::chrono::milliseconds>(
-                       ss::engine().uptime())
-                .count();
-          },
-          sm::description("Redpanda uptime in milliseconds")),
+      {sm::make_gauge(
+         "uptime",
+         [] {
+             return std::chrono::duration_cast<std::chrono::milliseconds>(
+                      ss::engine().uptime())
+               .count();
+         },
+         sm::description("Redpanda uptime in milliseconds")),
 
-        sm::make_gauge(
-          "build",
-          [] { return 1; },
-          sm::description("Redpanda build information"),
-          build_labels),
-      });
+       sm::make_gauge(
+         "build",
+         [] { return 1; },
+         sm::description("Redpanda build information"),
+         build_labels),
+
+       sm::make_gauge(
+         "fips_mode",
+         [] { return static_cast<unsigned int>(config::node().fips_mode()); },
+         sm::description(
+           "Identifies whether or not Redpanda is running in FIPS mode."))});
 }
 
 void application::validate_arguments(const po::variables_map& cfg) {
@@ -739,7 +819,7 @@ void application::hydrate_config(const po::variables_map& cfg) {
     // Retain the original bytes loaded so that we can hexdump them later
     // if YAML Parse fails.
     // Related: https://github.com/redpanda-data/redpanda/issues/3798
-    auto yaml_raw_bytes = read_fully_tmpbuf(cfg_path).get0();
+    auto yaml_raw_bytes = read_fully_tmpbuf(cfg_path).get();
     auto yaml_raw_str = ss::to_sstring(yaml_raw_bytes.clone());
     YAML::Node config;
     try {
@@ -775,7 +855,7 @@ void application::hydrate_config(const po::variables_map& cfg) {
 
     ss::smp::invoke_on_all([&config, cfg_path] {
         config::node().load(cfg_path, config);
-    }).get0();
+    }).get();
 
     auto node_config_errors = config::node().load(config);
     for (const auto& i : node_config_errors) {
@@ -803,9 +883,18 @@ void application::hydrate_config(const po::variables_map& cfg) {
         config::node().rack.set_value(std::nullopt);
     }
 
+    // load ID overrides
+    if (!cfg["node-id-overrides"].empty()) {
+        ss::smp::invoke_on_all([&cfg] {
+            config::node().node_id_overrides.set_value(
+              cfg["node-id-overrides"]
+                .as<std::vector<config::node_id_override>>());
+        }).get();
+    }
+
     // This includes loading from local bootstrap file or legacy
     // config file on first-start or upgrade cases.
-    _config_preload = cluster::config_manager::preload(config).get0();
+    _config_preload = cluster::config_manager::preload(config).get();
 
     vlog(_log.info, "Cluster configuration properties:");
     vlog(_log.info, "(use `rpk cluster config edit` to change)");
@@ -887,21 +976,53 @@ void application::check_environment() {
         }
     }
 
-    if (config::node().fips_mode()) {
+    if (config::fips_mode_enabled(config::node().fips_mode())) {
         if (!ss::file_exists(fips_enabled_file).get()) {
-            throw std::runtime_error(fmt::format(
-              "File '{}' does not exist.  Redpanda cannot start in FIPS mode",
-              fips_enabled_file));
-        }
-
-        auto fd = ss::file_desc::open(fips_enabled_file.data(), O_RDONLY);
-        char buf[1];
-        fd.read(buf, 1);
-        if (buf[0] != '1') {
-            throw std::runtime_error(fmt::format(
-              "File '{}' not reporting '1'.  Redpanda cannot start in FIPS "
-              "mode",
-              fips_enabled_file));
+            if (config::node().fips_mode() == config::fips_mode_flag::enabled) {
+                throw std::runtime_error(fmt::format(
+                  "File '{}' does not exist.  Redpanda cannot start in FIPS "
+                  "mode",
+                  fips_enabled_file));
+            } else if (
+              config::node().fips_mode()
+              == config::fips_mode_flag::permissive) {
+                vlog(
+                  _log.warn,
+                  "File '{}' does not exist.  Redpanda will start in FIPS mode "
+                  "but this is not a support configuration",
+                  fips_enabled_file);
+            } else {
+                vassert(
+                  false,
+                  "Should not be performing environment check for FIPS when "
+                  "fips_mode flag is {}",
+                  config::node().fips_mode());
+            }
+        } else {
+            auto fd = ss::file_desc::open(fips_enabled_file.data(), O_RDONLY);
+            char buf[1];
+            fd.read(buf, 1);
+            if (buf[0] != '1') {
+                auto msg = fmt::format(
+                  "File '{}' not reporting '1'.  Redpanda cannot start in FIPS "
+                  "mode",
+                  fips_enabled_file);
+                if (
+                  config::node().fips_mode()
+                  == config::fips_mode_flag::enabled) {
+                    throw std::runtime_error(msg);
+                } else if (
+                  config::node().fips_mode()
+                  == config::fips_mode_flag::permissive) {
+                    vlog(_log.warn, "{}", msg);
+                } else {
+                    vassert(
+                      false,
+                      "Should not be performing environment check for FIPS "
+                      "when fips_mode flag is {}",
+                      config::node().fips_mode());
+                }
+            }
         }
         syschecks::systemd_message("Starting Redpanda in FIPS mode").get();
     }
@@ -940,7 +1061,7 @@ void application::check_for_crash_loop() {
 
     // Compute the checksum of the current node configuration.
     auto current_config
-      = read_fully_to_string(config::node().get_cfg_file_path()).get0();
+      = read_fully_to_string(config::node().get_cfg_file_path()).get();
     auto checksum = xxhash_64(current_config.c_str(), current_config.length());
 
     if (maybe_crash_md) {
@@ -1059,8 +1180,9 @@ void application::configure_admin_server() {
       &_transform_service,
       std::ref(audit_mgr),
       std::ref(_tx_manager_migrator),
-      std::ref(_kafka_server),
-      std::ref(tx_gateway_frontend))
+      std::ref(_kafka_server.ref()),
+      std::ref(tx_gateway_frontend),
+      std::ref(_debug_bundle_service))
       .get();
 }
 
@@ -1207,7 +1329,8 @@ make_upload_controller_config(ss::scheduling_group sg) {
 // add additional services in here
 void application::wire_up_runtime_services(
   model::node_id node_id, ::stop_signal& app_signal) {
-    wire_up_redpanda_services(node_id, app_signal);
+    std::optional<cloud_storage_clients::bucket_name> bucket;
+    wire_up_redpanda_services(node_id, app_signal, bucket);
     if (_proxy_config) {
         construct_single_service(
           _proxy,
@@ -1235,7 +1358,7 @@ void application::wire_up_runtime_services(
 
     if (wasm_data_transforms_enabled()) {
         syschecks::systemd_message("Starting wasm runtime").get();
-        auto base_runtime = wasm::runtime::create_default(
+        auto base_runtime = wasm::create_default_runtime(
           _schema_registry.get());
         construct_single_service(_wasm_runtime, std::move(base_runtime));
 
@@ -1299,13 +1422,85 @@ void application::wire_up_runtime_services(
           .get();
     }
 
-    construct_single_service(_monitor_unsafe_log_flag, std::ref(feature_table));
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+    if (datalake_enabled()) {
+        vassert(
+          bucket.has_value(),
+          "Bucket should have been set when configuring cloud IO");
+        // Construct datalake subsystems, now that dependencies are
+        // already constructed.
+        syschecks::systemd_message("Starting datalake services").get();
+        construct_service(
+          _datalake_coordinator_mgr,
+          node_id,
+          std::ref(raft_group_manager),
+          std::ref(partition_manager),
+          std::ref(controller->get_topics_state()),
+          std::ref(controller->get_topics_frontend()),
+          _schema_registry.get(),
+          ss::sharded_parameter(
+            [bucket](cloud_io::remote& remote)
+              -> std::unique_ptr<datalake::coordinator::catalog_factory> {
+                return datalake::coordinator::get_catalog_factory(
+                  config::shard_local_cfg(), remote, *bucket);
+            },
+            std::ref(cloud_io)),
+          std::ref(cloud_io),
+          std::ref(*bucket))
+          .get();
+        construct_service(
+          _datalake_coordinator_fe,
+          node_id,
+          &_datalake_coordinator_mgr,
+          &raft_group_manager,
+          &partition_manager,
+          &controller->get_topics_frontend(),
+          &metadata_cache,
+          &controller->get_partition_leaders(),
+          &controller->get_shard_table(),
+          &_connection_cache)
+          .get();
+
+        construct_service(
+          _datalake_manager,
+          node_id,
+          &raft_group_manager,
+          &partition_manager,
+          &controller->get_topics_state(),
+          &controller->get_topics_frontend(),
+          &controller->get_partition_leaders(),
+          &controller->get_shard_table(),
+          &feature_table,
+          &_datalake_coordinator_fe,
+          &cloud_io,
+          ss::sharded_parameter(
+            [bucket](cloud_io::remote& remote)
+              -> std::unique_ptr<datalake::coordinator::catalog_factory> {
+                return datalake::coordinator::get_catalog_factory(
+                  config::shard_local_cfg(), remote, *bucket);
+            },
+            std::ref(cloud_io)),
+          _schema_registry.get(),
+          &_as,
+          *bucket,
+          sched_groups.datalake_sg(),
+          memory_groups().datalake_max_memory())
+          .get();
+        _datalake_manager.invoke_on_all(&datalake::datalake_manager::start)
+          .get();
+    }
+#endif
+    construct_single_service(_monitor_unsafe, std::ref(feature_table));
+
+    construct_service(_debug_bundle_service, &storage.local().kvs()).get();
 
     configure_admin_server();
 }
 
 void application::wire_up_redpanda_services(
-  model::node_id node_id, ::stop_signal& app_signal) {
+  model::node_id node_id,
+  ::stop_signal& app_signal,
+  std::optional<cloud_storage_clients::bucket_name>& bucket_name) {
     ss::smp::invoke_on_all([] {
         resources::available_memory::local().register_metrics();
     }).get();
@@ -1366,6 +1561,14 @@ void application::wire_up_redpanda_services(
               .enable_longest_log_detection
               = config::shard_local_cfg()
                   .raft_enable_longest_log_detection.bind(),
+              .max_buffered_bytes_per_node
+              = config::shard_local_cfg()
+                  .raft_max_buffered_follower_append_entries_bytes_per_shard
+                  .bind(),
+              .max_inflight_requests_per_node
+              = config::shard_local_cfg()
+                  .raft_max_inflight_follower_append_entries_requests_per_shard
+                  .bind(),
             };
         },
         [] {
@@ -1395,18 +1598,24 @@ void application::wire_up_redpanda_services(
         recovery_throttle.stop().get();
     });
 
-    if (archival_storage_enabled()) {
-        syschecks::systemd_message("Starting cloud storage api").get();
-        ss::sharded<cloud_storage::configuration> cloud_configs;
+    model::cloud_storage_backend backend{model::cloud_storage_backend::unknown};
+    cloud_storage_clients::bucket_name bucket{};
+    ss::sharded<cloud_storage::configuration> cloud_configs;
+    auto stop_config = ss::defer(
+      [&cloud_configs] { cloud_configs.stop().get(); });
+    if (requires_cloud_io()) {
+        syschecks::systemd_message("Starting cloud IO").get();
         cloud_configs.start().get();
-        auto stop_config = ss::defer(
-          [&cloud_configs] { cloud_configs.stop().get(); });
         cloud_configs
           .invoke_on_all([](cloud_storage::configuration& c) {
               return cloud_storage::configuration::get_config().then(
                 [&c](cloud_storage::configuration cfg) { c = std::move(cfg); });
           })
           .get();
+        backend = cloud_storage_clients::infer_backend_from_configuration(
+          cloud_configs.local().client_config,
+          cloud_configs.local().cloud_credentials_source);
+        bucket = cloud_configs.local().bucket_name;
         construct_service(
           cloud_storage_clients,
           cloud_configs.local().connection_limit,
@@ -1426,8 +1635,23 @@ void application::wire_up_redpanda_services(
             }))
           .get();
         construct_service(
-          cloud_storage_api,
+          cloud_io,
           std::ref(cloud_storage_clients),
+          ss::sharded_parameter(
+            [&cloud_configs] { return cloud_configs.local().client_config; }),
+          ss::sharded_parameter([&cloud_configs] {
+              return cloud_configs.local().cloud_credentials_source;
+          }))
+          .get();
+        cloud_io.invoke_on_all(&cloud_io::remote::start).get();
+        bucket_name = cloud_configs.local().bucket_name;
+    }
+
+    if (archival_storage_enabled()) {
+        syschecks::systemd_message("Starting cloud storage api").get();
+        construct_service(
+          cloud_storage_api,
+          std::ref(cloud_io),
           ss::sharded_parameter(
             [&cloud_configs] { return cloud_configs.local(); }))
           .get();
@@ -1457,17 +1681,16 @@ void application::wire_up_redpanda_services(
           .get();
     }
 
-    syschecks::systemd_message("Creating tm_stm_cache_manager").get();
-
-    construct_service(tm_stm_cache_manager).get();
-
     syschecks::systemd_message("Initializing producer state manager").get();
     construct_service(
       producer_manager,
       ss::sharded_parameter([]() {
           return config::shard_local_cfg().max_concurrent_producer_ids.bind();
       }),
-      config::shard_local_cfg().transactional_id_expiration_ms.value(),
+      ss::sharded_parameter([]() {
+          return config::shard_local_cfg()
+            .transactional_id_expiration_ms.bind();
+      }),
       ss::sharded_parameter([]() {
           return config::shard_local_cfg()
             .virtual_cluster_min_producer_ids.bind();
@@ -1530,7 +1753,7 @@ void application::wire_up_redpanda_services(
       std::ref(shadow_index_cache),
       std::ref(node_status_table),
       std::ref(metadata_cache));
-    controller->wire_up().get0();
+    controller->wire_up().get();
 
     if (config::node().recovery_mode_enabled()) {
         construct_single_service(
@@ -1656,6 +1879,7 @@ void application::wire_up_redpanda_services(
     construct_service(
       metadata_cache,
       std::ref(controller->get_topics_state()),
+      std::ref(controller->get_data_migrated_resources()),
       std::ref(controller->get_members_table()),
       std::ref(controller->get_partition_leaders()),
       std::ref(controller->get_health_monitor()))
@@ -1670,12 +1894,16 @@ void application::wire_up_redpanda_services(
 
     // metrics and quota management
     syschecks::systemd_message("Adding kafka quota managers").get();
-    construct_service(quota_mgr).get();
+    construct_service(quota_mgr, std::ref(controller->get_quota_store())).get();
     construct_service(snc_quota_mgr, std::ref(snc_node_quota)).get();
 
     syschecks::systemd_message("Creating auditing subsystem").get();
     construct_service(
-      audit_mgr, controller.get(), std::ref(*_audit_log_client_config))
+      audit_mgr,
+      node_id,
+      controller.get(),
+      std::ref(*_audit_log_client_config),
+      &metadata_cache)
       .get();
 
     syschecks::systemd_message("Creating metadata dissemination service").get();
@@ -1711,6 +1939,10 @@ void application::wire_up_redpanda_services(
           ss::sharded_parameter([] {
               return config::shard_local_cfg()
                 .cloud_storage_cache_max_objects.bind();
+          }),
+          ss::sharded_parameter([] {
+              return config::shard_local_cfg()
+                .cloud_storage_cache_trim_walk_concurrency.bind();
           }))
           .get();
 
@@ -1762,6 +1994,60 @@ void application::wire_up_redpanda_services(
                   topic_recovery_status_frontend, topic_recovery_service);
             })
           .get();
+
+        if (
+          config::shard_local_cfg()
+            .cloud_storage_inventory_based_scrub_enabled()
+          && config::shard_local_cfg().cloud_storage_enable_scrubbing()) {
+            const auto manual_setup
+              = config::shard_local_cfg()
+                  .cloud_storage_inventory_self_managed_report_config();
+            const auto supported = cloud_storage::inventory::
+              validate_backend_supported_for_inventory_scrub(backend);
+            if (!manual_setup && !supported) {
+                throw std::runtime_error(fmt::format(
+                  "cloud storage backend inferred as {} which is "
+                  "not supported for inventory based scrubbing",
+                  backend));
+            }
+
+            std::shared_ptr<cluster::leaders_provider> leaders_provider
+              = std::make_shared<cluster::default_leaders_provider>(
+                controller->get_partition_leaders());
+            std::shared_ptr<cluster::remote_provider> remote_provider
+              = std::make_shared<cluster::default_remote_provider>(
+                cloud_storage_api);
+            auto inv_ops
+              = cloud_storage::inventory::make_inv_ops(
+                  bucket,
+                  cloud_storage::inventory::inventory_config_id{
+                    config::shard_local_cfg().cloud_storage_inventory_id()},
+                  config::shard_local_cfg()
+                    .cloud_storage_inventory_reports_prefix())
+                  .get();
+            const auto report_check_interval
+              = config::shard_local_cfg()
+                  .cloud_storage_inventory_report_check_interval_ms();
+            // If the self-managed flag is enabled, do not create report
+            // schedule
+            const auto should_create_report_config
+              = !config::shard_local_cfg()
+                   .cloud_storage_inventory_self_managed_report_config();
+            construct_single_service_sharded(
+              inventory_service,
+              config::node().cloud_storage_inventory_hash_path(),
+              leaders_provider,
+              remote_provider,
+              std::move(inv_ops),
+              report_check_interval,
+              should_create_report_config)
+              .get();
+            inventory_service
+              .invoke_on(
+                cluster::inventory_service::shard_id,
+                &cluster::inventory_service::start)
+              .get();
+        }
     }
 
     construct_single_service(
@@ -1776,6 +2062,13 @@ void application::wire_up_redpanda_services(
       &storage_node,
       &shadow_index_cache,
       &partition_manager);
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        vassert(
+          archival_storage_enabled(),
+          "cloud topics currently requires archival storage to be enabled");
+        construct_service(_reconciler, &partition_manager, &cloud_io).get();
+    }
 
     // group membership
     syschecks::systemd_message("Creating kafka group manager").get();
@@ -1920,12 +2213,11 @@ void application::wire_up_redpanda_services(
       std::ref(metadata_cache),
       std::ref(_connection_cache),
       std::ref(controller->get_partition_leaders()),
-      controller.get(),
+      node_id,
       std::ref(id_allocator_frontend),
       _rm_group_proxy.get(),
       std::ref(rm_partition_frontend),
       std::ref(feature_table),
-      std::ref(tm_stm_cache_manager),
       std::ref(tx_topic_manager),
       ss::sharded_parameter([] {
           return config::shard_local_cfg()
@@ -2044,9 +2336,9 @@ void application::wire_up_redpanda_services(
           });
       })
       .get();
-    std::optional<kafka::qdc_monitor::config> qdc_config;
+    std::optional<kafka::qdc_monitor_config> qdc_config;
     if (config::shard_local_cfg().kafka_qdc_enable()) {
-        qdc_config = kafka::qdc_monitor::config{
+        qdc_config = kafka::qdc_monitor_config{
           .latency_alpha = config::shard_local_cfg().kafka_qdc_latency_alpha(),
           .max_latency = config::shard_local_cfg().kafka_qdc_max_latency_ms(),
           .window_count = config::shard_local_cfg().kafka_qdc_window_count(),
@@ -2062,7 +2354,7 @@ void application::wire_up_redpanda_services(
     syschecks::systemd_message("Starting kafka RPC {}", kafka_cfg.local())
       .get();
     _kafka_server
-      .start(
+      .init(
         &kafka_cfg,
         smp_service_groups.kafka_smp_sg(),
         sched_groups.fetch_sg(),
@@ -2070,6 +2362,8 @@ void application::wire_up_redpanda_services(
         std::ref(controller->get_topics_frontend()),
         std::ref(controller->get_config_frontend()),
         std::ref(controller->get_feature_table()),
+        std::ref(controller->get_quota_frontend()),
+        std::ref(controller->get_quota_store()),
         std::ref(quota_mgr),
         std::ref(snc_quota_mgr),
         std::ref(group_router),
@@ -2101,6 +2395,10 @@ ss::future<> application::set_proxy_config(ss::sstring name, std::any val) {
     return _proxy->set_config(std::move(name), std::move(val));
 }
 
+bool application::requires_cloud_io() {
+    return archival_storage_enabled() || datalake_enabled();
+}
+
 bool application::archival_storage_enabled() {
     const auto& cfg = config::shard_local_cfg();
     return cfg.cloud_storage_enabled();
@@ -2109,6 +2407,10 @@ bool application::archival_storage_enabled() {
 bool application::wasm_data_transforms_enabled() {
     return config::shard_local_cfg().data_transforms_enabled.value()
            && !config::node().emergency_disable_data_transforms.value();
+}
+
+bool application::datalake_enabled() {
+    return config::shard_local_cfg().iceberg_enabled();
 }
 
 ss::future<>
@@ -2127,18 +2429,32 @@ void application::trigger_abort_source() {
 void application::wire_up_and_start_crypto_services() {
     construct_single_service(thread_worker);
     thread_worker->start({.name = "worker"}).get();
+    auto fips_mode_flag = config::node().fips_mode();
     // config file and module path are not necessary when not
     // running in FIPS mode
     construct_service(
       ossl_context_service,
       std::ref(*thread_worker),
-      ss::sstring{config::node_config().openssl_config_file().value_or("")},
-      ss::sstring{
-        config::node_config().openssl_module_directory().value_or("")},
-      config::node_config().fips_mode() ? crypto::is_fips_mode::yes
-                                        : crypto::is_fips_mode::no)
+      ss::sstring{config::node().openssl_config_file().value_or("")},
+      ss::sstring{config::node().openssl_module_directory().value_or("")},
+      config::fips_mode_enabled(fips_mode_flag) ? crypto::is_fips_mode::yes
+                                                : crypto::is_fips_mode::no)
       .get();
     ossl_context_service.invoke_on_all(&crypto::ossl_context_service::start)
+      .get();
+    ossl_context_service.map([](auto& s) { return s.fips_mode(); })
+      .then([fips_mode_flag](auto fips_mode_vals) {
+          auto expected = config::fips_mode_enabled(fips_mode_flag)
+                            ? crypto::is_fips_mode::yes
+                            : crypto::is_fips_mode::no;
+          for (auto fips_mode : fips_mode_vals) {
+              vassert(
+                fips_mode == expected,
+                "Mismatch in FIPS mode: {} != {}",
+                fips_mode,
+                expected);
+          }
+      })
       .get();
 }
 
@@ -2205,7 +2521,7 @@ void application::wire_up_bootstrap_services() {
       .invoke_on_all([this](net::server_configuration& c) {
           return ss::async([this, &c] {
               auto rpc_server_addr
-                = net::resolve_dns(config::node().rpc_server()).get0();
+                = net::resolve_dns(config::node().rpc_server()).get();
               // Use port based load_balancing_algorithm to make connection
               // shard assignment deterministic.
               c.load_balancing_algo
@@ -2242,15 +2558,15 @@ void application::wire_up_bootstrap_services() {
     syschecks::systemd_message(
       "Constructing internal RPC services {}", rpc_cfg.local())
       .get();
-    _rpc.start(&rpc_cfg).get();
+    construct_service(_rpc, &rpc_cfg).get();
 }
 
 void application::start_bootstrap_services() {
     syschecks::systemd_message("Starting storage services").get();
 
     // single instance
-    storage_node.invoke_on_all(&storage::node::start).get0();
-    local_monitor.invoke_on_all(&cluster::node::local_monitor::start).get0();
+    storage_node.invoke_on_all(&storage::node::start).get();
+    local_monitor.invoke_on_all(&cluster::node::local_monitor::start).get();
 
     storage.invoke_on_all(&storage::api::start).get();
 
@@ -2262,7 +2578,8 @@ void application::start_bootstrap_services() {
     // Before we start up our bootstrapping RPC service, load any relevant
     // on-disk state we may need: existing cluster UUID, node ID, etc.
     if (std::optional<iobuf> cluster_uuid_buf = storage.local().kvs().get(
-          cluster::cluster_uuid_key_space, bytes(cluster::cluster_uuid_key));
+          cluster::cluster_uuid_key_space,
+          bytes::from_string(cluster::cluster_uuid_key));
         cluster_uuid_buf) {
         const auto cluster_uuid = model::cluster_uuid{
           serde::from_iobuf<uuid_t>(std::move(*cluster_uuid_buf))};
@@ -2315,13 +2632,13 @@ void application::start_bootstrap_services() {
               // their cluster can easily stop it and run an older version,
               // before we've committed any version info to disk.
           })
-          .get0();
+          .get();
     }
 
     auto configured_node_id = config::node().node_id();
     if (auto invariants_buf = storage.local().kvs().get(
           storage::kvstore::key_space::controller,
-          cluster::controller::invariants_key);
+          cluster::controller::invariants_key());
         invariants_buf) {
         auto invariants
           = reflection::from_iobuf<cluster::configuration_invariants>(
@@ -2339,12 +2656,12 @@ void application::start_bootstrap_services() {
         ss::smp::invoke_on_all([stored_node_id] {
             config::node().node_id.set_value(
               std::make_optional(stored_node_id));
-        }).get0();
+        }).get();
     }
 
     // Load the local node UUID, or create one if none exists.
     auto& kvs = storage.local().kvs();
-    static const bytes node_uuid_key = "node_uuid";
+    static const auto node_uuid_key = bytes::from_string("node_uuid");
     model::node_uuid node_uuid;
     auto node_uuid_buf = kvs.get(
       storage::kvstore::key_space::controller, node_uuid_key);
@@ -2358,6 +2675,25 @@ void application::start_bootstrap_services() {
     } else {
         node_uuid = model::node_uuid(uuid_t::create());
         vlog(_log.info, "Generated new UUID for node: {}", node_uuid);
+        kvs
+          .put(
+            storage::kvstore::key_space::controller,
+            node_uuid_key,
+            serde::to_iobuf(node_uuid))
+          .get();
+    }
+
+    _node_overrides.maybe_set_overrides(
+      node_uuid, config::node().node_id_overrides());
+
+    // Apply UUID override to node config if present
+    if (auto u = _node_overrides.node_uuid(); u.has_value()) {
+        vlog(
+          _log.warn,
+          "Overriding UUID for node: {} -> {}",
+          node_uuid,
+          u.value());
+        node_uuid = u.value();
         kvs
           .put(
             storage::kvstore::key_space::controller,
@@ -2410,16 +2746,28 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
                                  .kvs()
                                  .get(
                                    storage::kvstore::key_space::controller,
-                                   cluster::controller::invariants_key)
+                                   cluster::controller::invariants_key())
                                  .has_value();
 
     model::node_id node_id;
     if (config::node().node_id().has_value() && ever_ran_controller) {
         vlog(
-          _log.debug,
+          _log.info,
           "Running with already-established node ID {}",
           config::node().node_id());
         node_id = config::node().node_id().value();
+    } else if (auto id = _node_overrides.node_id(); id.has_value()) {
+        vlog(
+          _log.warn,
+          "Overriding node ID: {} -> {}",
+          config::node().node_id(),
+          id);
+        node_id = id.value();
+        // null out the config'ed ID indiscriminately; it will be set outside
+        // the conditional
+        ss::smp::invoke_on_all([] {
+            config::node().node_id.set_value(std::nullopt);
+        }).get();
     } else {
         auto registration_result = cd.register_with_cluster().get();
         node_id = registration_result.assigned_node_id;
@@ -2506,6 +2854,9 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
             *controller));
         _migrators.push_back(
           std::make_unique<features::migrators::rbac_migrator>(*controller));
+        _migrators.push_back(
+          std::make_unique<features::migrators::shard_placement_migrator>(
+            *controller));
     }
 
     if (cd.is_cluster_founder().get()) {
@@ -2568,7 +2919,7 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     construct_service(_aggregate_metrics_watcher).get();
 
     _admin.invoke_on_all([](admin_server& admin) { admin.set_ready(); }).get();
-    _monitor_unsafe_log_flag->start().get();
+    _monitor_unsafe->start().get();
 
     vlog(_log.info, "Successfully started Redpanda!");
     syschecks::systemd_notify_ready().get();
@@ -2576,28 +2927,13 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
 
 void application::start_runtime_services(
   cluster::cluster_discovery& cd, ::stop_signal& app_signal) {
-    ssx::background = feature_table.invoke_on_all(
-      [this](features::feature_table& ft) {
-          return ft.await_feature_then(
-            features::feature::rpc_transport_unknown_errc, [this] {
-                if (ss::this_shard_id() == 0) {
-                    vlog(
-                      _log.debug, "All nodes support unknown RPC error codes");
-                }
-                // Redpanda versions <= v22.3.x don't properly parse error
-                // codes they don't know about.
-                _rpc.local().set_use_service_unavailable();
-            });
-      });
-
     // single instance
     node_status_backend.invoke_on_all(&cluster::node_status_backend::start)
       .get();
     syschecks::systemd_message("Starting the partition manager").get();
     partition_manager
       .invoke_on_all([this](cluster::partition_manager& pm) {
-          pm.register_factory<cluster::tm_stm_factory>(
-            tm_stm_cache_manager, feature_table);
+          pm.register_factory<cluster::tm_stm_factory>(feature_table);
           pm.register_factory<cluster::id_allocator_stm_factory>();
           pm.register_factory<transform::transform_offsets_stm_factory>(
             controller->get_topics_state());
@@ -2613,7 +2949,19 @@ void application::start_runtime_services(
           pm.register_factory<cluster::archival_metadata_stm_factory>(
             config::shard_local_cfg().cloud_storage_enabled(),
             cloud_storage_api,
-            feature_table);
+            feature_table,
+            controller->get_topics_state());
+          pm.register_factory<kafka::group_tx_tracker_stm_factory>();
+          pm.register_factory<cluster::partition_properties_stm_factory>(
+            storage.local().kvs(),
+            config::shard_local_cfg().rm_sync_timeout_ms.bind());
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+          pm.register_factory<datalake::coordinator::stm_factory>();
+          pm.register_factory<datalake::translation::stm_factory>();
+#endif
+          if (config::shard_local_cfg().development_enable_cloud_topics()) {
+              pm.register_factory<experimental::cloud_topics::dl_stm_factory>();
+          }
       })
       .get();
     partition_manager.invoke_on_all(&cluster::partition_manager::start).get();
@@ -2657,6 +3005,15 @@ void application::start_runtime_services(
     if (offsets_recovery_router.local_is_initialized()) {
         offsets_recovery_requestor = offsets_recovery_manager;
     }
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+    if (_datalake_coordinator_mgr.local_is_initialized()) {
+        // Before starting the controller, start the coordinator manager so we
+        // don't miss any partition/leadership notifications.
+        _datalake_coordinator_mgr
+          .invoke_on_all(&datalake::coordinator::coordinator_manager::start)
+          .get();
+    }
+#endif
     controller
       ->start(
         cd,
@@ -2665,7 +3022,7 @@ void application::start_runtime_services(
         producer_id_recovery_manager,
         std::move(offsets_recovery_requestor),
         redpanda_start_time)
-      .get0();
+      .get();
 
     if (archiver_manager.local_is_initialized()) {
         archiver_manager.invoke_on_all(&archival::archiver_manager::start)
@@ -2734,7 +3091,8 @@ void application::start_runtime_services(
             std::ref(controller->get_health_monitor()),
             std::ref(_connection_cache),
             std::ref(controller->get_partition_manager()),
-            std::ref(node_status_backend)));
+            std::ref(node_status_backend),
+            std::ref(controller->get_quota_frontend())));
           runtime_services.push_back(
             std::make_unique<cluster::metadata_dissemination_handler>(
               sched_groups.cluster_sg(),
@@ -2791,6 +3149,21 @@ void application::start_runtime_services(
                   std::ref(controller->get_partition_leaders()),
                   config::node().node_id().value()));
           }
+          runtime_services.push_back(
+            std::make_unique<cluster::data_migrations::service_handler>(
+              sched_groups.cluster_sg(),
+              smp_service_groups.cluster_smp_sg(),
+              std::ref(controller->get_data_migration_frontend()),
+              std::ref(controller->get_data_migration_irpc_frontend())));
+
+#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+          runtime_services.push_back(
+            std::make_unique<datalake::coordinator::rpc::service>(
+              sched_groups.datalake_sg(),
+              smp_service_groups.datalake_sg(),
+              &_datalake_coordinator_fe));
+#endif
+
           s.add_services(std::move(runtime_services));
 
           // Done! Disallow unknown method errors.
@@ -2823,8 +3196,29 @@ void application::start_runtime_services(
           .get();
     }
 
+    // Verify the enterprise license when trying to upgrade Redpanda.
+    // By this point during startup we have enough information to evaluate both
+    // the state of the license and what enterprise features are used.
+    // - If redpanda has been restarted on an existing node, we have already
+    //   loaded the feature table from the local snapshot in
+    //   application::load_feature_table_snapshot and replayed the local
+    //   controller log in controller::start.
+    // - If this is a new node joining an existing cluster, by this point we
+    //   have received a controller snapshot from another node in the join
+    //   response and have replicated and replayed the the controller stm to the
+    //   last_applied offset received in the join_node_reply above.
+    controller->get_feature_manager()
+      .invoke_on(
+        cluster::feature_manager::backend_shard,
+        [](cluster::feature_manager& fm) {
+            return fm.verify_enterprise_license();
+        })
+      .get();
+
+    _debug_bundle_service.invoke_on_all(&debug_bundle::service::start).get();
+
     if (!config::node().admin().empty()) {
-        _admin.invoke_on_all(&admin_server::start).get0();
+        _admin.invoke_on_all(&admin_server::start).get();
     }
 
     _compaction_controller.invoke_on_all(&storage::compaction_controller::start)
@@ -2838,6 +3232,10 @@ void application::start_runtime_services(
     }
 
     space_manager->start().get();
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        _reconciler.invoke_on_all([](auto& app) { return app.start(); }).get();
+    }
 }
 
 /**
@@ -2878,7 +3276,7 @@ void application::start_kafka(
         cvar.wait().get();
     }
 
-    _kafka_server.invoke_on_all(&net::server::start).get();
+    _kafka_server.start().get();
     vlog(
       _log.info,
       "Started Kafka API server listening at {}",

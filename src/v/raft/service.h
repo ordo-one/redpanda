@@ -71,7 +71,7 @@ public:
     [[gnu::always_inline]] ss::future<heartbeat_reply>
     heartbeat(heartbeat_request r, rpc::streaming_context&) final {
         using ret_t = std::vector<append_entries_reply>;
-        auto const req_sz = r.heartbeats.size();
+        const auto req_sz = r.heartbeats.size();
         auto grouped = group_hbeats_by_shard(std::move(r.heartbeats));
 
         std::vector<ss::future<std::vector<append_entries_reply>>> futures;
@@ -368,6 +368,7 @@ private:
           hb.meta,
           model::make_memory_record_batch_reader(
             ss::circular_buffer<model::record_batch>{}),
+          0,
           flush_after_append::no};
     }
     static append_entries_request make_append_entries_request(
@@ -389,6 +390,7 @@ private:
           },
           model::make_memory_record_batch_reader(
             ss::circular_buffer<model::record_batch>{}),
+          0,
           flush_after_append::no};
     }
 
@@ -469,7 +471,7 @@ private:
         shard_groupped_hbeat_requests ret;
 
         for (auto& r : reqs) {
-            auto const shard = _shard_table.shard_for(r.meta.group);
+            const auto shard = _shard_table.shard_for(r.meta.group);
             if (unlikely(!shard)) {
                 ret.group_missing_requests.push_back(r);
                 continue;
@@ -487,7 +489,7 @@ private:
         shard_groupped_hbeat_requests_v2 ret;
 
         for (const auto& full_beat : hb_request.full_heartbeats()) {
-            auto const shard = _shard_table.shard_for(full_beat.group);
+            const auto shard = _shard_table.shard_for(full_beat.group);
             if (unlikely(!shard)) {
                 ret.group_missing_requests.push_back(group_heartbeat{
                   .group = full_beat.group, .data = full_beat.data});
@@ -499,8 +501,8 @@ private:
               full_heartbeat{.group = full_beat.group, .data = full_beat.data});
         }
         hb_request.for_each_lw_heartbeat([this, &ret](int64_t group_id) {
-            auto const lw_beat = raft::group_id(group_id);
-            auto const shard = _shard_table.shard_for(lw_beat);
+            const auto lw_beat = raft::group_id(group_id);
+            const auto shard = _shard_table.shard_for(lw_beat);
             if (unlikely(!shard)) {
                 ret.group_missing_requests.push_back(
                   group_heartbeat{.group = lw_beat});

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "container/chunked_hash_map.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -87,8 +88,8 @@ public:
      */
     ktp(ss::sstring topic_name, int32_t partition_id)
       : ktp{
-        model::topic(std::move(topic_name)),
-        model::partition_id(partition_id)} {}
+          model::topic(std::move(topic_name)),
+          model::partition_id(partition_id)} {}
 
     /**
      * @brief Return the equivalent ntp object.
@@ -193,6 +194,10 @@ public:
         return tp_equals(other.tp, tp) && kafka_ns_view == other.ns();
     }
 
+    auto operator<=>(const ktp& other) const noexcept {
+        return tp <=> other.tp;
+    }
+
     friend std::ostream& operator<<(std::ostream& os, const ktp& t) {
         os << t.to_ntp();
         return os;
@@ -292,8 +297,8 @@ struct ktp_with_hash : public ktp {
      */
     ktp_with_hash(ss::sstring topic_name, int32_t partition_id)
       : ktp_with_hash{
-        model::topic(std::move(topic_name)),
-        model::partition_id(partition_id)} {}
+          model::topic(std::move(topic_name)),
+          model::partition_id(partition_id)} {}
 
     template<typename T>
     friend class std::hash; // std::hash needs _hash_code
@@ -334,22 +339,12 @@ struct ktp_hash_eq {
 };
 
 /**
- * @brief Helper alias to declare a flat map from ntp to V.
+ * @brief Helper alias to declare a map from ntp to V.
  *
  * Uses transparent comparator to allow any ntp object to be used for lookup.
  */
 template<typename V>
-using ntp_flat_map_type
-  = absl::flat_hash_map<model::ntp, V, ktp_hash_eq, ktp_hash_eq>;
-
-/**
- * @brief Helper alias to declare a flat map from ntp to V.
- *
- * Uses transparent comparator to allow any ntp object to be used for lookup.
- */
-template<typename V>
-using ntp_node_map_type
-  = absl::node_hash_map<model::ntp, V, ktp_hash_eq, ktp_hash_eq>;
+using ntp_map_type = chunked_hash_map<model::ntp, V, ktp_hash_eq, ktp_hash_eq>;
 
 } // namespace model
 

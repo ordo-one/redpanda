@@ -14,6 +14,7 @@
 #include "base/seastarx.h"
 #include "base/units.h"
 #include "config/property.h"
+#include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
@@ -46,6 +47,8 @@
 #include <optional>
 
 namespace storage {
+
+class log_manager_probe;
 
 namespace testing_details {
 class log_manager_accessor;
@@ -170,6 +173,7 @@ public:
       kvstore& kvstore,
       storage_resources&,
       ss::sharded<features::feature_table>&) noexcept;
+    ~log_manager();
 
     ss::future<ss::shared_ptr<log>> manage(
       ntp_config,
@@ -209,6 +213,7 @@ public:
       ss::io_priority_class pc,
       size_t read_buffer_size,
       unsigned read_ahead,
+      size_t segment_size_hint,
       record_version_type = record_version_type::v1);
 
     const log_config& config() const { return _config; }
@@ -251,7 +256,7 @@ public:
 
 private:
     using logs_type
-      = absl::flat_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
+      = chunked_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
     using compaction_list_type
       = intrusive_list<log_housekeeping_meta, &log_housekeeping_meta::link>;
 
@@ -279,6 +284,8 @@ private:
 
     ss::future<> housekeeping_scan(model::timestamp);
 
+    void update_log_count();
+
     log_config _config;
     kvstore& _kvstore;
     storage_resources& _resources;
@@ -292,6 +299,10 @@ private:
     // Hash key-map to use across multiple compactions to reuse reserved memory
     // rather than reallocating repeatedly.
     std::unique_ptr<hash_key_offset_map> _compaction_hash_key_map;
+
+    // Metrics.
+    std::unique_ptr<log_manager_probe> _probe;
+
     ss::gate _gate;
     ss::abort_source _abort_source;
 

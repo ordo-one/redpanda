@@ -14,6 +14,7 @@
 #include "cluster/cloud_metadata/offsets_snapshot.h"
 #include "cluster/notification.h"
 #include "cluster/topic_table.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/delete_groups.h"
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/errors.h"
@@ -34,6 +35,7 @@
 #include "kafka/server/member.h"
 #include "model/metadata.h"
 #include "raft/fwd.h"
+#include "raft/notification.h"
 #include "ssx/semaphore.h"
 #include "utils/rwlock.h"
 
@@ -43,6 +45,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
 
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/node_hash_map.h>
 
 #include <span>
@@ -134,6 +137,12 @@ public:
     ss::future<> start();
     ss::future<> stop();
 
+    struct list_groups_filter_data {
+        using states_filter_t = absl::flat_hash_set<group_state>;
+
+        states_filter_t states_filter;
+    };
+
 public:
     /// \brief Handle a JoinGroup request
     group::join_group_stages join_group(join_group_request&& request);
@@ -171,7 +180,8 @@ public:
 
     // returns the set of registered groups, and an error if one occurred while
     // retrieving the group list (e.g. coordinator_load_in_progress).
-    std::pair<error_code, std::vector<listed_group>> list_groups() const;
+    std::pair<error_code, chunked_vector<listed_group>>
+    list_groups(const list_groups_filter_data& filter_data = {}) const;
 
     described_group describe_group(const model::ntp&, const kafka::group_id&);
 
@@ -188,6 +198,8 @@ public:
 
     ss::future<kafka::error_code>
       recover_offsets(cluster::cloud_metadata::group_offsets_snapshot);
+
+    size_t attached_partitions_count() const { return _partitions.size(); }
 
 public:
     error_code validate_group_status(
@@ -225,7 +237,7 @@ private:
         ~attached_partition() noexcept;
     };
 
-    cluster::notification_id_type _leader_notify_handle;
+    raft::group_manager_notification_id _leader_notify_handle;
     cluster::notification_id_type _topic_table_notify_handle;
 
     void handle_leader_change(
@@ -233,7 +245,7 @@ private:
       ss::lw_shared_ptr<cluster::partition>,
       std::optional<model::node_id>);
 
-    void handle_topic_delta(cluster::topic_table::delta_range_t);
+    void handle_topic_delta(cluster::topic_table::ntp_delta_range_t);
 
     ss::future<> cleanup_removed_topic_partitions(
       const chunked_vector<model::topic_partition>&);
