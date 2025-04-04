@@ -35,6 +35,7 @@ public:
         model::tx_seq tx_seq;
         model::partition_id tm_partition;
         model::timeout_clock::duration timeout;
+        model::offset begin_offset{-1};
         chunked_hash_map<model::topic_partition, group::offset_metadata>
           offsets;
     };
@@ -43,6 +44,9 @@ public:
         model::producer_epoch epoch;
         std::unique_ptr<ongoing_tx> tx;
     };
+    explicit group_stm(ss::sstring group_id)
+      : _group_id(std::move(group_id)) {}
+
     void overwrite_metadata(group_metadata_value&&);
 
     void update_offset(
@@ -57,7 +61,8 @@ public:
       model::producer_epoch epoch,
       model::tx_seq txseq,
       model::timeout_clock::duration transaction_timeout_ms,
-      model::partition_id tm_partition);
+      model::partition_id tm_partition,
+      model::offset fence_offset);
 
     bool has_data() const {
         return !_is_removed && (_is_loaded || _offsets.size() > 0);
@@ -79,7 +84,7 @@ public:
 private:
     chunked_hash_map<model::topic_partition, logged_metadata> _offsets;
     chunked_hash_map<model::producer_id, producer> _producers;
-
+    ss::sstring _group_id;
     group_metadata_value _metadata;
     bool _is_loaded{false};
     bool _is_removed{false};

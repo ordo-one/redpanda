@@ -9,8 +9,9 @@
  */
 
 #include "bytes/iobuf_parser.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
-#include "cloud_storage/tests/s3_imposter.h"
+#include "config/types.h"
 #include "iceberg/json_writer.h"
 #include "iceberg/rest_catalog.h"
 #include "iceberg/rest_client/catalog_client.h"
@@ -44,6 +45,7 @@ iceberg::rest_client::credentials get_credentials() {
     return {
       .client_id = "redpanda",
       .client_secret = "being_cute",
+      .oauth2_scope = "PRINCIPAL_ROLE:ALL",
     };
 }
 struct RestCatalogTest
@@ -66,8 +68,11 @@ struct RestCatalogTest
           endpoint,
           get_credentials(),
           iceberg::rest_client::base_path{"/catalog"},
+          iceberg::rest_client::warehouse{"x"},
+          iceberg::rest_client::api_version("v1"),
           std::nullopt,
-          iceberg::rest_client::api_version("v1"));
+          nullptr,
+          config::datalake_catalog_auth_mode::oauth2);
     }
     std::unique_ptr<cloud_io::scoped_remote> sr;
     iceberg::manifest_io io;
@@ -123,7 +128,7 @@ ss::future<http::downloaded_response> handle_token_request(
     EXPECT_TRUE(query_params_equal(
       absl::flat_hash_map<ss::sstring, ss::sstring>{
         {"grant_type", "client_credentials"},
-        {"scope", "PRINCIPAL_ROLE%3aALL"},
+        {"scope", "PRINCIPAL_ROLE%3AALL"},
         {"client_secret", get_credentials().client_secret},
         {"client_id", get_credentials().client_id}},
       received));
@@ -272,11 +277,38 @@ void setup_token_request_expectations(client_mock& mock) {
         _))
       .WillOnce(handle_token_request);
 }
+void setup_config_expectations(client_mock& mock) {
+    auto ret = [](
+                 [[maybe_unused]] boost::beast::http::request_header<>&& r,
+                 [[maybe_unused]] std::optional<iobuf> payload,
+                 [[maybe_unused]] ss::lowres_clock::duration timeout) {
+        return ss::make_ready_future<http::downloaded_response>(
+          http::downloaded_response{
+            .status = boost::beast::http::status::ok, .body = iobuf::from(R"({
+              "defaults": {"prefix": "x"},
+              "overrides": {"prefix": ""}
+            })")});
+    };
+    EXPECT_CALL(
+      mock,
+      request_and_collect_response(
+        AllOf(
+          Property(
+            &boost::beast::http::request_header<>::target,
+            EndsWith("/config?warehouse=x")),
+          Property(
+            &boost::beast::http::request_header<>::method,
+            Eq(boost::beast::http::verb::get))),
+        _,
+        _))
+      .WillRepeatedly(ret);
+}
 } // namespace
 
 TEST_F(RestCatalogTest, CheckLoadTableHappyPath) {
     auto client = make_catalog_client({[](client_mock& m) {
         setup_token_request_expectations(m);
+        setup_config_expectations(m);
 
         EXPECT_CALL(
           m,
@@ -317,6 +349,7 @@ ss::future<http::downloaded_response> handle_create_table(
 TEST_F(RestCatalogTest, CheckCreateTableHappyPath) {
     auto client = make_catalog_client({[](client_mock& m) {
         setup_token_request_expectations(m);
+        setup_config_expectations(m);
 
         EXPECT_CALL(
           m,
@@ -417,6 +450,7 @@ iceberg::table_metadata create_empty_table_metadata(const ss::sstring& bucket) {
 TEST_F(RestCatalogTest, CommitTxnHappyPath) {
     auto client = make_catalog_client({[](client_mock& m) {
         setup_token_request_expectations(m);
+        setup_config_expectations(m);
 
         EXPECT_CALL(
           m,
@@ -436,18 +470,22 @@ TEST_F(RestCatalogTest, CommitTxnHappyPath) {
     iceberg::rest_catalog catalog(
       std::move(client), config::mock_binding<std::chrono::milliseconds>(10s));
     auto table_md = create_empty_table_metadata(bucket_name);
-    chunked_vector<iceberg::data_file> files;
+    iceberg::transaction txn(std::move(table_md));
+
+    chunked_vector<iceberg::file_to_append> files;
     std::unique_ptr<iceberg::struct_value> partition_key_val
       = std::make_unique<iceberg::struct_value>();
     partition_key_val->fields.push_back(iceberg::int_value{0});
-
-    files.push_back(iceberg::data_file{
+    iceberg::data_file file{
       .content_type = iceberg::data_file_content_type::data,
       .file_format = iceberg::data_file_format::parquet,
       .partition = iceberg::partition_key{.val = std::move(partition_key_val)},
+    };
+    files.push_back(iceberg::file_to_append{
+      .file = std::move(file),
+      .schema_id = txn.table().current_schema_id,
+      .partition_spec_id = txn.table().default_spec_id,
     });
-
-    iceberg::transaction txn(std::move(table_md));
 
     auto outcome = txn.merge_append(io, std::move(files)).get();
     ASSERT_FALSE(outcome.has_error());
@@ -457,6 +495,26 @@ TEST_F(RestCatalogTest, CommitTxnHappyPath) {
                         .ns = {"foo", "bar", "baz"}, .table = "panda_table"},
                       std::move(txn))
                     .get();
+    ASSERT_FALSE(result.has_error());
+}
+
+TEST_F(RestCatalogTest, CommitEmptyTransaction) {
+    // No expectations to fail if the client is used at all.
+    auto client = make_catalog_client({[](client_mock&) {}});
+
+    iceberg::rest_catalog catalog(
+      std::move(client), config::mock_binding<std::chrono::milliseconds>(10s));
+    auto table_md = create_empty_table_metadata(bucket_name);
+
+    iceberg::transaction txn(std::move(table_md));
+    auto result = catalog
+                    .commit_txn(
+                      iceberg::table_identifier{
+                        .ns = {"foo", "bar", "baz"}, .table = "panda_table"},
+                      std::move(txn))
+                    .get();
+
+    // The client shouldn't be used at all.
     ASSERT_FALSE(result.has_error());
 }
 
@@ -482,6 +540,7 @@ ss::future<http::downloaded_response> handle_load_table_check_concurrency(
 TEST_F(RestCatalogTest, TestConcurrentAccesses) {
     auto client = make_catalog_client({[](client_mock& m) {
         setup_token_request_expectations(m);
+        setup_config_expectations(m);
         // setup mock to always reply in a
         EXPECT_CALL(
           m,

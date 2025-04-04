@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
 
 #include "bytes/iobuf.h"
@@ -102,19 +103,21 @@ public:
         return true;
     }
 
+    // Allows for returning data in cur_frag_ *only*.
     void backup(size_t len) final {
         cur_pos_ -= len;
         if (cur_frag_ == buf_.end()) {
-            cur_frag_ = std::prev(buf_.end());
-            cur_frag_pos_ = cur_frag_->size();
+            throw std::runtime_error(
+              "invalid `backup` call in avro_iobuf_istream after `next` has "
+              "returned false");
         }
-        while (cur_frag_pos_ < len) {
-            len -= cur_frag_pos_;
-            if (cur_frag_ == buf_.begin()) {
-                return;
-            }
-            --cur_frag_;
-            cur_frag_pos_ = cur_frag_->size();
+        if (cur_frag_pos_ < len) {
+            throw std::runtime_error(fmt::format(
+              "invalid `backup` call in avro_iobuf_istream - trying to backup "
+              "more than the last call to `next` current_fragment_position: "
+              "{}, backup_len: {}",
+              cur_frag_pos_,
+              len));
         }
         cur_frag_pos_ -= len;
     }

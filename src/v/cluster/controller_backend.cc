@@ -530,8 +530,7 @@ controller_backend::calculate_learner_initial_offset(
      *   initial retention settings and configured move policy.
      */
     const bool no_initial_retention_settings = !(
-      initial_retention_bytes.has_value()
-      || initial_retention_bytes.has_value());
+      initial_retention_bytes.has_value() || initial_retention_ms.has_value());
 
     bool full_move = policy == reconfiguration_policy::full_local_retention
                      || no_initial_retention_settings;
@@ -577,8 +576,7 @@ controller_backend::calculate_learner_initial_offset(
         return std::nullopt;
     }
 
-    const auto cloud_storage_safe_offset
-      = p->archival_meta_stm()->max_collectible_offset();
+    const auto max_collectible_offset = p->max_collectible_offset();
     /**
      * Last offset uploaded to the cloud is target learner retention upper
      * bound. We can not start retention recover from the point which is not yet
@@ -592,10 +590,10 @@ controller_backend::calculate_learner_initial_offset(
       *retention_offset,
       p->archival_meta_stm()->manifest().get_last_offset(),
       p->archival_meta_stm()->get_last_clean_at(),
-      cloud_storage_safe_offset);
+      max_collectible_offset);
 
     return model::next_offset(
-      std::min(cloud_storage_safe_offset, *retention_offset));
+      std::min(max_collectible_offset, *retention_offset));
 }
 
 void controller_backend::process_delta(const topic_table::ntp_delta& d) {
@@ -1363,6 +1361,20 @@ ss::future<std::error_code> controller_backend::create_partition(
             ntp_config.get_overrides().recovery_enabled
               = storage::topic_recovery_enabled::yes;
             rtp.emplace(remote_rev, cfg.partition_count);
+        }
+        /**
+         * Reset remote topic properties if a topic is recovered from tiered
+         * storage and current node is joining replica set. A node is joining
+         * replica set if its initial nodes set is empty.
+         */
+        if (initial_nodes.empty() && rtp.has_value()) {
+            // reset remote topic properties
+            vlog(
+              clusterlog.info,
+              "[{}] Disabling remote recovery while creating partition "
+              "replica. Current node is added to the replica set as learner.",
+              ntp);
+            rtp.reset();
         }
         // we use offset as an rev as it is always increasing and it
         // increases while ntp is being created again

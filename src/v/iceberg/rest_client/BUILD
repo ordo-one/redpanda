@@ -3,6 +3,37 @@ load("//bazel:build.bzl", "redpanda_cc_library")
 package(default_visibility = ["//src/v/iceberg:__subpackages__"])
 
 redpanda_cc_library(
+    name = "catalog_config",
+    hdrs = [
+        "catalog_config.h",
+    ],
+    include_prefix = "iceberg/rest_client",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/container:chunked_hash_map",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "client_probe",
+    srcs = [
+        "client_probe.cc",
+    ],
+    hdrs = [
+        "client_probe.h",
+    ],
+    include_prefix = "iceberg/rest_client",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/http",
+        "//src/v/metrics",
+        "//src/v/net",
+    ],
+)
+
+redpanda_cc_library(
     name = "error",
     srcs = [
         "error.cc",
@@ -31,6 +62,7 @@ redpanda_cc_library(
     ],
     include_prefix = "iceberg/rest_client",
     deps = [
+        ":catalog_config",
         ":oauth_token",
         "//src/v/iceberg:json_utils",
         "//src/v/json",
@@ -50,6 +82,7 @@ redpanda_cc_library(
     include_prefix = "iceberg/rest_client",
     deps = [
         ":error",
+        "//src/v/bytes:streambuf",
         "//src/v/http",
         "//src/v/net",
     ],
@@ -61,6 +94,7 @@ redpanda_cc_library(
         "credentials.h",
     ],
     include_prefix = "iceberg/rest_client",
+    visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "@seastar",
@@ -73,6 +107,7 @@ redpanda_cc_library(
         "oauth_token.h",
     ],
     include_prefix = "iceberg/rest_client",
+    visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "@seastar",
@@ -106,6 +141,7 @@ redpanda_cc_library(
     include_prefix = "iceberg/rest_client",
     visibility = ["//visibility:public"],
     deps = [
+        ":client_probe",
         ":credentials",
         ":entities",
         ":error",
@@ -114,16 +150,20 @@ redpanda_cc_library(
         ":retry_policy",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:streambuf",
+        "//src/v/config",
         "//src/v/http",
         "//src/v/http:request_builder",
+        "//src/v/http:rest_entity",
         "//src/v/http:utils",
         "//src/v/iceberg:json_writer",
+        "//src/v/iceberg:logger",
         "//src/v/iceberg:table_identifier",
         "//src/v/iceberg:table_metadata",
         "//src/v/iceberg:table_metadata_json",
         "//src/v/iceberg:table_requests",
         "//src/v/iceberg:table_requests_json",
         "//src/v/json",
+        "//src/v/ssx:future_util",
         "//src/v/utils:named_type",
         "//src/v/utils:retry_chain_node",
         "@abseil-cpp//absl/strings",

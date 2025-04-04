@@ -24,27 +24,39 @@ namespace datalake {
 class local_parquet_file_writer : public parquet_file_writer {
 public:
     local_parquet_file_writer(
-      local_path, ss::shared_ptr<parquet_ostream_factory>);
+      local_path, ss::shared_ptr<parquet_ostream_factory>, writer_mem_tracker&);
 
     ss::future<checked<std::nullopt_t, writer_error>>
     initialize(const iceberg::struct_type&);
 
     ss::future<writer_error> add_data_struct(
-      iceberg::struct_value /* data */, int64_t /* approx_size */) final;
+      iceberg::struct_value /* data */,
+      int64_t /* approx_size */,
+      ss::abort_source&) final;
 
+    size_t buffered_bytes() const final;
+
+    size_t flushed_bytes() const final;
+
+    ss::future<writer_error> flush() final;
+
+    /**
+     * Must be called in all cases, including write errors for proper
+     * cleanup of resources.
+     */
     ss::future<result<local_file_metadata, writer_error>> finish() final;
 
 private:
-    ss::future<> abort();
-
     local_path _output_file_path;
-    ss::file _output_file;
     size_t _row_count{0};
     size_t _raw_bytes_count{0};
 
     std::unique_ptr<parquet_ostream> _writer;
     ss::shared_ptr<parquet_ostream_factory> _writer_factory;
+    writer_mem_tracker& _mem_tracker;
     bool _initialized{false};
+    // set once the writer ran into an error, fences further writes.
+    writer_error _error{writer_error::ok};
 };
 
 class local_parquet_file_writer_factory : public parquet_file_writer_factory {
@@ -52,10 +64,11 @@ public:
     local_parquet_file_writer_factory(
       local_path base_directory,
       ss::sstring file_name_prefix,
-      ss::shared_ptr<parquet_ostream_factory>);
+      ss::shared_ptr<parquet_ostream_factory>,
+      writer_mem_tracker&);
 
     ss::future<result<std::unique_ptr<parquet_file_writer>, writer_error>>
-    create_writer(const iceberg::struct_type& schema) final;
+    create_writer(const iceberg::struct_type& schema, ss::abort_source&) final;
 
 private:
     local_path create_filename() const;
@@ -63,6 +76,7 @@ private:
     local_path _base_directory;
     ss::sstring _file_name_prefix;
     ss::shared_ptr<parquet_ostream_factory> _writer_factory;
+    writer_mem_tracker& _mem_tracker;
 };
 
 } // namespace datalake

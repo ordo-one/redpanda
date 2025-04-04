@@ -26,6 +26,7 @@
 #include <boost/lexical_cast.hpp>
 
 #include <array>
+#include <type_traits>
 
 namespace kafka {
 
@@ -52,6 +53,8 @@ inline constexpr std::string_view topic_property_remote_read
   = "redpanda.remote.read";
 inline constexpr std::string_view topic_property_read_replica
   = "redpanda.remote.readreplica";
+inline constexpr std::string_view topic_property_remote_allow_gaps
+  = "redpanda.remote.allowgaps";
 inline constexpr std::string_view topic_property_replication_factor
   = "replication.factor";
 inline constexpr std::string_view topic_property_remote_delete
@@ -108,6 +111,18 @@ inline constexpr std::string_view topic_property_cloud_topic_enabled
 inline constexpr std::string_view topic_property_iceberg_delete
   = "redpanda.iceberg.delete";
 
+inline constexpr std::string_view topic_property_iceberg_partition_spec
+  = "redpanda.iceberg.partition.spec";
+
+inline constexpr std::string_view topic_property_iceberg_invalid_record_action
+  = "redpanda.iceberg.invalid.record.action";
+
+inline constexpr std::string_view topic_property_iceberg_target_lag_ms
+  = "redpanda.iceberg.target.lag.ms";
+
+inline constexpr std::string_view topic_property_min_cleanable_dirty_ratio
+  = "min.cleanable.dirty.ratio";
+
 // Kafka topic properties that is not relevant for Redpanda
 // Or cannot be altered with kafka alter handler
 inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
@@ -119,7 +134,6 @@ inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
   "segment.jitter.ms",
   "min.insync.replicas",
   "min.compaction.lag.ms",
-  "min.cleanable.dirty.ratio",
   "message.timestamp.difference.max.ms",
   "message.format.version",
   "max.compaction.lag.ms",
@@ -179,7 +193,9 @@ get_config_value(const config_map_t& config, std::string_view key) {
 template<typename T>
 tristate<T>
 get_tristate_value(const config_map_t& config, std::string_view key) {
-    auto v = get_config_value<int64_t>(config, key);
+    using config_t
+      = std::conditional_t<std::is_floating_point_v<T>, T, int64_t>;
+    auto v = get_config_value<config_t>(config, key);
     // no value set
     if (!v) {
         return tristate<T>(std::nullopt);

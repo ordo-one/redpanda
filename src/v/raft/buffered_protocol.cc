@@ -71,10 +71,12 @@ ss::future<result<Ret>> apply_with_gate(
 } // namespace
 
 buffered_protocol::buffered_protocol(
+  ss::scheduling_group sg,
   consensus_client_protocol base,
   config::binding<size_t> max_inflight_requests,
   config::binding<size_t> max_buffered_bytes)
-  : _base_protocol(std::move(base))
+  : _sg(sg)
+  , _base_protocol(std::move(base))
   , _max_inflight_requests(std::move(max_inflight_requests))
   , _max_buffered_bytes(std::move(max_buffered_bytes))
   , _gc_timer([this] { garbage_collect_unused_queues(); }) {
@@ -110,6 +112,7 @@ ss::future<result<append_entries_reply>> buffered_protocol::append_entries(
                 it,
                 target_node,
                 std::make_unique<internal::append_entries_queue>(
+                  _sg,
                   target_node,
                   _base_protocol,
                   _gate.hold(),
@@ -227,12 +230,14 @@ void buffered_protocol::garbage_collect_unused_queues() {
 
 namespace internal {
 append_entries_queue::append_entries_queue(
+  ss::scheduling_group sg,
   model::node_id target_node,
   consensus_client_protocol base_protocol,
   ss::gate::holder gate_holder,
   config::binding<size_t> max_inflight_requests,
   config::binding<size_t> max_buffered_bytes)
-  : _target_node(target_node)
+  : _sg(sg)
+  , _target_node(target_node)
   , _base_protocol(std::move(base_protocol))
   , _logger(raftlog, fmt::format("[node: {}]", _target_node))
   , _current_max_inflight_requests(max_inflight_requests())
@@ -253,10 +258,13 @@ append_entries_queue::append_entries_queue(
         }
         _current_max_inflight_requests = new_value;
     });
+    setup_internal_metrics();
     // start dispatch loop
     ssx::repeat_until_gate_closed(
-      _gate,
-      [this, gate_holder = std::move(gate_holder)] { return dispatch_loop(); });
+      _gate, [this, gate_holder = std::move(gate_holder)] {
+          return ss::with_scheduling_group(
+            _sg, [this] { return dispatch_loop(); });
+      });
 };
 
 ss::future<> append_entries_queue::dispatch_loop() {
@@ -282,6 +290,9 @@ ss::future<> append_entries_queue::do_dispatch(
   request_entry entry, ssx::semaphore_units inflight_units) {
     auto sent_ts = clock_type::now();
     _last_sent_timestamp = sent_ts;
+    // update timeout not to account for the time in a queue
+    entry.opts.timeout = rpc::timeout_spec::from_now(
+      entry.opts.timeout.timeout_period);
     return _base_protocol
       .append_entries(
         _target_node, std::move(entry.request), std::move(entry.opts))
@@ -313,6 +324,8 @@ ss::future<result<append_entries_reply>> append_entries_queue::append_entries(
     // or wait until we can buffer next request, this will propagate back
     // pressure to caller
     auto sz = r.total_size();
+    // hold gate to prevent accessing state after the queue is stopped
+    auto holder = _gate.hold();
     return _dispatched.wait([this, sz] { return can_buffer_next_request(sz); })
       .then([this, r = std::move(r), opts = std::move(opts)]() mutable {
           /// consensus is no longer responsible for tracking memory usage and
@@ -323,7 +336,8 @@ ss::future<result<append_entries_reply>> append_entries_queue::append_entries(
 
           _new_requests.signal();
           return _requests.back().reply.get_future();
-      });
+      })
+      .finally([h = std::move(holder)] {});
 }
 ss::future<> append_entries_queue::stop() {
     vlog(_logger.debug, "stopping append entries queue");
@@ -357,7 +371,7 @@ void append_entries_queue::setup_internal_metrics() {
     }
     sm::label_instance target_node_id_label("target_node_id", _target_node);
     _internal_metrics.add_group(
-      prometheus_sanitize::metrics_name("raft::buffered::protocol"),
+      prometheus_sanitize::metrics_name("raft:buffered:protocol"),
       {sm::make_gauge(
          "inflight_requests",
          [this] { return inflight_requests(); },
@@ -374,12 +388,7 @@ void append_entries_queue::setup_internal_metrics() {
          [this] { return _requests.size(); },
          sm::description(
            "Total number of append entries requests in the queue"),
-         {target_node_id_label}),
-       sm::make_histogram(
-         "append_entries_request_latency",
-         sm::description("Latency of append entries requests"),
-         {target_node_id_label},
-         [this] { return _hist.internal_histogram_logform(); })});
+         {target_node_id_label})});
 }
 
 void append_entries_queue::setup_public_metrics() {

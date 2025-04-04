@@ -10,18 +10,21 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 
-	dataplanev1alpha2 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha2"
+	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -50,19 +53,29 @@ Status for a mount/unmount operation
 			out.MaybeDie(err, "invalid migration ID: %v", err)
 
 			var mState rpadmin.MigrationState
+			handleMigrationHTTPError := func(err error) {
+				if he := (*rpadmin.HTTPResponseError)(nil); errors.As(err, &he) {
+					if he.Response.StatusCode == http.StatusNotFound {
+						out.Exit("The mount/unmount operation %s is not found, likely completed or never started.\nRun 'rpk cluster storage list-mountable' to see mountable topics", from[0])
+					} else {
+						out.Die("unable to get the status of the mount/unmount operation: %v", err)
+					}
+				}
+			}
+
 			if p.FromCloud {
-				cl, err := createDataplaneClient(p)
-				out.MaybeDieErr(err)
+				cl, err := publicapi.DataplaneClientFromRpkProfile(p)
+				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
 
 				resp, err := cl.CloudStorage.GetMountTask(
 					cmd.Context(),
 					connect.NewRequest(
-						&dataplanev1alpha2.GetMountTaskRequest{
+						&dataplanev1.GetMountTaskRequest{
 							Id: int32(migrationID),
 						},
 					),
 				)
-				out.MaybeDie(err, "unable to get the status of mount/unmount operation: %v", err)
+				handleMigrationHTTPError(err)
 				if resp != nil {
 					mState = mountTaskToAdminMigrationState(resp.Msg)
 				}
@@ -71,7 +84,7 @@ Status for a mount/unmount operation
 				out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 				mState, err = adm.GetMigration(cmd.Context(), migrationID)
-				out.MaybeDie(err, "unable to get the status of the migration: %v", err)
+				handleMigrationHTTPError(err)
 			}
 			outStatus := migrationState{
 				ID:            mState.ID,
@@ -97,7 +110,7 @@ func printDetailedStatusMount(f config.OutFormatter, d migrationState, w io.Writ
 	tw.Print(d.ID, d.State, d.MigrationType, strings.Join(d.Topics, ", "))
 }
 
-func mountTaskToAdminMigrationState(resp *dataplanev1alpha2.GetMountTaskResponse) rpadmin.MigrationState {
+func mountTaskToAdminMigrationState(resp *dataplanev1.GetMountTaskResponse) rpadmin.MigrationState {
 	var state rpadmin.MigrationState
 	if resp != nil {
 		task := resp.Task

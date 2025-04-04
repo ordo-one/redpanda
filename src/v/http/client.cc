@@ -72,6 +72,12 @@ client::client(
 client::client(
   const net::base_transport::configuration& cfg,
   const ss::abort_source* as,
+  ss::shared_ptr<client_probe> probe)
+  : client(cfg, as, std::move(probe), default_max_idle_time) {}
+
+client::client(
+  const net::base_transport::configuration& cfg,
+  const ss::abort_source* as,
   ss::shared_ptr<client_probe> probe,
   ss::lowres_clock::duration max_idle_time)
   : net::base_transport(cfg, &http_log)
@@ -202,6 +208,11 @@ ss::future<reconnect_result_t> client::get_connected(
             vlog(
               ctxlog.debug,
               "Stopping connect attempts due to shutdown request");
+            if (is_valid()) {
+                // We might have established connection at this point
+                // which has to be closed.
+                shutdown();
+            }
             co_return reconnect_result_t::timed_out;
         }
         current = ss::lowres_clock::now();

@@ -132,12 +132,6 @@ ss::future<ss::file> make_handle(
   ss::file_open_options opt,
   std::optional<ntp_sanitizer_config> ntp_sanitizer_config);
 
-ss::future<compacted_index_writer> make_compacted_index_writer(
-  const std::filesystem::path& path,
-  ss::io_priority_class iopc,
-  storage_resources& resources,
-  std::optional<ntp_sanitizer_config> ntp_sanitizer_config);
-
 ss::future<segment_appender_ptr> make_segment_appender(
   const segment_full_path& path,
   size_t number_of_chunks,
@@ -191,7 +185,8 @@ model::record_batch_reader create_segment_full_reader(
   ss::lw_shared_ptr<storage::segment>,
   storage::compaction_config,
   storage::probe&,
-  ss::rwlock::holder);
+  ss::rwlock::holder,
+  std::optional<model::offset> start_offset = std::nullopt);
 
 ss::future<storage::index_state> do_copy_segment_data(
   ss::lw_shared_ptr<storage::segment>,
@@ -283,8 +278,11 @@ bool may_have_removable_tombstones(
 // which case the `clean_compact_timestamp` is set in the segment's index).
 // Also potentially issues a call to seg->index()->flush(), if the
 // `clean_compact_timestamp` was set in the index.
-ss::future<> mark_segment_as_finished_window_compaction(
-  ss::lw_shared_ptr<segment> seg, bool set_clean_compact_timestamp);
+//
+// Returns a boolean indicating if the segment was marked as cleanly compacted
+// for the first time and assigned a cleanly compacted timestamp.
+ss::future<bool> mark_segment_as_finished_window_compaction(
+  ss::lw_shared_ptr<segment> seg, bool set_clean_compact_timestamp, probe& pb);
 
 template<typename Func>
 auto with_segment_reader_handle(segment_reader_handle handle, Func func) {

@@ -412,7 +412,9 @@ ss::future<> service::do_start() {
     }
     co_await container().invoke_on_all(_ctx.smp_sg, [](service& s) {
         s._is_started = true;
-        return s.fetch_internal_topic();
+        return ss::this_shard_id() == seq_writer::reader_shard
+                 ? s.fetch_internal_topic()
+                 : ss::now();
     });
 }
 
@@ -614,7 +616,7 @@ service::service(
       config::shard_local_cfg()
         .max_in_flight_schema_registry_requests_per_shard.bind())
   , _client(client)
-  , _ctx{{{}, _mem_sem, _inflight_sem, {}, smp_sg}, *this}
+  , _ctx{{{}, max_memory, _mem_sem, _inflight_config_binding(), _inflight_sem, {}, smp_sg}, *this}
   , _server(
       "schema_registry", // server_name
       "schema_registry", // public_metric_group_name
@@ -632,8 +634,11 @@ service::service(
       config::always_true(),
       config::shard_local_cfg().superusers.bind(),
       controller.get()} {
-    _inflight_config_binding.watch(
-      [this]() { _inflight_sem.set_capacity(_inflight_config_binding()); });
+    _inflight_config_binding.watch([this]() {
+        const size_t capacity = _inflight_config_binding();
+        _inflight_sem.set_capacity(capacity);
+        _ctx.max_inflight = capacity;
+    });
 }
 
 ss::future<> service::start() {

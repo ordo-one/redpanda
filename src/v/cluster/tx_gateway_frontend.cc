@@ -577,9 +577,9 @@ ss::future<try_abort_reply> tx_gateway_frontend::do_try_abort(
     }
     vlog(txlog.info, "[tx_id={}] found transaction {} to abort", tx_id, tx);
     switch (tx.status) {
-    case empty:
+    case tx_status::empty:
         [[fallthrough]];
-    case ongoing: {
+    case tx_status::ongoing: {
         vlog(txlog.trace, "[tx_id={}] aborting transaction: {}", tx_id, tx);
         auto killed_tx = co_await stm->update_transaction_status(
           term, tx.id, tx_status::preparing_internal_abort);
@@ -595,22 +595,22 @@ ss::future<try_abort_reply> tx_gateway_frontend::do_try_abort(
         }
         co_return try_abort_reply::make_aborted();
     }
-    case preparing_commit:
+    case tx_status::preparing_commit:
         [[fallthrough]];
-    case completed_commit:
+    case tx_status::completed_commit:
         vlog(
           txlog.trace,
           "[tx_id={}] transaction: {} is already committed",
           tx_id,
           tx);
         co_return try_abort_reply::make_committed();
-    case preparing_abort:
+    case tx_status::preparing_abort:
         [[fallthrough]];
-    case preparing_internal_abort:
+    case tx_status::preparing_internal_abort:
         [[fallthrough]];
-    case completed_abort:
+    case tx_status::completed_abort:
         [[fallthrough]];
-    case tombstone:
+    case tx_status::tombstone:
         vlog(
           txlog.trace,
           "[tx_id={}] transaction: {} is already aborted",
@@ -1005,7 +1005,7 @@ ss::future<cluster::init_tm_tx_reply> tx_gateway_frontend::do_init_tm_tx(
     }
 
     switch (tx.status) {
-    case ongoing: {
+    case tx_status::ongoing: {
         vlog(txlog.info, "[tx_id={}] tx is ongoing, aborting", tx_id);
         auto abort_result = co_await do_abort_tm_tx(term, stm, tx, timeout);
         if (!abort_result) {
@@ -1019,10 +1019,10 @@ ss::future<cluster::init_tm_tx_reply> tx_gateway_frontend::do_init_tm_tx(
         }
         co_return init_tm_tx_reply{tx::errc::concurrent_transactions};
     }
-    case empty:
-    case tombstone:
-    case completed_commit:
-    case completed_abort: {
+    case tx_status::empty:
+    case tx_status::tombstone:
+    case tx_status::completed_commit:
+    case tx_status::completed_abort: {
         co_return co_await increase_producer_epoch(
           tx.id,
           tx.pid,
@@ -1033,9 +1033,9 @@ ss::future<cluster::init_tm_tx_reply> tx_gateway_frontend::do_init_tm_tx(
           transaction_timeout_ms,
           timeout);
     }
-    case preparing_abort:
-    case preparing_internal_abort:
-    case preparing_commit:
+    case tx_status::preparing_abort:
+    case tx_status::preparing_internal_abort:
+    case tx_status::preparing_commit:
         co_return init_tm_tx_reply{tx::errc::concurrent_transactions};
     }
 }
@@ -1402,7 +1402,8 @@ ss::future<add_partitions_tx_reply> tx_gateway_frontend::do_add_partition_to_tx(
                                || br.ec == tx::errc::shard_not_found
                                || br.ec == tx::errc::stale
                                || br.ec == tx::errc::timeout
-                               || br.ec == tx::errc::partition_not_exists;
+                               || br.ec == tx::errc::partition_not_exists
+                               || br.ec == tx::errc::producer_creation_error;
             should_abort = should_abort
                            || (br.ec != tx::errc::none && !expected_ec);
             should_retry = should_retry || expected_ec;
@@ -2972,6 +2973,88 @@ ss::future<tx::errc> tx_gateway_frontend::do_delete_partition_from_tx(
     }
 
     co_return tx::errc::none;
+}
+
+ss::future<tx::errc> tx_gateway_frontend::unsafe_abort_group_transaction(
+  kafka::group_id group,
+  model::producer_identity pid,
+  model::tx_seq tx_seq,
+  model::timeout_clock::duration timeout) {
+    auto holder = _gate.hold();
+    vlog(
+      txlog.warn,
+      "Issuing an unsafe abort of group transaction, group: {}, pid: {}, seq: "
+      "{}, timeout: {}",
+      group,
+      pid,
+      tx_seq,
+      timeout);
+    auto result = co_await _rm_group_proxy->abort_group_tx(
+      std::move(group), pid, tx_seq, timeout);
+    co_return result.ec;
+}
+
+ss::future<get_producers_reply>
+tx_gateway_frontend::get_producers(get_producers_request request) {
+    auto holder = _gate.hold();
+    const auto& ntp = request.ntp;
+    if (!_metadata_cache.local().contains(ntp)) {
+        co_return get_producers_reply{
+          .error_code = tx::errc::partition_not_exists};
+    }
+
+    auto leader_opt = _leaders.local().get_leader(ntp);
+    if (!leader_opt) {
+        co_return get_producers_reply{.error_code = tx::errc::leader_not_found};
+    }
+    auto leader = leader_opt.value();
+    if (leader == _self) {
+        auto shard = _shard_table.local().shard_for(ntp);
+        if (!shard.has_value()) {
+            co_return get_producers_reply{
+              .error_code = tx::errc::shard_not_found};
+        }
+        co_return co_await container().invoke_on(
+          shard.value(),
+          _ssg,
+          [request = std::move(request)](tx_gateway_frontend& local) mutable {
+              return local.get_producers_locally(std::move(request));
+          });
+    }
+    auto timeout = request.timeout;
+    auto result = co_await _connection_cache.local()
+                    .with_node_client<tx_gateway_client_protocol>(
+                      _self,
+                      ss::this_shard_id(),
+                      leader,
+                      model::timeout_clock::now() + timeout,
+                      [request = std::move(request),
+                       timeout](tx_gateway_client_protocol cp) mutable {
+                          return cp.get_producers(
+                            std::move(request),
+                            rpc::client_opts(
+                              model::timeout_clock::now() + timeout));
+                      });
+    if (result.has_error()) {
+        co_return get_producers_reply{.error_code = tx::errc::not_coordinator};
+    }
+    co_return std::move(result.value().data);
+}
+
+ss::future<get_producers_reply>
+tx_gateway_frontend::get_producers_locally(get_producers_request request) {
+    auto& ntp = request.ntp;
+    bool is_consumer_offsets_ntp = ntp.ns()
+                                     == model::kafka_consumer_offsets_nt.ns()
+                                   && ntp.tp.topic
+                                        == model::kafka_consumer_offsets_nt.tp;
+
+    if (is_consumer_offsets_ntp) {
+        co_return co_await _rm_group_proxy->get_group_producers_locally(
+          std::move(request));
+    }
+    co_return co_await _rm_partition_frontend.local().get_producers_locally(
+      std::move(request));
 }
 
 } // namespace cluster

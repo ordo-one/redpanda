@@ -11,7 +11,6 @@
 
 #pragma once
 #include "base/seastarx.h"
-#include "config/client_group_byte_rate_quota.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "kafka/server/atomic_token_bucket.h"
@@ -101,17 +100,16 @@ public:
     ss::future<clock::duration> record_produce_tp_and_throttle(
       std::optional<std::string_view> client_id,
       uint64_t bytes,
-      clock::time_point now = clock::now());
+      clock::time_point now);
 
     // record a new observation
     ss::future<> record_fetch_tp(
       std::optional<std::string_view> client_id,
       uint64_t bytes,
-      clock::time_point now = clock::now());
+      clock::time_point now);
 
     ss::future<clock::duration> throttle_fetch_tp(
-      std::optional<std::string_view> client_id,
-      clock::time_point now = clock::now());
+      std::optional<std::string_view> client_id, clock::time_point now);
 
     // Used to record new number of partitions mutations
     // Only for use with the quotas introduced by KIP-599, namely to track
@@ -120,16 +118,13 @@ public:
     ss::future<std::chrono::milliseconds> record_partition_mutations(
       std::optional<std::string_view> client_id,
       uint32_t mutations,
-      clock::time_point now = clock::now());
+      clock::time_point now);
 
     const std::optional<global_map_t>& get_global_map_for_testing() const;
 
 private:
     using quota_mutation_callback_t
       = ss::noncopyable_function<clock::duration(client_quota&)>;
-
-    using quota_config
-      = std::unordered_map<ss::sstring, config::client_group_quota>;
 
     class client_quotas_probe;
 
@@ -160,7 +155,7 @@ private:
     std::unique_ptr<client_quotas_probe> _probe;
 
     ss::timer<> _gc_timer;
-    clock::duration _gc_freq;
+    config::binding<std::chrono::milliseconds> _gc_freq;
     config::binding<std::chrono::milliseconds> _max_delay;
     ss::gate _gate;
     std::optional<mutex> _global_map_mutex; // Only on shard 0

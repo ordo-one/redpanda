@@ -13,6 +13,9 @@
 #include "cluster/partition_manager.h"
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
+#include "config/node_config.h"
+#include "datalake/backlog_controller.h"
 #include "datalake/catalog_schema_manager.h"
 #include "datalake/cloud_data_io.h"
 #include "datalake/coordinator/catalog_factory.h"
@@ -22,37 +25,62 @@
 #include "datalake/record_translator.h"
 #include "raft/group_manager.h"
 #include "schema/registry.h"
+#include "utils/directory_walker.h"
+#include "utils/human.h"
 
 #include <memory>
+#include <ranges>
+
+constexpr std::chrono::milliseconds translation_jitter{500};
+constexpr std::chrono::milliseconds translation_jitter_base{5000};
+static constexpr std::chrono::milliseconds retry_initial_backoff{300};
+static constexpr std::chrono::milliseconds retry_max_timeout{3min};
+static constexpr std::string_view iceberg_data_path_prefix = "data";
 
 namespace datalake {
 
 namespace {
 
-static std::unique_ptr<type_resolver>
-make_type_resolver(model::iceberg_mode mode, schema::registry& sr) {
-    switch (mode) {
-    case model::iceberg_mode::disabled:
+static std::unique_ptr<type_resolver> make_type_resolver(
+  const model::iceberg_mode& mode,
+  model::topic_view topic_name,
+  schema::registry& sr,
+  schema_cache& cache) {
+    switch (mode.kind()) {
+    case model::iceberg_mode::variant::disabled:
         vassert(
           false,
           "Cannot make record translator when iceberg is disabled, logic bug.");
-    case model::iceberg_mode::key_value:
+    case model::iceberg_mode::variant::key_value:
         return std::make_unique<binary_type_resolver>();
-    case model::iceberg_mode::value_schema_id_prefix:
-        return std::make_unique<record_schema_resolver>(sr);
+    case model::iceberg_mode::variant::value_schema_id_prefix:
+        return std::make_unique<record_schema_resolver>(sr, cache);
+    case model::iceberg_mode::variant::value_schema_latest:
+        auto subject = pandaproxy::schema_registry::subject(
+          fmt::format("{}-value", topic_name));
+        if (auto explicit_subject = mode.subject_name()) {
+            subject = pandaproxy::schema_registry::subject(*explicit_subject);
+        }
+        return std::make_unique<latest_subject_schema_resolver>(
+          sr,
+          subject,
+          mode.protobuf_full_name(),
+          config::shard_local_cfg().iceberg_latest_schema_cache_ttl_ms.bind(),
+          cache);
     }
 }
 
 static std::unique_ptr<record_translator>
-make_record_translator(model::iceberg_mode mode) {
-    switch (mode) {
-    case model::iceberg_mode::disabled:
+make_record_translator(const model::iceberg_mode& mode) {
+    switch (mode.kind()) {
+    case model::iceberg_mode::variant::disabled:
         vassert(
           false,
           "Cannot make record translator when iceberg is disabled, logic bug.");
-    case model::iceberg_mode::key_value:
+    case model::iceberg_mode::variant::key_value:
         return std::make_unique<key_value_translator>();
-    case model::iceberg_mode::value_schema_id_prefix:
+    case model::iceberg_mode::variant::value_schema_id_prefix:
+    case model::iceberg_mode::variant::value_schema_latest:
         return std::make_unique<structured_data_translator>();
     }
 }
@@ -84,22 +112,57 @@ datalake_manager::datalake_manager(
   , _shards(shards)
   , _features(features)
   , _coordinator_frontend(frontend)
-  , _cloud_data_io(std::make_unique<cloud_data_io>(
-      cloud_io->local(), std::move(bucket_name)))
+  , _cloud_data_io(
+      std::make_unique<cloud_data_io>(cloud_io->local(), bucket_name))
+  , _location_provider(cloud_io->local().provider(), bucket_name)
   , _schema_registry(schema::registry::make_default(sr_api))
   , _catalog_factory(std::move(catalog_factory))
-  , _type_resolver(std::make_unique<record_schema_resolver>(*_schema_registry))
+  // TODO: The cache size is currently arbitrary. Figure out a more reasoned
+  // size and allocate a share of the datalake memory semaphore to this cache.
+  , _schema_cache(std::make_unique<chunked_schema_cache>(
+      chunked_schema_cache::cache_t::config{
+        .cache_size = 50, .small_size = 10}))
   , _as(as)
   , _sg(sg)
-  , _effective_max_translator_buffered_data(
-      std::min(memory_limit, max_translator_buffered_data))
-  , _parallel_translations(std::make_unique<ssx::semaphore>(
-      size_t(
-        std::floor(memory_limit / _effective_max_translator_buffered_data)),
-      "datalake_parallel_translations"))
-  , _iceberg_commit_interval(
-      config::shard_local_cfg().iceberg_catalog_commit_interval_ms.bind()) {}
+  , _iceberg_invalid_record_action(
+      config::shard_local_cfg().iceberg_invalid_record_action.bind())
+  , _writer_scratch_space(config::node().datalake_staging_path())
+  , _scheduler(
+      memory_limit,
+      config::shard_local_cfg().datalake_scheduler_block_size_bytes(),
+      translation::scheduling::scheduling_policy::make_default(
+        config::shard_local_cfg()
+          .datalake_scheduler_max_concurrent_translations.bind(),
+        std::chrono::duration_cast<translation::scheduling::clock::duration>(
+          config::shard_local_cfg().datalake_scheduler_time_slice_ms())))
+  , _queue(
+      sg,
+      [](const std::exception_ptr& ex) {
+          vlog(
+            datalake_log.error,
+            "unexpected error in managing translator: {}",
+            ex);
+      })
+  , _disk_usage_interval(
+      config::shard_local_cfg().datalake_disk_space_monitor_interval.bind()) {}
 datalake_manager::~datalake_manager() = default;
+
+size_t datalake_manager::total_translation_backlog() const {
+    size_t total_backlog = 0;
+    for (const auto& [_, translator] : _scheduler.all_translators()) {
+        total_backlog += translator.status().translation_backlog.value_or(0);
+    }
+    return total_backlog;
+}
+
+ss::lw_shared_ptr<class translation_probe>
+datalake_manager::get_or_create_probe(const model::ntp& ntp) {
+    auto [it, inserted] = _translation_probe_by_ntp.try_emplace(ntp, nullptr);
+    if (inserted) {
+        it->second = ss::make_lw_shared<class translation_probe>(ntp);
+    }
+    return it->second;
+}
 
 ss::future<> datalake_manager::start() {
     _catalog = co_await _catalog_factory->create_catalog();
@@ -110,14 +173,20 @@ ss::future<> datalake_manager::start() {
       = _partition_mgr->local().register_manage_notification(
         model::kafka_namespace,
         [this](ss::lw_shared_ptr<cluster::partition> new_partition) {
-            on_group_notification(new_partition->ntp());
+            _queue.submit([this, ntp = new_partition->ntp()]() {
+                return handle_translator_state_change(ntp);
+            });
         });
     auto partition_unmanaged_notification
       = _partition_mgr->local().register_unmanage_notification(
         model::kafka_namespace, [this](model::topic_partition_view tp) {
             model::ntp ntp{model::kafka_namespace, tp.topic, tp.partition};
-            ssx::spawn_with_gate(_gate, [this, ntp = std::move(ntp)] {
-                return stop_translator(ntp);
+            // We remove the probe only when partition is moved out of the
+            // shard to avoid metrics disappearing during much more common
+            // leadership changes.
+            _translation_probe_by_ntp.erase(ntp);
+            _queue.submit([this, ntp = std::move(ntp)]() {
+                return handle_translator_state_change(ntp);
             });
         });
     // Handle leadership changes
@@ -129,11 +198,14 @@ ss::future<> datalake_manager::start() {
           std::optional<::model::node_id>) {
             auto partition = _partition_mgr->local().partition_for(group);
             if (partition) {
-                on_group_notification(partition->ntp());
+                _queue.submit([this, ntp = partition->ntp()]() {
+                    return handle_translator_state_change(ntp);
+                });
             }
         });
 
-    // Handle topic properties changes (iceberg_mode)
+    // Handle topic properties changes (iceberg_mode,
+    // iceberg_invalid_record_action)
     auto topic_properties_registration
       = _topic_table->local().register_ntp_delta_notification(
         [this](cluster::topic_table::ntp_delta_range_t range) {
@@ -141,7 +213,9 @@ ss::future<> datalake_manager::start() {
                 if (
                   entry.type
                   == cluster::topic_table_ntp_delta_type::properties_updated) {
-                    on_group_notification(entry.ntp);
+                    _queue.submit([this, ntp = entry.ntp]() {
+                        return handle_translator_state_change(ntp);
+                    });
                 }
             }
         });
@@ -163,101 +237,418 @@ ss::future<> datalake_manager::start() {
         _topic_table->local().unregister_ntp_delta_notification(
           topic_properties_registration);
     });
-    _iceberg_commit_interval.watch([this] {
-        ssx::spawn_with_gate(_gate, [this]() {
-            for (const auto& [group, _] : _translators) {
-                on_group_notification(group);
-            }
-        });
+    _iceberg_invalid_record_action.watch([this] {
+        for (auto& [_, entry] : _scheduler.all_translators()) {
+            entry.translator_ptr()->reconcile_properties();
+        }
     });
+
+    if (!_features->local().is_active(features::feature::datalake_iceberg_ga)) {
+        ssx::spawn_with_gate(_gate, [this] {
+            return _features->local()
+              .await_feature(
+                features::feature::datalake_iceberg_ga, _as->local())
+              .then([this] {
+                  for (const auto& [ntp, _] : _scheduler.all_translators()) {
+                      _queue.submit([this, ntp]() {
+                          return handle_translator_state_change(ntp);
+                      });
+                  }
+              });
+        });
+    }
+
+    _schema_cache->start();
+    _backlog_controller = std::make_unique<backlog_controller>(
+      [this] { return total_translation_backlog(); }, _sg);
+    co_await _backlog_controller->start();
+
+    /*
+     * Start the global disk space usage monitor loop
+     */
+    const ss::shard_id disk_space_monitor_core = 0;
+    if (ss::this_shard_id() == disk_space_monitor_core) {
+        ssx::spawn_with_gate(_gate, [this] { return disk_space_monitor(); });
+    }
+
+    _disk_usage_interval.watch([this] { _disk_space_monitor_sem.signal(); });
 }
 
-ss::future<> datalake_manager::stop() {
-    auto f = _gate.close();
-    _deregistrations.clear();
-    co_await ss::max_concurrent_for_each(
-      _translators, 32, [](auto& entry) mutable {
-          return entry.second->stop();
+ss::future<> datalake_manager::disk_space_monitor() {
+    while (!_gate.is_closed()) {
+        const auto interval = _disk_usage_interval();
+        try {
+            co_await _disk_space_monitor_sem.wait(
+              interval, std::max(_disk_space_monitor_sem.current(), size_t(1)));
+        } catch (const ss::semaphore_timed_out& ex) {
+            std::ignore = ex;
+            // drop through to perform work
+        }
+
+        if (_disk_usage_interval() != interval) {
+            // configuration change
+            continue;
+        }
+
+        if (!config::shard_local_cfg().datalake_disk_space_monitor_enable()) {
+            continue;
+        }
+
+        try {
+            co_await check_and_manage_disk_space();
+        } catch (...) {
+            vlog(
+              datalake_log.info,
+              "Recoverable error checking datalake disk space: {}",
+              std::current_exception());
+        }
+    }
+}
+
+ss::future<> datalake_manager::check_and_manage_disk_space() {
+    using translator_id = translation::scheduling::translator_id;
+    using translator_info = std::pair<ss::shard_id, translator_id>;
+    using index_type = absl::btree_multimap<size_t, translator_info>;
+
+    /*
+     * Collect disk usage from all translators managed by the scheduler, and
+     * combine these usages from across all cores to create a global set of
+     * translators ordered by their disk usage.
+     */
+    auto usage = co_await container().map_reduce0(
+      [](datalake_manager& mgr) {
+          index_type usage;
+          for (const auto& it : mgr._scheduler.all_translators()) {
+              auto status = it.second.status();
+              auto size = status.disk_bytes_flushed.value_or(0);
+              usage.emplace(
+                size, std::make_tuple(ss::this_shard_id(), it.first));
+          }
+          return usage;
+      },
+      index_type{},
+      [](index_type acc, index_type usage) {
+          acc.merge(usage);
+          return acc;
       });
-    co_await std::move(f);
-}
 
-std::chrono::milliseconds datalake_manager::translation_interval_ms() const {
-    // This aims to have multiple translations within a single commit interval
-    // window. A minimum interval is in place to disallow frequent translations
-    // and hence tiny parquet files. This is generally optimized for higher
-    // throughputs that accumulate enough data within a commit interval window.
-    static constexpr std::chrono::milliseconds min_translation_interval{5s};
-    return std::max(min_translation_interval, _iceberg_commit_interval() / 3);
-}
+    const size_t target_size
+      = config::shard_local_cfg().datalake_scratch_space_size_bytes();
 
-void datalake_manager::on_group_notification(const model::ntp& ntp) {
-    auto partition = _partition_mgr->local().get(ntp);
-    if (!partition || !model::is_user_topic(ntp)) {
-        return;
-    }
-    const auto& topic_cfg = _topic_table->local().get_topic_cfg(
-      model::topic_namespace_view{ntp});
-    if (!topic_cfg) {
-        return;
-    }
-    auto it = _translators.find(ntp);
-    // todo(iceberg) handle topic / partition disabling
-    auto iceberg_disabled = topic_cfg->properties.iceberg_mode
-                            == model::iceberg_mode::disabled;
-    if (!partition->is_leader() || iceberg_disabled) {
-        if (it != _translators.end()) {
-            ssx::spawn_with_gate(_gate, [this, partition] {
-                return stop_translator(partition->ntp());
-            });
-        }
-        return;
-    }
-    // By now we know the partition is a leader and iceberg is enabled, so
-    // there has to be a translator, spin one up if it doesn't already exist.
-    if (it == _translators.end()) {
-        start_translator(partition, topic_cfg->properties.iceberg_mode);
-    } else {
-        // check if translation interval changed.
-        auto target_interval = translation_interval_ms();
-        if (it->second->translation_interval() != target_interval) {
-            it->second->reset_translation_interval(target_interval);
-        }
-    }
-}
+    const auto total_bytes = std::reduce(
+      usage.begin(),
+      usage.end(),
+      size_t(0),
+      [](const auto acc, const auto& elem) { return acc + elem.first; });
 
-void datalake_manager::start_translator(
-  ss::lw_shared_ptr<cluster::partition> partition, model::iceberg_mode mode) {
-    auto it = _translators.find(partition->ntp());
-    vassert(
-      it == _translators.end(),
-      "Attempt to start a translator for ntp {} in term {} while another "
-      "instance already exists",
-      partition->ntp(),
-      partition->term());
-    auto translator = std::make_unique<translation::partition_translator>(
-      partition,
-      _coordinator_frontend,
-      _features,
-      &_cloud_data_io,
-      _schema_mgr.get(),
-      make_type_resolver(mode, *_schema_registry),
-      make_record_translator(mode),
-      translation_interval_ms(),
-      _sg,
-      _effective_max_translator_buffered_data,
-      &_parallel_translations);
-    _translators.emplace(partition->ntp(), std::move(translator));
-}
+    // the amount of disk usage over the target
+    const auto real_target_excess = total_bytes < target_size
+                                      ? 0
+                                      : total_bytes - target_size;
 
-ss::future<> datalake_manager::stop_translator(const model::ntp& ntp) {
-    auto it = _translators.find(ntp);
-    if (it == _translators.end()) {
+    /*
+     * do nothing if we are over the limit, but only by a "small" amount, which
+     * increases the chances of having meaningful work to do and avoid some
+     * thrashing scenarios. this is the same strategy used in space management
+     * to avoid thrashing (see resource_mgm/storage.cc).
+     */
+    const size_t min_size_threshold = 64_MiB;
+    if (real_target_excess <= min_size_threshold) {
+        vlog(
+          datalake_log.trace,
+          "Disk monitor total {} target {} excess",
+          human::bytes(total_bytes),
+          human::bytes(target_size),
+          human::bytes(real_target_excess));
         co_return;
     }
-    auto translator = std::move(it->second);
-    _translators.erase(it);
-    co_await translator->stop();
+
+    const double coeff
+      = config::shard_local_cfg().datalake_disk_usage_overage_coeff();
+
+    const auto adjusted_target_excess = static_cast<size_t>(
+      real_target_excess * coeff);
+
+    /*
+     * Generate a schedule of translators that should be finished immediately so
+     * that their on disk data is uploaded and deleted locally. Iteration is
+     * from largest usage to smallest usage, and that order is preserved in the
+     * per-core vector constructed for `scheduler::request_immediate_finish`.
+     */
+    size_t num_translators = 0;
+    size_t schedule_total_bytes = 0;
+    absl::flat_hash_map<
+      ss::shard_id,
+      chunked_vector<std::pair<translator_id, size_t>>>
+      schedule;
+    for (auto& it : std::ranges::reverse_view(usage)) {
+        if (schedule_total_bytes >= adjusted_target_excess) {
+            break;
+        }
+        schedule[it.second.first].push_back(
+          std::make_pair(it.second.second, it.first));
+        schedule_total_bytes += it.first;
+        num_translators++;
+    }
+
+    vlog(
+      datalake_log.info,
+      "Requesting {} translators to reclaim {}. Current total {} target {}/{} "
+      "excess {}",
+      num_translators,
+      human::bytes(schedule_total_bytes),
+      human::bytes(total_bytes),
+      human::bytes(target_size),
+      human::bytes(real_target_excess),
+      human::bytes(adjusted_target_excess));
+
+    /*
+     * Make the request to each core with translators in the schedule.
+     */
+    co_await ss::parallel_for_each(
+      schedule.begin(), schedule.end(), [this](auto& it) {
+          return container().invoke_on(
+            it.first,
+            [translators = std::move(it.second)](
+              datalake_manager& mgr) mutable {
+                mgr._scheduler.request_immediate_finish(std::move(translators));
+            });
+      });
+}
+
+ss::future<>
+datalake_manager::prepare_staging_directory(std::filesystem::path path) {
+    try {
+        co_await ss::make_directory(path.string());
+    } catch (const std::filesystem::filesystem_error& e) {
+        if (e.code() != std::errc::file_exists) {
+            vlog(
+              datalake_log.error,
+              "Could not create datalake staging directory: {}: {}",
+              config::node().datalake_staging_path(),
+              e);
+            throw;
+        }
+    }
+
+    chunked_vector<std::filesystem::path> files;
+    co_await directory_walker::walk(
+      path.string(), [&files, path](const ss::directory_entry& de) {
+          if (de.type == ss::directory_entry_type::regular) {
+              files.push_back(path / std::filesystem::path(de.name));
+          }
+          return ss::now();
+      });
+
+    uint64_t total = 0;
+    co_await ss::max_concurrent_for_each(
+      files.begin(),
+      files.end(),
+      config::shard_local_cfg().space_management_max_log_concurrency(),
+      [&total](const std::filesystem::path& path) {
+          return ss::file_size(path.string())
+            .then([&total](uint64_t size) { total += size; })
+            .finally([path] { return ss::remove_file(path.string()); })
+            .handle_exception([path](std::exception_ptr e) {
+                vlog(
+                  datalake_log.warn,
+                  "Error clearing datalake staging file {}: {}",
+                  path,
+                  e);
+            });
+      });
+
+    if (total) {
+        vlog(
+          datalake_log.info,
+          "Cleared datalake staging directory: {}",
+          human::bytes(total));
+    }
+}
+
+ss::future<> datalake_manager::shutdown() {
+    vlog(datalake_log.debug, "Stopping datalake manager...");
+    _disk_space_monitor_sem.broken();
+    auto f = _gate.close();
+    co_await _queue.shutdown();
+    if (_backlog_controller) {
+        co_await _backlog_controller->stop();
+    }
+    if (_catalog) {
+        co_await _catalog->stop();
+    }
+    _deregistrations.clear();
+    co_await _scheduler.stop();
+    co_await std::move(f);
+    _schema_cache->stop();
+    vlog(datalake_log.debug, "Stopped datalake manager...");
+}
+
+ss::future<>
+datalake_manager::handle_translator_state_change(const model::ntp& ntp) {
+    if (_gate.is_closed() || !model::is_user_topic(ntp)) {
+        co_return;
+    }
+    vlog(datalake_log.debug, "Translator state change for {} detected.", ntp);
+    auto partition = _partition_mgr->local().get(ntp);
+    auto is_leader = partition && partition->raft()->is_leader();
+    const auto& topic_cfg = _topic_table->local().get_topic_cfg(
+      model::topic_namespace_view{ntp});
+    const auto& translators = _scheduler.all_translators();
+    auto translator_it = translators.find(ntp);
+    auto translator_exists = translator_it != translators.end();
+    auto iceberg_disabled = topic_cfg
+                            && topic_cfg->properties.iceberg_mode
+                                 == model::iceberg_mode::disabled;
+    auto requires_active_translator = partition && topic_cfg
+                                      && !iceberg_disabled && is_leader;
+
+    if (translator_exists) {
+        if (requires_active_translator) {
+            // TODO: add more tests that exercise this code path (to ensure new
+            // property updates are getting picked up correctly)
+            translator_it->second.translator_ptr()->reconcile_properties();
+        } else {
+            co_await _scheduler.remove_translator(ntp);
+        }
+        co_return;
+    }
+
+    if (!requires_active_translator) {
+        // no active translator, so nothing to do
+        co_return;
+    }
+
+    // otherwise we need to set up a translator
+
+    auto mode = topic_cfg->properties.iceberg_mode;
+    auto type_resolver = make_type_resolver(
+      mode, ntp.tp.topic, *_schema_registry, *_schema_cache);
+    auto record_translator = make_record_translator(mode);
+    auto table_creator = translation::make_default_table_creator(
+      _coordinator_frontend->local());
+
+    auto& reservations = _scheduler.reservations();
+    //  make a new translator
+    auto coordinator
+      = translation::coordinator_api::make_default_coordinator_api(
+        _coordinator_frontend->local());
+    auto data_src = translation::data_source::make_default_data_source(
+      partition);
+    auto translation_ctx
+      = translation::translation_context::make_default_translation_context(
+        local_path{_writer_scratch_space},
+        data_src->ntp(),
+        data_src->topic_revision(),
+        *_cloud_data_io,
+        *_schema_mgr,
+        std::move(type_resolver),
+        std::move(record_translator),
+        std::move(table_creator),
+        _location_provider,
+        remote_path{iceberg_data_path_prefix},
+        *reservations,
+        _topic_table,
+        _features,
+        get_or_create_probe(partition->ntp()));
+    auto lag_tracker
+      = translation::translation_lag_tracker::make_default_lag_tracker(
+        partition, _topic_table->local());
+
+    auto translator = std::make_unique<translation::partition_translator>(
+      _sg,
+      std::move(coordinator),
+      std::move(data_src),
+      std::move(translation_ctx),
+      std::move(lag_tracker),
+      simple_time_jitter<ss::lowres_clock, std::chrono::milliseconds>{
+        translation_jitter_base, translation_jitter},
+      retry_max_timeout,
+      retry_initial_backoff);
+
+    auto add_f = co_await ss::coroutine::as_future(
+      _scheduler.add_translator(std::move(translator)));
+
+    if (add_f.failed() || !add_f.get()) {
+        add_f.ignore_ready_future();
+        vlog(
+          datalake_log.warn,
+          "adding translator for {} failed, retrying in a bit",
+          ntp);
+        if (!_gate.is_closed()) {
+            _queue.submit_delayed(10s, [this, ntp]() {
+                return handle_translator_state_change(ntp);
+            });
+        }
+    }
+}
+
+ss::future<uint64_t> datalake_manager::disk_usage() {
+    const auto path = config::node().datalake_staging_path();
+
+    if (!co_await ss::file_exists(path.string())) {
+        co_return 0;
+    }
+
+    chunked_vector<std::filesystem::path> files;
+    co_await directory_walker::walk(
+      path.string(), [&files, path](const ss::directory_entry& de) {
+          if (de.type == ss::directory_entry_type::regular) {
+              files.push_back(path / std::filesystem::path(de.name));
+          }
+          return ss::now();
+      });
+
+    uint64_t total = 0;
+    co_await ss::max_concurrent_for_each(
+      files.begin(),
+      files.end(),
+      config::shard_local_cfg().space_management_max_log_concurrency(),
+      [&total](const std::filesystem::path& path) {
+          return ss::file_size(path.string())
+            .then([&total](uint64_t size) { total += size; })
+            .handle_exception_type(
+              [path](const std::filesystem::filesystem_error& e) {
+                  if (e.code() == std::errc::no_such_file_or_directory) {
+                      vlog(
+                        datalake_log.debug,
+                        "Stat failed for path: {}: {}",
+                        path,
+                        e.code());
+                  }
+                  return ss::make_exception_future<>(e);
+              })
+            .handle_exception([path](std::exception_ptr eptr) {
+                vlog(
+                  datalake_log.warn,
+                  "Stat failed for path: {}: {}",
+                  path,
+                  eptr);
+            });
+      });
+
+    co_return total;
+}
+
+bool datalake_manager::max_shares_assigned() const {
+    return _backlog_controller->max_shares_assigned();
+}
+
+size_t datalake_manager::overdue_translation_partition_count() const {
+    auto now = translation::scheduling::clock::now();
+    return std::ranges::count_if(
+      _scheduler.all_translators(), [now](const auto& entry) {
+          return entry.second.status().next_checkpoint_deadline < now;
+      });
+}
+/**
+ * Returns count of partitions that translation is blocked. This value
+ * should be 0 in normal conditions.
+ */
+size_t datalake_manager::partitions_with_translation_blocked() const {
+    // TODO: Return blocked if partition wasn't translated for a long time f.e.
+    // moret
+    return 0;
 }
 
 } // namespace datalake

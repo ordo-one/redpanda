@@ -15,6 +15,7 @@
 #include "bytes/bytes.h"
 #include "container/fragmented_vector.h"
 #include "hashing/xx.h"
+#include "model/fundamental.h"
 #include "model/record_batch_reader.h"
 #include "storage/compacted_index.h"
 #include "storage/compacted_index_writer.h"
@@ -24,6 +25,7 @@
 #include "storage/logger.h"
 #include "utils/tracking_allocator.h"
 
+#include <seastar/core/loop.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 #include <absl/container/btree_map.h>
@@ -121,6 +123,40 @@ class copy_data_segment_reducer : public compaction_reducer {
 public:
     using filter_t = ss::noncopyable_function<ss::future<bool>(
       const model::record_batch&, const model::record&, bool)>;
+    struct stats {
+        // Total number of batches passed to this reducer.
+        size_t batches_processed{0};
+        // Number of batches that were completely removed.
+        size_t batches_discarded{0};
+        // Number of records removed by this reducer, including batches that
+        // were entirely removed.
+        size_t records_discarded{0};
+        // Number of batches that were ignored because they are not
+        // of a compactible type.
+        size_t non_compactible_batches{0};
+
+        // Returns whether any data was removed by this reducer.
+        bool has_removed_data() const {
+            return batches_discarded > 0 || records_discarded > 0;
+        }
+
+        friend std::ostream& operator<<(std::ostream& os, const stats& s) {
+            fmt::print(
+              os,
+              "{{ batches_processed: {}, batches_discarded: {}, "
+              "records_discarded: {}, non_compactible_batches: {} }}",
+              s.batches_processed,
+              s.batches_discarded,
+              s.records_discarded,
+              s.non_compactible_batches);
+            return os;
+        }
+    };
+    struct idx_and_stats {
+        index_state new_idx;
+        stats reducer_stats;
+    };
+
     copy_data_segment_reducer(
       filter_t f,
       segment_appender* a,
@@ -140,7 +176,7 @@ public:
       , _as(as) {}
 
     ss::future<ss::stop_iteration> operator()(model::record_batch);
-    storage::index_state end_of_stream() { return std::move(_idx); }
+    idx_and_stats end_of_stream() { return {std::move(_idx), _stats}; }
 
 private:
     ss::future<ss::stop_iteration>
@@ -180,6 +216,8 @@ private:
     /// Allows the reducer to stop early, e.g. in case the partition is being
     /// shut down.
     ss::abort_source* _as;
+
+    stats _stats;
 };
 
 class index_rebuilder_reducer : public compaction_reducer {
@@ -271,6 +309,39 @@ private:
     stats _stats;
     // Set if a transactional stm is attached to this partition.
     std::optional<storage::stm_type> _transactional_stm_type;
+};
+
+// Builds up a key_offset_map for a segment, starting from the offset
+// start_offset_inclusive. Intended to be used for chunked compaction,
+// in which it is expected that the map will not be able to fit the entire
+// key set of the segment at once due to memory constraints.
+// As many keys as possible will be added to the map from start_offset_inclusive
+// onwards until the capacity limit is reached, or the end of the segment is
+// reached.
+//
+// end_of_stream() returns a bool value indicating whether the segment was fully
+// indexed or not.
+class map_building_reducer : public compaction_reducer {
+public:
+    explicit map_building_reducer(
+      key_offset_map* map, model::offset start_offset_inclusive)
+      : _map(map)
+      , _start_offset(start_offset_inclusive) {}
+
+    ss::future<ss::stop_iteration> operator()(model::record_batch);
+    bool end_of_stream() { return _fully_indexed_segment; }
+
+private:
+    ss::future<ss::stop_iteration> maybe_index_record_in_map(
+      const model::record& r,
+      model::offset base_offset,
+      model::record_batch_type type,
+      bool is_control,
+      bool& fully_indexed_batch);
+
+    key_offset_map* _map;
+    model::offset _start_offset;
+    bool _fully_indexed_segment = true;
 };
 
 } // namespace storage::internal

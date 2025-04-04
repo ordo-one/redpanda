@@ -10,8 +10,8 @@
 
 #include "datalake/local_parquet_file_writer.h"
 #include "datalake/tests/test_data.h"
+#include "datalake/tests/test_data_writer.h"
 #include "iceberg/tests/value_generator.h"
-#include "test_utils/test.h"
 #include "test_utils/tmp_dir.h"
 
 #include <seastar/core/seastar.hh>
@@ -27,8 +27,11 @@ struct test_writer : datalake::parquet_ostream {
       : error_after_rows_(error_after_rows)
       , error_on_finish_(error_on_finish)
       , os_(std::move(os)) {}
+    ~test_writer() {
+        vassert(stream_closed_, "Ensure output stream is closed in all cases");
+    }
     ss::future<datalake::writer_error>
-    add_data_struct(iceberg::struct_value, size_t) final {
+    add_data_struct(iceberg::struct_value, size_t, ss::abort_source&) final {
         if (rows_ >= error_after_rows_) {
             co_return datalake::writer_error::file_io_error;
         }
@@ -37,17 +40,23 @@ struct test_writer : datalake::parquet_ostream {
         co_return datalake::writer_error::ok;
     };
 
+    size_t buffered_bytes() const final { return 0; };
+    size_t flushed_bytes() const final { return 0; }
+    ss::future<> flush() final { return ss::make_ready_future<>(); }
+
     ss::future<datalake::writer_error> finish() final {
+        co_await os_.close();
+        stream_closed_ = true;
         if (error_on_finish_) {
             co_return datalake::writer_error::file_io_error;
         }
-        co_await os_.close();
         co_return datalake::writer_error::ok;
     }
 
     size_t error_after_rows_;
     bool error_on_finish_;
     size_t rows_{0};
+    bool stream_closed_;
     ss::output_stream<char> os_;
 };
 
@@ -59,7 +68,9 @@ struct test_writer_factory : datalake::parquet_ostream_factory {
       , error_on_finish_(error_on_finish) {}
 
     ss::future<std::unique_ptr<datalake::parquet_ostream>> create_writer(
-      const iceberg::struct_type&, ss::output_stream<char> os) final {
+      const iceberg::struct_type&,
+      ss::output_stream<char> os,
+      datalake::writer_mem_tracker&) final {
         co_return std::make_unique<test_writer>(
           error_after_rows_, error_on_finish_, std::move(os));
     };
@@ -80,11 +91,15 @@ struct LocalFileWriterTest : public testing::Test {
     temporary_dir tmp_dir = temporary_dir("batching_parquet_writer");
     std::filesystem::path file_path = "test_file.parquet";
     std::filesystem::path full_path = tmp_dir.get_path() / file_path;
+    datalake::noop_mem_tracker mem_tracker;
+    ss::abort_source as;
 };
 
 TEST_F(LocalFileWriterTest, TestHappyPath) {
     datalake::local_parquet_file_writer file_writer(
-      datalake::local_path(full_path), ss::make_shared<test_writer_factory>());
+      datalake::local_path(full_path),
+      ss::make_shared<test_writer_factory>(),
+      mem_tracker);
 
     auto schema = test_schema(iceberg::field_required::no);
     file_writer.initialize(schema).get();
@@ -95,7 +110,7 @@ TEST_F(LocalFileWriterTest, TestHappyPath) {
           iceberg::tests::value_spec{},
           test_schema(iceberg::field_required::no));
 
-        auto res = file_writer.add_data_struct(std::move(data), 1000).get();
+        auto res = file_writer.add_data_struct(std::move(data), 1000, as).get();
         ASSERT_EQ(datalake::writer_error::ok, res);
     }
 
@@ -112,7 +127,8 @@ TEST_F(LocalFileWriterTest, TestHappyPath) {
 TEST_F(LocalFileWriterTest, TestErrorOnWrite) {
     datalake::local_parquet_file_writer file_writer(
       datalake::local_path(full_path),
-      ss::make_shared<test_writer_factory>(100));
+      ss::make_shared<test_writer_factory>(100),
+      mem_tracker);
     auto schema = test_schema(iceberg::field_required::no);
     file_writer.initialize(schema).get();
 
@@ -122,7 +138,7 @@ TEST_F(LocalFileWriterTest, TestErrorOnWrite) {
           iceberg::tests::value_spec{},
           test_schema(iceberg::field_required::no));
 
-        file_writer.add_data_struct(std::move(data), 1000).get();
+        file_writer.add_data_struct(std::move(data), 1000, as).get();
     }
 
     auto result = file_writer.finish().get();
@@ -136,7 +152,8 @@ TEST_F(LocalFileWriterTest, TestErrorOnWrite) {
 TEST_F(LocalFileWriterTest, TestErrorOnFinish) {
     datalake::local_parquet_file_writer file_writer(
       datalake::local_path(full_path),
-      ss::make_shared<test_writer_factory>(5000, true));
+      ss::make_shared<test_writer_factory>(5000, true),
+      mem_tracker);
     auto schema = test_schema(iceberg::field_required::no);
     file_writer.initialize(schema).get();
 
@@ -146,7 +163,7 @@ TEST_F(LocalFileWriterTest, TestErrorOnFinish) {
           iceberg::tests::value_spec{},
           test_schema(iceberg::field_required::no));
 
-        file_writer.add_data_struct(std::move(data), 1000).get();
+        file_writer.add_data_struct(std::move(data), 1000, as).get();
     }
 
     auto result = file_writer.finish().get();

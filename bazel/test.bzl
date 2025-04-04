@@ -6,9 +6,10 @@ changes. For example, redpanda_cc_gtest will automatically configure Seastar for
 running tests, like setting a reasonable number of cores and amount of memory.
 """
 
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load(":internal.bzl", "redpanda_copts")
 
-def has_flags(args, *flags):
+def _has_flags(args, *flags):
     """
     Check if flags are present in a set of arguments.
 
@@ -25,7 +26,7 @@ def has_flags(args, *flags):
                 return True
     return False
 
-def parse_bytes(value):
+def _parse_bytes(value):
     """
     Convert a string into bytes number. Does not respect SI standard.
 
@@ -47,10 +48,25 @@ def parse_bytes(value):
             break
     return int(value) * factor
 
-# TODO(bazel)
-# - Make log level configurable (e.g. CI)
-# - Set --overprovisioned in CI context
-# - Other ASAN settings used in cmake_test.py
+def _test_options():
+    data = [
+        "//:ubsan_suppressions",
+        "//:lsan_suppressions",
+        "@llvm_18_toolchain//:llvm-symbolizer",
+    ]
+    env = {
+        "BOOST_TEST_LOG_LEVEL": "test_suite",
+        "BOOST_TEST_COLOR_OUTPUT": "0",
+        "BOOST_TEST_CATCH_SYSTEM_ERRORS": "no",
+        "BOOST_TEST_REPORT_LEVEL": "no",
+        "BOOST_LOGGER": "HRF,test_suite",
+        "ASAN_OPTIONS": "disable_coredump=0:abort_on_error=1",
+        "ASAN_SYMBOLIZER_PATH": "$(rootpath @llvm_18_toolchain//:llvm-symbolizer)",
+        "LSAN_OPTIONS": "suppressions=$(rootpath //:lsan_suppressions)",
+        "UBSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:report_error_type=1:suppressions=$(rootpath //:ubsan_suppressions)",
+    }
+    return data, env
+
 def _redpanda_cc_test(
         name,
         timeout,
@@ -95,9 +111,9 @@ def _redpanda_cc_test(
 
     args = common_args + extra_args + custom_args
 
-    if has_flags(args, "-m", "--memory"):
+    if _has_flags(args, "-m", "--memory"):
         fail("Use `memory=\"XGiB\"` test parameter instead of -m/--memory")
-    if has_flags(args, "-c", "--smp"):
+    if _has_flags(args, "-c", "--smp"):
         fail("Use `cpu=N` test parameter instead of -c/--smp")
 
     args.append("-m{}".format(memory))
@@ -105,12 +121,14 @@ def _redpanda_cc_test(
     resource_tags = [
         "resources:cpu:{}".format(cpu),
         # This is always defined in MiB for Bazel
-        "resources:memory:{}".format(parse_bytes(memory) / (1 << 20)),
+        "resources:memory:{}".format(_parse_bytes(memory) / (1 << 20)),
     ]
 
     # Google test / benchmarks don't understand the "--" protocol
     if args and dash_dash_protocol:
         args = ["--"] + args
+
+    test_data, test_env = _test_options()
 
     native.cc_test(
         name = name,
@@ -124,10 +142,57 @@ def _redpanda_cc_test(
             "layering_check",
         ],
         tags = resource_tags + tags,
-        env = env,
+        env = {"RP_FIXTURE_ENV": "1"} | env | test_env,
         target_compatible_with = target_compatible_with,
-        data = data,
+        data = data + test_data,
         local_defines = local_defines,
+    )
+
+def _redpanda_cc_fuzz_test(
+        name,
+        timeout,
+        srcs = [],
+        defines = [],
+        deps = [],
+        custom_args = [],
+        env = {},
+        data = []):
+    """
+    Helper to define a Redpanda C++ fuzzing test.
+
+    Args:
+      name: name of the test
+      timeout: same as native cc_test
+      srcs: test source files
+      defines: definitions of object-like macros
+      deps: test dependencies
+      custom_args: arguments from cc_test users
+      env: environment variables
+      data: data file dependencies
+    """
+    native.cc_test(
+        name = name,
+        timeout = timeout,
+        srcs = srcs,
+        defines = defines,
+        deps = deps,
+        copts = redpanda_copts(),
+        args = custom_args,
+        features = [
+            "layering_check",
+        ],
+        tags = [
+            "fuzz",
+        ],
+        env = env,
+        data = data,
+        linkopts = [
+            "-fsanitize=fuzzer",
+        ],
+        target_compatible_with = select({
+            "//bazel:enable_fuzz_testing": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
     )
 
 def _redpanda_cc_unit_test(cpu, memory, **kwargs):
@@ -203,7 +268,7 @@ def redpanda_cc_btest(
         tags = tags,
     )
 
-def redpanda_cc_bench(
+def redpanda_cc_fuzz_test(
         name,
         timeout,
         srcs = [],
@@ -211,13 +276,8 @@ def redpanda_cc_bench(
         deps = [],
         args = [],
         env = {},
-        cpu = None,
-        memory = None,
         data = []):
-    _redpanda_cc_test(
-        dash_dash_protocol = False,
-        cpu = cpu or 1,
-        memory = memory or "1GiB",
+    _redpanda_cc_fuzz_test(
         data = data,
         env = env,
         name = name,
@@ -226,9 +286,6 @@ def redpanda_cc_bench(
         defines = defines,
         deps = deps,
         custom_args = args,
-        tags = [
-            "bench",
-        ],
     )
 
 def redpanda_cc_btest_no_seastar(
@@ -244,12 +301,15 @@ def redpanda_cc_btest_no_seastar(
         timeout = timeout,
         tags = [
             "resources:cpu:{}".format(cpu),
-            "resources:memory:{}".format(parse_bytes(memory) / (2 << 20)),
+            "resources:memory:{}".format(_parse_bytes(memory) / (2 << 20)),
         ],
         srcs = srcs,
         defines = defines,
         copts = redpanda_copts(),
-        deps = ["@boost//:test.so"] + deps,
+        deps = [
+            "//src/v/test_utils:boost_result_redirect",
+            "@boost//:test.so",
+        ] + deps,
     )
 
 def redpanda_test_cc_library(
@@ -277,4 +337,107 @@ def redpanda_test_cc_library(
         features = [
             "layering_check",
         ],
+    )
+
+def redpanda_cc_bench(
+        name,
+        srcs = [],
+        defines = [],
+        timeout = "short",
+        deps = [],
+        args = [],
+        env = {},
+        cpu = 1,
+        memory = "1GiB",
+        runs = None,
+        duration = None,
+        data = [],
+        tags = [],
+        target_compatible_with = []):
+    """
+    Create a seastar benchmark target
+
+    Args:
+      name: the name of the target
+      srcs: the cc files for the benchmark
+      defines: any preprocessor defines
+      deps: the dependencies for the benchmark binary
+      args: any custom arguments for the binary
+      env: any custom environment variables for the binary
+      cpu: the number of cores the benchmark needs
+      memory: the amount of RAM needed for the benchmark
+      runs: number of runs
+      duration: duration of a single run in seconds
+      data: any data files available to the benchmark as runfiles
+      tags: custom tags for the test
+      timeout: the timeout for smoke testing the benchmark
+      target_compatible_with: constraints for the test target
+    """
+    args = [
+        "--blocked-reactor-notify-ms 2000000",
+        "--abort-on-seastar-bad-alloc",
+    ] + args
+
+    if _has_flags(args, "-m", "--memory"):
+        fail("Use `memory=\"XGiB\"` test parameter instead of -m/--memory")
+    if _has_flags(args, "-c", "--smp"):
+        fail("Use `cpu=N` test parameter instead of -c/--smp")
+    if _has_flags(args, "--runs"):
+        fail("Use `runs=N` test parameter instead of --runs")
+    if _has_flags(args, "--duration"):
+        fail("Use `duration=N` test parameter instead of --duration")
+
+    args.append("-m{}".format(memory))
+    args.append("-c{}".format(cpu))
+    resource_tags = [
+        "resources:cpu:{}".format(cpu),
+        # This is always defined in MiB for Bazel
+        "resources:memory:{}".format(_parse_bytes(memory) / (1 << 20)),
+    ]
+
+    binary_args = []
+    if runs != None:
+        binary_args.append("--runs={}".format(runs))
+    if duration != None:
+        binary_args.append("--duration={}".format(duration))
+
+    tags = tags + ["bench"]
+
+    native.cc_binary(
+        name = name,
+        srcs = srcs,
+        defines = defines,
+        deps = deps,
+        testonly = True,
+        copts = redpanda_copts(),
+        args = args + binary_args,
+        features = [
+            "layering_check",
+        ],
+        tags = tags,
+        env = env,
+        data = data,
+    )
+    write_file(
+        name = name + "_test_script",
+        out = name + "_test_wrapper.sh",
+        content = [
+            "#!/bin/bash",
+            "exec $@ --iterations=1 --runs=1 --duration=0 --no-stdout --overprovisioned",
+        ],
+    )
+    test_data, test_env = _test_options()
+    native.sh_test(
+        name = name + "_test",
+        timeout = timeout,
+        tags = resource_tags + tags,
+        srcs = [name + "_test_script"],
+        env = env | test_env,
+        args = [
+            "$(rootpath :{})".format(name),
+        ] + args,
+        data = [
+            ":" + name,
+        ] + data + test_data,
+        target_compatible_with = target_compatible_with,
     )

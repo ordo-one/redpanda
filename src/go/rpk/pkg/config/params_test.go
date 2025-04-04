@@ -744,7 +744,7 @@ rpk:
 pandaproxy: {}
 schema_registry: {}
 `,
-			expVirtualRpk: `version: 6
+			expVirtualRpk: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -842,7 +842,7 @@ rpk:
     tune_disk_write_cache: true
     tune_disk_irq: true
 `,
-			expVirtualRpk: `version: 6
+			expVirtualRpk: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -884,7 +884,7 @@ cloud_auth:
 		// * admin api is defaulted, using kafka broker ip
 		{
 			name: "rpk.yaml exists",
-			rpkYaml: `version: 6
+			rpkYaml: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -944,7 +944,7 @@ rpk:
 pandaproxy: {}
 schema_registry: {}
 `,
-			expVirtualRpk: `version: 6
+			expVirtualRpk: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -1008,7 +1008,7 @@ rpk:
     tune_disk_write_cache: true
     tune_disk_irq: true
 `,
-			rpkYaml: `version: 6
+			rpkYaml: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -1063,7 +1063,7 @@ rpk:
     tune_disk_irq: true
 `,
 
-			expVirtualRpk: `version: 6
+			expVirtualRpk: `version: 7
 globals:
     prompt: ""
     no_default_cluster: false
@@ -1168,6 +1168,7 @@ func TestConfig_parseDevOverrides(t *testing.T) {
 func TestParamsHelpComplete(t *testing.T) {
 	h := ParamsHelp()
 	m := maps.Clone(xflags)
+	delete(m, xCloudEnvironment) // We leave this out of the list and docs on purpose.
 	for _, line := range strings.Split(h, "\n") {
 		key := strings.Split(line, "=")[0]
 		delete(m, key)
@@ -1180,6 +1181,7 @@ func TestParamsHelpComplete(t *testing.T) {
 func TestParamsListComplete(t *testing.T) {
 	h := ParamsList()
 	m := maps.Clone(xflags)
+	delete(m, xCloudEnvironment) // We leave this out of the list and docs on purpose.
 	for _, line := range strings.Split(h, "\n") {
 		key := strings.Split(line, "=")[0]
 		delete(m, key)
@@ -1240,5 +1242,182 @@ func TestXSetDefaultsPaths(t *testing.T) {
 		if !strings.HasPrefix(x, "globals.") {
 			t.Errorf("XRpkGlobalFlags() returned xflag %s that doesn't start with globals.", x)
 		}
+	}
+}
+
+func TestConfig_fixSchemePorts(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+		expect Config
+		errMsg string
+	}{
+		{
+			name: "fix missing ports in redpanda.yaml addresses",
+			config: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"broker1", "broker2:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"address1", "address2:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"address1", "address2", "address3:8088"},
+						},
+					},
+				},
+			},
+			expect: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"broker1:9092", "broker2:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"address1:9644", "address2:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"address1:8081", "address2:8081", "address3:8088"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "fix missing ports in profile brokers",
+			config: Config{
+				rpkYaml: RpkYaml{
+					CurrentProfile: "default",
+					Profiles: []RpkProfile{
+						{
+							Name: "default",
+							KafkaAPI: RpkKafkaAPI{
+								Brokers: []string{"profile-broker1", "profile-broker2:9094"},
+							},
+							AdminAPI: RpkAdminAPI{
+								Addresses: []string{"address1", "address2:2222"},
+							},
+							SR: RpkSchemaRegistryAPI{
+								Addresses: []string{"address1", "address2", "address3:8088"},
+							},
+						},
+					},
+				},
+			},
+			expect: Config{
+				rpkYaml: RpkYaml{
+					CurrentProfile: "default",
+					Profiles: []RpkProfile{
+						{
+							Name: "default",
+							KafkaAPI: RpkKafkaAPI{
+								Brokers: []string{"profile-broker1:9092", "profile-broker2:9094"},
+							},
+							AdminAPI: RpkAdminAPI{
+								Addresses: []string{"address1:9644", "address2:2222"},
+							},
+							SR: RpkSchemaRegistryAPI{
+								Addresses: []string{"address1:8081", "address2:8081", "address3:8088"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "fix missing ports in redpanda.yaml addresses",
+			config: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"broker1", "broker2:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"address1", "address2:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"address1", "address2", "address3:8088"},
+						},
+					},
+				},
+			},
+			expect: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"broker1:9092", "broker2:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"address1:9644", "address2:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"address1:8081", "address2:8081", "address3:8088"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "fix missing ports in redpanda.yaml addresses with IPv6",
+			config: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"[2001:db8::1]", "[2001:db8::2]:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"[2001:db8::3]", "[2001:db8::4]:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"[2001:db8::5]", "[2001:db8::6]", "[2001:db8::7]:8088"},
+						},
+					},
+				},
+			},
+			expect: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{"[2001:db8::1]:9092", "[2001:db8::2]:9093"},
+						},
+						AdminAPI: RpkAdminAPI{
+							Addresses: []string{"[2001:db8::3]:9644", "[2001:db8::4]:2222"},
+						},
+						SR: RpkSchemaRegistryAPI{
+							Addresses: []string{"[2001:db8::5]:8081", "[2001:db8::6]:8081", "[2001:db8::7]:8088"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid broker address",
+			config: Config{
+				redpandaYaml: RedpandaYaml{
+					Rpk: RpkNodeConfig{
+						KafkaAPI: RpkKafkaAPI{
+							Brokers: []string{":invalid"},
+						},
+					},
+				},
+			},
+			expect: Config{},
+			errMsg: "unable to fix broker address",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.fixSchemePorts()
+			if tt.errMsg != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errMsg)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.expect, tt.config)
+			}
+		})
 	}
 }

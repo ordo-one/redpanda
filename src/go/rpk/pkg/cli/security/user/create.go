@@ -15,9 +15,12 @@ import (
 	"math/big"
 	"strings"
 
+	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
+	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -57,10 +60,6 @@ acl help text for more info.
 			}
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
-			config.CheckExitNotServerlessAdmin(p)
-
-			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
-			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// Backwards compatibility: we favor the new user
 			// format and the new password flag. If either are
@@ -103,8 +102,27 @@ acl help text for more info.
 				out.Die("unsupported mechanism %q", mechanism)
 			}
 
-			err = cl.CreateUser(cmd.Context(), user, pass, mechanism)
-			out.MaybeDie(err, "unable to create user %q: %v", user, err)
+			if p.FromCloud && !p.CloudCluster.IsServerless() {
+				cl, err := publicapi.DataplaneClientFromRpkProfile(p)
+				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
+				req := connect.NewRequest(
+					&dataplanev1.CreateUserRequest{
+						User: &dataplanev1.CreateUserRequest_User{
+							Name:      user,
+							Password:  pass,
+							Mechanism: stringToDataplaneMechanism(mechanism),
+						},
+					},
+				)
+				_, err = cl.User.CreateUser(cmd.Context(), req)
+				out.MaybeDie(err, "unable to create user %q: %v", user, err)
+			} else {
+				cl, err := adminapi.NewClient(cmd.Context(), fs, p)
+				out.MaybeDie(err, "unable to initialize admin client: %v", err)
+
+				err = cl.CreateUser(cmd.Context(), user, pass, mechanism)
+				out.MaybeDie(err, "unable to create user %q: %v", user, err)
+			}
 			c := credentials{user, "", mechanism}
 			if generated {
 				c.Password = pass // We only want to display the password if it was generated.

@@ -36,7 +36,7 @@ ss::future<checked<table_metadata, catalog::errc>>
 catalog::load_or_create_table(
   const table_identifier& table_ident,
   const struct_type& type,
-  const partition_spec& spec) {
+  const unresolved_partition_spec& spec) {
     auto load_res = co_await load_table(table_ident);
     if (load_res.has_value()) {
         co_return std::move(load_res.value());
@@ -58,8 +58,19 @@ catalog::load_or_create_table(
       .schema_id = schema::unassigned_id,
       .identifier_field_ids = {},
     };
-    schema.assign_fresh_ids();
-    auto create_res = co_await create_table(table_ident, schema, spec);
+    if (auto schm_res = schema.assign_fresh_ids(); schm_res.has_error()) {
+        co_return errc::unexpected_state;
+    }
+    auto resolved_spec = partition_spec::resolve(spec, schema.schema_struct);
+    if (!resolved_spec) {
+        vlog(
+          log.warn,
+          "Iceberg table {} failed to resolve partition spec",
+          table_ident);
+        co_return errc::unexpected_state;
+    }
+    auto create_res = co_await create_table(
+      table_ident, schema, resolved_spec.value());
     if (create_res.has_value()) {
         co_return std::move(create_res.value());
     }

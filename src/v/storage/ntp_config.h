@@ -33,8 +33,8 @@ public:
     // is handled during adl/serde decode).
     static constexpr bool default_remote_delete{true};
     static constexpr bool legacy_remote_delete{false};
-    static constexpr model::iceberg_mode default_iceberg_mode
-      = model::iceberg_mode::disabled;
+    static inline model::iceberg_mode default_iceberg_mode
+      = model::iceberg_mode{};
     static constexpr bool default_cloud_topic_enabled{false};
 
     static constexpr std::chrono::milliseconds read_replica_retention{3600000};
@@ -85,6 +85,10 @@ public:
         // Should not be enabled at the same time as any other tiered storage
         // properties.
         tristate<std::chrono::milliseconds> tombstone_retention_ms;
+
+        tristate<double> min_cleanable_dirty_ratio;
+        // Controls behavior during pause
+        std::optional<bool> remote_allow_gaps;
 
         friend std::ostream&
         operator<<(std::ostream&, const default_overrides&);
@@ -231,6 +235,15 @@ public:
                && _overrides->read_replica.value();
     }
 
+    bool is_remote_allow_gaps_enabled() const {
+        auto cluster_default
+          = config::shard_local_cfg().cloud_storage_enable_remote_allow_gaps();
+        if (_overrides == nullptr) {
+            return cluster_default;
+        }
+        return _overrides->remote_allow_gaps.value_or(cluster_default);
+    }
+
     /**
      * True if the topic is configured for "normal" tiered storage, i.e.
      * both reads and writes to S3, and is not a read replica.
@@ -363,6 +376,29 @@ public:
         }
         return _overrides ? _overrides->cloud_topic_enabled
                           : default_cloud_topic_enabled;
+    }
+
+    std::optional<double> min_cleanable_dirty_ratio() const {
+        if (_overrides) {
+            if (_overrides->min_cleanable_dirty_ratio.is_disabled()) {
+                return std::nullopt;
+            }
+            if (_overrides->min_cleanable_dirty_ratio.has_optional_value()) {
+                return _overrides->min_cleanable_dirty_ratio.value();
+            }
+        }
+        return config::shard_local_cfg().min_cleanable_dirty_ratio();
+    }
+
+    ntp_config copy() const {
+        return {
+          _ntp,
+          _base_dir,
+          _overrides ? std::make_unique<default_overrides>(*_overrides)
+                     : nullptr,
+          _revision_id,
+          _topic_rev,
+          _remote_rev};
     }
 
 private:

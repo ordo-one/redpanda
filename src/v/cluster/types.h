@@ -482,7 +482,7 @@ struct partition_assignment
       = default;
 };
 
-enum incremental_update_operation : int8_t { none, set, remove };
+enum class incremental_update_operation : int8_t { none, set, remove };
 
 inline std::string_view
 incremental_update_operation_as_string(incremental_update_operation op) {
@@ -496,6 +496,11 @@ incremental_update_operation_as_string(incremental_update_operation op) {
     default:
         vassert(false, "Unknown operation type passed: {}", int8_t(op));
     }
+}
+
+inline std::ostream&
+operator<<(std::ostream& os, const incremental_update_operation& op) {
+    return os << incremental_update_operation_as_string(op);
 }
 
 template<typename T>
@@ -563,7 +568,7 @@ struct property_update<tristate<T>>
 struct incremental_topic_updates
   : serde::envelope<
       incremental_topic_updates,
-      serde::version<7>,
+      serde::version<8>,
       serde::compat_version<0>> {
     static constexpr int8_t version_with_data_policy = -1;
     static constexpr int8_t version_with_shadow_indexing = -3;
@@ -636,6 +641,14 @@ struct incremental_topic_updates
       leaders_preference;
     property_update<tristate<std::chrono::milliseconds>> delete_retention_ms;
     property_update<std::optional<bool>> iceberg_delete;
+    property_update<std::optional<ss::sstring>> iceberg_partition_spec;
+    property_update<std::optional<model::iceberg_invalid_record_action>>
+      iceberg_invalid_record_action;
+    property_update<tristate<double>> min_cleanable_dirty_ratio;
+    property_update<std::optional<bool>> remote_allow_gaps;
+
+    property_update<std::optional<std::chrono::milliseconds>>
+      iceberg_target_lag_ms;
 
     // To allow us to better control use of the deprecated shadow_indexing
     // field, use getters and setters instead.
@@ -675,7 +688,12 @@ struct incremental_topic_updates
           remote_read,
           remote_write,
           delete_retention_ms,
-          iceberg_delete);
+          iceberg_delete,
+          iceberg_partition_spec,
+          iceberg_invalid_record_action,
+          iceberg_target_lag_ms,
+          min_cleanable_dirty_ratio,
+          remote_allow_gaps);
     }
 
     friend std::ostream&
@@ -1512,9 +1530,41 @@ struct delete_acls_reply
 using transfer_leadership_request = raft::transfer_leadership_request;
 using transfer_leadership_reply = raft::transfer_leadership_reply;
 
+struct replica_recovery_state
+  : serde::envelope<
+      replica_recovery_state,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    model::offset last_offset;
+    size_t bytes_left;
+    friend std::ostream&
+    operator<<(std::ostream&, const replica_recovery_state&);
+
+    friend bool
+    operator==(const replica_recovery_state&, const replica_recovery_state&)
+      = default;
+
+    auto serde_fields() { return std::tie(last_offset, bytes_left); }
+};
+struct recovery_state
+  : serde::
+      envelope<recovery_state, serde::version<0>, serde::compat_version<0>> {
+    model::offset local_last_offset;
+    size_t local_size;
+
+    absl::flat_hash_map<model::node_id, replica_recovery_state> replicas;
+
+    friend std::ostream& operator<<(std::ostream&, const recovery_state&);
+
+    friend bool operator==(const recovery_state&, const recovery_state&)
+      = default;
+
+    auto serde_fields() { return std::tie(local_last_offset, replicas); }
+};
+
 struct backend_operation
   : serde::
-      envelope<backend_operation, serde::version<1>, serde::compat_version<0>> {
+      envelope<backend_operation, serde::version<2>, serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
     ss::shard_id source_shard;
     partition_assignment p_as;
@@ -1523,6 +1573,7 @@ struct backend_operation
     uint64_t current_retry;
     cluster::errc last_operation_result;
     model::revision_id revision_of_operation;
+    std::optional<recovery_state> recovery_state;
 
     friend std::ostream& operator<<(std::ostream&, const backend_operation&);
 
@@ -1536,7 +1587,8 @@ struct backend_operation
           type,
           current_retry,
           last_operation_result,
-          revision_of_operation);
+          revision_of_operation,
+          recovery_state);
     }
 };
 
@@ -2009,7 +2061,7 @@ struct reconciliation_state_request
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
 
-    std::vector<model::ntp> ntps;
+    chunked_vector<model::ntp> ntps;
 
     friend bool operator==(
       const reconciliation_state_request&, const reconciliation_state_request&)
@@ -2017,11 +2069,15 @@ struct reconciliation_state_request
 
     friend std::ostream&
     operator<<(std::ostream& o, const reconciliation_state_request& req) {
-        fmt::print(o, "{{ ntps: {} }}", req.ntps);
+        fmt::print(o, "{{ ntps: {} }}", fmt::join(req.ntps, ", "));
         return o;
     }
 
     auto serde_fields() { return std::tie(ntps); }
+
+    reconciliation_state_request copy() const {
+        return reconciliation_state_request{.ntps = ntps.copy()};
+    }
 };
 
 struct ntp_with_majority_loss
@@ -2099,7 +2155,7 @@ struct reconciliation_state_reply
       serde::version<0>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
-    std::vector<ntp_reconciliation_state> results;
+    chunked_vector<ntp_reconciliation_state> results;
 
     friend bool operator==(
       const reconciliation_state_reply&, const reconciliation_state_reply&)
@@ -2107,12 +2163,12 @@ struct reconciliation_state_reply
 
     friend std::ostream&
     operator<<(std::ostream& o, const reconciliation_state_reply& rep) {
-        fmt::print(o, "{{ results {} }}", rep.results);
+        fmt::print(o, "{{ results {} }}", fmt::join(rep.results, ", "));
         return o;
     }
 
     reconciliation_state_reply copy() const {
-        std::vector<ntp_reconciliation_state> results_cp;
+        chunked_vector<ntp_reconciliation_state> results_cp;
         results_cp.reserve(results.size());
         for (auto& r : results) {
             results_cp.push_back(r.copy());
@@ -3134,7 +3190,9 @@ std::ostream& operator<<(std::ostream&, reconfiguration_state);
 
 struct replica_bytes {
     model::node_id node;
-    size_t bytes{0};
+    size_t bytes_left{0};
+    size_t bytes_transferred{0};
+    model::offset offset;
 };
 
 struct partition_reconfiguration_state {
@@ -3145,7 +3203,7 @@ struct partition_reconfiguration_state {
     // state indicating if reconfiguration was cancelled or requested
     reconfiguration_state state;
     // amount of bytes already transferred to new replicas
-    std::vector<replica_bytes> already_transferred_bytes;
+    std::vector<replica_bytes> replicas;
     // current size of partition
     size_t current_partition_size{0};
     // policy used to execute an update
@@ -3160,7 +3218,7 @@ struct node_decommission_progress {
     // Replicas on the node with failures during reallocation.
     ss::chunked_fifo<model::ntp> allocation_failures;
     // list of currently ongoing partition reconfigurations
-    std::vector<partition_reconfiguration_state> current_reconfigurations;
+    chunked_vector<partition_reconfiguration_state> current_reconfigurations;
 };
 
 enum class cloud_storage_mode : uint8_t {
@@ -3216,6 +3274,16 @@ struct metrics_reporter_cluster_info
       = default;
 
     auto serde_fields() { return std::tie(uuid, creation_timestamp); }
+};
+
+struct crash_reporter_rate_limiting_metadata
+  : serde::envelope<
+      crash_reporter_rate_limiting_metadata,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    model::timestamp last_upload_time;
+
+    auto serde_fields() { return std::tie(last_upload_time); }
 };
 
 struct controller_committed_offset_request

@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/update_schema_action.h"
 
 #include "iceberg/schema.h"
@@ -41,9 +42,16 @@ ss::future<action::action_outcome> update_schema_action::build_updates() && {
     const schema::id_t new_schema_id{highest_schema_id() + 1};
     new_schema_.schema_id = new_schema_id;
 
-    // TODO: when we support schema evolution, we'll need to assign IDs to only
-    // the new fields.
-    new_schema_.assign_fresh_ids();
+    // NOTE: assumes that
+    //   - the table's last_column_id increases monotonically
+    //   - carry-over fields in a compat-checked schema already have
+    //     IDs assigned
+    //   - those carry-over IDs are all strictly <= table.last
+    // so we start column ID assignment for any new fields at table.last + 1
+    if (auto schm_res = new_schema_.assign_fresh_ids(table_.last_column_id + 1);
+        schm_res.has_error()) {
+        co_return errc::unexpected_state;
+    }
     auto last_column_id = new_schema_.highest_field_id();
     ret.updates.emplace_back(table_update::add_schema{
       .schema = std::move(new_schema_),

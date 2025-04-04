@@ -65,7 +65,7 @@ struct partition_properties_stm_fixture : raft::raft_fixture {
     }
 
     ss::future<> disable_writes() {
-        co_await retry_with_leader(
+        std::ignore = co_await retry_with_leader(
           raft::default_timeout(),
           2s,
           [](raft::raft_node_instance& leader_node) {
@@ -74,7 +74,7 @@ struct partition_properties_stm_fixture : raft::raft_fixture {
     }
 
     ss::future<> enable_writes() {
-        co_await retry_with_leader(
+        std::ignore = co_await retry_with_leader(
           raft::default_timeout(),
           2s,
           [](raft::raft_node_instance& leader_node) {
@@ -118,8 +118,7 @@ struct partition_properties_stm_fixture : raft::raft_fixture {
                 .then([&](ss::circular_buffer<model::record_batch> batches) {
                     return leader_node.raft()
                       ->replicate(
-                        model::make_memory_record_batch_reader(
-                          std::move(batches)),
+                        chunked_vector<model::record_batch>(std::move(batches)),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack))
                       .then([](result<raft::replicate_result> res) {

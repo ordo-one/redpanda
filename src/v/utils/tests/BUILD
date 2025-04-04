@@ -110,13 +110,13 @@ redpanda_cc_gtest(
         "//src/v/test_utils:gtest",
         "//src/v/utils:xid",
         "@abseil-cpp//absl/container:node_hash_map",
+        "@boost//:lexical_cast",
         "@googletest//:gtest",
     ],
 )
 
 redpanda_cc_bench(
-    name = "vint_bench",
-    timeout = "short",
+    name = "vint_rpbench",
     srcs = [
         "vint_bench.cc",
     ],
@@ -155,8 +155,8 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/bytes:iobuf_parser",
-        "//src/v/bytes:random",
         "//src/v/random:generators",
+        "//src/v/test_utils:random_bytes",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:base64",
         "@boost//:test",
@@ -259,8 +259,7 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_bench(
-    name = "coro_bench",
-    timeout = "short",
+    name = "coro_rpbench",
     srcs = [
         "coro_bench.cc",
     ],
@@ -273,8 +272,7 @@ redpanda_cc_bench(
 )
 
 redpanda_cc_bench(
-    name = "seastar_histogram_bench",
-    timeout = "short",
+    name = "seastar_histogram_rpbench",
     srcs = [
         "seastar_histogram_bench.cc",
     ],
@@ -389,9 +387,9 @@ redpanda_cc_btest(
         "//src/v/bytes",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iostream",
-        "//src/v/bytes:random",
         "//src/v/random:generators",
         "//src/v/test_utils:iostream",
+        "//src/v/test_utils:random_bytes",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:stream_utils",
         "@boost//:test",
@@ -483,8 +481,7 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_bench(
-    name = "delta_for_bench",
-    timeout = "short",
+    name = "delta_for_rpbench",
     srcs = [
         "delta_for_bench.cc",
     ],
@@ -511,5 +508,52 @@ redpanda_cc_gtest(
         "//src/v/utils:external_process",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "s3_fifo_test",
+    timeout = "short",
+    srcs = ["s3_fifo_test.cc"],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:s3_fifo",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "chunked_kv_cache_test",
+    timeout = "short",
+    srcs = ["chunked_kv_cache_test.cc"],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:chunked_kv_cache",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "arch_test",
+    timeout = "short",
+    srcs = [
+        "arch_test.cc",
+    ],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:arch",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "file_io_test",
+    timeout = "short",
+    srcs = ["file_io_test.cc"],
+    deps = [
+        "//src/v/base",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/utils:file_io",
+        "@googletest//:gtest",
     ],
 )

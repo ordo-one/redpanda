@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/schema_avro.h"
 
 #include "iceberg/datatypes.h"
@@ -78,7 +79,7 @@ struct avro_primitive_type_visitor {
         return ret;
     }
     avro::Schema operator()(const date_type&) {
-        auto ret = avro::LongSchema();
+        auto ret = avro::IntSchema();
         ret.root()->setLogicalType(avro::LogicalType(avro::LogicalType::DATE));
         return ret;
     }

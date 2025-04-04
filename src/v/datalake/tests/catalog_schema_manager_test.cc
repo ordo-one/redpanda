@@ -8,9 +8,10 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 #include "cloud_io/remote.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "datalake/catalog_schema_manager.h"
+#include "iceberg/datatypes.h"
 #include "iceberg/field_collecting_visitor.h"
 #include "iceberg/filesystem_catalog.h"
 #include "iceberg/table_identifier.h"
@@ -23,6 +24,7 @@ using namespace iceberg;
 
 namespace {
 const auto table_ident = table_identifier{.ns = {"redpanda"}, .table = "foo"};
+const auto empty_pspec = iceberg::unresolved_partition_spec{};
 } // namespace
 
 class CatalogSchemaManagerTest
@@ -46,6 +48,7 @@ public:
         while (!to_visit.empty()) {
             auto* f = to_visit.back();
             f->id = nested_field::id_t{0};
+            f->meta = std::nullopt;
             to_visit.pop_back();
             std::visit(reverse_field_collecting_visitor{to_visit}, f->type);
         }
@@ -93,15 +96,14 @@ TEST_F(CatalogSchemaManagerTest, TestCreateTable) {
 
     // Create the table
     auto create_res
-      = schema_mgr.ensure_table_schema(model::topic{"foo"}, type).get();
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
     ASSERT_FALSE(create_res.has_error());
 
     // Fill the field IDs in `type`.
-    auto fill_res
-      = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(fill_res.has_error());
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
 
-    auto table_ident = table_identifier{.ns = {"redpanda"}, .table = "foo"};
     auto schema = load_table_schema(table_ident).get();
     ASSERT_TRUE(schema.has_value());
     EXPECT_EQ(type, schema->schema_struct);
@@ -114,10 +116,12 @@ TEST_F(CatalogSchemaManagerTest, TestFillFromExistingTable) {
 
     // Even if the table already exists, we should be able to fill fields IDs
     // without trouble.
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+
     auto type = std::get<struct_type>(test_nested_schema_type());
     reset_field_ids(type);
-    auto res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
     EXPECT_EQ(type, schema.value().schema_struct);
 }
 
@@ -131,8 +135,9 @@ TEST_F(CatalogSchemaManagerTest, TestFillSubset) {
     reset_field_ids(type);
     type.fields.pop_back();
 
-    auto res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(res.has_error());
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
 
     schema.value().schema_struct.fields.pop_back();
     EXPECT_EQ(type, schema.value().schema_struct);
@@ -148,8 +153,9 @@ TEST_F(CatalogSchemaManagerTest, TestFillNestedSubset) {
     reset_field_ids(type);
     std::get<struct_type>(type.fields.back()->type).fields.pop_back();
 
-    auto res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(res.has_error());
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
 
     std::get<struct_type>(schema.value().schema_struct.fields.back()->type)
       .fields.pop_back();
@@ -179,13 +185,13 @@ TEST_F(CatalogSchemaManagerTest, TestFillSuperset) {
     }
     // Alter the table schema
     auto ensure_res
-      = schema_mgr.ensure_table_schema(model::topic{"foo"}, type).get();
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
     ASSERT_FALSE(ensure_res.has_error());
 
     // Fill the ids in `type`
-    auto fill_res
-      = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(fill_res.has_error());
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
 
     // Check the resulting schema.
     schema s{
@@ -217,13 +223,13 @@ TEST_F(CatalogSchemaManagerTest, TestFillSupersetSubtype) {
     }
     // Alter the table schema
     auto ensure_res
-      = schema_mgr.ensure_table_schema(model::topic{"foo"}, type).get();
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
     ASSERT_FALSE(ensure_res.has_error());
 
     // Fill the ids
-    auto fill_res
-      = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_FALSE(fill_res.has_error());
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
 
     // Check the resulting schema.
     schema s{
@@ -242,21 +248,22 @@ TEST_F(CatalogSchemaManagerTest, TestFillSupersetSubtype) {
 TEST_F(CatalogSchemaManagerTest, TestOptionalMismatch) {
     struct_type type;
     type.fields.emplace_back(
-      nested_field::create(0, "required", field_required::yes, int_type{}));
+      nested_field::create(1, "required", field_required::yes, int_type{}));
     type.fields.emplace_back(
-      nested_field::create(0, "optional", field_required::no, int_type{}));
+      nested_field::create(2, "optional", field_required::no, int_type{}));
     create_table(type);
 
-    // Make the destinations both optional.
+    // Make the destinations both optional. This is fine.
     type.fields[0]->required = field_required::no;
-    auto res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
-    ASSERT_TRUE(res.has_error());
-    EXPECT_EQ(res.error(), schema_manager::errc::not_supported);
+    auto res
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
+    ASSERT_FALSE(res.has_error());
 
-    // Make the destinations both required.
+    // Make the destinations both required. We don't support upgrading optional
+    // fields to required (though it is allowed by the iceberg spec).
     type.fields[0]->required = field_required::yes;
     type.fields[1]->required = field_required::yes;
-    res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
+    res = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
     ASSERT_TRUE(res.has_error());
     EXPECT_EQ(res.error(), schema_manager::errc::not_supported);
 }
@@ -266,9 +273,164 @@ TEST_F(CatalogSchemaManagerTest, TestTypeMismatch) {
 
     auto type = std::get<struct_type>(test_nested_schema_type());
     reset_field_ids(type);
-    std::swap(type.fields.front(), type.fields.back());
+    std::swap(type.fields.front()->type, type.fields.back()->type);
 
-    auto res = schema_mgr.get_registered_ids(model::topic{"foo"}, type).get();
+    auto res
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
     ASSERT_TRUE(res.has_error());
     EXPECT_EQ(res.error(), schema_manager::errc::not_supported);
+}
+
+TEST_F(CatalogSchemaManagerTest, TestReorderFields) {
+    create_nested_table();
+
+    auto type = std::get<struct_type>(test_nested_schema_type());
+    reset_field_ids(type);
+    std::swap(type.fields.front(), type.fields.back());
+
+    auto res
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
+    ASSERT_FALSE(res.has_error());
+}
+
+TEST_F(CatalogSchemaManagerTest, AcceptsValidTypePromotion) {
+    auto original_type = std::get<struct_type>(test_nested_schema_type());
+    original_type.fields.emplace_back(
+      nested_field::create(18, "some_field", field_required::yes, int_type{}));
+    create_table(original_type);
+
+    auto type = original_type.copy();
+    // int->long is a valid primitive type promotion
+    type.fields.back()->type = long_type{};
+    reset_field_ids(type);
+
+    // so schema_mgr should accept the new schema
+    auto ensure_res
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
+    ASSERT_FALSE(ensure_res.has_error()) << ensure_res.error();
+
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    ASSERT_TRUE(load_res.value().fill_registered_ids(type));
+
+    auto loaded_table = load_table_schema(table_ident).get();
+    ASSERT_TRUE(loaded_table.has_value());
+    ASSERT_EQ(loaded_table.value().schema_struct, type);
+}
+
+TEST_F(CatalogSchemaManagerTest, RejectsInvalidTypePromotion) {
+    auto original_type = std::get<struct_type>(test_nested_schema_type());
+    original_type.fields.emplace_back(
+      nested_field::create(18, "some_field", field_required::yes, int_type{}));
+    create_table(original_type);
+
+    auto type = original_type.copy();
+    // int->string is not a valid primitive type promotion
+    type.fields.back()->type = string_type{};
+    reset_field_ids(type);
+
+    // so schema_mgr should reject the new schema
+    auto ensure_res
+      = schema_mgr.ensure_table_schema(table_ident, type, empty_pspec).get();
+    ASSERT_TRUE(ensure_res.has_error());
+    EXPECT_EQ(ensure_res.error(), schema_manager::errc::not_supported)
+      << ensure_res.error();
+
+    auto load_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+
+    ASSERT_FALSE(load_res.value().fill_registered_ids(type));
+
+    // check that the table still holds the original schema
+    load_res = schema_mgr.get_table_info(table_ident).get();
+    reset_field_ids(original_type);
+    ASSERT_TRUE(load_res.value().fill_registered_ids(original_type));
+
+    auto loaded_table = load_table_schema(table_ident).get();
+    ASSERT_TRUE(loaded_table.has_value());
+    ASSERT_EQ(loaded_table.value().schema_struct, original_type);
+}
+
+TEST_F(CatalogSchemaManagerTest, CustomPartitionSpec) {
+    auto schema_type = std::get<struct_type>(test_nested_schema_type());
+
+    auto pspec_fields
+      = chunked_vector<unresolved_partition_spec::field>::single(
+        unresolved_partition_spec::field{
+          .source_name = {"bar"},
+          .transform = identity_transform{},
+          .name = "field1"});
+
+    auto ensure_res = schema_mgr
+                        .ensure_table_schema(
+                          table_ident,
+                          schema_type,
+                          unresolved_partition_spec{
+                            .fields = std::move(pspec_fields)})
+                        .get();
+    ASSERT_FALSE(ensure_res.has_error());
+
+    auto load_res = catalog.load_table(table_ident).get();
+    ASSERT_TRUE(load_res.has_value());
+
+    auto pspec = load_res.value().get_partition_spec(
+      load_res.value().default_spec_id);
+    ASSERT_TRUE(pspec);
+
+    chunked_vector<partition_field> expected_fields{partition_field{
+      .source_id = nested_field::id_t{2},
+      .field_id = partition_field::id_t{1000},
+      .name = "field1",
+      .transform = identity_transform{},
+    }};
+    auto expected = partition_spec{
+      .spec_id = partition_spec::id_t{0},
+      .fields = std::move(expected_fields),
+    };
+    ASSERT_EQ(*pspec, expected);
+}
+
+TEST_F(CatalogSchemaManagerTest, GetTableInfo) {
+    struct_type first{};
+    first.fields.emplace_back(
+      nested_field::create(1, "foo", field_required::no, int_type{}));
+
+    auto second = first.copy();
+    second.fields.emplace_back(
+      nested_field::create(2, "bar", field_required::no, string_type{}));
+
+    // set schema to 'first'
+    auto ensure_res
+      = schema_mgr.ensure_table_schema(table_ident, first, empty_pspec).get();
+    ASSERT_FALSE(ensure_res.has_error());
+
+    // get_table_info returns current schema by default
+    auto info_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(info_res.has_error());
+    ASSERT_EQ(info_res.value().schema.schema_struct, first);
+
+    // we can also retrieve 'first' by equivalence match
+    info_res = schema_mgr.get_table_info(table_ident, first).get();
+    ASSERT_FALSE(info_res.has_error());
+    ASSERT_EQ(info_res.value().schema.schema_struct, first);
+
+    // set schema to 'second'
+    ensure_res
+      = schema_mgr.ensure_table_schema(table_ident, second, empty_pspec).get();
+    ASSERT_FALSE(ensure_res.has_error());
+
+    // 'second' is current, so get_table_info returns this by default
+    info_res = schema_mgr.get_table_info(table_ident).get();
+    ASSERT_FALSE(info_res.has_error());
+    ASSERT_EQ(info_res.value().schema.schema_struct, second);
+
+    // or by equivalence match, as before
+    info_res = schema_mgr.get_table_info(table_ident, second).get();
+    ASSERT_FALSE(info_res.has_error());
+    ASSERT_EQ(info_res.value().schema.schema_struct, second);
+
+    // but now we can retrieve 'first' as well
+    info_res = schema_mgr.get_table_info(table_ident, first).get();
+    ASSERT_FALSE(info_res.has_error());
+    ASSERT_EQ(info_res.value().schema.schema_struct, first);
 }

@@ -17,6 +17,7 @@
 #include "kafka/server/handlers/configs/config_utils.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
@@ -236,6 +237,9 @@ to_cluster_type(const creatable_topic& t) {
       = get_bool_value(config_entries, topic_property_remote_delete)
           .value_or(storage::ntp_config::default_remote_delete);
 
+    cfg.properties.remote_topic_allow_gaps = get_bool_value(
+      config_entries, topic_property_remote_allow_gaps);
+
     cfg.properties.segment_ms = get_tristate_value<std::chrono::milliseconds>(
       config_entries, topic_property_segment_ms);
 
@@ -271,6 +275,20 @@ to_cluster_type(const creatable_topic& t) {
 
     cfg.properties.iceberg_delete = get_bool_value(
       config_entries, topic_property_iceberg_delete);
+
+    cfg.properties.iceberg_partition_spec = get_string_value(
+      config_entries, topic_property_iceberg_partition_spec);
+
+    cfg.properties.iceberg_invalid_record_action
+      = get_enum_value<model::iceberg_invalid_record_action>(
+        config_entries, topic_property_iceberg_invalid_record_action);
+
+    cfg.properties.iceberg_target_lag_ms
+      = get_duration_value<std::chrono::milliseconds>(
+        config_entries, topic_property_iceberg_target_lag_ms);
+
+    cfg.properties.min_cleanable_dirty_ratio = get_tristate_value<double>(
+      config_entries, topic_property_min_cleanable_dirty_ratio);
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
       cfg.properties};

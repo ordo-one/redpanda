@@ -33,7 +33,7 @@ namespace cluster {
  */
 struct topic_properties
   : serde::
-      envelope<topic_properties, serde::version<10>, serde::compat_version<0>> {
+      envelope<topic_properties, serde::version<11>, serde::compat_version<0>> {
     topic_properties() noexcept = default;
     topic_properties(
       std::optional<model::compression> compression,
@@ -76,7 +76,13 @@ struct topic_properties
       std::optional<config::leaders_preference> leaders_preference,
       bool cloud_topic_enabled,
       tristate<std::chrono::milliseconds> delete_retention_ms,
-      std::optional<bool> iceberg_delete)
+      std::optional<bool> iceberg_delete,
+      std::optional<ss::sstring> iceberg_partition_spec,
+      std::optional<model::iceberg_invalid_record_action>
+        iceberg_invalid_record_action,
+      std::optional<std::chrono::milliseconds> iceberg_target_lag_ms,
+      tristate<double> min_cleanable_dirty_ratio,
+      std::optional<bool> remote_topic_allow_gaps)
       : compression(compression)
       , cleanup_policy_bitflags(cleanup_policy_bitflags)
       , compaction_strategy(compaction_strategy)
@@ -90,6 +96,7 @@ struct topic_properties
       , read_replica_bucket(std::move(read_replica_bucket))
       , remote_topic_namespace_override(remote_topic_namespace_override)
       , remote_topic_properties(remote_topic_properties)
+      , remote_topic_allow_gaps(remote_topic_allow_gaps)
       , batch_max_bytes(batch_max_bytes)
       , retention_local_target_bytes(retention_local_target_bytes)
       , retention_local_target_ms(retention_local_target_ms)
@@ -118,7 +125,11 @@ struct topic_properties
       , leaders_preference(std::move(leaders_preference))
       , cloud_topic_enabled(cloud_topic_enabled)
       , delete_retention_ms(delete_retention_ms)
-      , iceberg_delete(iceberg_delete) {}
+      , iceberg_delete(iceberg_delete)
+      , iceberg_partition_spec(std::move(iceberg_partition_spec))
+      , iceberg_invalid_record_action(iceberg_invalid_record_action)
+      , iceberg_target_lag_ms(iceberg_target_lag_ms)
+      , min_cleanable_dirty_ratio(min_cleanable_dirty_ratio) {}
 
     std::optional<model::compression> compression;
     std::optional<model::cleanup_policy_bitflags> cleanup_policy_bitflags;
@@ -139,6 +150,10 @@ struct topic_properties
     // Topic properties for a topic that already has remote data (e.g.
     // recovery topics).
     std::optional<remote_topic_properties> remote_topic_properties;
+
+    // The override that indicates that when tiered-storage is paused the local
+    // retention is allowed to work and potentially create a gap in the data.
+    std::optional<bool> remote_topic_allow_gaps;
 
     std::optional<uint32_t> batch_max_bytes;
     tristate<size_t> retention_local_target_bytes{std::nullopt};
@@ -194,6 +209,16 @@ struct topic_properties
     tristate<std::chrono::milliseconds> delete_retention_ms{disable_tristate};
     // Should we delete the corresponding iceberg table when deleting the topic.
     std::optional<bool> iceberg_delete;
+    // Partition spec expression for the corresponding Iceberg table.
+    // std::nullopt means that the cluster default will be used.
+    std::optional<ss::sstring> iceberg_partition_spec;
+
+    std::optional<model::iceberg_invalid_record_action>
+      iceberg_invalid_record_action;
+
+    std::optional<std::chrono::milliseconds> iceberg_target_lag_ms{};
+
+    tristate<double> min_cleanable_dirty_ratio{std::nullopt};
 
     bool is_compacted() const;
     bool has_overrides() const;
@@ -241,7 +266,12 @@ struct topic_properties
           leaders_preference,
           cloud_topic_enabled,
           delete_retention_ms,
-          iceberg_delete);
+          iceberg_delete,
+          iceberg_partition_spec,
+          iceberg_invalid_record_action,
+          iceberg_target_lag_ms,
+          min_cleanable_dirty_ratio,
+          remote_topic_allow_gaps);
     }
 
     friend bool operator==(const topic_properties&, const topic_properties&)

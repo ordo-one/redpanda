@@ -11,6 +11,7 @@
 #include "iceberg/rest_catalog.h"
 
 #include "iceberg/rest_client/catalog_client.h"
+#include "iceberg/rest_client/error.h"
 #include "iceberg/table_requests.h"
 namespace iceberg {
 
@@ -49,6 +50,10 @@ struct http_error_mapping_visitor {
 
     errc operator()(const http::url_build_error&) const {
         return unexpected_state;
+    }
+
+    errc operator()(const rest_client::aborted_error&) const {
+        return shutting_down;
     }
 };
 // Translates domain error to more general catalog::errc.
@@ -93,7 +98,8 @@ ss::future<checked<table_metadata, catalog::errc>> rest_catalog::create_table(
   const table_identifier& t_id,
   const schema& schema,
   const partition_spec& spec) {
-    auto rtc = create_rtc();
+    auto parent_rtc = create_rtc();
+    auto table_rtc = retry_chain_node(&parent_rtc);
     vlog(log.trace, "create table {} requested", t_id);
     create_table_request request{
       .name = t_id.table,
@@ -101,7 +107,8 @@ ss::future<checked<table_metadata, catalog::errc>> rest_catalog::create_table(
       .partition_spec = spec.copy()};
     auto h = co_await lock_.get_units();
 
-    auto res = co_await client_->create_table(t_id.ns, std::move(request), rtc);
+    auto res = co_await client_->create_table(
+      t_id.ns, std::move(request), table_rtc);
     if (res.has_value()) {
         co_return get_metadata(std::move(res.value()));
     }
@@ -116,8 +123,9 @@ ss::future<checked<table_metadata, catalog::errc>> rest_catalog::create_table(
     create_namespace_request ns_request{
       .ns = t_id.ns.copy(),
     };
+    auto namespace_rtc = retry_chain_node(&parent_rtc);
     auto ns_res = co_await client_->create_namespace(
-      std::move(ns_request), rtc);
+      std::move(ns_request), namespace_rtc);
     if (!ns_res.has_value()) {
         auto ns_errc = map_error("create_namespace", ns_res.error());
         if (ns_errc != catalog::errc::already_exists) {
@@ -130,8 +138,9 @@ ss::future<checked<table_metadata, catalog::errc>> rest_catalog::create_table(
       .name = t_id.table,
       .schema = schema.copy(),
       .partition_spec = spec.copy()};
-    co_return (
-      co_await client_->create_table(t_id.ns, std::move(retry_request), rtc))
+    auto table_retry_rtc = retry_chain_node(&parent_rtc);
+    co_return (co_await client_->create_table(
+                 t_id.ns, std::move(retry_request), table_retry_rtc))
       .transform(get_metadata)
       .transform_error([](const rest_client::domain_error& err) {
           return map_error("create_table_retry", err);
@@ -163,6 +172,13 @@ rest_catalog::commit_txn(const table_identifier& t_id, transaction txn) {
           "catalog. Current transaction error: {}",
           txn.error());
         co_return errc::unexpected_state;
+    }
+    if (txn.updates().updates.empty()) {
+        vlog(
+          log.debug,
+          "Transaction has no updates to table {}, returning early",
+          t_id.table);
+        co_return std::nullopt;
     }
 
     commit_table_request req;

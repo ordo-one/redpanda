@@ -30,6 +30,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/socket_defs.hh>
@@ -173,6 +174,8 @@ public:
 
     /// The instance of \ref kafka::server on the shard serving the connection
     server& server() { return _server; }
+
+    const class server& server() const { return _server; }
     ssx::sharded_abort_source& abort_source() { return _as; }
     bool abort_requested() const { return _as.abort_requested(); }
     const ss::sstring& listener() const { return conn->name(); }
@@ -267,7 +270,7 @@ private:
     };
 
     using sequence_id = named_type<uint64_t, struct kafka_protocol_sequence>;
-    using map_t = absl::flat_hash_map<sequence_id, response_and_resources>;
+    using map_t = chunked_hash_map<sequence_id, response_and_resources>;
 
     /*
      * dispatch_method_once is the first stage processing of a request and
@@ -279,6 +282,10 @@ private:
     bool is_first_request() const {
         return _protocol_state.is_first_request() && _virtual_states.empty();
     }
+
+    // Returns handler specific connection override if available.
+    std::optional<ss::scheduling_group>
+      get_scheduling_group_override(api_key) const;
 
     class ctx_log {
     public:
@@ -312,10 +319,10 @@ private:
 
         template<typename... Args>
         void log(ss::log_level lvl, const char* format, Args&&... args) {
-            if (klog.is_enabled(lvl)) {
+            if (kauthzlog.is_enabled(lvl)) {
                 auto line_fmt = ss::sstring("{}:{} failed authorization - ")
                                 + format;
-                klog.log(
+                kauthzlog.log(
                   lvl,
                   line_fmt.c_str(),
                   _client_addr,
@@ -383,6 +390,7 @@ private:
 
         sequence_id _next_response;
         sequence_id _seq_idx;
+        ssx::semaphore _resp_sem{1, "k/conn_ctx/response"};
         map_t _responses;
     };
 

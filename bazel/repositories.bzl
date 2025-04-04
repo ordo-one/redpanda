@@ -73,9 +73,9 @@ def data_dependency():
     http_archive(
         name = "krb5",
         build_file = "//bazel/thirdparty:krb5.BUILD",
-        sha256 = "ec3861c3bec29aa8da9281953c680edfdab1754d1b1db8761c1d824e4b25496a",
-        strip_prefix = "krb5-krb5-1.20.1-final",
-        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/krb5-krb5-1.20.1-final.tar.gz",
+        sha256 = "2157d92020d408ed63ebcd886a92d1346a1383b0f91123a0473b4f69b4a24861",
+        strip_prefix = "krb5-krb5-1.21.3-final",
+        url = "https://github.com/krb5/krb5/archive/refs/tags/krb5-1.21.3-final.tar.gz",
     )
 
     http_archive(
@@ -110,14 +110,6 @@ def data_dependency():
         url = "https://vectorized-public.s3.amazonaws.com/dependencies/lksctp-tools-1.0.19.tar.gz",
     )
 
-    http_archive(
-        name = "numactl",
-        build_file = "//bazel/thirdparty:numactl.BUILD",
-        sha256 = "1ee27abd07ff6ba140aaf9bc6379b37825e54496e01d6f7343330cf1a4487035",
-        strip_prefix = "numactl-2.0.14",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/numactl-v2.0.14.tar.gz",
-    )
-
     #
     # ** IMPORTANT - OpenSSL and FIPS **
     #
@@ -135,9 +127,9 @@ def data_dependency():
     http_archive(
         name = "openssl",
         build_file = "//bazel/thirdparty:openssl.BUILD",
-        sha256 = "23c666d0edf20f14249b3d8f0368acaee9ab585b09e1de82107c66e1f3ec9533",
-        strip_prefix = "openssl-3.0.15",
-        url = "https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz",
+        sha256 = "57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86",
+        strip_prefix = "openssl-3.0.16",
+        url = "https://github.com/openssl/openssl/releases/download/openssl-3.0.16/openssl-3.0.16.tar.gz",
     )
 
     http_archive(
@@ -167,11 +159,9 @@ def data_dependency():
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
-        sha256 = "8b71096e8c57a5a1a447638fc64b05686ecd7f079861de7a3fe3112fd0e4d6f7",
-        strip_prefix = "seastar-ef24a8bc3f7dca212dfe982911bb726e5d37cef5",
-        url = "https://github.com/redpanda-data/seastar/archive/ef24a8bc3f7dca212dfe982911bb726e5d37cef5.tar.gz",
-        patches = ["//bazel/thirdparty:seastar-fortify-source.patch"],
-        patch_args = ["-p1"],
+        sha256 = "963e40e474abc1db9930c7b6761d372347b427aa65958667a6a5a994cad361e1",
+        strip_prefix = "seastar-5a4eeae48a2c8281f6e68544f335388f562b3dc8",
+        url = "https://github.com/redpanda-data/seastar/archive/5a4eeae48a2c8281f6e68544f335388f562b3dc8.tar.gz",
     )
 
     http_archive(
@@ -196,4 +186,24 @@ def data_dependency():
         sha256 = "716fbe4fc85ecd36488afbbc635b59b5ab6aba5ed3b69d4a32a46eae5a453d38",
         strip_prefix = "xxHash-bbb27a5efb85b92a0486cf361a8635715a53f6ba",
         url = "https://github.com/Cyan4973/xxHash/archive/bbb27a5efb85b92a0486cf361a8635715a53f6ba.tar.gz",
+    )
+
+    sysroot_build_file = """
+filegroup(
+  name = "sysroot",
+  srcs = glob(["*/**"]),
+  visibility = ["//visibility:public"],
+)"""
+    http_archive(
+        name = "x86_64_sysroot",
+        build_file_content = sysroot_build_file,
+        sha256 = "282b7eb89ca45d2309217d5d2099cc087c1e7bd55f7891b9d2ddca648b6663b7",
+        urls = ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-19.1.7/sysroot-ubuntu-22.04-x86_64-2025-02-24.tar.zst"],
+    )
+
+    http_archive(
+        name = "aarch64_sysroot",
+        build_file_content = sysroot_build_file,
+        sha256 = "39e3d368d57a40d36f6735dcfe3ed699c6a5962cd47c5b1f652254f077632688",
+        urls = ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-19.1.7/sysroot-ubuntu-22.04-aarch64-2025-02-27.tar.zst"],
     )

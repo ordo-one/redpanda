@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:native_binary.bzl", "native_binary")
 load("@buildifier_prebuilt//:rules.bzl", "buildifier")
 load("@rules_python//python:defs.bzl", "py_binary")
 
@@ -23,16 +24,14 @@ buildifier(
     mode = "fix",
 )
 
+native_binary(
+    name = "minio",
+    src = "@minio//file",
+)
+
+# Run a dev_cluster, by default the data directory is in the repository root.
 #
-# When running the dev_cluster the default data path is the working directory
-# where the python script is run. Bazel runs the commands in a runfiles
-# directory which makes it inconvenient to interact with the cluster data
-# directory.
-#
-# When running you can pass in `-d` so that the data directory will be your
-# current working directory.
-#
-#     bazel run //tools:dev_cluster -- --nodes 1 -d ${PWD}/data
+#     bazel run //tools:dev_cluster -- --nodes 1
 #
 py_binary(
     name = "dev_cluster",
@@ -41,14 +40,19 @@ py_binary(
     ],
     args = [
         "-e $(rootpath //src/v/redpanda:redpanda)",
+        "-o $(rootpath :minio)",
     ],
     data = [
+        ":minio",
         "//src/v/redpanda",
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "@python_deps//aioboto3",
+        "@python_deps//boto3",
         "@python_deps//psutil",
         "@python_deps//pyyaml",
+        "@python_deps//s3transfer",
     ],
 )
 

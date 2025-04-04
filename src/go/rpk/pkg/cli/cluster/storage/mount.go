@@ -13,12 +13,13 @@ import (
 	"fmt"
 	"strings"
 
-	dataplanev1alpha2 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha2"
+	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -66,10 +67,10 @@ with my-new-topic as the new topic name
 				if an != "" && strings.ToLower(an) != "kafka" {
 					out.Die("Failed to parse '--to' flag: namespace %q not allowed. Only kafka topics can be mounted in Redpanda Cloud clusters", an)
 				}
-				cl, err := createDataplaneClient(p)
-				out.MaybeDieErr(err)
+				cl, err := publicapi.DataplaneClientFromRpkProfile(p)
+				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
 
-				topicMount := &dataplanev1alpha2.MountTopicsRequest_TopicMount{
+				topicMount := &dataplanev1.MountTopicsRequest_TopicMount{
 					SourceTopicReference: t,
 				}
 				if at != "" {
@@ -79,8 +80,8 @@ with my-new-topic as the new topic name
 				resp, err := cl.CloudStorage.MountTopics(
 					cmd.Context(),
 					connect.NewRequest(
-						&dataplanev1alpha2.MountTopicsRequest{
-							Topics: []*dataplanev1alpha2.MountTopicsRequest_TopicMount{topicMount},
+						&dataplanev1.MountTopicsRequest{
+							Topics: []*dataplanev1.MountTopicsRequest_TopicMount{topicMount},
 						}),
 				)
 				out.MaybeDie(err, "unable to mount topic: %v", err)

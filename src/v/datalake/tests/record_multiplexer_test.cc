@@ -11,15 +11,19 @@
 #include "datalake/record_multiplexer.h"
 #include "datalake/record_schema_resolver.h"
 #include "datalake/record_translator.h"
-#include "datalake/table_creator.h"
 #include "datalake/table_definition.h"
+#include "datalake/table_id_provider.h"
 #include "datalake/tests/catalog_and_registry_fixture.h"
 #include "datalake/tests/record_generator.h"
 #include "datalake/tests/test_data_writer.h"
+#include "datalake/tests/test_utils.h"
+#include "datalake/translation/translation_probe.h"
 #include "iceberg/filesystem_catalog.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
+#include "model/tests/random_batch.h"
 #include "model/timeout_clock.h"
+#include "random/generators.h"
 #include "storage/record_batch_builder.h"
 
 #include <seastar/core/circular_buffer.hh>
@@ -101,6 +105,21 @@ public:
       , type_resolver(registry)
       , t_creator(type_resolver, schema_mgr) {}
 
+    record_multiplexer make_mux() {
+        return record_multiplexer(
+          ntp,
+          topic_rev,
+          std::make_unique<test_data_writer_factory>(false),
+          schema_mgr,
+          type_resolver,
+          translator,
+          t_creator,
+          model::iceberg_invalid_record_action::dlq_table,
+          location_provider(
+            scoped_remote->remote.local().provider(), bucket_name),
+          *get_or_create_probe(ntp));
+    }
+
     // Runs the multiplexer on records generated with cb() based on the test
     // parameters.
     std::optional<record_multiplexer::write_result> mux(
@@ -129,17 +148,32 @@ public:
                 batches.emplace_back(std::move(batch_builder).build());
             }
         }
-        auto reader = model::make_memory_record_batch_reader(
-          std::move(batches));
-        record_multiplexer mux(
-          ntp,
-          topic_rev,
-          std::make_unique<test_data_writer_factory>(false),
-          schema_mgr,
-          type_resolver,
-          translator,
-          t_creator);
-        auto res = reader.consume(std::move(mux), model::no_timeout).get();
+        record_multiplexer mux = make_mux();
+        // randomly split batches into multiple readers
+        size_t total_batches = batches.size();
+        size_t total_split_batches = 0;
+        while (!batches.empty()) {
+            auto subset_size = random_generators::get_int<size_t>(
+              1, batches.size());
+            ss::circular_buffer<model::record_batch> subset;
+            while (subset.size() != subset_size) {
+                subset.push_back(batches.front().share());
+                batches.pop_front();
+            }
+            total_split_batches += subset.size();
+            auto reader = model::make_memory_record_batch_reader(
+              std::move(subset));
+            mux
+              .multiplex(
+                std::move(reader),
+                kafka::offset{start_offset},
+                model::no_timeout,
+                as)
+              .get();
+            mux.flush_writers().get();
+        }
+        EXPECT_EQ(total_batches, total_split_batches);
+        auto res = std::move(mux).finish().get();
         if (expect_error) {
             EXPECT_TRUE(res.has_error());
         } else {
@@ -173,9 +207,32 @@ public:
         return std::move(*it);
     }
 
+    void assert_dlq_table(const model::topic& t, bool exists) {
+        auto dlq_table_id = datalake::table_id_provider::dlq_table_id(t);
+        auto load_res = catalog.load_table(dlq_table_id).get();
+        if (exists) {
+            EXPECT_FALSE(load_res.has_error())
+              << "Expected DLQ table to exit but got an error: "
+              << load_res.error();
+        } else {
+            EXPECT_TRUE(load_res.has_error());
+        }
+    }
+
+    ss::lw_shared_ptr<translation_probe>
+    get_or_create_probe(const model::ntp& ntp) {
+        auto [it, inserted] = probes.try_emplace(ntp, nullptr);
+        if (inserted) {
+            it->second = ss::make_lw_shared<translation_probe>(ntp);
+        }
+        return it->second;
+    }
+
     catalog_schema_manager schema_mgr;
     record_schema_resolver type_resolver;
     direct_table_creator t_creator;
+    std::map<model::ntp, ss::lw_shared_ptr<translation_probe>> probes;
+    ss::abort_source as;
 
     static constexpr records_param default_param = {
       .records_per_batch = 1,
@@ -198,13 +255,14 @@ public:
 
 TEST_P(RecordMultiplexerParamTest, TestNoSchema) {
     auto start_offset = model::offset{0};
-    auto res = mux(
-      start_offset,
-      [](storage::record_batch_builder& b) {
-          b.add_raw_kv(std::nullopt, iobuf::from("foobar"));
-      },
-      true);
-    ASSERT_FALSE(res.has_value());
+    auto res = mux(start_offset, [](storage::record_batch_builder& b) {
+        b.add_raw_kv(std::nullopt, iobuf::from("foobar"));
+    });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().data_files.size(), 0);
+
+    assert_dlq_table(ntp.tp.topic, true);
+    EXPECT_EQ(res.value().dlq_files.size(), GetParam().hrs);
 }
 
 TEST_P(RecordMultiplexerParamTest, TestSimpleAvroRecords) {
@@ -225,14 +283,17 @@ TEST_P(RecordMultiplexerParamTest, TestSimpleAvroRecords) {
 
     std::unordered_set<int> hrs;
     for (auto& f : write_res.data_files) {
-        hrs.emplace(f.hour);
-        EXPECT_EQ(f.row_count, GetParam().records_per_hr());
+        hrs.emplace(get_hour(f.partition_key));
+        EXPECT_EQ(f.local_file.row_count, GetParam().records_per_hr());
     }
     EXPECT_EQ(hrs.size(), GetParam().hrs);
 
     // 4 default columns + RootRecord + mylong
     auto schema = get_current_schema();
     EXPECT_EQ(schema->highest_field_id(), 10);
+
+    // No DLQ table when all records are valid.
+    assert_dlq_table(ntp.tp.topic, false);
 }
 
 TEST_P(RecordMultiplexerParamTest, TestAvroRecordsMultipleSchemas) {
@@ -261,10 +322,10 @@ TEST_P(RecordMultiplexerParamTest, TestAvroRecordsMultipleSchemas) {
 
     std::unordered_set<int> hrs;
     for (auto& f : write_res.data_files) {
-        hrs.emplace(f.hour);
+        hrs.emplace(get_hour(f.partition_key));
         // Each file should have half the records as normal, since we have
         // twice the files.
-        EXPECT_EQ(f.row_count, GetParam().records_per_hr() / 2);
+        EXPECT_EQ(f.local_file.row_count, GetParam().records_per_hr() / 2);
     }
     EXPECT_EQ(hrs.size(), GetParam().hrs);
     auto schema = get_current_schema();
@@ -315,8 +376,8 @@ TEST_F(RecordMultiplexerTest, TestAvroRecordsWithRedpandaField) {
 
     std::unordered_set<int> hrs;
     for (auto& f : write_res.data_files) {
-        hrs.emplace(f.hour);
-        EXPECT_EQ(f.row_count, default_param.records_per_hr());
+        hrs.emplace(get_hour(f.partition_key));
+        EXPECT_EQ(f.local_file.row_count, default_param.records_per_hr());
     }
     EXPECT_EQ(hrs.size(), default_param.hrs);
 
@@ -335,17 +396,24 @@ TEST_F(RecordMultiplexerTest, TestAvroRecordsWithRedpandaField) {
 TEST_F(RecordMultiplexerTest, TestMissingSchema) {
     auto start_offset = model::offset{0};
     auto res = mux(
-      default_param,
-      start_offset,
-      [](storage::record_batch_builder& b) {
+      default_param, start_offset, [](storage::record_batch_builder& b) {
           iobuf buf;
           // Append data with a magic 0 byte that doesn't actually correspond to
           // anything.
           buf.append("\0\0\0\0\0\0\0", 7);
           b.add_raw_kv(std::nullopt, std::move(buf));
-      },
-      true);
-    ASSERT_FALSE(res.has_value());
+      });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().data_files.size(), 0);
+
+    assert_dlq_table(ntp.tp.topic, true);
+    EXPECT_EQ(res.value().dlq_files.size(), default_param.hrs);
+
+    EXPECT_EQ(
+      get_or_create_probe(ntp)->counter_ref(
+        translation_probe::invalid_record_cause::
+          failed_kafka_schema_resolution),
+      default_param.num_records());
 }
 
 TEST_F(RecordMultiplexerTest, TestBadData) {
@@ -353,20 +421,32 @@ TEST_F(RecordMultiplexerTest, TestBadData) {
     auto reg_res
       = gen.register_avro_schema("avro_v1", avro_schema_v1_str).get();
     EXPECT_FALSE(reg_res.has_error()) << reg_res.error();
+    auto schema_id = reg_res.value();
 
     auto start_offset = model::offset{0};
     auto res = mux(
       default_param,
       start_offset,
-      [](storage::record_batch_builder& b) {
+      [schema_id](storage::record_batch_builder& b) {
           iobuf buf;
           // Append data with a magic bytes that corresponds to the actual
           // schema.
-          buf.append("\0\0\0\0\0\1\0", 7);
+          buf.append("\0", 1);
+          int32_t encoded_id = ss::cpu_to_be(schema_id());
+          buf.append((const uint8_t*)(&encoded_id), 4);
+          buf.append("\1\1", 2);
           b.add_raw_kv(std::nullopt, std::move(buf));
-      },
-      true);
-    ASSERT_FALSE(res.has_value());
+      });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().data_files.size(), 0);
+
+    assert_dlq_table(ntp.tp.topic, true);
+    EXPECT_EQ(res.value().dlq_files.size(), default_param.hrs);
+
+    EXPECT_EQ(
+      get_or_create_probe(ntp)->counter_ref(
+        translation_probe::invalid_record_cause::failed_data_translation),
+      default_param.num_records());
 }
 
 TEST_F(RecordMultiplexerTest, TestBadSchemaChange) {
@@ -374,8 +454,7 @@ TEST_F(RecordMultiplexerTest, TestBadSchemaChange) {
         "type": "record",
         "name": "RootRecord",
         "fields": [
-            { "name": "wrongname", "doc": "mylong field doc.", "type": "long" },
-            { "name": "wrongname2", "doc": "mylong field doc.", "type": "long" }
+            { "name": "mylong", "doc": "bad type promotion.", "type": "string" }
         ]
     })";
     tests::record_generator gen(&registry);
@@ -403,18 +482,52 @@ TEST_F(RecordMultiplexerTest, TestBadSchemaChange) {
 
     // Now try writing with an incompatible schema.
     res = mux(
-      default_param,
-      start_offset,
-      [&gen](storage::record_batch_builder& b) {
+      default_param, start_offset, [&gen](storage::record_batch_builder& b) {
           auto res
             = gen.add_random_avro_record(b, "incompat", std::nullopt).get();
           ASSERT_FALSE(res.has_error());
-      },
-      true);
+      });
 
-    // This should successfully write the binary records but not update the
-    // schema.
-    ASSERT_FALSE(res.has_value());
+    // No new files should have been written to the main table.
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value().data_files.size(), 0);
+
+    // The DLQ table should have the invalid records.
+    assert_dlq_table(ntp.tp.topic, true);
+    EXPECT_EQ(res.value().dlq_files.size(), default_param.hrs);
+
+    // The schema for the main table should not have changed.
     schema = get_current_schema();
     EXPECT_EQ(schema->highest_field_id(), 10);
+
+    // Metrics updated.
+    EXPECT_EQ(
+      get_or_create_probe(ntp)->counter_ref(
+        translation_probe::invalid_record_cause::
+          failed_iceberg_schema_resolution),
+      default_param.num_records());
+}
+
+TEST_F(RecordMultiplexerTest, TestMultiplexingFromMiddleOfBatch) {
+    // Ensures that we can multiplex from the middle of a batch and respects
+    // input start offset
+    auto mux = make_mux();
+    auto batches = model::test::make_random_batches(
+                     {
+                       .offset = model::offset{0},
+                       .count = 1,
+                       .records = 100,
+                     })
+                     .get();
+    auto start_offset = model::offset(random_generators::get_int(0, 100));
+    auto last_offset = batches.back().last_offset();
+    auto reader = model::make_memory_record_batch_reader(std::move(batches));
+    mux
+      .multiplex(
+        std::move(reader), kafka::offset{start_offset}, model::no_timeout, as)
+      .get();
+    auto result = std::move(mux).finish().get();
+    EXPECT_FALSE(result.has_error()) << result.error();
+    EXPECT_EQ(result.value().start_offset(), start_offset);
+    EXPECT_EQ(result.value().last_offset(), last_offset);
 }

@@ -31,12 +31,14 @@ rp_test(
   BINARY_NAME coordinator_iceberg
   SOURCES
     iceberg_file_committer_test.cc
+    iceberg_snapshot_remover_test.cc
   LIBRARIES
     Boost::iostreams
     v::cloud_io
     v::cloud_io_utils
     v::datalake_coordinator
     v::datalake_coordinator_test_utils
+    v::datalake_test_utils
     v::gtest_main
     v::iceberg
     v::raft_fixture

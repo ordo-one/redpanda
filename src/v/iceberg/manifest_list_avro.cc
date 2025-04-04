@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/manifest_list_avro.h"
 
 #include "base/units.h"
@@ -96,10 +97,9 @@ avrogen::manifest_file file_to_avro(const manifest_file& f) {
     ret.min_sequence_number = f.min_seq_number();
     ret.added_snapshot_id = f.added_snapshot_id();
 
-    ret.added_data_files_count = static_cast<int32_t>(f.added_files_count);
-    ret.existing_data_files_count = static_cast<int32_t>(
-      f.existing_files_count);
-    ret.deleted_data_files_count = static_cast<int32_t>(f.deleted_files_count);
+    ret.added_files_count = static_cast<int32_t>(f.added_files_count);
+    ret.existing_files_count = static_cast<int32_t>(f.existing_files_count);
+    ret.deleted_files_count = static_cast<int32_t>(f.deleted_files_count);
 
     ret.added_rows_count = static_cast<int32_t>(f.added_rows_count);
     ret.existing_rows_count = static_cast<int32_t>(f.existing_rows_count);
@@ -128,9 +128,9 @@ manifest_file file_from_avro(const avrogen::manifest_file& f) {
     ret.min_seq_number = sequence_number{f.min_sequence_number};
     ret.added_snapshot_id = snapshot_id{f.added_snapshot_id};
 
-    ret.added_files_count = f.added_data_files_count;
-    ret.existing_files_count = f.existing_data_files_count;
-    ret.deleted_files_count = f.deleted_data_files_count;
+    ret.added_files_count = f.added_files_count;
+    ret.existing_files_count = f.existing_files_count;
+    ret.deleted_files_count = f.deleted_files_count;
 
     ret.added_rows_count = f.added_rows_count;
     ret.existing_rows_count = f.existing_rows_count;
@@ -161,7 +161,6 @@ iobuf serialize_avro(const manifest_list& m) {
         for (const auto& f : m.files) {
             writer.write(file_to_avro(f));
         }
-        writer.flush();
         writer.close();
 
         // NOTE: ~DataFileWriter does a final sync which may write to the

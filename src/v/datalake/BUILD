@@ -10,9 +10,10 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        ":table_definition",
         "//src/v/base",
+        "//src/v/iceberg:compatibility",
         "//src/v/iceberg:field_collecting_visitor",
+        "//src/v/iceberg:partition",
         "//src/v/iceberg:schema",
         "//src/v/iceberg:transaction",
     ],
@@ -112,17 +113,18 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        ":table_definition",
         "//src/v/base",
         "//src/v/iceberg:struct_accessor",
     ],
     include_prefix = "datalake",
     visibility = [":__subpackages__"],
     deps = [
+        ":partition_key_path",
         ":writer",
         "//src/v/container:chunked_hash_map",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:partition_key",
+        "//src/v/iceberg:schema",
         "//src/v/iceberg:values",
     ],
 )
@@ -174,8 +176,10 @@ redpanda_cc_library(
     include_prefix = "datalake",
     visibility = ["//visibility:public"],
     deps = [
+        ":backlog_controller",
         ":catalog_schema_manager",
         ":cloud_data_io",
+        ":location",
         ":logger",
         ":record_translator",
         ":types",
@@ -187,6 +191,8 @@ redpanda_cc_library(
         "//src/v/datalake/coordinator:catalog_factory",
         "//src/v/datalake/coordinator:frontend",
         "//src/v/datalake/translation:partition_translator",
+        "//src/v/datalake/translation:scheduler",
+        "//src/v/datalake/translation:translation_probe",
         "//src/v/features",
         "//src/v/model",
         "//src/v/pandaproxy",
@@ -194,8 +200,35 @@ redpanda_cc_library(
         "//src/v/schema:registry",
         "//src/v/serde",
         "//src/v/ssx:semaphore",
+        "//src/v/ssx:work_queue",
+        "//src/v/utils:directory_walker",
+        "//src/v/utils:human",
         "@fmt",
         "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "partition_spec_parser",
+    srcs = [
+        "partition_spec_parser.cc",
+    ],
+    hdrs = [
+        "partition_spec_parser.h",
+    ],
+    implementation_deps = [
+        "//src/v/container:fragmented_vector",
+        "//src/v/iceberg:transform",
+        "//src/v/utils:fixed_string",
+        "//src/v/utils:variant",
+        "@fmt",
+        "@seastar",
+    ],
+    include_prefix = "datalake",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/iceberg:unresolved_partition_spec",
     ],
 )
 
@@ -211,12 +244,15 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cloud_data_io",
+        ":location",
         ":logger",
         ":record_multiplexer",
         ":types",
         ":writer",
         "//src/v/base",
         "//src/v/datalake/coordinator:translated_offset_range",
+        "//src/v/datalake/translation:translation_probe",
+        "//src/v/iceberg:values_bytes",
         "//src/v/model",
         "//src/v/utils:lazy_abort_source",
         "//src/v/utils:retry_chain_node",
@@ -233,13 +269,9 @@ redpanda_cc_library(
     hdrs = [
         "table_definition.h",
     ],
-    implementation_deps = [
-        "//src/v/iceberg:transform",
-    ],
     include_prefix = "datalake",
     visibility = [":__subpackages__"],
     deps = [
-        "//src/v/iceberg:partition",
         "//src/v/iceberg:schema",
     ],
 )
@@ -262,6 +294,7 @@ redpanda_cc_library(
         "//src/v/iceberg:values",
         "//src/v/serde/protobuf",
         "//src/v/ssx:future_util",
+        "@abseil-cpp//absl/time",
         "@fmt",
         "@protobuf",
         "@seastar",
@@ -293,7 +326,7 @@ redpanda_cc_library(
         "cloud_data_io.h",
     ],
     include_prefix = "datalake",
-    visibility = [":__subpackages__"],
+    visibility = ["//visibility:public"],
     deps = [
         ":base_types",
         ":logger",
@@ -343,18 +376,22 @@ redpanda_cc_library(
         ":record_schema_resolver",
         ":record_translator",
         ":table_creator",
+        ":table_id_provider",
         "//src/v/base",
         "//src/v/storage:parser_utils",
+        "//src/v/utils:lazy_abort_source",
         "//src/v/utils:prefix_logger",
     ],
     include_prefix = "datalake",
     visibility = [":__subpackages__"],
     deps = [
+        ":location",
         ":partitioning_writer",
         ":schema_identifier",
         ":types",
         ":writer",
         "//src/v/container:chunked_hash_map",
+        "//src/v/datalake/translation:translation_probe",
         "//src/v/model",
         "@seastar",
     ],
@@ -374,6 +411,7 @@ redpanda_cc_library(
         ":schema_avro",
         ":schema_protobuf",
         ":schema_registry",
+        "//src/v/metrics",
         "//src/v/pandaproxy",
         "//src/v/schema:registry",
         "@avro",
@@ -384,7 +422,9 @@ redpanda_cc_library(
     deps = [
         ":schema_identifier",
         "//src/v/base",
+        "//src/v/config",
         "//src/v/iceberg:datatypes",
+        "//src/v/utils:chunked_kv_cache",
         "@seastar",
     ],
 )
@@ -405,7 +445,9 @@ redpanda_cc_library(
         ":values_avro",
         ":values_protobuf",
         "//src/v/iceberg:avro_utils",
+        "//src/v/iceberg:compatibility_utils",
         "//src/v/iceberg:values",
+        "@abseil-cpp//absl/container:flat_hash_set",
         "@avro",
         "@protobuf",
         "@seastar",
@@ -520,16 +562,19 @@ redpanda_cc_library(
     hdrs = [
         "serde_parquet_writer.h",
     ],
-    include_prefix = "datalake",
-    visibility = [":__subpackages__"],
-    deps = [
+    implementation_deps = [
         ":logger",
         ":schema_parquet",
         ":values_parquet",
+        "//src/v/iceberg:values",
+        "//src/v/version",
+    ],
+    include_prefix = "datalake",
+    visibility = [":__subpackages__"],
+    deps = [
         ":writer",
         "//src/v/base",
         "//src/v/iceberg:datatypes",
-        "//src/v/iceberg:values",
         "//src/v/serde/parquet:writer",
         "@seastar",
     ],
@@ -543,13 +588,81 @@ redpanda_cc_library(
     hdrs = [
         "table_creator.h",
     ],
-    implementation_deps = [
-        ":record_translator",
+    include_prefix = "datalake",
+    visibility = [":__subpackages__"],
+    deps = [
+        ":schema_identifier",
+    ],
+)
+
+redpanda_cc_library(
+    name = "table_id_provider",
+    hdrs = [
+        "table_id_provider.h",
+    ],
+    include_prefix = "datalake",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/iceberg:table_identifier",
+        "//src/v/model",
+    ],
+)
+
+redpanda_cc_library(
+    name = "location",
+    hdrs = [
+        "location.h",
     ],
     include_prefix = "datalake",
     visibility = [":__subpackages__"],
     deps = [
-        ":catalog_schema_manager",
-        ":record_schema_resolver",
+        ":base_types",
+        "//src/v/iceberg:uri",
+        "//src/v/model",
+    ],
+)
+
+redpanda_cc_library(
+    name = "backlog_controller",
+    srcs = [
+        "backlog_controller.cc",
+    ],
+    hdrs = [
+        "backlog_controller.h",
+    ],
+    include_prefix = "datalake",
+    visibility = [":__subpackages__"],
+    deps = [
+        ":logger",
+        "//src/v/base",
+        "//src/v/config",
+        "//src/v/metrics",
+        "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "partition_key_path",
+    srcs = [
+        "partition_key_path.cc",
+    ],
+    hdrs = [
+        "partition_key_path.h",
+    ],
+    include_prefix = "datalake",
+    visibility = [":__subpackages__"],
+    deps = [
+        ":base_types",
+        ":logger",
+        "//src/v/base",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/http:utils",
+        "//src/v/iceberg:partition_key",
+        "//src/v/ssx:sformat",
+        "//src/v/utils:base64",
+        "@abseil-cpp//absl/strings",
+        "@fmt",
+        "@seastar",
     ],
 )

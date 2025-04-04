@@ -8,31 +8,35 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
+#include "base/vassert-register.h"
+#include "base/vassert.h"
 #include "cloud_storage/cache_service.h"
 #include "cluster/cloud_storage_size_reducer.h"
 #include "cluster/controller.h"
 #include "cluster/controller_stm.h"
-#include "cluster/members_manager.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/shard_table.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
-#include "config/configuration.h"
 #include "config/node_config.h"
 #include "container/lw_shared_container.h"
+#include "finjector/stress_fiber.h"
 #include "json/validator.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "redpanda/admin/api-doc/debug.json.hh"
 #include "redpanda/admin/server.h"
 #include "redpanda/admin/util.h"
 #include "resource_mgmt/cpu_profiler.h"
 #include "serde/rw/rw.h"
 #include "storage/kvstore.h"
+#include "utils/arch.h"
+#include "version/version.h"
 
 #include <seastar/core/shard_id.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/http/exception.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/json/json_elements.hh>
 
@@ -128,7 +132,7 @@ void admin_server::register_debug_routes() {
     register_route<user>(
       ss::httpd::debug_json::stress_fiber_start,
       [this](std::unique_ptr<ss::http::request> req) {
-          vlog(adminlog.info, "Requested stress fiber");
+          vlog(adminlog.info, "Requested stress fiber: {}", req->format_url());
           stress_config cfg;
           const auto parse_int =
             [&](const ss::sstring& param, std::optional<int>& val) {
@@ -149,6 +153,7 @@ void admin_server::register_debug_routes() {
           parse_int(
             "max_spins_per_scheduling_point",
             cfg.max_spins_per_scheduling_point);
+          parse_int("stack_depth", cfg.stack_depth);
           parse_int(
             "min_ms_per_scheduling_point", cfg.min_ms_per_scheduling_point);
           parse_int(
@@ -204,10 +209,13 @@ void admin_server::register_debug_routes() {
               }
           }
           return _stress_fiber_manager
-            .invoke_on_all([cfg](auto& stress_mgr) {
+            .invoke_on_all([cfg](stress_fiber_manager& stress_mgr) {
                 auto ran = stress_mgr.start(cfg);
                 if (ran) {
-                    vlog(adminlog.info, "Started stress fiber...");
+                    vlog(
+                      adminlog.info,
+                      "Started stress fiber with config: {}",
+                      cfg);
                 } else {
                     vlog(adminlog.info, "Stress fiber already running...");
                 }
@@ -418,6 +426,13 @@ void admin_server::register_debug_routes() {
           return get_partition_state_handler(std::move(req));
       });
 
+    register_route<user>(
+      seastar::httpd::debug_json::get_partition_producers,
+      [this](std::unique_ptr<ss::http::request> req)
+        -> ss::future<ss::json::json_return_type> {
+          return get_producers_state_handler(std::move(req));
+      });
+
     register_route<superuser>(
       ss::httpd::debug_json::cpu_profile,
       [this](std::unique_ptr<ss::http::request> req)
@@ -491,6 +506,16 @@ void admin_server::register_debug_routes() {
         -> ss::future<ss::json::json_return_type> {
           return get_node_uuid_handler();
       });
+
+    if constexpr (admin_server::is_store_message_enabled()) {
+        register_route_raw_async<superuser>(
+          ss::httpd::debug_json::put_ctracker_va,
+          [this](
+            std::unique_ptr<ss::http::request> req,
+            std::unique_ptr<ss::http::reply> res) {
+              return put_ctracker_va(std::move(req), std::move(res));
+          });
+    }
 }
 
 using admin::apply_validator;
@@ -505,38 +530,47 @@ void check_shard_id(seastar::shard_id id) {
 
 ss::future<ss::json::json_return_type>
 admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
-    vlog(adminlog.info, "Request to sampled cpu profile");
+    using namespace ss::httpd::debug_json;
+
+    auto shard_param = req->get_query_param("shard");
+    auto wait_param = req->get_query_param("wait_ms");
+
+    vlog(
+      adminlog.info,
+      "Request to sample cpu profile, shard: {}, wait_ms: {}",
+      shard_param,
+      wait_param);
+
+    cpu_profile_result result;
+    // update this when you make an incompatible change to the result schema
+    result.schema = 2;
+    result.sample_period_ms = _cpu_profiler.local().sample_period() / 1ms;
 
     std::optional<size_t> shard_id;
-    if (auto e = req->get_query_param("shard"); !e.empty()) {
+    if (!shard_param.empty()) {
         try {
-            shard_id = boost::lexical_cast<size_t>(e);
+            shard_id = boost::lexical_cast<size_t>(shard_param);
         } catch (const boost::bad_lexical_cast&) {
-            throw ss::httpd::bad_param_exception(
-              fmt::format("Invalid parameter 'shard_id' value {{{}}}", e));
+            throw ss::httpd::bad_param_exception(fmt::format(
+              "Invalid parameter 'shard_id' value {{{}}}", shard_param));
         }
-    }
-
-    if (shard_id.has_value()) {
         check_shard_id(*shard_id);
     }
 
     std::optional<std::chrono::milliseconds> wait_ms;
-    if (auto e = req->get_query_param("wait_ms"); !e.empty()) {
+    if (!wait_param.empty()) {
         try {
             wait_ms = std::chrono::milliseconds(
-              boost::lexical_cast<uint64_t>(e));
+              boost::lexical_cast<uint64_t>(wait_param));
         } catch (const boost::bad_lexical_cast&) {
-            throw ss::httpd::bad_param_exception(
-              fmt::format("Invalid parameter 'wait_ms' value {{{}}}", e));
+            throw ss::httpd::bad_param_exception(fmt::format(
+              "Invalid parameter 'wait_ms' value {{{}}}", wait_param));
         }
-    }
-
-    if (wait_ms.has_value()) {
         if (*wait_ms < 1ms || *wait_ms > 15min) {
             throw ss::httpd::bad_param_exception(
               "wait_ms must be between 1ms and 15min");
         }
+        result.wait_ms = *wait_ms / 1ms;
     }
 
     std::vector<resources::cpu_profiler::shard_samples> profiles;
@@ -547,23 +581,42 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
           *wait_ms, shard_id);
     }
 
-    co_return co_await ss::make_ready_future<ss::json::json_return_type>(
-      ss::json::stream_range_as_array(
-        lw_shared_container(std::move(profiles)),
-        [](const resources::cpu_profiler::shard_samples& profile) {
-            ss::httpd::debug_json::cpu_profile_shard_samples ret;
-            ret.shard_id = profile.shard;
-            ret.dropped_samples = profile.dropped_samples;
+    result.arch = ss::sstring{util::cpu_arch::current().name};
+    // this version will help us identify the right symbols, it is like so:
+    // In released builds:
+    // v24.2.11 - 29b8a8e2329043d587e6de2cbf8e73cc32d9d69e
+    // Local bazel builds:
+    // 0.0.0-dev - 0000000000000000000000000000000000000000
+    // Local cmake builds with ENABLE_GIT_HASH=OFF and ENABLE_GIT_VERSION=OFF:
+    // no_version - 000-dev
+    result.version = ss::sstring{redpanda_version()};
 
-            for (auto& sample : profile.samples) {
-                ss::httpd::debug_json::cpu_profile_sample s;
-                s.occurrences = sample.occurrences;
-                s.user_backtrace = sample.user_backtrace;
+    auto& profile_vec = result.profile._elements;
+    profile_vec.reserve(profiles.size());
 
-                ret.samples.push(s);
-            }
-            return ret;
-        }));
+    for (auto& shard_profile : profiles) {
+        ss::httpd::debug_json::cpu_profile_shard_samples shard_samples;
+        shard_samples.shard_id = shard_profile.shard;
+        shard_samples.dropped_samples = shard_profile.dropped_samples;
+
+        // build up the samples list
+        std::vector<cpu_profile_sample> samples;
+        samples.reserve(shard_profile.samples.size());
+        for (auto& sample : shard_profile.samples) {
+            ss::httpd::debug_json::cpu_profile_sample json_sample;
+            json_sample.user_backtrace = sample.user_backtrace;
+            json_sample.scheduling_group = sample.sg;
+            json_sample.occurrences = sample.occurrences;
+            samples.emplace_back(std::move(json_sample));
+        }
+
+        shard_samples.samples._set = true;
+        shard_samples.samples._elements = std::move(samples);
+
+        result.profile.push(shard_samples);
+    }
+
+    co_return co_await ssx::now(stream_object(result));
 }
 
 ss::future<ss::json::json_return_type>
@@ -810,6 +863,92 @@ admin_server::get_partition_state_handler(
     co_return ss::json::json_return_type(std::move(response));
 }
 
+ss::future<ss::json::json_return_type>
+admin_server::get_producers_state_handler(
+  std::unique_ptr<ss::http::request> req) {
+    if (!_tx_gateway_frontend.local_is_initialized()) {
+        throw ss::httpd::server_error_exception(
+          "Server is not yet ready to process requests, retry later.");
+    }
+    const model::ntp ntp = parse_ntp_from_request(req->param);
+    auto timeout = std::chrono::duration_cast<model::timeout_clock::duration>(
+      10s);
+    size_t limit = 1000;
+    if (auto e = req->get_query_param("limit"); !e.empty()) {
+        try {
+            limit = boost::lexical_cast<size_t>(e);
+        } catch (const boost::bad_lexical_cast&) {
+            // ignore
+        }
+    }
+    auto result = co_await _tx_gateway_frontend.local().get_producers(
+      cluster::get_producers_request{ntp, timeout, limit});
+    if (result.error_code != cluster::tx::errc::none) {
+        throw ss::httpd::server_error_exception(fmt::format(
+          "Error {} getting producers for ntp: {}", result.error_code, ntp));
+    }
+    vlog(
+      adminlog.debug,
+      "producers for {}, size: {}",
+      ntp,
+      result.producers.size());
+    ss::httpd::debug_json::partition_producers producers;
+    producers.ntp = fmt::format("{}", ntp);
+    producers.total_producer_count = result.producer_count;
+    for (auto& producer : result.producers) {
+        ss::httpd::debug_json::partition_producer_state producer_state;
+        producer_state.id = producer.pid.id();
+        producer_state.epoch = producer.pid.epoch();
+        for (const auto& req : producer.inflight_requests) {
+            ss::httpd::debug_json::idempotent_producer_request_state inflight;
+            inflight.first_sequence = req.first_sequence;
+            inflight.last_sequence = req.last_sequence;
+            inflight.term = req.term();
+            producer_state.inflight_idempotent_requests.push(
+              std::move(inflight));
+        }
+        for (const auto& req : producer.finished_requests) {
+            ss::httpd::debug_json::idempotent_producer_request_state finished;
+            finished.first_sequence = req.first_sequence;
+            finished.last_sequence = req.last_sequence;
+            finished.term = req.term();
+            producer_state.finished_idempotent_requests.push(
+              std::move(finished));
+        }
+        if (producer.last_update) {
+            producer_state.last_update_timestamp
+              = producer.last_update.value()();
+        }
+        if (producer.tx_begin_offset) {
+            producer_state.transaction_begin_offset
+              = producer.tx_begin_offset.value();
+        }
+        if (producer.tx_end_offset) {
+            producer_state.transaction_last_offset
+              = producer.tx_end_offset.value();
+        }
+        if (producer.tx_seq) {
+            producer_state.transaction_sequence = producer.tx_seq.value();
+        }
+        if (producer.tx_timeout) {
+            producer_state.transaction_timeout_ms
+              = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  producer.tx_timeout.value())
+                  .count();
+        }
+        if (producer.coordinator_partition) {
+            producer_state.transaction_coordinator_partition
+              = producer.coordinator_partition.value()();
+        }
+        if (producer.group_id) {
+            producer_state.transaction_group_id = producer.group_id.value();
+        }
+        producers.producers.push(std::move(producer_state));
+        co_await ss::coroutine::maybe_yield();
+    }
+    co_return ss::json::json_return_type(std::move(producers));
+}
+
 ss::future<ss::json::json_return_type> admin_server::get_node_uuid_handler() {
     ss::httpd::debug_json::broker_uuid uuid;
     uuid.node_uuid = ssx::sformat(
@@ -935,4 +1074,43 @@ ss::future<ss::json::json_return_type> admin_server::override_node_uuid_handler(
       });
 
     co_return ss::json::json_return_type(ss::json::json_void());
+}
+
+ss::future<std::unique_ptr<ss::http::reply>> admin_server::put_ctracker_va(
+  std::unique_ptr<ss::http::request> req,
+  std::unique_ptr<ss::http::reply> res) {
+    ss::shard_id shard = 0;
+    try {
+        shard = std::stoi(req->get_path_param("shard"));
+    } catch (...) {
+        throw ss::httpd::bad_param_exception(
+          fmt::format("Invalid shard id: {}", req->get_path_param("shard")));
+    }
+
+    if (shard >= ss::smp::count) {
+        throw ss::httpd::bad_param_exception(
+          fmt::format("Invalid shard id: {}", shard));
+    }
+
+    auto doc = co_await parse_json_body(req.get());
+    if (!doc.IsObject()) {
+        throw ss::httpd::bad_request_exception(
+          "Request body must be a JSON object");
+    }
+    if (!doc.HasMember("message")) {
+        throw ss::httpd::bad_request_exception(
+          fmt::format("'message' missing"));
+    }
+    if (!doc["message"].IsString()) {
+        throw ss::httpd::bad_request_exception(
+          fmt::format("'message' must be a string"));
+    }
+    auto msg = ss::sstring{doc["message"].GetString()};
+
+    co_await ss::smp::submit_to(shard, [msg = std::move(msg)] {
+        base::register_event(ss::current_backtrace(), msg);
+    });
+
+    res->set_status(ss::http::reply::status_type::ok);
+    co_return std::move(res);
 }

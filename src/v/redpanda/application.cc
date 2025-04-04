@@ -86,22 +86,23 @@
 #include "config/node_config.h"
 #include "config/seed_server.h"
 #include "config/types.h"
+#include "crash_tracker/signals.h"
 #include "crypto/ossl_context_service.h"
-#include "datalake/coordinator/catalog_factory.h"
-#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
 #include "datalake/cloud_data_io.h"
+#include "datalake/coordinator/catalog_factory.h"
 #include "datalake/coordinator/coordinator_manager.h"
 #include "datalake/coordinator/frontend.h"
 #include "datalake/coordinator/service.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/datalake_manager.h"
 #include "datalake/translation/state_machine.h"
-#endif
 #include "debug_bundle/debug_bundle_service.h"
 #include "features/feature_table_snapshot.h"
 #include "features/fwd.h"
 #include "finjector/stress_fiber.h"
 #include "kafka/client/configuration.h"
+#include "kafka/server/consumer_group_lag_metrics_frontend.h"
+#include "kafka/server/consumer_group_lag_metrics_service.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/group_manager.h"
 #include "kafka/server/group_router.h"
@@ -159,6 +160,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/json/json_elements.hh>
@@ -183,9 +185,6 @@
 #include <exception>
 #include <memory>
 #include <vector>
-
-// Crash tracking resets every 1h.
-static constexpr model::timestamp_clock::duration crash_reset_duration{1h};
 
 static void set_local_kafka_client_config(
   std::optional<kafka::client::configuration>& client_config,
@@ -346,6 +345,21 @@ void application::shutdown() {
     if (cloud_io.local_is_initialized()) {
         cloud_io.invoke_on_all(&cloud_io::remote::request_stop).get();
     }
+    /**
+     * Shutdown the datalake services before stopping all the partitions.
+     * NOTE: translators may call into the coordinator via the coordinator
+     * frontend; stop the coordinators first to stop all work as quickly as
+     * possible.
+     */
+    if (_datalake_coordinator_mgr.local_is_initialized()) {
+        _datalake_coordinator_mgr
+          .invoke_on_all(&datalake::coordinator::coordinator_manager::shutdown)
+          .get();
+    }
+    if (_datalake_manager.local_is_initialized()) {
+        _datalake_manager.invoke_on_all(&datalake::datalake_manager::shutdown)
+          .get();
+    }
 
     // Stop all partitions before destructing the subsystems (transaction
     // coordinator, etc). This interrupts ongoing replication requests,
@@ -501,9 +515,9 @@ int application::run(int ac, char** av) {
                 });
                 // must initialize configuration before services
                 hydrate_config(cfg);
+                init_crashtracker(app_signal);
                 initialize();
                 check_environment();
-                check_for_crash_loop();
                 setup_metrics();
                 wire_up_and_start(app_signal);
                 post_start_tasks();
@@ -524,6 +538,10 @@ int application::run(int ac, char** av) {
                   _log.error,
                   "Failure during startup: {}",
                   std::current_exception());
+                if (_crash_tracker_service) {
+                    _crash_tracker_service->get_recorder()
+                      .record_crash_exception(std::current_exception());
+                }
                 return 1;
             }
             return 0;
@@ -582,12 +600,8 @@ void application::initialize(
      * Disable the logger for protobuf; some interfaces don't allow a pluggable
      * error collector.
      */
-#if PROTOBUF_VERSION < 5027000
-    google::protobuf::SetLogHandler(nullptr);
-#else
     // Protobuf uses absl logging in the latest version
     absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfinity);
-#endif
 
     /*
      * allocate per-core zstd decompression workspace and per-core
@@ -955,6 +969,7 @@ void application::check_environment() {
     syschecks::systemd_message("checking environment (CPU, Mem)").get();
     syschecks::cpu();
     syschecks::memory(config::node().developer_mode());
+    memory_groups().log_memory_group_allocations(_log);
     storage::directories::initialize(
       config::node().data_directory().as_sstring())
       .get();
@@ -1028,99 +1043,10 @@ void application::check_environment() {
     }
 }
 
-/// Here we check for too many consecutive unclean shutdowns/crashes
-/// and abort the startup sequence if the limit exceeds
-/// crash_loop_limit until the operator intervenes. Crash tracking
-/// is reset if the node configuration changes or its been 1h since
-/// the broker last failed to start. This metadata is tracked in the
-/// tracker file. This is to prevent on disk state from piling up in
-/// each unclean run and creating more state to recover for the next run.
-void application::check_for_crash_loop() {
-    if (config::node().developer_mode()) {
-        // crash loop tracking has value only in long running clusters
-        // that can potentially accumulate state across restarts.
-        return;
-    }
-    auto file_path = config::node().crash_loop_tracker_path();
-    std::optional<crash_tracker_metadata> maybe_crash_md;
-    if (
-      // Tracking is reset every time the broker boots in recovery mode.
-      !config::node().recovery_mode_enabled()
-      && ss::file_exists(file_path.string()).get()) {
-        // Ok to read the entire file, it contains a serialized uint32_t.
-        auto buf = read_fully(file_path).get();
-        try {
-            maybe_crash_md = serde::from_iobuf<crash_tracker_metadata>(
-              std::move(buf));
-        } catch (const serde::serde_exception&) {
-            // A malformed log file, ignore and reset it later.
-            // We truncate it below.
-            vlog(_log.warn, "Ignorning malformed tracker file {}", file_path);
-        }
-    }
-
-    // Compute the checksum of the current node configuration.
-    auto current_config
-      = read_fully_to_string(config::node().get_cfg_file_path()).get();
-    auto checksum = xxhash_64(current_config.c_str(), current_config.length());
-
-    if (maybe_crash_md) {
-        auto& crash_md = maybe_crash_md.value();
-        auto& limit = config::node().crash_loop_limit.value();
-
-        // Check if it has been atleast 1h since last unsuccessful restart.
-        // Tracking resets every 1h.
-        auto time_since_last_start
-          = model::duration_since_epoch(model::timestamp::now())
-            - model::duration_since_epoch(crash_md._last_start_ts);
-
-        auto crash_limit_ok = !limit || crash_md._crash_count <= limit.value();
-        auto node_config_changed = crash_md._config_checksum != checksum;
-        auto tracking_reset = time_since_last_start > crash_reset_duration;
-
-        auto ok_to_proceed = crash_limit_ok || node_config_changed
-                             || tracking_reset;
-
-        if (!ok_to_proceed) {
-            vlog(
-              _log.error,
-              "Crash loop detected. Too many consecutive crashes {}, exceeded "
-              "{} configured value {}. To recover Redpanda from this state, "
-              "manually remove file at path {}. Crash loop automatically "
-              "resets 1h after last crash or with node configuration changes.",
-              crash_md._crash_count,
-              config::node().crash_loop_limit.name(),
-              limit.value(),
-              file_path);
-            throw std::runtime_error("Crash loop detected, aborting startup.");
-        }
-
-        vlog(
-          _log.debug,
-          "Consecutive crashes detected: {} node config changed: {} "
-          "time based tracking reset: {}",
-          crash_md._crash_count,
-          node_config_changed,
-          tracking_reset);
-
-        if (node_config_changed || tracking_reset) {
-            crash_md._crash_count = 0;
-        }
-    }
-
-    // Truncate and bump the crash count. We consider a run to be unclean by
-    // default unless the scheduled cleanup (that runs very late in shutdown)
-    // resets the file. See schedule_crash_tracker_file_cleanup().
-    auto new_crash_count = maybe_crash_md
-                             ? maybe_crash_md.value()._crash_count + 1
-                             : 1;
-    crash_tracker_metadata updated{
-      ._crash_count = new_crash_count,
-      ._config_checksum = checksum,
-      ._last_start_ts = model::timestamp::now()};
-    write_fully(file_path, serde::to_iobuf(updated)).get();
-    ss::sync_directory(config::node().data_directory.value().as_sstring())
-      .get();
+void application::init_crashtracker(::stop_signal& app_signal) {
+    _crash_tracker_service = std::make_unique<crash_tracker::service>();
+    _crash_tracker_service->start(app_signal.abort_source()).get();
+    crash_tracker::install_sighandlers();
 }
 
 void application::schedule_crash_tracker_file_cleanup() {
@@ -1131,12 +1057,8 @@ void application::schedule_crash_tracker_file_cleanup() {
     // next run.
     // We emplace it in the front to make it the last task to run.
     _deferred.emplace_front([&] {
-        auto file = config::node().crash_loop_tracker_path().string();
-        if (ss::file_exists(file).get()) {
-            ss::remove_file(file).get();
-            ss::sync_directory(config::node().data_directory().as_sstring())
-              .get();
-            vlog(_log.debug, "Deleted crash loop tracker file: {}", file);
+        if (_crash_tracker_service) {
+            _crash_tracker_service->stop().get();
         }
     });
 }
@@ -1422,7 +1344,6 @@ void application::wire_up_runtime_services(
           .get();
     }
 
-#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
     if (datalake_enabled()) {
         vassert(
           bucket.has_value(),
@@ -1433,6 +1354,7 @@ void application::wire_up_runtime_services(
         construct_service(
           _datalake_coordinator_mgr,
           node_id,
+          std::ref(storage),
           std::ref(raft_group_manager),
           std::ref(partition_manager),
           std::ref(controller->get_topics_state()),
@@ -1442,7 +1364,10 @@ void application::wire_up_runtime_services(
             [bucket](cloud_io::remote& remote)
               -> std::unique_ptr<datalake::coordinator::catalog_factory> {
                 return datalake::coordinator::get_catalog_factory(
-                  config::shard_local_cfg(), remote, *bucket);
+                  config::shard_local_cfg(),
+                  remote,
+                  *bucket,
+                  ss::metrics::label_instance{"role", "coordinator"});
             },
             std::ref(cloud_io)),
           std::ref(cloud_io),
@@ -1477,7 +1402,10 @@ void application::wire_up_runtime_services(
             [bucket](cloud_io::remote& remote)
               -> std::unique_ptr<datalake::coordinator::catalog_factory> {
                 return datalake::coordinator::get_catalog_factory(
-                  config::shard_local_cfg(), remote, *bucket);
+                  config::shard_local_cfg(),
+                  remote,
+                  *bucket,
+                  ss::metrics::label_instance{"role", "translator"});
             },
             std::ref(cloud_io)),
           _schema_registry.get(),
@@ -1486,13 +1414,45 @@ void application::wire_up_runtime_services(
           sched_groups.datalake_sg(),
           memory_groups().datalake_max_memory())
           .get();
+        datalake::datalake_manager::prepare_staging_directory(
+          config::node().datalake_staging_path())
+          .get();
         _datalake_manager.invoke_on_all(&datalake::datalake_manager::start)
           .get();
+
+        construct_service(
+          datalake_throttle_manager,
+          [&mgr = _datalake_manager] {
+              return ssx::now(kafka::datalake_throttle_manager::status{
+                .max_shares_assigned = mgr.local().max_shares_assigned(),
+                .total_translation_backlog
+                = mgr.local().total_translation_backlog(),
+
+              });
+          },
+          std::ref(storage_node),
+          ss::sharded_parameter([] {
+              return config::shard_local_cfg()
+                .max_kafka_throttle_delay_ms.bind();
+          }),
+          ss::sharded_parameter([] {
+              return config::shard_local_cfg().quota_manager_gc_sec.bind();
+          }),
+          ss::sharded_parameter([] {
+              return config::shard_local_cfg()
+                .iceberg_throttle_backlog_size_ratio.bind();
+          }))
+          .get();
+
+        datalake_throttle_manager
+          .invoke_on_all(&kafka::datalake_throttle_manager::start)
+          .get();
     }
-#endif
     construct_single_service(_monitor_unsafe, std::ref(feature_table));
 
     construct_service(_debug_bundle_service, &storage.local().kvs()).get();
+
+    construct_single_service(_host_metrics_watcher, std::ref(_log));
 
     configure_admin_server();
 }
@@ -1534,7 +1494,9 @@ void application::wire_up_redpanda_services(
     raft_group_manager
       .start(
         node_id,
-        sched_groups.raft_sg(),
+        sched_groups.raft_recv_sg(),
+        sched_groups.raft_send_sg(),
+        sched_groups.raft_heartbeats(),
         [] {
             return raft::group_manager::configuration{
               .heartbeat_interval
@@ -2067,11 +2029,24 @@ void application::wire_up_redpanda_services(
         vassert(
           archival_storage_enabled(),
           "cloud topics currently requires archival storage to be enabled");
-        construct_service(_reconciler, &partition_manager, &cloud_io).get();
+        construct_service(
+          _reconciler,
+          &partition_manager,
+          &cloud_io,
+          &shadow_index_cache,
+          bucket)
+          .get();
     }
 
     // group membership
     syschecks::systemd_message("Creating kafka group manager").get();
+    construct_service(
+      _consumer_group_lag_metrics_frontend,
+      node_id,
+      std::ref(_connection_cache),
+      std::ref(metadata_cache),
+      std::ref(partition_manager))
+      .get();
     construct_service(
       _group_manager,
       model::kafka_consumer_offsets_nt,
@@ -2080,8 +2055,8 @@ void application::wire_up_redpanda_services(
       std::ref(controller->get_topics_state()),
       std::ref(tx_gateway_frontend),
       std::ref(controller->get_feature_table()),
-      &kafka::make_consumer_offsets_serializer,
-      kafka::enable_group_metrics::yes)
+      std::ref(_consumer_group_lag_metrics_frontend),
+      &kafka::make_consumer_offsets_serializer)
       .get();
     construct_service(
       offsets_recoverer,
@@ -2358,6 +2333,8 @@ void application::wire_up_redpanda_services(
         &kafka_cfg,
         smp_service_groups.kafka_smp_sg(),
         sched_groups.fetch_sg(),
+        sched_groups.produce_sg(),
+        sched_groups.kafka_sg(),
         std::ref(metadata_cache),
         std::ref(controller->get_topics_frontend()),
         std::ref(controller->get_config_frontend()),
@@ -2378,6 +2355,7 @@ void application::wire_up_redpanda_services(
         std::ref(controller->get_security_frontend()),
         std::ref(controller->get_api()),
         std::ref(tx_gateway_frontend),
+        std::ref(datalake_throttle_manager),
         qdc_config,
         std::ref(*thread_worker),
         std::ref(_schema_registry))
@@ -2410,7 +2388,8 @@ bool application::wasm_data_transforms_enabled() {
 }
 
 bool application::datalake_enabled() {
-    return config::shard_local_cfg().iceberg_enabled();
+    return config::shard_local_cfg().iceberg_enabled()
+           && !config::node().recovery_mode_enabled();
 }
 
 ss::future<>
@@ -2463,6 +2442,11 @@ void application::wire_up_bootstrap_services() {
     ss::smp::invoke_on_all([] {
         return storage::internal::chunks().start();
     }).get();
+    _deferred.emplace_back([] {
+        ss::smp::invoke_on_all([] {
+            return storage::internal::chunks().stop();
+        }).get();
+    });
     construct_service(stress_fiber_manager).get();
     syschecks::systemd_message("Constructing storage services").get();
     construct_single_service_sharded(
@@ -2951,14 +2935,14 @@ void application::start_runtime_services(
             cloud_storage_api,
             feature_table,
             controller->get_topics_state());
-          pm.register_factory<kafka::group_tx_tracker_stm_factory>();
+          pm.register_factory<kafka::group_tx_tracker_stm_factory>(
+            feature_table);
           pm.register_factory<cluster::partition_properties_stm_factory>(
             storage.local().kvs(),
             config::shard_local_cfg().rm_sync_timeout_ms.bind());
-#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
           pm.register_factory<datalake::coordinator::stm_factory>();
-          pm.register_factory<datalake::translation::stm_factory>();
-#endif
+          pm.register_factory<datalake::translation::stm_factory>(
+            config::shard_local_cfg().iceberg_enabled());
           if (config::shard_local_cfg().development_enable_cloud_topics()) {
               pm.register_factory<experimental::cloud_topics::dl_stm_factory>();
           }
@@ -2970,6 +2954,9 @@ void application::start_runtime_services(
     raft_group_manager.invoke_on_all(&raft::group_manager::start).get();
 
     syschecks::systemd_message("Starting Kafka group manager").get();
+    _consumer_group_lag_metrics_frontend
+      .invoke_on_all(&kafka::consumer_group_lag_metrics_frontend::start)
+      .get();
     _group_manager.invoke_on_all(&kafka::group_manager::start).get();
 
     // Initialize the Raft RPC endpoint before the rest of the runtime RPC
@@ -2984,8 +2971,9 @@ void application::start_runtime_services(
               runtime_services.push_back(std::make_unique<raft::service<
                                            cluster::partition_manager,
                                            cluster::shard_table>>(
-                sched_groups.raft_sg(),
+                sched_groups.raft_recv_sg(),
                 smp_service_groups.raft_smp_sg(),
+                sched_groups.raft_heartbeats(),
                 partition_manager,
                 shard_table.local(),
                 config::shard_local_cfg().raft_heartbeat_interval_ms(),
@@ -3005,7 +2993,6 @@ void application::start_runtime_services(
     if (offsets_recovery_router.local_is_initialized()) {
         offsets_recovery_requestor = offsets_recovery_manager;
     }
-#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
     if (_datalake_coordinator_mgr.local_is_initialized()) {
         // Before starting the controller, start the coordinator manager so we
         // don't miss any partition/leadership notifications.
@@ -3013,7 +3000,6 @@ void application::start_runtime_services(
           .invoke_on_all(&datalake::coordinator::coordinator_manager::start)
           .get();
     }
-#endif
     controller
       ->start(
         cd,
@@ -3049,13 +3035,13 @@ void application::start_runtime_services(
               std::ref(offsets_recovery_router),
               std::ref(offsets_upload_router)));
           runtime_services.push_back(std::make_unique<cluster::id_allocator>(
-            sched_groups.raft_sg(),
+            sched_groups.raft_recv_sg(),
             smp_service_groups.raft_smp_sg(),
             std::ref(id_allocator_frontend)));
           // _rm_group_proxy is wrap around a sharded service with only
           // `.local()' access so it's ok to share without foreign_ptr
           runtime_services.push_back(std::make_unique<cluster::tx_gateway>(
-            sched_groups.raft_sg(),
+            sched_groups.raft_recv_sg(),
             smp_service_groups.raft_smp_sg(),
             std::ref(tx_gateway_frontend),
             _rm_group_proxy.get(),
@@ -3065,8 +3051,9 @@ void application::start_runtime_services(
               runtime_services.push_back(std::make_unique<raft::service<
                                            cluster::partition_manager,
                                            cluster::shard_table>>(
-                sched_groups.raft_sg(),
+                sched_groups.raft_recv_sg(),
                 smp_service_groups.raft_smp_sg(),
+                sched_groups.raft_heartbeats(),
                 partition_manager,
                 shard_table.local(),
                 config::shard_local_cfg().raft_heartbeat_interval_ms(),
@@ -3101,13 +3088,13 @@ void application::start_runtime_services(
 
           runtime_services.push_back(
             std::make_unique<cluster::node_status_rpc_handler>(
-              sched_groups.node_status(),
+              sched_groups.raft_heartbeats(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(node_status_backend)));
 
           runtime_services.push_back(
             std::make_unique<cluster::self_test_rpc_handler>(
-              sched_groups.node_status(),
+              sched_groups.raft_heartbeats(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(self_test_backend)));
 
@@ -3155,14 +3142,18 @@ void application::start_runtime_services(
               smp_service_groups.cluster_smp_sg(),
               std::ref(controller->get_data_migration_frontend()),
               std::ref(controller->get_data_migration_irpc_frontend())));
-
-#ifndef BAZEL_DISABLE_DATALAKE_FEATURE
+          if (datalake_enabled()) {
+              runtime_services.push_back(
+                std::make_unique<datalake::coordinator::rpc::service>(
+                  sched_groups.datalake_sg(),
+                  smp_service_groups.datalake_sg(),
+                  &_datalake_coordinator_fe));
+          }
           runtime_services.push_back(
-            std::make_unique<datalake::coordinator::rpc::service>(
-              sched_groups.datalake_sg(),
-              smp_service_groups.datalake_sg(),
-              &_datalake_coordinator_fe));
-#endif
+            std::make_unique<kafka::consumer_group_lag_metrics_service>(
+              sched_groups.cluster_sg(),
+              smp_service_groups.cluster_smp_sg(),
+              std::ref(_consumer_group_lag_metrics_frontend)));
 
           s.add_services(std::move(runtime_services));
 

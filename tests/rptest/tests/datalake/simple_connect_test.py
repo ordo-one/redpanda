@@ -6,10 +6,6 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
-import json
-import os
-import tempfile
-import time
 from rptest.clients.rpk import RpkTool
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import SISettings, SchemaRegistryConfig
@@ -19,10 +15,16 @@ from rptest.tests.datalake.datalake_verifier import DatalakeVerifier
 from rptest.tests.datalake.query_engine_base import QueryEngineType
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.tests.datalake.utils import supported_storage_types
+from rptest.utils.rpcn_utils import counter_stream_config
 from ducktape.mark import matrix
 
+from rptest.utils.data_migrations import DataMigrationTestMixin
 
-class RedpandaConnectIcebergTest(RedpandaTest):
+
+class RedpandaConnectIcebergTest(RedpandaTest, DataMigrationTestMixin):
+    TOPIC_NAME = "ducky_topic"
+    PARTITION_COUNT = 5
+    FAST_COMMIT_INTVL_S = 5
 
     verifier_schema_avro = """
 {
@@ -57,83 +59,48 @@ class RedpandaConnectIcebergTest(RedpandaTest):
                                    cloud_storage_enable_remote_read=False,
                                    cloud_storage_enable_remote_write=False),
             extra_rp_conf={
-                "iceberg_enabled": True,
-                "iceberg_catalog_commit_interval_ms": 5000
+                "iceberg_enabled":
+                True,
+                "iceberg_catalog_commit_interval_ms":
+                self.FAST_COMMIT_INTVL_S * 1000,
             },
             schema_registry_config=SchemaRegistryConfig())
-
-    def avro_stream_config(self, topic, subject):
-        return {
-            "input": {
-                "generate": {
-                    "mapping": "root = counter()",
-                    "interval": "",
-                    "count": 3000,
-                    "batch_size": 1
-                }
-            },
-            "pipeline": {
-                "processors": [{
-                    "mapping":
-                    """
-                            root.ordinal = this
-                            root.timestamp = timestamp_unix_milli()
-                            root.verifier_string = uuid_v4()
-                        """
-                }, {
-                    "schema_registry_encode": {
-                        "url": self.redpanda.schema_reg().split(",")[0],
-                        "subject": subject,
-                        "refresh_period": "10s"
-                    }
-                }]
-            },
-            "output": {
-                "redpanda": {
-                    "seed_brokers": self.redpanda.brokers_list(),
-                    "topic": topic,
-                }
-            }
-        }
+        self.dl = DatalakeServices(
+            self.test_context,
+            redpanda=self.redpanda,
+            include_query_engines=[QueryEngineType.SPARK])
 
     def setUp(self):
-        pass
-
-    def _create_schema(self, subject: str, schema: str, schema_type="avro"):
+        self.dl.setUp()
+        self.dl.create_iceberg_enabled_topic(
+            self.TOPIC_NAME,
+            partitions=self.PARTITION_COUNT,
+            replicas=3,
+            iceberg_mode="value_schema_id_prefix")
         rpk = RpkTool(self.redpanda)
-        with tempfile.NamedTemporaryFile(suffix=f".{schema_type}") as tf:
-            tf.write(bytes(schema, 'UTF-8'))
-            tf.flush()
-            rpk.create_schema(subject, tf.name)
+        rpk.create_schema_from_str("verifier_schema",
+                                   self.verifier_schema_avro)
+
+    def tearDown(self):
+        self.dl.tearDown()
 
     @cluster(num_nodes=6)
     @matrix(cloud_storage_type=supported_storage_types())
     def test_translating_avro_serialized_records(self, cloud_storage_type):
-        topic_name = "ducky-topic"
-        with DatalakeServices(self.test_context,
-                              redpanda=self.redpanda,
-                              filesystem_catalog_mode=False,
-                              include_query_engines=[
-                                  QueryEngineType.SPARK,
-                              ]) as dl:
-
-            dl.create_iceberg_enabled_topic(
-                topic_name,
-                partitions=5,
-                replicas=3,
-                iceberg_mode="value_schema_id_prefix")
-
-            self._create_schema("verifier_schema", self.verifier_schema_avro)
-            connect = RedpandaConnectService(self.test_context, self.redpanda)
-            connect.start()
-
-            # create verifier
-            verifier = DatalakeVerifier(self.redpanda, topic_name, dl.spark())
-            # create a stream
-            connect.start_stream(name="ducky_stream",
-                                 config=self.avro_stream_config(
-                                     topic_name, "verifier_schema"))
-
-            verifier.start()
-            connect.wait_for_stream_to_finish("ducky_stream")
-            verifier.wait()
+        connect = RedpandaConnectService(self.test_context, self.redpanda)
+        connect.start()
+        verifier = DatalakeVerifier(self.redpanda, self.TOPIC_NAME,
+                                    self.dl.spark())
+        mapping = dict(
+            ordinal="this",
+            timestamp="timestamp_unix_milli()",
+            verifier_string="uuid_v4()",
+        )
+        avro_stream_config = counter_stream_config(self.redpanda,
+                                                   self.TOPIC_NAME,
+                                                   "verifier_schema", mapping,
+                                                   3000)
+        connect.start_stream(name="ducky_stream", config=avro_stream_config)
+        verifier.start()
+        connect.stop_stream("ducky_stream")
+        verifier.wait()

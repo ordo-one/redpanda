@@ -39,7 +39,7 @@ using election_success = ss::bool_class<struct election_success_tag>;
 
 struct protocol_metadata
   : serde::
-      envelope<protocol_metadata, serde::version<1>, serde::compat_version<0>> {
+      envelope<protocol_metadata, serde::version<2>, serde::compat_version<0>> {
     group_id group;
     model::offset commit_index;
     model::term_id term;
@@ -47,6 +47,8 @@ struct protocol_metadata
     model::term_id prev_log_term;
     model::offset last_visible_index;
     model::offset dirty_offset;
+    // offset delta corresponding to the prev_log_index
+    model::offset_delta prev_log_delta{};
 
     friend std::ostream&
     operator<<(std::ostream& o, const protocol_metadata& m);
@@ -62,7 +64,8 @@ struct protocol_metadata
           prev_log_index,
           prev_log_term,
           last_visible_index,
-          dirty_offset);
+          dirty_offset,
+          prev_log_delta);
     }
 };
 
@@ -200,6 +203,8 @@ struct follower_metrics {
     clock_type::time_point last_heartbeat;
     bool is_live;
     bool under_replicated;
+
+    friend std::ostream& operator<<(std::ostream& o, const follower_metrics& i);
 };
 using flush_after_append = ss::bool_class<struct flush_after_append_tag>;
 
@@ -217,7 +222,7 @@ struct append_entries_request
     append_entries_request(
       vnode src,
       protocol_metadata m,
-      model::record_batch_reader r,
+      chunked_vector<model::record_batch> r,
       size_t batches_size,
       flush_after_append f = flush_after_append::yes) noexcept;
 
@@ -225,7 +230,7 @@ struct append_entries_request
       vnode src,
       vnode target,
       protocol_metadata m,
-      model::record_batch_reader r,
+      chunked_vector<model::record_batch> r,
       size_t batches_size,
       flush_after_append f = flush_after_append::yes) noexcept;
 
@@ -244,14 +249,15 @@ struct append_entries_request
     const protocol_metadata& metadata() const { return _meta; }
     flush_after_append is_flush_required() const { return _flush; }
 
-    model::record_batch_reader release_batches() && {
+    chunked_vector<model::record_batch> release_batches() && {
         return std::move(_batches);
     }
 
-    model::record_batch_reader& batches() { return _batches; }
-    const model::record_batch_reader& batches() const { return _batches; }
+    chunked_vector<model::record_batch>& batches() { return _batches; }
 
-    static append_entries_request make_foreign(append_entries_request&& req);
+    const chunked_vector<model::record_batch>& batches() const {
+        return _batches;
+    }
 
     friend std::ostream&
     operator<<(std::ostream& o, const append_entries_request& r);
@@ -271,7 +277,7 @@ private:
     vnode _target_node_id;
     protocol_metadata _meta;
     flush_after_append _flush;
-    model::record_batch_reader _batches;
+    chunked_vector<model::record_batch> _batches;
 
     // not serialized field used for accounting in raft internals
     size_t _total_size;
@@ -735,23 +741,16 @@ inline constexpr voter_priority min_voter_priority = voter_priority{1};
  */
 struct scheduling_config {
     scheduling_config(
-      ss::scheduling_group default_sg,
-      ss::io_priority_class default_iopc,
-      ss::scheduling_group learner_recovery_sg,
-      ss::io_priority_class learner_recovery_iopc)
-      : default_sg(default_sg)
-      , default_iopc(default_iopc)
-      , learner_recovery_sg(learner_recovery_sg)
-      , learner_recovery_iopc(learner_recovery_iopc) {}
+      ss::scheduling_group recv_sg,
+      ss::scheduling_group send_sg,
+      ss::io_priority_class default_iopc)
+      : recv_sg(recv_sg)
+      , send_sg(send_sg)
+      , default_iopc(default_iopc) {}
 
-    scheduling_config(
-      ss::scheduling_group default_sg, ss::io_priority_class default_iopc)
-      : scheduling_config(default_sg, default_iopc, default_sg, default_iopc) {}
-
-    ss::scheduling_group default_sg;
+    ss::scheduling_group recv_sg;
+    ss::scheduling_group send_sg;
     ss::io_priority_class default_iopc;
-    ss::scheduling_group learner_recovery_sg;
-    ss::io_priority_class learner_recovery_iopc;
 };
 
 std::ostream& operator<<(std::ostream& o, const consistency_level& l);

@@ -11,8 +11,9 @@
 
 #include "config/validators.h"
 
-#include "config/client_group_byte_rate_quota.h"
 #include "config/configuration.h"
+#include "config/types.h"
+#include "datalake/partition_spec_parser.h"
 #include "model/namespace.h"
 #include "model/validation.h"
 #include "serde/rw/chrono.h"
@@ -82,40 +83,10 @@ validate_connection_rate(const std::vector<ss::sstring>& ips_with_limit) {
     return std::nullopt;
 }
 
-std::optional<ss::sstring> validate_client_groups_byte_rate_quota(
-  const std::unordered_map<ss::sstring, config::client_group_quota>&
-    groups_with_limit) {
-    for (const auto& gal : groups_with_limit) {
-        if (gal.second.quota <= 0) {
-            return fmt::format(
-              "Quota must be a non zero positive number, got: {}",
-              gal.second.quota);
-        }
-
-        for (const auto& another_group : groups_with_limit) {
-            if (another_group.first == gal.first) {
-                continue;
-            }
-            if (std::string_view(gal.second.clients_prefix)
-                  .starts_with(
-                    std::string_view(another_group.second.clients_prefix))) {
-                return fmt::format(
-                  "Group client prefix can not be prefix for another group "
-                  "name. "
-                  "Violation: {}, {}",
-                  gal.second.clients_prefix,
-                  another_group.second.clients_prefix);
-            }
-        }
-    }
-
-    return std::nullopt;
-}
-
 std::optional<ss::sstring>
 validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
     constexpr auto supported = std::to_array<std::string_view>(
-      {"GSSAPI", "SCRAM", "OAUTHBEARER"});
+      {"GSSAPI", "SCRAM", "OAUTHBEARER", "PLAIN"});
 
     // Validate results
     for (const auto& m : mechanisms) {
@@ -124,6 +95,15 @@ validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
             return ssx::sformat("'{}' is not a supported SASL mechanism", m);
         }
     }
+
+    const auto contains = [&mechanisms](const std::string_view& s) {
+        return absl::c_find(mechanisms, s) != mechanisms.end();
+    };
+
+    if (contains("PLAIN") && !contains("SCRAM")) {
+        return "SCRAM mechanism must be enabled if PLAIN is enabled";
+    }
+
     return std::nullopt;
 }
 
@@ -251,32 +231,77 @@ validate_api_endpoint(const std::optional<ss::sstring>& os) {
 std::optional<ss::sstring> validate_tombstone_retention_ms(
   const std::optional<std::chrono::milliseconds>& ms) {
     if (ms.has_value()) {
-        // For simplicity's sake, cloud storage enable/read/write permissions
-        // cannot be enabled at the same time as tombstone_retention_ms at the
-        // cluster level, to avoid the case in which redpanda refuses to create
-        // new, misconfigured topics due to cluster defaults
-        const auto& cloud_storage_enabled
-          = config::shard_local_cfg().cloud_storage_enabled;
-        const auto& cloud_storage_remote_write
-          = config::shard_local_cfg().cloud_storage_enable_remote_write;
-        const auto& cloud_storage_remote_read
-          = config::shard_local_cfg().cloud_storage_enable_remote_read;
-        if (
-          cloud_storage_enabled() || cloud_storage_remote_write()
-          || cloud_storage_remote_read()) {
-            return fmt::format(
-              "cannot set {} if any of ({}, {}, {}) are enabled at the cluster "
-              "level",
-              config::shard_local_cfg().tombstone_retention_ms.name(),
-              cloud_storage_enabled.name(),
-              cloud_storage_remote_write.name(),
-              cloud_storage_remote_read.name());
-        }
-
         if (ms.value() < 1ms || ms.value() > serde::max_serializable_ms) {
             return fmt::format(
               "tombstone_retention_ms should be in range: [1, {}]",
               serde::max_serializable_ms);
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_iceberg_partition_spec(const ss::sstring& value) {
+    auto parsed = datalake::parse_partition_spec(value);
+    if (parsed.has_error()) {
+        return fmt::format(
+          "couldn't parse iceberg partition spec `{}': {}",
+          value,
+          parsed.error());
+    }
+    if (!parsed.value().is_valid_for_default_spec()) {
+        return fmt::format(
+          "partition spec `{}' can't be used as a default spec", value);
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_iceberg_rest_catalog_auth_mode(const config::configuration& config) {
+    auto auth_mode = config.iceberg_rest_catalog_authentication_mode();
+    switch (auth_mode) {
+    case datalake_catalog_auth_mode::none:
+        return std::nullopt;
+    case datalake_catalog_auth_mode::bearer: {
+        const auto& token = config.iceberg_rest_catalog_token;
+        if (!token().has_value()) {
+            return fmt::format(
+              "Must set {} when iceberg_rest_catalog_authentication_mode is "
+              "set to {}.",
+              token.name(),
+              auth_mode);
+        }
+        break;
+    }
+    case datalake_catalog_auth_mode::oauth2: {
+        const auto& client_id = config.iceberg_rest_catalog_client_id;
+        const auto& client_secret = config.iceberg_rest_catalog_client_secret;
+        if (!(client_id().has_value() && client_secret().has_value())) {
+            return fmt::format(
+              "Must set both of {} and {} when "
+              "iceberg_rest_catalog_authentication_mode is "
+              "set to {}.",
+              client_id.name(),
+              client_secret.name(),
+              auth_mode);
+        }
+        break;
+    }
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_consumer_group_metrics(const std::vector<ss::sstring>& metrics) {
+    constexpr auto supported = std::to_array<std::string_view>(
+      {"group", "partition", "consumer_lag"});
+
+    // Validate results
+    for (const auto& m : metrics) {
+        if (std::ranges::none_of(
+              supported, [&m](const auto& s) { return s == m; })) {
+            return ssx::sformat("'{}' is not a valid consumer group metric", m);
         }
     }
 

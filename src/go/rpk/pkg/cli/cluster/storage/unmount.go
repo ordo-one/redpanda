@@ -13,12 +13,13 @@ import (
 	"fmt"
 	"strings"
 
-	dataplanev1alpha2 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1alpha2"
+	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -63,13 +64,13 @@ Unmount topic 'my-topic' from the cluster in the 'my-namespace'
 				if ns != "" && strings.ToLower(ns) != "kafka" {
 					out.Die("Namespace %q not allowed. Only kafka topics can be unmounted in Redpanda Cloud clusters", ns)
 				}
-				cl, err := createDataplaneClient(p)
-				out.MaybeDieErr(err)
+				cl, err := publicapi.DataplaneClientFromRpkProfile(p)
+				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
 
 				resp, err := cl.CloudStorage.UnmountTopics(
 					cmd.Context(),
 					connect.NewRequest(
-						&dataplanev1alpha2.UnmountTopicsRequest{
+						&dataplanev1.UnmountTopicsRequest{
 							Topics: []string{t},
 						}),
 				)

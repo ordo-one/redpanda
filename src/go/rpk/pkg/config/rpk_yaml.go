@@ -17,12 +17,10 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
+	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-
-	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 )
 
 // DefaultRpkYamlPath returns the OS equivalent of ~/.config/rpk/rpk.yaml, if
@@ -39,7 +37,7 @@ func defaultVirtualRpkYaml() (RpkYaml, error) {
 	path, _ := DefaultRpkYamlPath() // if err is non-nil, we fail in Write
 	y := RpkYaml{
 		fileLocation: path,
-		Version:      6,
+		Version:      currentRpkYAMLVersion,
 		Profiles:     []RpkProfile{DefaultRpkProfile()},
 		CloudAuths:   []RpkCloudAuth{DefaultRpkCloudAuth()},
 	}
@@ -70,7 +68,7 @@ func DefaultRpkCloudAuth() RpkCloudAuth {
 
 func emptyVirtualRpkYaml() RpkYaml {
 	return RpkYaml{
-		Version: 6,
+		Version: currentRpkYAMLVersion,
 	}
 }
 
@@ -143,6 +141,10 @@ type (
 		AdminAPI     RpkAdminAPI          `json:"admin_api" yaml:"admin_api"`
 		SR           RpkSchemaRegistryAPI `json:"schema_registry" yaml:"schema_registry"`
 		LicenseCheck *LicenseStatusCache  `json:"license_check,omitempty" yaml:"license_check,omitempty"`
+
+		// This is an internal configuration, not to be documented nor set
+		// as part of the RpkCloudCluster.
+		CloudEnvironment string `json:"cloud_environment,omitempty" yaml:"cloud_environment,omitempty"`
 
 		// We stash the config struct itself so that we can provide
 		// the logger / dev overrides.
@@ -295,9 +297,12 @@ func (y *RpkYaml) CurrentAuth() *RpkCloudAuth {
 }
 
 const (
-	CloudAuthUninitialized     = ""
-	CloudAuthSSO               = "sso"
-	CloudAuthClientCredentials = "client-credentials"
+	CloudAuthUninitialized      = ""
+	CloudAuthSSO                = "sso"
+	CloudAuthClientCredentials  = "client-credentials"
+	ServerlessClusterType       = "TYPE_SERVERLESS" // Configuration setting to identify a serverless cluster.
+	CloudEnvironmentIntegration = "integration"
+	CloudEnvironmentPreprod     = "preprod"
 )
 
 ///////////
@@ -441,7 +446,7 @@ func (c *RpkCloudCluster) HasAuth(a RpkCloudAuth) bool {
 }
 
 func (c *RpkCloudCluster) IsServerless() bool {
-	return c != nil && c.ClusterType == publicapi.ServerlessClusterType
+	return c != nil && c.ClusterType == ServerlessClusterType
 }
 
 func (c *RpkCloudCluster) CheckClusterURL() (string, error) {

@@ -15,6 +15,7 @@
 #include "container/fragmented_vector.h"
 #include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
+#include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/types.h"
 
@@ -86,7 +87,7 @@ public:
     /// version.
     ///
     /// return the schema_version and schema_id, and whether it's new.
-    insert_result insert(canonical_schema schema) {
+    insert_result insert(unparsed_schema schema) {
         auto [sub, def] = std::move(schema).destructure();
         auto id = insert_schema(std::move(def)).id;
         auto [version, inserted] = insert_subject(std::move(sub), id);
@@ -94,25 +95,13 @@ public:
     }
 
     ///\brief Return a schema definition by id.
-    result<canonical_schema_definition>
+    result<unparsed_schema_definition>
     get_schema_definition(const schema_id& id) const {
         auto it = _schemas.find(id);
         if (it == _schemas.end()) {
             return not_found(id);
         }
         return {it->second.definition.share()};
-    }
-
-    ///\brief Return the id of the schema, if it already exists.
-    std::optional<schema_id>
-    get_schema_id(const canonical_schema_definition& def) const {
-        const auto s_it = std::find_if(
-          _schemas.begin(), _schemas.end(), [&](const auto& s) {
-              const auto& entry = s.second;
-              return def == entry.definition;
-          });
-        return s_it == _schemas.end() ? std::optional<schema_id>{}
-                                      : s_it->first;
     }
 
     ///\brief Return a list of subject-versions for the shema id.
@@ -168,7 +157,7 @@ public:
     }
 
     ///\brief Return a schema by subject and version.
-    result<subject_schema> get_subject_schema(
+    result<unparsed_subject_schema> get_subject_schema(
       const subject& sub,
       std::optional<schema_version> version,
       include_deleted inc_del) const {
@@ -177,7 +166,7 @@ public:
 
         auto def = BOOST_OUTCOME_TRYX(get_schema_definition(v_id.id));
 
-        return subject_schema{
+        return unparsed_subject_schema{
           .schema = {sub, std::move(def)},
           .version = v_id.version,
           .id = v_id.id,
@@ -388,6 +377,11 @@ public:
             } else {
                 maxver = std::max(maxver, v.version);
             }
+        }
+
+        // Once we have hit the maximum version number, we can't continue on
+        if (maxver == std::numeric_limits<schema_version::type>::max()) {
+            throw as_exception(versions_exhausted(sub));
         }
 
         return maxver + 1;
@@ -620,7 +614,7 @@ public:
         schema_id id;
         bool inserted;
     };
-    insert_schema_result insert_schema(canonical_schema_definition def) {
+    insert_schema_result insert_schema(unparsed_schema_definition def) {
         const auto s_it = std::find_if(
           _schemas.begin(), _schemas.end(), [&](const auto& s) {
               const auto& entry = s.second;
@@ -636,7 +630,7 @@ public:
         return {id, inserted};
     }
 
-    bool upsert_schema(schema_id id, canonical_schema_definition def) {
+    bool upsert_schema(schema_id id, unparsed_schema_definition def) {
         return _schemas.insert_or_assign(id, schema_entry(std::move(def)))
           .second;
     }
@@ -777,12 +771,15 @@ public:
         }
     };
 
+    ///\brief _schemas const getter
+    const auto& get_schemas() const { return _schemas; }
+
 private:
     struct schema_entry {
-        explicit schema_entry(canonical_schema_definition definition)
+        explicit schema_entry(unparsed_schema_definition definition)
           : definition{std::move(definition)} {}
 
-        canonical_schema_definition definition;
+        unparsed_schema_definition definition;
     };
 
     class subject_entry {

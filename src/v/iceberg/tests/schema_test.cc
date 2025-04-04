@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/datatypes.h"
 #include "iceberg/field_collecting_visitor.h"
 #include "iceberg/schema.h"
@@ -115,7 +116,7 @@ TEST(SchemaTest, TestAssignFreshFieldIds) {
 
     // Reassign the IDs and ensure that they match the original, which are hard
     // coded to match what is expected by Iceberg.
-    s.assign_fresh_ids();
+    ASSERT_FALSE(s.assign_fresh_ids().has_error());
     ASSERT_EQ(17, s.highest_field_id().value()());
     ASSERT_EQ(
       s.schema_struct, std::get<struct_type>(test_nested_schema_type()));

@@ -130,7 +130,7 @@ public:
           });
     }
 
-    ss::future<>
+    ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&& bytes) override {
         auto holder = _gate.hold();
         iobuf_parser parser(std::move(bytes));
@@ -144,6 +144,7 @@ public:
             }
         }
         _kvs = std::move(snap.kv_data);
+        co_return raft::local_snapshot_applied::yes;
     }
 
     ss::future<raft::stm_snapshot>
@@ -399,12 +400,9 @@ private:
     }
 
     ss::future<errc> replicate_and_wait(simple_batch_builder builder) {
-        auto batch = std::move(builder).build();
-        auto reader = model::make_memory_record_batch_reader(std::move(batch));
-
         auto r = co_await _raft->replicate(
           _insync_term,
-          std::move(reader),
+          std::move(builder).build(),
           raft::replicate_options(raft::consistency_level::quorum_ack));
 
         if (!r) {

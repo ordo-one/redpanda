@@ -11,12 +11,15 @@
 
 #include "base/vlog.h"
 #include "cluster/topic_table.h"
+#include "config/configuration.h"
 #include "container/fragmented_vector.h"
+#include "datalake/catalog_schema_manager.h"
 #include "datalake/coordinator/state_update.h"
 #include "datalake/logger.h"
-#include "datalake/table_creator.h"
+#include "datalake/partition_spec_parser.h"
+#include "datalake/record_translator.h"
+#include "datalake/table_id_provider.h"
 #include "model/fundamental.h"
-#include "model/record_batch_reader.h"
 #include "ssx/future-util.h"
 #include "ssx/sleep_abortable.h"
 #include "storage/record_batch_builder.h"
@@ -25,6 +28,7 @@
 #include <seastar/util/defer.hh>
 
 #include <exception>
+#include <optional>
 
 namespace datalake::coordinator {
 
@@ -42,6 +46,39 @@ coordinator::errc convert_stm_errc(coordinator_stm::errc e) {
     }
 }
 } // namespace
+
+coordinator::ensure_table_result_t coordinator::notify_waiters_and_erase(
+  const coordinator::table_key& key,
+  coordinator::ensure_table_map_t& in_flight_map,
+  ensure_table_result_t res) {
+    auto it = in_flight_map.find(key);
+    if (it == in_flight_map.end()) {
+        // Unexpected, but benign.
+        return res;
+    }
+    for (auto& prom : it->second) {
+        prom.set_value(res);
+    }
+    in_flight_map.erase(it);
+    return res;
+}
+
+std::optional<ss::future<coordinator::ensure_table_result_t>>
+coordinator::maybe_add_waiter(
+  const table_key& key, coordinator::ensure_table_map_t& in_flight_map) {
+    auto it = in_flight_map.find(key);
+    if (it != in_flight_map.end()) {
+        // There's an in-flight request already. Attach to it and wait for it
+        // to complete.
+        auto& proms = it->second;
+        ss::promise<ensure_table_result_t> res_prom;
+        auto res_fut = res_prom.get_future();
+        proms.emplace_back(std::move(res_prom));
+        return std::move(res_fut);
+    }
+    in_flight_map.insert({key, {}});
+    return std::nullopt;
+}
 
 std::ostream& operator<<(std::ostream& o, coordinator::errc e) {
     switch (e) {
@@ -67,12 +104,14 @@ void coordinator::start() {
 }
 
 ss::future<> coordinator::stop_and_wait() {
+    vlog(datalake_log.debug, "Coordinator stopping...");
     as_.request_abort();
     leader_cond_.broken();
     if (term_as_.has_value()) {
         term_as_->get().request_abort();
     }
-    return gate_.close();
+    co_await gate_.close();
+    vlog(datalake_log.debug, "Coordinator stopped...");
 }
 
 ss::future<> coordinator::run_until_abort() {
@@ -112,11 +151,15 @@ ss::future<> coordinator::run_until_abort() {
         auto term_fut = co_await ss::coroutine::as_future(
           run_until_term_change(synced_term));
         if (term_fut.failed()) {
-            vlog(
-              datalake_log.error,
-              "Coordinator hit exception while running in term {}: {}",
+            auto e = term_fut.get_exception();
+            auto lvl = ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                                     : ss::log_level::error;
+            vlogl(
+              datalake_log,
+              lvl,
+              "Coordinator exception in term {}: {}",
               synced_term,
-              term_fut.get_exception());
+              e);
             continue;
         }
         auto term_res = term_fut.get();
@@ -150,6 +193,28 @@ coordinator::run_until_term_change(model::term_id term) {
         }
         for (const auto& t : topics) {
             // TODO: per topic means embarrassingly parallel.
+
+            if (!disable_snapshot_expiry_()) {
+                // Before we add to the table, clean up any expired snapshots.
+                // TODO: consider decoupling this from the commit interval.
+                auto removal_res
+                  = co_await snapshot_remover_.remove_expired_snapshots(
+                    t, stm_->state(), model::timestamp::now());
+                if (removal_res.has_error()) {
+                    switch (removal_res.error()) {
+                    case snapshot_remover::errc::shutting_down:
+                        co_return errc::shutting_down;
+                    case snapshot_remover::errc::failed:
+                        vlog(
+                          datalake_log.debug,
+                          "Error removing snapshots from catalog for topic {}",
+                          t);
+                    }
+                    // Inentional fallthrough -- snapshot removal shouldn't
+                    // block progressing appends.
+                }
+            }
+
             auto commit_res
               = co_await file_committer_.commit_topic_files_to_catalog(
                 t, stm_->state());
@@ -226,11 +291,26 @@ checked<ss::gate::holder, coordinator::errc> coordinator::maybe_gate() {
     return gate_.hold();
 }
 
+struct coordinator::table_schema_provider {
+    virtual iceberg::table_identifier get_table_id(const model::topic&) const
+      = 0;
+
+    virtual ss::future<checked<iceberg::struct_type, coordinator::errc>>
+      get_record_type(record_schema_components) const = 0;
+
+    virtual ss::sstring get_partition_spec(const cluster::topic_metadata&) const
+      = 0;
+
+    virtual ~table_schema_provider() = default;
+};
+
 ss::future<checked<std::nullopt_t, coordinator::errc>>
-coordinator::sync_ensure_table_exists(
+coordinator::do_ensure_table_exists(
   model::topic topic,
   model::revision_id topic_revision,
-  record_schema_components comps) {
+  record_schema_components comps,
+  std::string_view method_name,
+  const table_schema_provider& schema_provider) {
     auto gate = maybe_gate();
     if (gate.has_error()) {
         co_return gate.error();
@@ -238,7 +318,8 @@ coordinator::sync_ensure_table_exists(
 
     vlog(
       datalake_log.debug,
-      "Sync ensure table exists requested, topic: {} rev: {}",
+      "{} requested, topic: {} rev: {}",
+      method_name,
       topic,
       topic_revision);
 
@@ -247,7 +328,34 @@ coordinator::sync_ensure_table_exists(
         co_return convert_stm_errc(sync_res.error());
     }
 
-    // TODO: add mutex to protect against the thundering herd problem
+    auto topic_md = topic_table_.get_topic_metadata_ref(
+      model::topic_namespace_view{model::kafka_namespace, topic});
+    if (!topic_md || topic_md->get().get_revision() != topic_revision) {
+        vlog(
+          datalake_log.debug,
+          "Rejecting {} for {} rev {}, topic table revision {}",
+          method_name,
+          topic,
+          topic_revision,
+          topic_md ? std::optional{topic_md->get().get_revision()}
+                   : std::nullopt);
+        co_return errc::revision_mismatch;
+    }
+
+    auto partition_spec_str = schema_provider.get_partition_spec(
+      topic_md->get());
+    auto partition_spec = parse_partition_spec(partition_spec_str);
+    if (!partition_spec.has_value()) {
+        vlog(
+          datalake_log.warn,
+          "{} failed, couldn't parse partition spec {} for {} rev {}: {}",
+          method_name,
+          partition_spec_str,
+          topic,
+          topic_revision,
+          partition_spec.error());
+        co_return errc::failed;
+    }
 
     topic_lifecycle_update update{
       .topic = topic,
@@ -258,12 +366,14 @@ coordinator::sync_ensure_table_exists(
     if (check_res.has_error()) {
         vlog(
           datalake_log.debug,
-          "Rejecting ensure_table_exist for {} rev {}: {}",
+          "Rejecting {} for {} rev {}: {}",
+          method_name,
           topic,
           topic_revision,
           check_res.error());
         co_return errc::revision_mismatch;
     }
+
     if (check_res.value()) {
         // update is non-trivial
         storage::record_batch_builder builder(
@@ -280,20 +390,142 @@ coordinator::sync_ensure_table_exists(
 
     // TODO: verify stm state after replication
 
-    auto ensure_res = co_await table_creator_.ensure_table(
-      topic, topic_revision, std::move(comps));
+    auto table_id = schema_provider.get_table_id(topic);
+
+    auto record_type = co_await schema_provider.get_record_type(
+      std::move(comps));
+    if (!record_type.has_value()) {
+        co_return errc::failed;
+    }
+
+    auto ensure_res = co_await schema_mgr_.ensure_table_schema(
+      table_id, record_type.value(), partition_spec.value());
     if (ensure_res.has_error()) {
         switch (ensure_res.error()) {
-        case table_creator::errc::incompatible_schema:
+        case schema_manager::errc::not_supported:
             co_return errc::incompatible_schema;
-        case table_creator::errc::failed:
+        case schema_manager::errc::failed:
             co_return errc::failed;
-        case table_creator::errc::shutting_down:
+        case schema_manager::errc::shutting_down:
             co_return errc::shutting_down;
         }
     }
 
     co_return std::nullopt;
+}
+
+struct coordinator::main_table_schema_provider
+  : public coordinator::table_schema_provider {
+    explicit main_table_schema_provider(coordinator& parent)
+      : parent(parent) {}
+
+    iceberg::table_identifier
+    get_table_id(const model::topic& topic) const final {
+        return table_id_provider::table_id(topic);
+    }
+
+    ss::future<checked<iceberg::struct_type, coordinator::errc>>
+    get_record_type(record_schema_components comps) const final {
+        std::optional<resolved_type> val_type;
+        if (comps.val_identifier) {
+            auto type_res = co_await parent.type_resolver_.resolve_identifier(
+              comps.val_identifier.value());
+            if (type_res.has_error()) {
+                co_return errc::failed;
+            }
+            val_type = std::move(type_res.value());
+        }
+
+        auto record_type = default_translator{}.build_type(std::move(val_type));
+        co_return std::move(record_type.type);
+    }
+
+    ss::sstring
+    get_partition_spec(const cluster::topic_metadata& topic_md) const final {
+        return topic_md.get_configuration()
+          .properties.iceberg_partition_spec.value_or(
+            parent.default_partition_spec_());
+    }
+
+    const coordinator& parent;
+};
+
+ss::future<checked<std::nullopt_t, coordinator::errc>>
+coordinator::sync_ensure_table_exists(
+  model::topic topic,
+  model::revision_id topic_revision,
+  record_schema_components comps) {
+    // If there's already an inflight request for this table, attach it to the
+    // in-flight request.
+    table_key key{
+      .topic = topic, .topic_revision = topic_revision, .record_comps = comps};
+    auto waiter_fut = maybe_add_waiter(key, in_flight_main_);
+    if (waiter_fut.has_value()) {
+        co_return co_await std::move(*waiter_fut);
+    }
+    auto res_fut = co_await ss::coroutine::as_future(do_ensure_table_exists(
+      topic,
+      topic_revision,
+      std::move(comps),
+      "sync_ensure_table_exists",
+      main_table_schema_provider{*this}));
+
+    if (res_fut.failed()) {
+        // NOTE: we don't expect any exceptions given we're using result types,
+        // but be conservative to guarantee fulfilling the promises.
+        auto ex = res_fut.get_exception();
+        vlog(datalake_log.error, "Exception ensuring table: {}", ex);
+        co_return notify_waiters_and_erase(key, in_flight_main_, errc::failed);
+    }
+    co_return notify_waiters_and_erase(key, in_flight_main_, res_fut.get());
+}
+
+struct coordinator::dlq_table_schema_provider
+  : public coordinator::table_schema_provider {
+    explicit dlq_table_schema_provider(coordinator& parent)
+      : parent(parent) {}
+
+    iceberg::table_identifier
+    get_table_id(const model::topic& topic) const final {
+        return table_id_provider::dlq_table_id(topic);
+    }
+
+    ss::future<checked<iceberg::struct_type, coordinator::errc>>
+    get_record_type(record_schema_components) const final {
+        co_return key_value_translator{}.build_type(std::nullopt).type;
+    }
+
+    ss::sstring get_partition_spec(const cluster::topic_metadata&) const final {
+        return parent.default_partition_spec_();
+    }
+
+    const coordinator& parent;
+};
+
+ss::future<checked<std::nullopt_t, coordinator::errc>>
+coordinator::sync_ensure_dlq_table_exists(
+  model::topic topic, model::revision_id topic_revision) {
+    table_key key{
+      .topic = topic, .topic_revision = topic_revision, .record_comps = {}};
+    auto waiter_fut = maybe_add_waiter(key, in_flight_dlq_);
+    if (waiter_fut.has_value()) {
+        co_return co_await std::move(*waiter_fut);
+    }
+    auto res_fut = co_await ss::coroutine::as_future(do_ensure_table_exists(
+      topic,
+      topic_revision,
+      record_schema_components{},
+      "sync_ensure_dlq_table_exists",
+      dlq_table_schema_provider{*this}));
+
+    if (res_fut.failed()) {
+        // NOTE: we don't expect any exceptions given we're using result types,
+        // but be conservative to guarantee fulfilling the promises.
+        auto ex = res_fut.get_exception();
+        vlog(datalake_log.error, "Exception ensuring DLQ table: {}", ex);
+        co_return notify_waiters_and_erase(key, in_flight_dlq_, errc::failed);
+    }
+    co_return notify_waiters_and_erase(key, in_flight_dlq_, res_fut.get());
 }
 
 ss::future<checked<std::nullopt_t, coordinator::errc>>
@@ -510,17 +742,41 @@ coordinator::update_lifecycle_state(
         if (tombstone_it != topic_table_.get_iceberg_tombstones().end()) {
             auto tombstone_rev = tombstone_it->second.last_deleted_revision;
             if (tombstone_rev >= topic.revision) {
-                auto drop_res = co_await file_committer_.drop_table(t);
-                if (drop_res.has_error()) {
-                    switch (drop_res.error()) {
-                    case file_committer::errc::shutting_down:
-                        co_return errc::shutting_down;
-                    case file_committer::errc::failed:
-                        vlog(
-                          datalake_log.warn,
-                          "failed to drop table for topic {}",
-                          t);
-                        co_return ss::stop_iteration::yes;
+                // Drop the main table if it exists.
+                {
+                    auto table_id = table_id_provider::table_id(t);
+                    auto drop_res = co_await file_committer_.drop_table(
+                      table_id);
+                    if (drop_res.has_error()) {
+                        switch (drop_res.error()) {
+                        case file_committer::errc::shutting_down:
+                            co_return errc::shutting_down;
+                        case file_committer::errc::failed:
+                            vlog(
+                              datalake_log.warn,
+                              "failed to drop table for topic {}",
+                              t);
+                            co_return ss::stop_iteration::yes;
+                        }
+                    }
+                }
+
+                // Drop the DLQ table if it exists.
+                {
+                    auto dlq_table_id = table_id_provider::dlq_table_id(t);
+                    auto drop_res = co_await file_committer_.drop_table(
+                      dlq_table_id);
+                    if (drop_res.has_error()) {
+                        switch (drop_res.error()) {
+                        case file_committer::errc::shutting_down:
+                            co_return errc::shutting_down;
+                        case file_committer::errc::failed:
+                            vlog(
+                              datalake_log.warn,
+                              "failed to drop dlq table for topic {}",
+                              t);
+                            co_return ss::stop_iteration::yes;
+                        }
                     }
                 }
             }

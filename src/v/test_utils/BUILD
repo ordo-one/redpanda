@@ -5,7 +5,6 @@ redpanda_test_cc_library(
     hdrs = [
         "async.h",
         "fixture.h",
-        "logs.h",
         "test_macros.h",
         "tmp_dir.h",
     ],
@@ -13,8 +12,8 @@ redpanda_test_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
-        "//src/v/model",
-        "//src/v/storage",
+        "//src/v/model:timeout_clock",
+        "//src/v/ssx:sformat",
         "@seastar//:testing",
     ],
 )
@@ -29,7 +28,6 @@ redpanda_test_cc_library(
         "async.h",
         "fixture.h",
         "gtest_utils.h",
-        "logs.h",
         "test.h",
         "test_macros.h",
         "tmp_dir.h",
@@ -54,16 +52,34 @@ redpanda_test_cc_library(
     hdrs = [
         "async.h",
         "fixture.h",
-        "logs.h",
         "test_macros.h",
         "tmp_dir.h",
     ],
     include_prefix = "test_utils",
     visibility = ["//visibility:public"],
     deps = [
-        "//src/v/test_utils:fixture",
+        ":boost_result_redirect",
+        ":fixture",
         "@seastar//:testing",
     ],
+)
+
+redpanda_test_cc_library(
+    name = "boost_result_redirect",
+    srcs = [
+        "boost_result_redirect.cc",
+    ],
+    implementation_deps = [
+        "//src/v/thirdparty/libxml2",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+        "@abseil-cpp//absl/time",
+        "@boost//:config",
+        "@boost//:core",
+        "@boost//:test",
+    ],
+    include_prefix = "test_utils",
+    visibility = ["//visibility:public"],
 )
 
 redpanda_test_cc_library(
@@ -81,6 +97,23 @@ redpanda_test_cc_library(
         "@abseil-cpp//absl/container:btree",
         "@abseil-cpp//absl/container:node_hash_map",
         "@abseil-cpp//absl/container:node_hash_set",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "random_bytes",
+    srcs = ["random_bytes.cc"],
+    hdrs = [
+        "random_bytes.h",
+    ],
+    implementation_deps = [
+        "//src/v/random:generators",
+    ],
+    include_prefix = "test_utils",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/bytes",
+        "//src/v/bytes:iobuf",
     ],
 )
 
@@ -140,6 +173,21 @@ redpanda_test_cc_library(
     deps = [
         "//src/v/reflection:adl",
         "//src/v/serde",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "logs",
+    hdrs = [
+        "logs.h",
+    ],
+    include_prefix = "test_utils",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/model",
+        "//src/v/storage",
+        "@seastar",
     ],
 )
 

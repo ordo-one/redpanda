@@ -34,8 +34,14 @@ class CloudBroker():
 
         # Backward compatibility
         # Various classes will use this to hash and compare nodes
-        self.account = DummyAccount(node_name=pod['spec']['nodeName'],
-                                    pod_name=pod['metadata']['name'])
+        try:
+            self.account = DummyAccount(node_name=pod['spec']['nodeName'],
+                                        pod_name=pod['metadata']['name'])
+        except KeyError as e:
+            self.logger.error(
+                f"Failed to create DummyAccount: missing key {e} in pod spec. Pod details: {pod}"
+            )
+            raise
 
         # It appears that the node-id label will only be added if the cluster
         # is still being managed by the operator - if managed=false then this
@@ -83,7 +89,7 @@ class CloudBroker():
         # Copy agent -> broker node
         remote_path = os.path.join("/tmp", script_name)
         _cp_cmd = self._kubeclient._ssh_prefix() + [
-            'kubectl', 'cp', script_name,
+            'kubectl', '-n', 'redpanda', 'cp', script_name,
             f"{self.nodeshell.pod_name}:{remote_path}"
         ]
         self.logger.debug(_cp_cmd)

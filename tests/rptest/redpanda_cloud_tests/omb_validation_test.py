@@ -24,6 +24,7 @@ from rptest.services.openmessaging_benchmark_configs import \
     OMBSampleConfigurations
 from rptest.services.machinetype import get_machine_info
 from rptest.utils.type_utils import rcast
+from rptest.tests.write_caching_test import WriteCachingMode
 
 # pyright: strict
 
@@ -92,7 +93,7 @@ class OMBValidationTest(RedpandaCloudTest):
             self.logger.info(
                 f"Starting benchmark attempt {try_count}/{max_retries}.")
             benchmark.start()
-            benchmark_time_min = benchmark.benchmark_time() + 5
+            benchmark_time_min = benchmark.benchmark_time_mins() + 5
             benchmark.wait(timeout_sec=benchmark_time_min * 60)
 
             res = benchmark.check_succeed(raise_exceptions=False)
@@ -231,7 +232,7 @@ class OMBValidationTest(RedpandaCloudTest):
         return math.floor(0.9537 * mb)
 
     @cluster(num_nodes=CLUSTER_NODES)
-    @matrix(write_caching=["on", "off"])
+    @matrix(write_caching=[WriteCachingMode.TRUE, WriteCachingMode.FALSE])
     def test_max_connections(self, write_caching: str):
         tier_limits = self.tier_limits
 
@@ -470,15 +471,15 @@ class OMBValidationTest(RedpandaCloudTest):
 
         # run the OMB portion of the benchmark and ensure it succeeded
         benchmark.start()
-        omb_seconds = benchmark.benchmark_time() * 60
+        omb_seconds = benchmark.benchmark_time_mins() * 60
         benchmark.wait(timeout_sec=omb_seconds + 300)
 
         assert_no_rejected()
 
         body_runtime = time() - time_before_body
 
-        assert body_runtime >= benchmark.benchmark_time(), \
-            f"unexpectedly short runtime: {body_runtime} vs {benchmark.benchmark_time()}"
+        assert body_runtime >= benchmark.benchmark_time_mins(), \
+            f"unexpectedly short runtime: {body_runtime} vs {benchmark.benchmark_time_mins()}"
 
         assert time() - time_before_swarm < swarm_runtime, (
             f"test ran too long and so swarm will have stopped: "
@@ -564,7 +565,7 @@ class OMBValidationTest(RedpandaCloudTest):
             self.logger.warn(str(results))
 
     @cluster(num_nodes=CLUSTER_NODES)
-    @matrix(write_caching=["on", "off"])
+    @matrix(write_caching=[WriteCachingMode.TRUE, WriteCachingMode.FALSE])
     def test_max_partitions(self, write_caching: str):
         tier_limits = self.tier_limits
 
@@ -584,7 +585,10 @@ class OMBValidationTest(RedpandaCloudTest):
                             1)
         producer_rate = tier_limits.max_ingress // 2
         total_producers = self._producer_count(producer_rate)
-        total_consumers = self._consumer_count(producer_rate * subscriptions)
+        # double consumer count which is a bit more friendly and realistic in
+        # high partition scenarios
+        total_consumers = self._consumer_count(
+            producer_rate * subscriptions) * 2
 
         workload = self.WORKLOAD_DEFAULTS | {
             "name":
@@ -646,7 +650,7 @@ class OMBValidationTest(RedpandaCloudTest):
                                            num_workers=self.CLUSTER_NODES - 1,
                                            topology="ensemble")
         benchmark.start()
-        benchmark_time_min = benchmark.benchmark_time() + 5
+        benchmark_time_min = benchmark.benchmark_time_mins() + 5
         benchmark.wait(timeout_sec=benchmark_time_min * 60)
 
         # check if omb gave errors, but don't process metrics
@@ -670,7 +674,7 @@ class OMBValidationTest(RedpandaCloudTest):
         self.redpanda.assert_cluster_is_reusable()
 
     @cluster(num_nodes=CLUSTER_NODES)
-    @matrix(write_caching=["on", "off"])
+    @matrix(write_caching=[WriteCachingMode.TRUE, WriteCachingMode.FALSE])
     def test_common_workload(self, write_caching: str):
         tier_limits = self.tier_limits
 
@@ -728,7 +732,7 @@ class OMBValidationTest(RedpandaCloudTest):
         self.redpanda.assert_cluster_is_reusable()
 
     @cluster(num_nodes=CLUSTER_NODES)
-    @matrix(write_caching=["on", "off"])
+    @matrix(write_caching=[WriteCachingMode.TRUE, WriteCachingMode.FALSE])
     def test_retention(self, write_caching: str):
         tier_limits = self.tier_limits
 

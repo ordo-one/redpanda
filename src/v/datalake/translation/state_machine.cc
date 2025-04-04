@@ -10,24 +10,33 @@
 
 #include "datalake/translation/state_machine.h"
 
+#include "base/vassert.h"
 #include "datalake/logger.h"
 #include "datalake/translation/types.h"
+#include "datalake/translation/utils.h"
+#include "model/fundamental.h"
+#include "model/timestamp.h"
+
+#include <seastar/core/future.hh>
 
 namespace {
-raft::replicate_options make_replicate_options() {
-    auto opts = raft::replicate_options(raft::consistency_level::quorum_ack);
+raft::replicate_options make_replicate_options(ss::abort_source& as) {
+    auto opts = raft::replicate_options(
+      raft::consistency_level::quorum_ack, std::ref(as));
     opts.set_force_flush();
+
     return opts;
 }
 
-model::record_batch_reader make_translation_state_batch(kafka::offset offset) {
+model::record_batch make_translation_state_batch(
+  kafka::offset offset, std::optional<model::timestamp> timestamp) {
     auto val = datalake::translation::translation_state{
-      .highest_translated_offset = offset};
+      .highest_translated_offset = offset,
+      .last_translated_timestamp = timestamp};
     storage::record_batch_builder builder(
       model::record_batch_type::datalake_translation_state, model::offset(0));
     builder.add_raw_kv(std::nullopt, serde::to_iobuf(val));
-    auto batch = std::move(builder).build();
-    return model::make_memory_record_batch_reader(std::move(batch));
+    return std::move(builder).build();
 }
 
 } // namespace
@@ -36,6 +45,11 @@ namespace datalake::translation {
 
 translation_stm::translation_stm(ss::logger& logger, raft::consensus* raft)
   : raft::persisted_stm<>("datalake_translation_stm.snapshot", logger, raft) {}
+
+ss::future<> translation_stm::stop() {
+    _waiters_for_translated.stop();
+    return base::stop();
+}
 
 ss::future<> translation_stm::do_apply(const model::record_batch& batch) {
     if (
@@ -52,9 +66,45 @@ ss::future<> translation_stm::do_apply(const model::record_batch& batch) {
           _log.trace,
           "updating highest translated offset to {}",
           value.highest_translated_offset);
-        _highest_translated_offset = std::max(
-          _highest_translated_offset, value.highest_translated_offset);
+
+        _last_translated_timestamp = std::max(
+          _last_translated_timestamp, value.last_translated_timestamp);
+        if (value.highest_translated_offset > _highest_translated_offset) {
+            update_highest_translated_offset(value.highest_translated_offset);
+        }
     }
+}
+
+ss::future<> translation_stm::wait_translated(
+  kafka::offset offset,
+  model::timeout_clock::time_point timeout,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) const {
+    vlog(_log.debug, "waiting for translated offset {}", offset);
+    co_await _waiters_for_translated.wait(offset, timeout, as);
+    vlog(_log.debug, "waited for translated offset {}", offset);
+}
+
+ss::future<> translation_stm::wait_translated(
+  model::offset offset,
+  model::timeout_clock::time_point timeout,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) const {
+    // `kafka_offset` is the last data entry at or before `offset`
+    offset = model::next_offset(offset);
+    auto kafka_offset = model::offset_cast(
+      _raft->log()->from_log_offset(offset));
+    kafka_offset = kafka::prev_offset(kafka_offset);
+
+    vlog(
+      _log.debug,
+      "[{}] waiting for kafka offset {} to be translated",
+      _raft->ntp(),
+      kafka_offset);
+    co_await wait_translated(kafka_offset, timeout, as);
+    vlog(
+      _log.debug,
+      "[{}] kafka offset {} has been translated",
+      _raft->ntp(),
+      kafka_offset);
 }
 
 ss::future<std::optional<kafka::offset>>
@@ -66,8 +116,18 @@ translation_stm::highest_translated_offset(
     co_return _highest_translated_offset;
 }
 
+ss::future<std::optional<model::timestamp>>
+translation_stm::last_translated_timestamp(
+  model::timeout_clock::duration timeout) {
+    if (!_raft->log_config().iceberg_enabled() || !co_await sync(timeout)) {
+        co_return std::nullopt;
+    }
+    co_return _last_translated_timestamp;
+}
+
 ss::future<std::error_code> translation_stm::reset_highest_translated_offset(
   kafka::offset new_translated_offset,
+  std::optional<model::timestamp> new_translated_ts,
   model::term_id term,
   model::timeout_clock::duration timeout,
   ss::abort_source& as) {
@@ -76,7 +136,8 @@ ss::future<std::error_code> translation_stm::reset_highest_translated_offset(
     }
     vlog(
       _log.debug,
-      "Reset-ing highest translated offset to {} from {} in term: {}",
+      "Reset-ing highest translated offset to {} from {} in "
+      "term: {}",
       new_translated_offset,
       _highest_translated_offset,
       term);
@@ -88,8 +149,8 @@ ss::future<std::error_code> translation_stm::reset_highest_translated_offset(
     }
     auto result = co_await _raft->replicate(
       current_term,
-      make_translation_state_batch(new_translated_offset),
-      make_replicate_options());
+      make_translation_state_batch(new_translated_offset, new_translated_ts),
+      make_replicate_options(as));
     auto deadline = model::timeout_clock::now() + timeout;
     if (
       result
@@ -117,35 +178,62 @@ model::offset translation_stm::max_collectible_offset() {
     if (_highest_translated_offset == kafka::offset{}) {
         return model::offset{};
     }
-    return _raft->log()->to_log_offset(
-      kafka::offset_cast(_highest_translated_offset));
+
+    return highest_log_offset_below_next(
+      _raft->log(), _highest_translated_offset);
 }
 
-ss::future<> translation_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied> translation_stm::apply_local_snapshot(
   raft::stm_snapshot_header, iobuf&& bytes) {
-    _highest_translated_offset
-      = serde::from_iobuf<snapshot>(std::move(bytes)).highest_translated_offset;
-    co_return;
+    auto snap = serde::from_iobuf<snapshot>(std::move(bytes));
+    _highest_translated_offset = snap.highest_translated_offset;
+    _last_translated_timestamp = snap.last_translated_timestamp;
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot>
 translation_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
     auto snapshot_offset = last_applied_offset();
-    snapshot snap{.highest_translated_offset = _highest_translated_offset};
+    snapshot snap{
+      .highest_translated_offset = _highest_translated_offset,
+      .last_translated_timestamp = _last_translated_timestamp,
+    };
     apply_units.return_all();
     iobuf result;
     co_await serde::write_async(result, snap);
     co_return raft::stm_snapshot::create(0, snapshot_offset, std::move(result));
 }
 
-ss::future<> translation_stm::apply_raft_snapshot(const iobuf&) { co_return; }
+ss::future<> translation_stm::apply_raft_snapshot(const iobuf&) {
+    // reset offset to not initalized when handling Raft snapshot, this way
+    // state machine will not hold any obsolete state that should be overriden
+    // with the snapshot.
+    vlog(_log.debug, "Applying raft snapshot, resetting state");
+    _highest_translated_offset = kafka::offset{};
+    _last_translated_timestamp = std::nullopt;
+    co_return;
+}
 
 ss::future<iobuf> translation_stm::take_snapshot(model::offset) {
     co_return iobuf{};
 }
 
+void translation_stm::update_highest_translated_offset(
+  kafka::offset new_offset) {
+    vassert(
+      new_offset >= _highest_translated_offset,
+      "attempt to lower _highest_translated_offset from {} to {}",
+      _highest_translated_offset,
+      new_offset);
+    _highest_translated_offset = new_offset;
+    _waiters_for_translated.notify(new_offset);
+}
+
+stm_factory::stm_factory(bool iceberg_enabled)
+  : _iceberg_enabled(iceberg_enabled) {}
+
 bool stm_factory::is_applicable_for(const storage::ntp_config& config) const {
-    return model::is_user_topic(config.ntp());
+    return _iceberg_enabled && model::is_user_topic(config.ntp());
 }
 
 void stm_factory::create(

@@ -16,7 +16,7 @@ from enum import Enum
 from functools import wraps
 from itertools import islice
 from time import sleep
-from typing import Iterator, NamedTuple, Union, Optional
+from typing import Callable, Iterator, NamedTuple, Union, Optional
 from ducktape.utils.util import wait_until
 
 
@@ -67,7 +67,8 @@ class S3Client:
                  endpoint=None,
                  disable_ssl=True,
                  signature_version='s3v4',
-                 before_call_headers=None,
+                 before_call_headers: Optional[Callable[[], dict[str,
+                                                                 str]]] = None,
                  use_fips_endpoint=False,
                  addressing_style: S3AddressingStyle = S3AddressingStyle.PATH):
 
@@ -102,20 +103,24 @@ class S3Client:
            loggers list that can be included can be found in ticket: PESDLC-876         
            
         """
+
+        # If something really need debugging, add 'urllib3'
+        boto_loggers = ['boto3', 'botocore']
+
         def populate_handler(filename, level):
-            # If something really need debugging, add 'urllib3'
-            loggers_list = ['boto3', 'botocore']
-            # get logger, configure it and set handlers
-            for logger_name in loggers_list:
-                l = logging.getLogger(logger_name)
-                l.setLevel(level)
+            for logger_name in boto_loggers:
                 handler = logging.FileHandler(filename)
+                handler.setLevel(level)
                 fmt = logging.Formatter('[%(levelname)-5s - %(asctime)s - '
                                         f'{logger_name} - %(module)s - '
                                         '%(funcName)s - lineno:%(lineno)s]: '
                                         '%(message)s')
                 handler.setFormatter(fmt)
-                l.addHandler(handler)
+
+                logging.getLogger(logger_name).addHandler(handler)
+
+        for logger_name in boto_loggers:
+            logging.getLogger(logger_name).setLevel(logging.DEBUG)
 
         # Extract info from ducktape loggers
         # Assume that there is only one DEBUG and one INFO handler
@@ -607,7 +612,8 @@ class S3Client:
         gcs_bucket.patch()
 
     def _add_header(self, model, params, request_signer, **kwargs):
-        params['headers'].update(self._before_call_headers)
+        assert self._before_call_headers is not None
+        params['headers'].update(self._before_call_headers())
 
     @property
     def _is_gcs(self):

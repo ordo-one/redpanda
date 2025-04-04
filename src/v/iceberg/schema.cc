@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/schema.h"
 
 #include "iceberg/field_collecting_visitor.h"
@@ -94,8 +95,9 @@ std::optional<nested_field::id_t> schema::highest_field_id() const {
     return highest;
 }
 
-void schema::assign_fresh_ids() {
-    int next_id = 1;
+auto schema::assign_fresh_ids(std::optional<nested_field::id_t> next_available)
+  -> schema_outcome {
+    nested_field::id_t next_id = next_available.value_or(nested_field::id_t{1});
     chunked_vector<nested_field*> to_visit_stack;
     for (auto& f : std::ranges::reverse_view(schema_struct.fields)) {
         to_visit_stack.push_back(f.get());
@@ -104,12 +106,19 @@ void schema::assign_fresh_ids() {
         auto* field = to_visit_stack.back();
         to_visit_stack.pop_back();
         if (!field) {
-            continue;
+            return errc::null_field;
+        } else if (field->is_add()) {
+            field->id = next_id++;
         }
+        if (field->id == 0) {
+            // TODO(oren): logger?
+            return errc::missing_id;
+        }
+
         auto& type = field->type;
-        field->id = nested_field::id_t{next_id++};
         std::visit(reverse_field_collecting_visitor{to_visit_stack}, type);
     }
+    return std::nullopt;
 }
 
 } // namespace iceberg

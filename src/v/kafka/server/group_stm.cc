@@ -2,6 +2,7 @@
 
 #include "cluster/logger.h"
 #include "kafka/server/group_metadata.h"
+#include "kafka/server/logger.h"
 #include "model/record.h"
 
 namespace kafka {
@@ -19,8 +20,27 @@ void group_stm::update_offset(
   const model::topic_partition& key,
   model::offset offset,
   offset_metadata_value&& meta) {
-    _offsets[key] = logged_metadata{
+    logged_metadata logged_md{
       .log_offset = offset, .metadata = std::move(meta)};
+
+    auto it = _offsets.find(key);
+    if (it == _offsets.end()) {
+        _offsets.emplace(key, std::move(logged_md));
+        return;
+    }
+    if (it->second.metadata.offset > logged_md.metadata.offset) {
+        vlog(
+          cg_klog.info,
+          "[group: {}] offset metadata for {}/{} is older than the one "
+          "already stored, stored offset: {}, new offset: {}. Log offset: {}",
+          _group_id,
+          key.topic,
+          key.partition,
+          it->second.metadata.offset,
+          logged_md.metadata.offset,
+          logged_md.log_offset);
+    }
+    it->second = std::move(logged_md);
 }
 
 void group_stm::update_tx_offset(
@@ -30,7 +50,7 @@ void group_stm::update_tx_offset(
       it == _producers.end() || it->second.tx == nullptr
       || offset_md.pid.epoch != it->second.epoch) {
         vlog(
-          cluster::txlog.warn,
+          cluster::txlog.debug,
           "producer {} not found, skipping offsets update",
           offset_md.pid);
         return;
@@ -57,7 +77,7 @@ void group_stm::commit(model::producer_identity pid) {
       || pid.epoch != it->second.epoch) {
         // missing prepare may happen when the consumer log gets truncated
         vlog(
-          cluster::txlog.warn,
+          cluster::txlog.debug,
           "unable to find ongoing transaction for producer: {}, skipping "
           "commit",
           pid);
@@ -103,7 +123,8 @@ void group_stm::try_set_fence(
   model::producer_epoch epoch,
   model::tx_seq txseq,
   model::timeout_clock::duration transaction_timeout_ms,
-  model::partition_id tm_partition) {
+  model::partition_id tm_partition,
+  model::offset fence_offset) {
     auto [it, _] = _producers.try_emplace(id, epoch);
     if (it->second.epoch <= epoch) {
         it->second.epoch = epoch;
@@ -111,6 +132,7 @@ void group_stm::try_set_fence(
           .tx_seq = txseq,
           .tm_partition = tm_partition,
           .timeout = transaction_timeout_ms,
+          .begin_offset = fence_offset,
           .offsets = {},
         });
     }

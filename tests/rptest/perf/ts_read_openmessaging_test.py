@@ -23,6 +23,8 @@ class TSReadOpenmessagingTest(RedpandaTest):
             "retention_local_strict": True,
             "retention_local_target_bytes_default": 16 * 1_000_000,  # 16 MB
             "cloud_storage_spillover_manifest_size": None,
+            # approximate limit for m7gd.xlarge
+            "cloud_storage_max_throughput_per_shard": 25 * 1_000_000,
         }
         si_settings = SISettings(
             test_context=ctx,
@@ -71,7 +73,7 @@ class TSReadOpenmessagingTest(RedpandaTest):
                                            driver=driver_idx,
                                            workload=(workload, validator))
         benchmark.start()
-        benchmark_time_min = benchmark.benchmark_time(
+        benchmark_time_min = benchmark.benchmark_time_mins(
         ) + TSReadOpenmessagingTest.BENCHMARK_WAIT_TIME_MIN
         benchmark.wait(timeout_sec=benchmark_time_min * 60)
         benchmark.check_succeed()

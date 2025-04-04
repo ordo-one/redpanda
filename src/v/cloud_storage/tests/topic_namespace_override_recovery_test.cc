@@ -7,9 +7,9 @@
  *
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/tests/produce_utils.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/types.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/ntp_archiver_service.h"
@@ -120,7 +120,10 @@ TEST_F(TopicRecoveryFixture, TestTopicNamespaceOverrideRecovery) {
 
         // Sync archiver, upload candidates (if needed) and upload manifest.
         archiver.sync_for_tests().get();
-        std::ignore = archiver.upload_next_candidates().get();
+        std::ignore = archiver
+                        .upload_next_candidates(archival::archival_stm_fence{
+                          .emit_rw_fence_cmd = false})
+                        .get();
         archiver.upload_topic_manifest().get();
     }
 
@@ -188,7 +191,10 @@ TEST_F(TopicRecoveryFixture, TestTopicNamespaceOverrideRecovery) {
         .get());
 
     archiver.sync_for_tests().get();
-    std::ignore = archiver.upload_next_candidates().get();
+    std::ignore = archiver
+                    .upload_next_candidates(
+                      archival::archival_stm_fence{.emit_rw_fence_cmd = false})
+                    .get();
 
     // Check requests with the same predicate at end of scope, just to be
     // explicit about bad requests.

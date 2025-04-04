@@ -57,7 +57,7 @@ public:
     ss::future<result<cluster_health_report>> get_cluster_health(
       cluster_report_filter, force_refresh, model::timeout_clock::time_point);
 
-    storage::disk_space_alert get_cluster_disk_health();
+    storage::disk_space_alert get_cluster_data_disk_health();
 
     // Collects or return cached version of current node health report.
     ss::future<result<node_health_report_ptr>> get_current_node_health();
@@ -69,6 +69,11 @@ public:
     get_node_drain_status(
       model::node_id node_id, model::timeout_clock::time_point deadline);
 
+    ss::future<result<restart_risk_report>> get_current_node_restart_risks(
+      size_t limit, model::timeout_clock::time_point deadline);
+
+    ss::future<result<double>> get_current_node_in_sync_replicas_share(
+      model::timeout_clock::time_point deadline);
     /**
      *  Return cluster health overview
      *
@@ -101,7 +106,7 @@ private:
     config::binding<std::chrono::milliseconds> _alive_timeout;
 
     // Currently the worst / max of all nodes' disk space state
-    storage::disk_space_alert _cluster_disk_health{
+    storage::disk_space_alert _cluster_data_disk_health{
       storage::disk_space_alert::ok};
     ss::timer<ss::lowres_clock> _refresh_timer;
     ss::gate _refresh_gate;

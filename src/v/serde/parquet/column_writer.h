@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "container/fragmented_vector.h"
 #include "serde/parquet/metadata.h"
 #include "serde/parquet/value.h"
 
@@ -28,11 +29,12 @@ struct data_page {
     iobuf serialized;
 };
 
-// The delta in stats when a value is written to a column.
-//
-// This is used to account memory usage at the row group level.
-struct incremental_column_stats {
-    uint64_t memory_usage;
+// All the accumulated data when a column_writer is flushed.
+struct flushed_pages {
+    // All the pages that were flushed together into a single row group.
+    chunked_vector<data_page> pages;
+    // Stats for all flushed pages
+    statistics stats;
 };
 
 // A writer for a single column of parquet data.
@@ -43,7 +45,7 @@ public:
     // Options for changing how a column writer behaves.
     struct options {
         // If true, use zstd compression for the column data.
-        bool compress = false;
+        bool compress;
     };
 
     explicit column_writer(const schema_element&, options);
@@ -61,12 +63,23 @@ public:
     // nodes.
     //
     // Use `shred_record` to get the value and levels from an arbitrary value.
-    incremental_column_stats add(value, rep_level, def_level);
-
-    // Flush the currently buffered values to a page.
     //
-    // This also resets the writer to be able to start writing a new page.
-    ss::future<data_page> flush_page();
+    // Return the current information about the column after a value is written.
+    void add(value, rep_level, def_level);
+
+    // The memory usage of this entire column.
+    int64_t memory_usage() const;
+
+    // The memory usage of the current page being built.
+    int64_t current_page_memory_usage() const;
+
+    ss::future<> next_page();
+
+    // Flush the pages that have been accumulated so far in the column.
+    //
+    // This also resets the writer to be able to start writing a new column
+    // (within another row group).
+    ss::future<flushed_pages> flush_pages();
 
 private:
     std::unique_ptr<impl> _impl;

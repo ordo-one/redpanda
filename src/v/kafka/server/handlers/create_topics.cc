@@ -76,7 +76,12 @@ bool is_supported(std::string_view name) {
        topic_property_iceberg_mode,
        topic_property_leaders_preference,
        topic_property_delete_retention_ms,
-       topic_property_iceberg_delete});
+       topic_property_iceberg_delete,
+       topic_property_iceberg_partition_spec,
+       topic_property_iceberg_invalid_record_action,
+       topic_property_iceberg_target_lag_ms,
+       topic_property_min_cleanable_dirty_ratio,
+       topic_property_remote_allow_gaps});
 
     if (std::any_of(
           supported_configs.begin(),
@@ -118,8 +123,10 @@ using validators = make_validator_types<
   vcluster_id_validator,
   write_caching_configs_validator,
   iceberg_config_validator,
+  iceberg_invalid_record_action_validator,
   cloud_topic_config_validator,
-  delete_retention_ms_validator>;
+  delete_retention_ms_validator,
+  iceberg_target_lag_ms_validator>;
 
 static void
 append_topic_configs(request_context& ctx, create_topics_response& response) {
@@ -371,13 +378,14 @@ ss::future<response_ptr> create_topics_handler::handle(
 
     // Record the number of partition mutations in each requested topic,
     // calulcating throttle delay if necessary
+    const auto now = quota_manager::clock::now();
     auto quota_exceeded_it = co_await ssx::partition(
-      begin, valid_range_end, [&ctx, &response](const creatable_topic& t) {
+      begin, valid_range_end, [&ctx, &response, now](const creatable_topic& t) {
           /// Capture before next scheduling point below
           auto& response_ref = response;
           return ctx.quota_mgr()
             .record_partition_mutations(
-              ctx.header().client_id, t.num_partitions)
+              ctx.header().client_id, t.num_partitions, now)
             .then([&response_ref](std::chrono::milliseconds delay) {
                 response_ref.data.throttle_time_ms = std::max(
                   response_ref.data.throttle_time_ms, delay);

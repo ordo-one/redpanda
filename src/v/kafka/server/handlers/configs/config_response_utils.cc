@@ -13,8 +13,10 @@
 
 #include "cluster/metadata_cache.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
 #include "config/node_config.h"
 #include "kafka/server/handlers/topics/types.h"
+#include "model/metadata.h"
 
 #include <charconv>
 #include <chrono>
@@ -103,7 +105,8 @@ consteval describe_configs_type property_config_type() {
         std::is_same_v<T, pandaproxy::schema_registry::subject_name_strategy> ||
         std::is_same_v<T, model::vcluster_id> ||
         std::is_same_v<T, model::write_caching_mode> ||
-        std::is_same_v<T, config::leaders_preference> || std::is_same_v<T, model::iceberg_mode>;
+        std::is_same_v<T, config::leaders_preference> || std::is_same_v<T, model::iceberg_mode> ||
+        std::is_same_v<T, model::iceberg_invalid_record_action>;
 
     constexpr auto is_long_type = is_long<T> ||
         // Long type since seconds is atleast a 35-bit signed integral
@@ -978,18 +981,87 @@ config_response_container_t make_topic_configs(
         "Preferred location (e.g. rack) for partition leaders of this topic."),
       &describe_as_string<config::leaders_preference>);
 
+    if (topic_properties.iceberg_mode != model::iceberg_mode::disabled) {
+        add_topic_config_if_requested(
+          config_keys,
+          result,
+          config::shard_local_cfg().iceberg_delete.name(),
+          config::shard_local_cfg().iceberg_delete(),
+          topic_property_iceberg_delete,
+          topic_properties.iceberg_delete,
+          include_synonyms,
+          maybe_make_documentation(
+            include_documentation,
+            "If true, delete the corresponding Iceberg table when deleting the "
+            "topic."),
+          &describe_as_string<bool>);
+
+        add_topic_config_if_requested(
+          config_keys,
+          result,
+          config::shard_local_cfg().iceberg_default_partition_spec.name(),
+          config::shard_local_cfg().iceberg_default_partition_spec(),
+          topic_property_iceberg_partition_spec,
+          topic_properties.iceberg_partition_spec,
+          include_synonyms,
+          maybe_make_documentation(
+            include_documentation,
+            "Partition spec of the corresponding Iceberg table."),
+          &describe_as_string<ss::sstring>,
+          true);
+
+        add_topic_config_if_requested(
+          config_keys,
+          result,
+          config::shard_local_cfg().iceberg_invalid_record_action.name(),
+          config::shard_local_cfg().iceberg_invalid_record_action(),
+          topic_property_iceberg_invalid_record_action,
+          topic_properties.iceberg_invalid_record_action,
+          include_synonyms,
+          maybe_make_documentation(
+            include_documentation,
+            "Action to take when an invalid record is encountered."),
+          &describe_as_string<model::iceberg_invalid_record_action>);
+
+        add_topic_config_if_requested(
+          config_keys,
+          result,
+          topic_property_iceberg_target_lag_ms,
+          metadata_cache.get_default_iceberg_target_lag_ms(),
+          topic_property_iceberg_target_lag_ms,
+          topic_properties.iceberg_target_lag_ms,
+          include_synonyms,
+          maybe_make_documentation(
+            include_documentation,
+            "Best effort target for Iceberg table lag relative to source "
+            "topic, in milliseconds."),
+          describe_as_string<std::chrono::milliseconds>);
+    }
+
     add_topic_config_if_requested(
       config_keys,
       result,
-      config::shard_local_cfg().iceberg_delete.name(),
-      config::shard_local_cfg().iceberg_delete(),
-      topic_property_iceberg_delete,
-      topic_properties.iceberg_delete,
+      topic_property_min_cleanable_dirty_ratio,
+      metadata_cache.get_default_min_cleanable_dirty_ratio(),
+      topic_property_min_cleanable_dirty_ratio,
+      topic_properties.min_cleanable_dirty_ratio,
       include_synonyms,
       maybe_make_documentation(
         include_documentation,
-        "If true, delete the corresponding Iceberg table when deleting the "
-        "topic."),
+        config::shard_local_cfg().min_cleanable_dirty_ratio.desc()));
+
+    add_topic_config_if_requested(
+      config_keys,
+      result,
+      config::shard_local_cfg().cloud_storage_enable_remote_allow_gaps.name(),
+      config::shard_local_cfg().cloud_storage_enable_remote_allow_gaps(),
+      topic_property_remote_allow_gaps,
+      topic_properties.remote_topic_allow_gaps,
+      include_synonyms,
+      maybe_make_documentation(
+        include_documentation,
+        config::shard_local_cfg()
+          .cloud_storage_enable_remote_allow_gaps.desc()),
       &describe_as_string<bool>);
 
     return result;

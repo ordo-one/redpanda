@@ -20,7 +20,7 @@ rp_test(
     vint_test.cc
     waiter_queue_test.cc
     auto_fmt_test.cc
-  LIBRARIES v::seastar_testing_main v::utils v::bytes v::version absl::flat_hash_set
+  LIBRARIES v::seastar_testing_main v::utils v::bytes v::version absl::flat_hash_set v::test_random_bytes
   ARGS "-- -c 1"
   LABELS utils
 )
@@ -31,6 +31,8 @@ rp_test(
   BINARY_NAME gtest_utils_single_thread
   SOURCES
     external_process_test.cc
+    s3_fifo_test.cc
+    chunked_kv_cache_test.cc
   LIBRARIES
     v::utils
     v::gtest_main

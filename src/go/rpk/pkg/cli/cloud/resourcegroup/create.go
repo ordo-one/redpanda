@@ -13,8 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	controlplanev1beta2 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1beta2"
-
+	controlplanev1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/oauth"
@@ -44,20 +43,19 @@ func createCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			cfg, err := p.Load(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			priorProfile := cfg.ActualProfile()
-			_, authVir, clearedProfile, _, err := oauth.LoadFlow(cmd.Context(), fs, cfg, auth0.NewClient(cfg.DevOverrides()), false, false, cfg.DevOverrides().CloudAPIURL)
+			_, authVir, clearedProfile, _, err := oauth.LoadFlow(cmd.Context(), fs, cfg, auth0.NewClient(cfg.DevOverrides()), false, false)
 			out.MaybeDie(err, "unable to authenticate with Redpanda Cloud: %v", err)
 			oauth.MaybePrintSwapMessage(clearedProfile, priorProfile, authVir)
 			authToken := authVir.AuthToken
-			cl, err := publicapi.NewControlPlaneClientSet(cfg.DevOverrides().PublicAPIURL, authToken)
-			out.MaybeDie(err, "unable to create the public api client: %v", err)
+			cl := publicapi.NewCloudClientSet(cfg.DevOverrides().PublicAPIURL, authToken)
 
 			var (
 				res   []createResponse
 				exit1 bool
 			)
 			for _, name := range args {
-				n, err := cl.ResourceGroup.CreateResourceGroup(cmd.Context(), connect.NewRequest(&controlplanev1beta2.CreateResourceGroupRequest{
-					ResourceGroup: &controlplanev1beta2.ResourceGroupCreate{
+				n, err := cl.ResourceGroup.CreateResourceGroup(cmd.Context(), connect.NewRequest(&controlplanev1.CreateResourceGroupRequest{
+					ResourceGroup: &controlplanev1.ResourceGroupCreate{
 						Name: name,
 					},
 				}))

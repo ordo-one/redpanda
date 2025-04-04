@@ -37,11 +37,11 @@ redpanda_test_cc_library(
     include_prefix = "iceberg/tests",
     visibility = ["//visibility:public"],
     deps = [
-        "//src/v/bytes:random",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:values",
         "//src/v/random:generators",
         "//src/v/test_utils:random",
+        "//src/v/test_utils:random_bytes",
     ],
 )
 
@@ -76,6 +76,25 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "values_json_test",
+    timeout = "short",
+    srcs = [
+        "values_json_test.cc",
+    ],
+    deps = [
+        ":test_schemas",
+        "//src/v/iceberg:json_writer",
+        "//src/v/iceberg:values",
+        "//src/v/iceberg:values_json",
+        "//src/v/json",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "@abseil-cpp//absl/numeric:int128",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "filesystem_catalog_test",
     timeout = "short",
     srcs = [
@@ -87,8 +106,8 @@ redpanda_cc_gtest(
         ":test_schemas",
         "//src/v/base",
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/iceberg:logger",
@@ -147,8 +166,8 @@ redpanda_cc_gtest(
         "//src/v/bytes:iobuf",
         "//src/v/cloud_io:remote",
         "//src/v/cloud_io:transfer_details",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/iceberg:manifest",
         "//src/v/iceberg:manifest_io",
         "//src/v/iceberg:manifest_list",
@@ -202,8 +221,9 @@ redpanda_cc_gtest(
     deps = [
         ":test_schemas",
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
+        "//src/v/iceberg:compatibility",
         "//src/v/iceberg:manifest",
         "//src/v/iceberg:manifest_entry",
         "//src/v/iceberg:manifest_io",
@@ -240,6 +260,7 @@ redpanda_cc_gtest(
         "partition_test.cc",
     ],
     deps = [
+        ":test_schemas",
         "//src/v/container:fragmented_vector",
         "//src/v/iceberg:partition",
         "//src/v/test_utils:gtest",
@@ -278,6 +299,24 @@ redpanda_cc_gtest(
         "//src/v/iceberg:partition_key_type",
         "//src/v/iceberg:schema",
         "//src/v/iceberg:transform",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "remove_snapshots_action_test",
+    timeout = "short",
+    srcs = [
+        "remove_snapshots_action_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/iceberg:manifest_entry",
+        "//src/v/iceberg:remove_snapshots_action",
+        "//src/v/iceberg:table_metadata",
+        "//src/v/iceberg:transaction",
+        "//src/v/random:generators",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
     ],
@@ -375,8 +414,8 @@ redpanda_cc_gtest(
         ":test_table_metadata",
         "//src/v/bytes:iobuf",
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/iceberg:table_io",
         "//src/v/iceberg:table_metadata",
         "//src/v/iceberg:table_metadata_json",
@@ -395,6 +434,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         ":test_table_metadata",
+        "//src/v/iceberg:compatibility_utils",
         "//src/v/iceberg:json_writer",
         "//src/v/iceberg:table_metadata",
         "//src/v/iceberg:table_metadata_json",
@@ -440,10 +480,31 @@ redpanda_cc_gtest(
         "transform_utils_test.cc",
     ],
     deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/iceberg:bucket_transform_hashing_visitor",
         "//src/v/iceberg:transform",
         "//src/v/iceberg:transform_utils",
         "//src/v/iceberg:values",
         "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "@abseil-cpp//absl/numeric:int128",
+        "@fmt",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "update_partition_spec_action_test",
+    timeout = "short",
+    srcs = [
+        "update_partition_spec_action_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":test_schemas",
+        "//src/v/iceberg:transaction",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
     ],
@@ -459,8 +520,11 @@ redpanda_cc_gtest(
     tags = ["exclusive"],
     deps = [
         ":test_schemas",
+        "//src/v/iceberg:compatibility_utils",
+        "//src/v/iceberg:datatypes",
         "//src/v/iceberg:transaction",
         "//src/v/test_utils:gtest",
+        "@fmt",
         "@googletest//:gtest",
     ],
 )
@@ -528,8 +592,8 @@ redpanda_cc_gtest(
     deps = [
         ":test_schemas",
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/container:chunked_hash_map",
         "//src/v/container:fragmented_vector",
         "//src/v/iceberg:merge_append_action",
@@ -567,6 +631,22 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "table_requirements_test",
+    timeout = "short",
+    srcs = [
+        "table_requirements_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":test_schemas",
+        "//src/v/iceberg:table_metadata",
+        "//src/v/iceberg:table_requirement",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "rest_catalog_test",
     timeout = "short",
     srcs = [
@@ -578,8 +658,9 @@ redpanda_cc_gtest(
         ":test_schemas",
         "//src/v/bytes:iobuf_parser",
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
+        "//src/v/config",
         "//src/v/iceberg:json_writer",
         "//src/v/iceberg:partition_json",
         "//src/v/iceberg:rest_catalog",
@@ -613,15 +694,57 @@ redpanda_cc_gtest(
     ],
 )
 
-redpanda_cc_bench(
-    name = "uri_bench",
+redpanda_cc_gtest(
+    name = "compatibility_test",
     timeout = "short",
+    srcs = [
+        "compatibility_test.cc",
+        "compatibility_utils_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":test_schemas",
+        "//src/v/datalake:partition_spec_parser",
+        "//src/v/iceberg:compatibility",
+        "//src/v/iceberg:compatibility_types",
+        "//src/v/iceberg:compatibility_utils",
+        "//src/v/iceberg:datatypes",
+        "//src/v/iceberg:field_collecting_visitor",
+        "//src/v/iceberg:partition",
+        "//src/v/random:generators",
+        "//src/v/test_utils:gtest",
+        "@abseil-cpp//absl/container:btree",
+        "@boost//:range",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "iceberg_uri_rpbench",
     srcs = [
         "uri_bench.cc",
     ],
     cpu = 1,
     deps = [
         "//src/v/iceberg:uri",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "iceberg_compatibility_rpbench",
+    srcs = [
+        "compatibility_bench.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":test_schemas",
+        "//src/v/iceberg:compatibility",
+        "//src/v/iceberg:datatypes",
+        "//src/v/iceberg:field_collecting_visitor",
+        "//src/v/iceberg:partition",
         "@seastar//:benchmark",
     ],
 )

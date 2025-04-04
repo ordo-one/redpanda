@@ -456,7 +456,7 @@ class Admin:
                  default_node: ClusterNode | None = None,
                  retry_codes: list[int] | None = None,
                  auth=None,
-                 retries_amount=5):
+                 retries_amount: int = 5):
         self.redpanda = redpanda
 
         self._session = AuthPreservingSession()
@@ -688,7 +688,7 @@ class Admin:
                  verb: str,
                  path: str,
                  node: MaybeNode = None,
-                 params: Optional[dict] = None,
+                 params: Optional[dict[str, str]] = None,
                  **kwargs: Any):
         if node is None and self._default_node is not None:
             # We were constructed with an explicit default node: use that one
@@ -980,6 +980,25 @@ class Admin:
         """
         return self._request('get', f"brokers/{id}", node=node).json()
 
+    def get_broker_pre_restart_probe(self, limit=None, node=None):
+        """
+        Return broker pre-restart probe.
+        """
+        assert node is not None
+        params = None if limit is None else {"limit": limit}
+        return self._request('get',
+                             "broker/pre_restart_probe",
+                             node=node,
+                             params=params).json()
+
+    def get_broker_post_restart_probe(self, node=None):
+        """
+        Return broker post-restart probe.
+        """
+        assert node is not None
+        return self._request('get', "broker/post_restart_probe",
+                             node=node).json()
+
     def get_cluster_view(self, node):
         """
         Return cluster_view.
@@ -1170,6 +1189,21 @@ class Admin:
         """
         path = f"debug/partitions/{namespace}/{topic}/{partition}/force_replicas"
         return self._request('post', path, node=node, json=replicas)
+
+    def toggle_failure_injection(
+        self,
+        topic,
+        partition,
+        op,
+        *,
+        inject: bool,
+        node,
+        namespace="kafka",
+    ):
+        assert op == "append_entries"
+        verb = "enable" if inject else "disable"
+        path = f"debug/partitions/{namespace}/{topic}/{partition}/{verb}_error_injection/{op}"
+        return self._request('post', path, node=node)
 
     def cancel_partition_move(self,
                               topic,
@@ -1451,6 +1485,33 @@ class Admin:
         if len(r.text) > 0:
             return r.json()["cluster_uuid"]
 
+    def get_metrics_uuid(self, node=None) -> str | None:
+        """
+        Returns the concents of the `/v1/cluster/metrics_uuid` endpoint.
+
+        Parameters
+        ----------
+        node: ClusterNode
+            The node to query the endpoint on. If None, a random node will be
+            chosen.
+
+        Returns
+        -------
+        str
+            The Metrics UUID
+
+        None
+            If the endpoint returns a 404 status code.
+        """
+        try:
+            r = self._request("GET", "cluster/metrics_uuid", node=node)
+        except HTTPError as ex:
+            if ex.response.status_code == 404:
+                return None
+            raise
+        if len(r.text) > 0:
+            return r.json()["uuid"]
+
     def initiate_topic_scan_and_recovery(self,
                                          payload: Optional[dict] = None,
                                          force_acquire_lock: bool = False,
@@ -1502,12 +1563,14 @@ class Admin:
 
     def stress_fiber_start(
         self,
-        node,
-        num_fibers,
-        min_spins_per_scheduling_point=None,
-        max_spins_per_scheduling_point=None,
-        min_ms_per_scheduling_point=None,
-        max_ms_per_scheduling_point=None,
+        node: MaybeNode,
+        num_fibers: int,
+        *,
+        min_spins_per_scheduling_point: int | None = None,
+        max_spins_per_scheduling_point: int | None = None,
+        min_ms_per_scheduling_point: int | None = None,
+        max_ms_per_scheduling_point: int | None = None,
+        stack_depth: int | None = None,
     ):
         p = {"num_fibers": str(num_fibers)}
         if min_spins_per_scheduling_point is not None:
@@ -1520,6 +1583,8 @@ class Admin:
             p["min_ms_per_scheduling_point"] = str(min_ms_per_scheduling_point)
         if max_ms_per_scheduling_point is not None:
             p["max_ms_per_scheduling_point"] = str(max_ms_per_scheduling_point)
+        if stack_depth is not None:
+            p["stack_depth"] = str(stack_depth)
         kwargs = {"params": p}
         return self._request("PUT",
                              "debug/stress_fiber_start",
@@ -1561,6 +1626,14 @@ class Admin:
 
     def get_partition_state(self, namespace, topic, partition, node=None):
         path = f"debug/partition/{namespace}/{topic}/{partition}"
+        return self._request("GET", path, node=node).json()
+
+    def get_partitions_local_summary(self, node: ClusterNode):
+        path = f"partitions/local_summary"
+        return self._request("GET", path, node=node).json()
+
+    def get_producers_state(self, namespace, topic, partition, node=None):
+        path = f"debug/producers/{namespace}/{topic}/{partition}"
         return self._request("GET", path, node=node).json()
 
     def get_local_storage_usage(self, node=None):
@@ -1614,7 +1687,9 @@ class Admin:
                              node=node,
                              **kwargs).json()
 
-    def get_cpu_profile(self, node=None, wait_ms=None):
+    def get_cpu_profile(self,
+                        node: MaybeNode = None,
+                        wait_ms: int | None = None):
         """
         Get the CPU profile of a node.
         """
@@ -1622,8 +1697,8 @@ class Admin:
         params = {}
         timeout = DEFAULT_TIMEOUT
 
-        if wait_ms:
-            params["wait_ms"] = wait_ms
+        if wait_ms is not None:
+            params["wait_ms"] = str(wait_ms)
             timeout = max(2 * (int(wait_ms) // 1_000), timeout)
 
         return self._request("get",
@@ -1849,3 +1924,25 @@ class Admin:
     def delete_debug_bundle_file(self, filename: str, node: MaybeNode = None):
         path = f"debug/bundle/file/{filename}"
         return self._request("DELETE", path, node=node)
+
+    def unsafe_abort_group_transaction(self, group_id: str, *, pid: int,
+                                       epoch: int, sequence: int):
+        params = {
+            "producer_id": pid,
+            "producer_epoch": epoch,
+            "sequence": sequence,
+        }
+        params = "&".join([f"{k}={v}" for k, v in params.items()])
+        return self._request(
+            'POST',
+            f"transaction/unsafe_abort_group_transaction/{group_id}?{params}")
+
+    def put_ctracker_va_message(self,
+                                shard: int,
+                                msg: str,
+                                node: MaybeNode = None):
+        params = {"message": msg}
+        return self._request("PUT",
+                             f'debug/ctracker/va/{shard}',
+                             node=node,
+                             data=json.dumps(params))

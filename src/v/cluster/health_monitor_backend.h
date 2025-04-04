@@ -34,6 +34,19 @@ using health_node_cb_t = ss::noncopyable_function<void(
   const node_health_report&,
   std::optional<ss::lw_shared_ptr<const node_health_report>>)>;
 
+namespace health_monitor_backend_details {
+template<class T>
+concept partition_leader_status_handler = std::is_invocable_r_v<
+  void,
+  T,
+  const followers_stats&,
+  const model::topic_namespace&,
+  model::partition_id>;
+
+template<class T>
+concept partition_handler = std::
+  is_invocable_r_v<void, T, const model::topic_namespace&, model::partition_id>;
+} // namespace health_monitor_backend_details
 /**
  * Health monitor backend is responsible for collecting cluster health status
  * and caching cluster health information.
@@ -65,7 +78,7 @@ public:
     ss::future<result<cluster_health_report>> get_cluster_health(
       cluster_report_filter, force_refresh, model::timeout_clock::time_point);
 
-    ss::future<storage::disk_space_alert> get_cluster_disk_health(
+    ss::future<storage::disk_space_alert> get_cluster_data_disk_health(
       force_refresh refresh, model::timeout_clock::time_point deadline);
 
     ss::future<result<node_health_report>> collect_current_node_health();
@@ -83,6 +96,12 @@ public:
 
     ss::future<cluster_health_overview>
       get_cluster_health_overview(model::timeout_clock::time_point);
+
+    ss::future<result<restart_risk_report>> get_current_node_restart_risks(
+      size_t limit, model::timeout_clock::time_point deadline);
+
+    ss::future<result<double>> get_current_node_in_sync_replicas_share(
+      model::timeout_clock::time_point deadline);
 
     bool does_raft0_have_leader();
 
@@ -138,6 +157,20 @@ private:
     std::chrono::milliseconds max_metadata_age();
     void abort_current_refresh();
 
+    ss::future<errc> walk_local_and_remote_reports(
+      health_monitor_backend_details::partition_leader_status_handler auto
+        local_leader_handler,
+      health_monitor_backend_details::partition_leader_status_handler auto
+        remote_leader_handler,
+      health_monitor_backend_details::partition_handler auto
+        unclaimed_partition_handler);
+
+    // read-only access to _reports
+    // unsafe across scheduling points:
+    const report_cache_t& reports() const;
+    // safe across scheduling points:
+    const ss::lw_shared_ptr<const report_cache_t> hold_reports() const;
+
     /**
      * @brief Stucture holding the aggregated results of partition status.
      */
@@ -164,7 +197,7 @@ private:
         bool operator==(const aggregated_report&) const = default;
     };
 
-    static aggregated_report aggregate_reports(report_cache_t& reports);
+    static aggregated_report aggregate_reports(const report_cache_t& reports);
 
     ss::lw_shared_ptr<raft::consensus> _raft0;
     ss::sharded<members_table>& _members;
@@ -181,9 +214,12 @@ private:
     ss::lw_shared_ptr<abortable_refresh_request> _refresh_request;
 
     status_cache_t _status;
-    report_cache_t _reports;
-    storage::disk_space_alert _reports_disk_health
+    // individual reports get inserted but never get replaced or removed,
+    // collection can also be replaced as a whole
+    ss::lw_shared_ptr<report_cache_t> _reports;
+    storage::disk_space_alert _reports_data_disk_health
       = storage::disk_space_alert::ok;
+    bool _restart_risks_collected = false;
     std::optional<size_t> _bytes_in_cloud_storage;
 
     ss::gate _gate;
@@ -199,4 +235,5 @@ private:
 
     friend struct health_report_accessor;
 };
+
 } // namespace cluster

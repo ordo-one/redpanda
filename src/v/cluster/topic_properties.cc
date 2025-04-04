@@ -23,6 +23,7 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       "read_replica: {}, read_replica_bucket: {}, "
       "remote_topic_namespace_override: {}, "
       "remote_topic_properties: {}, "
+      "remote_topic_allow_gaps: {}, "
       "batch_max_bytes: {}, retention_local_target_bytes: {}, "
       "retention_local_target_ms: {}, remote_delete: {}, segment_ms: {}, "
       "record_key_schema_id_validation: {}, "
@@ -42,7 +43,11 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       "remote_label: {}, iceberg_mode: {}, "
       "leaders_preference: {}, "
       "delete_retention_ms: {}, "
-      "iceberg_delete: {}",
+      "iceberg_delete: {}, "
+      "iceberg_partition_spec: {}, "
+      "iceberg_invalid_record_action: {}, "
+      "iceberg_target_lag_ms: {}, "
+      "min_cleanable_dirty_ratio: {}",
       properties.compression,
       properties.cleanup_policy_bitflags,
       properties.compaction_strategy,
@@ -56,6 +61,7 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       properties.read_replica_bucket,
       properties.remote_topic_namespace_override,
       properties.remote_topic_properties,
+      properties.remote_topic_allow_gaps,
       properties.batch_max_bytes,
       properties.retention_local_target_bytes,
       properties.retention_local_target_ms,
@@ -79,7 +85,11 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       properties.iceberg_mode,
       properties.leaders_preference,
       properties.delete_retention_ms,
-      properties.iceberg_delete);
+      properties.iceberg_delete,
+      properties.iceberg_partition_spec,
+      properties.iceberg_invalid_record_action,
+      properties.iceberg_target_lag_ms,
+      properties.min_cleanable_dirty_ratio);
 
     if (config::shard_local_cfg().development_enable_cloud_topics()) {
         fmt::print(
@@ -125,7 +135,11 @@ bool topic_properties::has_overrides() const {
         || flush_bytes.has_value() || remote_label.has_value()
         || (iceberg_mode != storage::ntp_config::default_iceberg_mode)
         || leaders_preference.has_value() || delete_retention_ms.is_engaged()
-        || iceberg_delete.has_value();
+        || iceberg_delete.has_value() || iceberg_partition_spec.has_value()
+        || iceberg_invalid_record_action.has_value()
+        || iceberg_target_lag_ms.has_value()
+        || min_cleanable_dirty_ratio.is_engaged()
+        || remote_topic_allow_gaps.has_value();
 
     if (config::shard_local_cfg().development_enable_cloud_topics()) {
         return overrides
@@ -168,6 +182,8 @@ topic_properties::get_ntp_cfg_overrides() const {
     ret.iceberg_mode = iceberg_mode;
     ret.cloud_topic_enabled = cloud_topic_enabled;
     ret.tombstone_retention_ms = delete_retention_ms;
+    ret.min_cleanable_dirty_ratio = min_cleanable_dirty_ratio;
+    ret.remote_allow_gaps = remote_topic_allow_gaps;
     return ret;
 }
 
@@ -260,6 +276,11 @@ adl<cluster::topic_properties>::from(iobuf_parser& parser) {
       std::nullopt,
       false,
       tristate<std::chrono::milliseconds>{disable_tristate},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      tristate<double>{std::nullopt},
       std::nullopt,
     };
 }

@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "iceberg/datatypes_json.h"
 
@@ -142,7 +143,7 @@ public:
     void operator()(const iceberg::float_type&) { w.String("float"); }
     void operator()(const iceberg::double_type&) { w.String("double"); }
     void operator()(const iceberg::decimal_type& t) {
-        w.String("decimal({}, {})", t.precision, t.scale);
+        w.String(fmt::format("decimal({}, {})", t.precision, t.scale));
     }
     void operator()(const iceberg::date_type&) { w.String("date"); }
     void operator()(const iceberg::time_type&) { w.String("time"); }
@@ -177,6 +178,9 @@ void rjson_serialize(iceberg::json_writer& w, const iceberg::nested_field& f) {
     w.Bool(bool(f.required));
     w.Key("type");
     rjson_serialize(w, f.type);
+    // TODO(iceberg): when/if we add support for required fields,
+    // 'initial-default' and 'write-default' should be written here See
+    // https://iceberg.apache.org/spec/#default-values for requirements
     w.EndObject();
 }
 

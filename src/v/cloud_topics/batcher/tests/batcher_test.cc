@@ -10,7 +10,6 @@
 #include "base/vlog.h"
 #include "bytes/bytes.h"
 #include "bytes/iostream.h"
-#include "bytes/random.h"
 #include "cloud_io/io_result.h"
 #include "cloud_io/remote.h"
 #include "cloud_topics/batcher/batcher.h"
@@ -26,6 +25,7 @@
 #include "remote_mock.h"
 #include "storage/record_batch_builder.h"
 #include "storage/record_batch_utils.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/test.h"
 
 #include <seastar/core/abort_source.hh>
@@ -67,8 +67,8 @@ get_random_reader(int num_batches, int num_records) { // NOLINT
           model::record_batch_type::raft_data, model::offset(offset));
 
         for (int r = 0; r < num_records; r++) {
-            auto k = random_generators::make_iobuf(32);
-            auto v = random_generators::make_iobuf(256);
+            auto k = tests::random_iobuf(32);
+            auto v = tests::random_iobuf(256);
             keys.push_back(iobuf_to_bytes(k.copy()));
             records.push_back(iobuf_to_bytes(v.copy()));
             builder.add_raw_kv(std::move(k), std::move(v));
@@ -97,7 +97,7 @@ namespace experimental::cloud_topics::core {
 struct write_pipeline_accessor {
     // Returns true if the write request is in the `_pending` collection
     bool write_requests_pending(size_t n) {
-        return pipeline->_pending.size() == n;
+        return pipeline->get_pending().size() == n;
     }
 
     cloud_topics::core::write_pipeline<ss::manual_clock>* pipeline;
@@ -138,7 +138,8 @@ TEST_CORO(batcher_test, single_write_request) {
     remote_mock mock;
     cloud_storage_clients::bucket_name bucket("foo");
     cloud_topics::core::write_pipeline<ss::manual_clock> pipeline;
-    cloud_topics::batcher<ss::manual_clock> batcher(pipeline, bucket, mock);
+    cloud_topics::batcher<ss::manual_clock> batcher(
+      pipeline.register_write_pipeline_stage(), bucket, mock);
     cloud_topics::batcher_accessor batcher_accessor{
       .batcher = &batcher,
     };
@@ -185,7 +186,8 @@ TEST_CORO(batcher_test, many_write_requests) {
     remote_mock mock;
     cloud_storage_clients::bucket_name bucket("foo");
     cloud_topics::core::write_pipeline<ss::manual_clock> pipeline;
-    cloud_topics::batcher<ss::manual_clock> batcher(pipeline, bucket, mock);
+    cloud_topics::batcher<ss::manual_clock> batcher(
+      pipeline.register_write_pipeline_stage(), bucket, mock);
     cloud_topics::batcher_accessor batcher_accessor{
       .batcher = &batcher,
     };
@@ -265,7 +267,8 @@ TEST_CORO(batcher_test, expired_write_request) {
     remote_mock mock;
     cloud_storage_clients::bucket_name bucket("foo");
     cloud_topics::core::write_pipeline<ss::manual_clock> pipeline;
-    cloud_topics::batcher<ss::manual_clock> batcher(pipeline, bucket, mock);
+    cloud_topics::batcher<ss::manual_clock> batcher(
+      pipeline.register_write_pipeline_stage(), bucket, mock);
     cloud_topics::batcher_accessor batcher_accessor{
       .batcher = &batcher,
     };

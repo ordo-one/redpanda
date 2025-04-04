@@ -606,6 +606,19 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
         # Don't modify oidc_principal mapping, the value is complex and tested elsewhere.
         exclude_settings.add('oidc_principal_mapping')
 
+        # Don't modify iceberg_default_partition_spec, it has its own syntax
+        # and is tested elsewhere.
+        exclude_settings.add('iceberg_default_partition_spec')
+
+        # Exclude iceberg catalog settings, these need to be a specific value
+        # to be valid, and if we enable iceberg and these settings things break.
+        exclude_settings.update([
+            'iceberg_rest_catalog_trust',
+            'iceberg_rest_catalog_trust_file',
+            'iceberg_rest_catalog_crl',
+            'iceberg_rest_catalog_crl_file',
+        ])
+
         # List of settings that must be odd
         odd_settings = [
             'default_topic_replications', 'minimum_topic_replications'
@@ -705,6 +718,26 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                     [e for e in p['enum_values'] if e != initial_value])
 
             if name == "iceberg_catalog_type":
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
+            if name == "iceberg_invalid_record_action":
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
+            if name == "enable_consumer_group_metrics":
+                valid_value = random.choice([[], ["group"], ["partition"]])
+
+            if name == "datalake_scheduler_block_size_bytes":
+                valid_value = random.choice(range(1048576, 8388608 + 1))
+
+            if name == "datalake_scheduler_max_concurrent_translations":
+                valid_value = random.choice(range(1, 8 + 1))
+
+            if name == "datalake_scheduler_time_slice_ms":
+                valid_value = random.choice(range(1000, 60000 + 1))
+
+            if name == "tls_certificate_name_format":
                 valid_value = random.choice(
                     [e for e in p['enum_values'] if e != initial_value])
 
@@ -1667,6 +1700,84 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 with expect_exception(requests.exceptions.HTTPError,
                                       lambda e: e.response.status_code == 400):
                     self.admin.patch_cluster_config(upsert=upsert)
+
+    @cluster(num_nodes=1)
+    def test_disable_bounded_property_checks(self):
+        """
+        Test that the environmental variable __REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS
+        being set disables bounded property checks for cluster properties.
+        """
+        out_of_bound_properties = {
+            "storage_compaction_key_map_memory": 1,
+            "log_segment_size": 2,
+            "log_segment_ms": 10
+        }
+
+        # Check that these out of bounds value updates for bounded properties are properly rejected
+        with expect_exception(requests.exceptions.HTTPError,
+                              lambda e: e.response.status_code == 400):
+            self.redpanda.set_cluster_config(out_of_bound_properties,
+                                             expect_restart=True)
+
+        environment = {"__REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS": "ON"}
+        self.redpanda.set_environment(environment)
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+
+        # Expect these out of bound value updates to succeed.
+        # expect_restart=True due to some of the properties used.
+        self.redpanda.set_cluster_config(out_of_bound_properties,
+                                         expect_restart=True)
+        for prop, value in out_of_bound_properties.items():
+            self._check_value_everywhere(prop, value)
+
+    @cluster(num_nodes=1)
+    def test_iceberg_authentication_properties(self):
+        """
+        Tests that the Iceberg authentication properties are properly validated when set.
+        """
+        validated_auth_modes = ["bearer", "oauth2"]
+
+        # Check that setting the authentication mode to anything other than "none" alone returns an error.
+        for mode in validated_auth_modes:
+            with expect_exception(requests.exceptions.HTTPError,
+                                  lambda e: e.response.status_code == 400):
+                self.redpanda.set_cluster_config(
+                    {'iceberg_rest_catalog_authentication_mode': mode},
+                    expect_restart=True)
+
+        # Bearer mode needs catalog_token set, oauth2 mode needs both client_id/secret set.
+        invalid_auth_mode_props = [{
+            'iceberg_rest_catalog_authentication_mode':
+            'bearer',
+        }, {
+            'iceberg_rest_catalog_authentication_mode':
+            'oauth2',
+            'iceberg_rest_catalog_client_id':
+            'panda_id',
+        }]
+
+        for invalid_props in invalid_auth_mode_props:
+            # These should fail.
+            with expect_exception(requests.exceptions.HTTPError,
+                                  lambda e: e.response.status_code == 400):
+                self.redpanda.set_cluster_config(invalid_props,
+                                                 expect_restart=True)
+
+        valid_auth_mode_props = [{
+            'iceberg_rest_catalog_authentication_mode': 'bearer',
+            'iceberg_rest_catalog_token': 'panda_token'
+        }, {
+            'iceberg_rest_catalog_authentication_mode':
+            'oauth2',
+            'iceberg_rest_catalog_client_id':
+            'panda_id',
+            'iceberg_rest_catalog_client_secret':
+            'panda_secret'
+        }]
+
+        for valid_props in valid_auth_mode_props:
+            # These should succeed.
+            self.redpanda.set_cluster_config(valid_props, expect_restart=True)
 
 
 """

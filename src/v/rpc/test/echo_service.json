@@ -2,8 +2,9 @@
     "namespace": "echo",
     "service_name": "echo",
     "includes": [
-        "rpc_gen_types.h"
+        "rpc/test/rpc_gen_types.h"
     ],
+    "final_protocol": false,
     "methods": [
         {
             "name": "echo",

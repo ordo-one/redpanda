@@ -109,6 +109,8 @@ std::ostream& operator<<(std::ostream& os, candidate_creation_error err) {
         return os << "failed to get file range for candidate";
     case candidate_creation_error::zero_content_length:
         return os << "candidate has no content";
+    case candidate_creation_error::concurrency_error:
+        return os << "collected segments are modified concurrently";
     }
 }
 
@@ -122,6 +124,7 @@ ss::log_level log_level_for_error(const candidate_creation_error& error) {
     case candidate_creation_error::no_segment_for_begin_offset:
     case candidate_creation_error::failed_to_get_file_range:
     case candidate_creation_error::zero_content_length:
+    case candidate_creation_error::concurrency_error:
         return ss::log_level::debug;
     case candidate_creation_error::offset_inside_batch:
     case candidate_creation_error::missing_ntp_config:
@@ -358,10 +361,14 @@ ss::future<std::optional<std::error_code>> get_file_range(
         upl->max_timestamp = seek.ts;
     }
     // Recompute content_length based on file offsets
-    vassert(
-      upl->file_offset <= upl->final_file_offset,
-      "Invalid upload candidate {}",
-      upl);
+    if (upl->file_offset > upl->final_file_offset) {
+        // This could potentially happen if the log was truncated after
+        // file_offset is set. In this case the index could become empty which
+        // will trigger the condition above. The operation could be retried
+        // later so throwing makes more sense then the assertion.
+        throw std::runtime_error(
+          fmt_with_ctx(fmt::format, "Invalid upload candidate {}", upl));
+    }
     upl->content_length = upl->final_file_offset - upl->file_offset;
     if (upl->content_length > segment->reader().file_size()) {
         throw std::runtime_error(fmt_with_ctx(

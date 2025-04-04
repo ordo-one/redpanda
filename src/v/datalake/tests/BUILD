@@ -1,5 +1,5 @@
 load("@rules_proto//proto:defs.bzl", "proto_library")
-load("//bazel:test.bzl", "redpanda_cc_gtest", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 proto_library(
     name = "person_proto",
@@ -9,6 +9,7 @@ proto_library(
 proto_library(
     name = "complex_proto",
     srcs = ["testdata/complex.proto"],
+    deps = ["@protobuf//:timestamp_proto"],
 )
 
 proto_library(
@@ -58,8 +59,8 @@ redpanda_test_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/schema/tests:fake_registry",
     ],
@@ -101,8 +102,10 @@ redpanda_test_cc_library(
     implementation_deps = [
         "//src/v/container:chunked_hash_map",
         "//src/v/schema:registry",
-        "//src/v/serde/avro/tests:data_generator",
+        "//src/v/utils:absl_sstring_hash",
+        "//src/v/utils:vint",
         "@avro",
+        "@protobuf",
     ],
     include_prefix = "datalake/tests",
     visibility = ["//visibility:public"],
@@ -112,6 +115,8 @@ redpanda_test_cc_library(
         "//src/v/container:fragmented_vector",
         "//src/v/model",
         "//src/v/pandaproxy",
+        "//src/v/serde/avro/tests:data_generator",
+        "//src/v/serde/protobuf/tests:data_generator",
         "//src/v/storage:record_batch_builder",
         "//src/v/utils:named_type",
         "@seastar",
@@ -125,10 +130,34 @@ redpanda_test_cc_library(
     ],
     include_prefix = "datalake/tests",
     deps = [
+        "//src/v/datalake:serde_parquet_writer",
         "//src/v/datalake:writer",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:values",
+        "//src/v/utils:null_output_stream",
         "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "test_utils",
+    srcs = [
+        "test_utils.cc",
+    ],
+    hdrs = [
+        "test_utils.h",
+    ],
+    implementation_deps = [
+        "//src/v/datalake:record_translator",
+        "//src/v/datalake:table_definition",
+        "//src/v/datalake:table_id_provider",
+    ],
+    include_prefix = "datalake/tests",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/datalake:catalog_schema_manager",
+        "//src/v/datalake:record_schema_resolver",
+        "//src/v/datalake:table_creator",
     ],
 )
 
@@ -141,9 +170,10 @@ redpanda_cc_gtest(
     cpu = 1,
     deps = [
         "//src/v/cloud_io:remote",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
-        "//src/v/cloud_storage/tests:s3_imposter_gtest",
         "//src/v/datalake:catalog_schema_manager",
+        "//src/v/iceberg:datatypes",
         "//src/v/iceberg:field_collecting_visitor",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/iceberg:table_identifier",
@@ -181,6 +211,20 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "partition_spec_parser_test",
+    timeout = "short",
+    srcs = [
+        "partition_spec_parser_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/datalake:partition_spec_parser",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "partitioning_writer_test",
     timeout = "short",
     srcs = [
@@ -188,6 +232,8 @@ redpanda_cc_gtest(
     ],
     deps = [
         ":test_data_writer",
+        ":test_utils",
+        "//src/v/bytes",
         "//src/v/datalake:partitioning_writer",
         "//src/v/datalake:table_definition",
         "//src/v/iceberg/tests:test_schemas",
@@ -210,15 +256,21 @@ redpanda_cc_gtest(
         ":catalog_and_registry_fixture",
         ":record_generator",
         ":test_data_writer",
+        ":test_utils",
+        "//src/v/cloud_io:provider",
         "//src/v/datalake:catalog_schema_manager",
+        "//src/v/datalake:location",
         "//src/v/datalake:record_multiplexer",
         "//src/v/datalake:record_schema_resolver",
         "//src/v/datalake:record_translator",
-        "//src/v/datalake:table_creator",
         "//src/v/datalake:table_definition",
+        "//src/v/datalake:table_id_provider",
+        "//src/v/datalake/translation:translation_probe",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/model",
+        "//src/v/model/tests:random",
         "//src/v/pandaproxy",
+        "//src/v/random:generators",
         "//src/v/schema:registry",
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:gtest",
@@ -237,6 +289,7 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/base",
         "//src/v/bytes",
+        "//src/v/config",
         "//src/v/datalake:logger",
         "//src/v/datalake:record_schema_resolver",
         "//src/v/iceberg:datatypes",
@@ -313,6 +366,7 @@ redpanda_cc_gtest(
         "local_parquet_file_writer_test.cc",
     ],
     deps = [
+        ":test_data_writer",
         "//src/v/datalake:local_parquet_file_writer",
         "//src/v/datalake/tests:test_data",
         "//src/v/iceberg:datatypes",
@@ -332,6 +386,7 @@ redpanda_cc_gtest(
         "serde_parquet_writer_test.cc",
     ],
     deps = [
+        ":test_data_writer",
         "//src/v/bytes:iostream",
         "//src/v/datalake:serde_parquet_writer",
         "//src/v/datalake/tests:test_data",
@@ -339,6 +394,50 @@ redpanda_cc_gtest(
         "//src/v/iceberg/tests:value_generator",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:seastar_boost",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "record_multiplexer_rpbench",
+    timeout = "long",
+    srcs = [
+        "record_multiplexer_bench.cc",
+    ],
+    deps = [
+        ":catalog_and_registry_fixture",
+        ":record_generator",
+        ":test_data_writer",
+        ":test_utils",
+        "//src/v/cloud_io:provider",
+        "//src/v/container:fragmented_vector",
+        "//src/v/datalake:catalog_schema_manager",
+        "//src/v/datalake:location",
+        "//src/v/datalake:record_multiplexer",
+        "//src/v/datalake:record_schema_resolver",
+        "//src/v/datalake:record_translator",
+        "//src/v/datalake:table_creator",
+        "//src/v/model",
+        "//src/v/serde/avro/tests:data_generator",
+        "//src/v/serde/protobuf/tests:data_generator",
+        "//src/v/storage:parser_utils",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "partition_key_path_test",
+    timeout = "short",
+    srcs = [
+        "partition_key_path_test.cc",
+    ],
+    deps = [
+        ":test_data",
+        "//src/v/datalake:partition_key_path",
+        "//src/v/test_utils:gtest",
         "@fmt",
         "@googletest//:gtest",
         "@seastar",

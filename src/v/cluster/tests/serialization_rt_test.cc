@@ -34,6 +34,7 @@
 #include "reflection/async_adl.h"
 #include "security/tests/randoms.h"
 #include "storage/types.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/randoms.h"
 #include "test_utils/rpc.h"
 #include "utils/tristate.h"
@@ -1379,14 +1380,14 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         roundtrip_test(data);
     }
     {
-        std::vector<model::ntp> ntps;
+        chunked_vector<model::ntp> ntps;
         for (int i = 0, mi = random_generators::get_int(10); i < mi; i++) {
             ntps.push_back(model::random_ntp());
         }
         cluster::reconciliation_state_request data{
-          .ntps = ntps,
+          .ntps = std::move(ntps),
         };
-        roundtrip_test(data);
+        roundtrip_test(std::move(data));
     }
     {
         cluster::backend_operation data{
@@ -1415,7 +1416,7 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         roundtrip_test(std::move(data));
     }
     {
-        std::vector<cluster::ntp_reconciliation_state> results;
+        chunked_vector<cluster::ntp_reconciliation_state> results;
         for (int i = 0, mi = random_generators::get_int(10); i < mi; i++) {
             ss::chunked_fifo<cluster::backend_operation> backend_operations;
             for (int j = 0, mj = random_generators::get_int(10); j < mj; j++) {
@@ -1776,7 +1777,7 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
           .last_included_index = tests::random_named_int<model::offset>(),
           .file_offset = random_generators::get_int<uint64_t>(),
           .chunk = bytes_to_iobuf(
-            random_generators::get_bytes(random_generators::get_int(1024))),
+            tests::random_bytes(random_generators::get_int(1024))),
           .done = tests::random_bool(),
           .dirty_offset = tests::random_named_int<model::offset>(),
         };

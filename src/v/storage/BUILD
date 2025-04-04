@@ -120,6 +120,10 @@ redpanda_cc_library(
         "@fmt",
     ],
     include_prefix = "storage",
+    visibility = [
+        "//src/v/resource_mgmt/tests:__pkg__",
+        "//src/v/storage/tests:__pkg__",
+    ],
     deps = [
         "//src/v/base",
         "//src/v/container:intrusive",
@@ -187,6 +191,7 @@ redpanda_cc_library(
     deps = [
         "//src/v/base",
         "//src/v/container:intrusive",
+        "//src/v/metrics",
         "//src/v/ssx:semaphore",
         "//src/v/utils:named_type",
         "@seastar",
@@ -408,6 +413,7 @@ redpanda_cc_library(
         "//src/v/ssx:future_util",
         "//src/v/ssx:semaphore",
         "//src/v/ssx:sformat",
+        "//src/v/ssx:watchdog",
         "//src/v/strings:static_str",
         "//src/v/strings:string_switch",
         "//src/v/utils:adjustable_semaphore",
@@ -419,6 +425,7 @@ redpanda_cc_library(
         "//src/v/utils:mutex",
         "//src/v/utils:named_type",
         "//src/v/utils:notification_list",
+        "//src/v/utils:null_output_stream",
         "//src/v/utils:prefix_logger",
         "//src/v/utils:stream_provider",
         "//src/v/utils:to_string",

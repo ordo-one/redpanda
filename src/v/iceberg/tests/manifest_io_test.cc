@@ -1,16 +1,17 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "cloud_io/remote.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
 #include "cloud_io/transfer_details.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "iceberg/manifest_io.h"
 #include "iceberg/manifest_list.h"
 #include "iceberg/tests/test_schemas.h"
@@ -20,8 +21,6 @@
 
 using namespace iceberg;
 using namespace std::chrono_literals;
-
-partition_key_type empty_pk_type() { return partition_key_type{struct_type{}}; }
 
 class ManifestIOTest
   : public s3_imposter_fixture
@@ -90,7 +89,7 @@ TEST_F(ManifestIOTest, TestManifestRoundtrip) {
     // Missing manifest.
     auto io = manifest_io(remote(), bucket_name);
     auto test_path = manifest_path{"foo/bar/baz"};
-    auto dl_res = io.download_manifest(test_path, empty_pk_type()).get();
+    auto dl_res = io.download_manifest(test_path).get();
     ASSERT_TRUE(dl_res.has_error());
     ASSERT_EQ(dl_res.error(), metadata_io::errc::failed);
 
@@ -99,7 +98,7 @@ TEST_F(ManifestIOTest, TestManifestRoundtrip) {
     ASSERT_TRUE(ul_res.has_value());
     ASSERT_LT(0, ul_res.value());
 
-    dl_res = io.download_manifest(test_path, empty_pk_type()).get();
+    dl_res = io.download_manifest(test_path).get();
     ASSERT_FALSE(dl_res.has_error());
     const auto& m_roundtrip = dl_res.value();
     ASSERT_EQ(m, m_roundtrip);
@@ -136,12 +135,12 @@ TEST_F(ManifestIOTest, TestManifestRoundtripURIs) {
     ASSERT_FALSE(up_res.has_error());
 
     // Use the URI string.
-    auto dl_res = io.download_manifest(test_uri, empty_pk_type()).get();
+    auto dl_res = io.download_manifest(test_uri).get();
     ASSERT_FALSE(dl_res.has_error());
     ASSERT_EQ(m, dl_res.value());
 
     // As a safety measure, we'll still parse the raw path if given.
-    dl_res = io.download_manifest(path, empty_pk_type()).get();
+    dl_res = io.download_manifest(path).get();
     ASSERT_FALSE(dl_res.has_error());
     ASSERT_EQ(m, dl_res.value());
 }
@@ -172,7 +171,7 @@ TEST_F(ManifestIOTest, TestShutdown) {
     sr->request_stop();
     auto io = manifest_io(remote(), bucket_name);
     {
-        auto dl_res = io.download_manifest(test_path, empty_pk_type()).get();
+        auto dl_res = io.download_manifest(test_path).get();
         ASSERT_TRUE(dl_res.has_error());
         ASSERT_EQ(dl_res.error(), metadata_io::errc::shutting_down);
 
@@ -207,7 +206,7 @@ TEST_F(ManifestIOTest, TestCorruptedDownload) {
     ASSERT_EQ(ul_res, cloud_io::upload_result::success);
     auto io = manifest_io(remote(), bucket_name);
     {
-        auto dl_res = io.download_manifest(test_path, empty_pk_type()).get();
+        auto dl_res = io.download_manifest(test_path).get();
         ASSERT_TRUE(dl_res.has_error());
         ASSERT_EQ(dl_res.error(), metadata_io::errc::failed);
     }

@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_update.h"
@@ -37,7 +38,7 @@ public:
           .schemas = std::move(schemas),
           .current_schema_id = schema::id_t{0},
           .partition_specs = {},
-          .default_spec_id = partition_spec::id_t{0},
+          .default_spec_id = partition_spec::id_t{-1},
           .last_partition_id = partition_field::id_t{-1},
         };
     }
@@ -74,9 +75,14 @@ TEST_F(UpdateApplyingVisitorTest, TestAddSchema) {
     ASSERT_EQ(table.schemas.size(), 3);
     ASSERT_EQ(table.schemas.back().schema_id(), 2);
 
-    // Last column id should only goes up.
+    // Last column id should only go up. If a request includes last column
+    // ID which is less than the one stored in table metadata, we accept the
+    // request, but the higher of the two IDs takes precedence.
+    auto before_update = table.last_column_id();
+    ASSERT_GT(before_update, 90);
     outcome = table_update::apply(make_update(3, 90), table);
-    ASSERT_EQ(outcome, table_update::outcome::unexpected_state);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(table.last_column_id(), before_update);
 
     // Can't add a schema whose id already exists.
     outcome = table_update::apply(make_update(0, 90), table);
@@ -140,24 +146,38 @@ TEST_F(UpdateApplyingVisitorTest, TestSetCurrentSchemaUnassigned) {
 
 TEST_F(UpdateApplyingVisitorTest, TestAddSpec) {
     auto table = create_table();
-    const auto make_update = [&](int32_t spec_id) -> table_update::update {
+    const auto make_update =
+      [&](
+        int32_t spec_id,
+        chunked_vector<partition_field> fields) -> table_update::update {
         return table_update::add_spec{
             .spec = partition_spec{
                 .spec_id = partition_spec::id_t{spec_id},
-                .fields = {},
+                .fields = std::move(fields),
             },
         };
     };
-    auto outcome = table_update::apply(make_update(0), table);
+    auto outcome = table_update::apply(make_update(0, {}), table);
     ASSERT_EQ(outcome, table_update::outcome::success);
     ASSERT_EQ(table.partition_specs.size(), 1);
+    ASSERT_EQ(table.last_partition_id, -1);
 
-    outcome = table_update::apply(make_update(1), table);
+    outcome = table_update::apply(
+      make_update(
+        1,
+        {partition_field{
+          .source_id = nested_field::id_t{1},
+          .field_id = partition_field::id_t{1001},
+          .name = "field",
+          .transform = identity_transform{},
+        }}),
+      table);
     ASSERT_EQ(outcome, table_update::outcome::success);
     ASSERT_EQ(table.partition_specs.size(), 2);
+    ASSERT_EQ(table.last_partition_id, 1001);
 
     // Adding an existing spec fails.
-    outcome = table_update::apply(make_update(1), table);
+    outcome = table_update::apply(make_update(1, {}), table);
     ASSERT_EQ(outcome, table_update::outcome::unexpected_state);
 }
 
@@ -290,4 +310,97 @@ TEST_F(UpdateApplyingVisitorTest, TestSetSnapshotReference) {
     // Trying to add a reference that doesn't exist fails.
     outcome = table_update::apply(make_update("noneya", 12345), table);
     ASSERT_EQ(outcome, table_update::outcome::unexpected_state);
+}
+
+TEST_F(UpdateApplyingVisitorTest, TestRemoveSnapshotReference) {
+    const auto make_update =
+      [&](std::string_view ref_name) -> table_update::update {
+        return table_update::remove_snapshot_ref{
+          .ref_name = ss::sstring(ref_name)};
+    };
+    auto table = create_table();
+    table.refs.emplace();
+    for (int64_t i = 0; i < 100; ++i) {
+        auto ref_name = fmt::format("ref-{}", i);
+        table.refs->emplace(
+          ref_name,
+          snapshot_reference{
+            .snapshot_id = snapshot_id{i},
+            .type = snapshot_ref_type::branch,
+          });
+    }
+    table.current_snapshot_id = snapshot_id{99};
+
+    // Simple removal.
+    auto outcome = table_update::apply(make_update("ref-0"), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(99, table.refs->size());
+
+    // Removing non-existent references should no-op.
+    outcome = table_update::apply(make_update("missing-ref"), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(99, table.refs->size());
+    ASSERT_EQ(table.current_snapshot_id.value()(), 99);
+
+    // Removing 'main', even if it doesn't exist, will reset the current
+    // snapshot id.
+    outcome = table_update::apply(make_update("main"), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(99, table.refs->size());
+    ASSERT_FALSE(table.current_snapshot_id.has_value());
+
+    // Removing 'main' whe it does exist will also reset the current snapshot.
+    table.current_snapshot_id = snapshot_id{99};
+    table.refs->emplace(
+      "main",
+      snapshot_reference{
+        .snapshot_id = snapshot_id{99},
+        .type = snapshot_ref_type::branch,
+      });
+    ASSERT_EQ(100, table.refs->size());
+    outcome = table_update::apply(make_update("main"), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(99, table.refs->size());
+    ASSERT_FALSE(table.current_snapshot_id.has_value());
+}
+
+TEST_F(UpdateApplyingVisitorTest, TestSetDefaultSpec) {
+    const auto make_update = [&](int32_t spec_id) -> table_update::update {
+        return table_update::set_default_spec{
+          .spec_id = partition_spec::id_t{spec_id},
+        };
+    };
+
+    auto table = create_table();
+    // add a couple of partition specs
+    table.partition_specs.push_back(partition_spec{
+      .spec_id = partition_spec::id_t{0},
+      .fields = {},
+    });
+    table.partition_specs.push_back(partition_spec{
+      .spec_id = partition_spec::id_t{1},
+      .fields = {},
+    });
+    table.default_spec_id = partition_spec::id_t{1};
+
+    // Sanity check for a no-op when setting to the current default spec.
+    auto outcome = table_update::apply(make_update(1), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(table.default_spec_id, 1);
+
+    // Now point to a different spec.
+    outcome = table_update::apply(make_update(0), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(table.default_spec_id, 0);
+
+    // Pointing at a spec that doesn't exist should fail.
+    outcome = table_update::apply(make_update(2), table);
+    ASSERT_EQ(outcome, table_update::outcome::unexpected_state);
+    ASSERT_EQ(table.default_spec_id, 0);
+
+    // Test setting to the latest added spec.
+    outcome = table_update::apply(
+      make_update(partition_spec::unassigned_id), table);
+    ASSERT_EQ(outcome, table_update::outcome::success);
+    ASSERT_EQ(table.default_spec_id, 1);
 }

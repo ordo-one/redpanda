@@ -26,8 +26,8 @@
 #include "cluster/archival/adjacent_segment_merger.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archival_policy.h"
-#include "cluster/archival/archiver_operations_api.h"
 #include "cluster/archival/logger.h"
+#include "cluster/archival/replica_state_validator.h"
 #include "cluster/archival/retention_calculator.h"
 #include "cluster/archival/scrubber.h"
 #include "cluster/archival/segment_reupload.h"
@@ -39,6 +39,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
+#include "net/connection.h"
 #include "raft/fundamental.h"
 #include "ssx/future-util.h"
 #include "storage/disk_log_impl.h"
@@ -81,16 +82,25 @@ constexpr auto housekeeping_jit = 5ms;
 
 namespace archival {
 
+/// Return true if the exception is a shutdown error or a network error (e.g.
+/// Broken pipe)
+static bool is_shutdown_or_disconnect(const std::exception_ptr& e) {
+    return ssx::is_shutdown_exception(e) || net::is_disconnect_exception(e);
+}
+
 static bool is_nested_shutdown_exception(const ss::nested_exception& ex) {
     // During shutdown we could potentially get a 'shutdown' exception. If the
     // 'finally' continuation is used it will be invoked and if it touches the
     // gate or abort source it will also trigger a 'shutdown' exception. The
     // 'finally' continuation is invoked even for the exceptional future. In
     // this case we will get the nested_exception. If both exceptions are
-    // actually exceptions we can safely conclude that the shutdown is in
-    // progress (somewhat safely).
-    return ssx::is_shutdown_exception(ex.inner)
-           && ssx::is_shutdown_exception(ex.outer);
+    // shutdown exceptions we can safely conclude that the shutdown is in
+    // progress (somewhat safely). If one of the exceptions is a shutdown
+    // exception and another is a network disconnect exception we can also
+    // conclude that the shutdown is in progress.
+    return (is_shutdown_or_disconnect(ex.inner)
+            && is_shutdown_or_disconnect(ex.outer))
+           && (ssx::is_shutdown_exception(ex.inner) || ssx::is_shutdown_exception(ex.outer));
 }
 
 static bool segment_meta_matches_stats(
@@ -125,6 +135,14 @@ static bool segment_meta_matches_stats(
         return false;
     }
     return true;
+}
+
+static bool emit_read_write_fence(
+  const ss::sharded<features::feature_table>& feature_table) {
+    return !config::shard_local_cfg()
+              .cloud_storage_disable_archival_stm_rw_fence.value()
+           && feature_table.local().is_active(
+             features::feature::cloud_storage_metadata_rw_fence);
 }
 
 ntp_archiver_upload_result::ntp_archiver_upload_result(
@@ -222,9 +240,7 @@ ntp_archiver::ntp_archiver(
   cloud_storage::remote& remote,
   cloud_storage::cache& c,
   cluster::partition& parent,
-  ss::shared_ptr<cloud_storage::async_manifest_view> amv,
-  ss::shared_ptr<archiver_operations_api> ops,
-  ss::shared_ptr<archiver_scheduler_api<ss::lowres_clock>> sched)
+  ss::shared_ptr<cloud_storage::async_manifest_view> amv)
   : _ntp(ntp.ntp())
   , _rev(ntp.get_remote_revision())
   , _remote(remote)
@@ -234,8 +250,6 @@ ntp_archiver::ntp_archiver(
   , _gate()
   , _rtcnode(_as)
   , _rtclog(archival_log, _rtcnode, _ntp.path())
-  , _ops(std::move(ops))
-  , _sched(std::move(sched))
   , _conf(conf)
   , _sync_manifest_timeout(
       config::shard_local_cfg()
@@ -278,14 +292,6 @@ ntp_archiver::ntp_archiver(
     if (_parent.is_read_replica_mode_enabled()) {
         _bucket_override = _parent.get_read_replica_bucket();
     }
-
-    const auto mode = _ops == nullptr ? "legacy mode " : "";
-    vlog(
-      archival_log.debug,
-      "{}created ntp_archiver {} in term {}",
-      mode,
-      _ntp,
-      _parent.term());
 }
 
 const cloud_storage::partition_manifest& ntp_archiver::manifest() const {
@@ -311,12 +317,8 @@ ss::future<> ntp_archiver::start() {
             });
         });
     } else {
-        // Legacy mode, the ntp-archiver uses archival_policy to create uploads.
-        // Otherwise use storage layer log_reader to create uploads
-        // and replicate read_write_fence command to protect from race
-        // conditions.
-        ssx::spawn_with_gate(_gate, [this, legacy_mode = !bool(_ops)] {
-            return upload_until_abort(legacy_mode).then([this]() {
+        ssx::spawn_with_gate(_gate, [this] {
+            return upload_until_abort().then([this]() {
                 if (!_as.abort_requested()) {
                     vlog(
                       _rtclog.error,
@@ -344,7 +346,7 @@ void ntp_archiver::notify_leadership(std::optional<model::node_id> leader_id) {
     }
 }
 
-ss::future<> ntp_archiver::upload_until_abort(bool legacy_mode) {
+ss::future<> ntp_archiver::upload_until_abort() {
     if (unlikely(config::shard_local_cfg()
                    .cloud_storage_disable_upload_loop_for_tests.value())) {
         vlog(_rtclog.warn, "Skipping upload loop start");
@@ -400,6 +402,28 @@ ss::future<> ntp_archiver::upload_until_abort(bool legacy_mode) {
             continue;
         }
 
+        replica_state_validator validator(
+          *_parent.log(), _parent.archival_meta_stm()->manifest());
+        if (validator.has_anomalies()) {
+            // The validation and printing of anomalies is happening
+            // every time we start an archiver
+            validator.maybe_print_scarry_log_message();
+            // Disable uploads and housekeeping if consistency
+            // checks are not disabled
+            if (!config::shard_local_cfg()
+                   .cloud_storage_disable_upload_consistency_checks()) {
+                // Consistency checks will not let us do anything anyway
+                vlog(
+                  _rtclog.warn,
+                  "upload loop stalled for {}ms in term {} because of "
+                  "anomalies",
+                  sync_timeout.count(),
+                  _start_term);
+                co_await ss::sleep_abortable(sync_timeout, _as);
+                continue;
+            }
+        }
+
         vlog(_rtclog.debug, "upload loop synced in term {}", _start_term);
         if (!may_begin_uploads()) {
             continue;
@@ -430,12 +454,7 @@ ss::future<> ntp_archiver::upload_until_abort(bool legacy_mode) {
             }
         });
 
-        auto do_upload = [this, legacy_mode] {
-            if (legacy_mode) {
-                return upload_until_term_change_legacy();
-            }
-            return upload_until_term_change();
-        };
+        auto do_upload = [this] { return upload_until_term_change_legacy(); };
 
         co_await ss::with_scheduling_group(
           _conf->upload_scheduling_group, do_upload)
@@ -760,33 +779,57 @@ ss::future<> ntp_archiver::upload_until_term_change_legacy() {
             continue;
         }
 
-        auto [non_compacted_upload_result, compacted_upload_result]
-          = co_await upload_next_candidates();
-        if (non_compacted_upload_result.num_failed != 0) {
-            // The logic in class `remote` already does retries: if we get here,
-            // it means the upload failed after several retries, justifying
-            // a warning to the operator: something non-transient may be wrong,
-            // although we do also see this in practice on AWS S3 occasionally
-            // during normal operation.
-            vlog(
-              _rtclog.warn,
-              "Failed to upload {} segments out of {}",
-              non_compacted_upload_result.num_failed,
-              non_compacted_upload_result.num_succeeded
-                + non_compacted_upload_result.num_failed
-                + non_compacted_upload_result.num_cancelled);
-        } else if (non_compacted_upload_result.num_succeeded != 0) {
-            vlog(
-              _rtclog.debug,
-              "Successfully uploaded {} segments",
-              non_compacted_upload_result.num_succeeded);
-        }
+        // This is the offset of the last applied command. It is used
+        // as a fence to implement optimistic concurrency control.
+        auto fence
+          = _parent.archival_meta_stm()->manifest().get_applied_offset();
+        vlog(
+          archival_log.debug,
+          "fence value is: {}, in-sync offset: {}",
+          fence,
+          _parent.archival_meta_stm()->get_insync_offset());
 
-        if (non_compacted_upload_result.num_cancelled != 0) {
-            vlog(
-              _rtclog.debug,
-              "Cancelled upload of {} segments",
-              non_compacted_upload_result.num_cancelled);
+        bool uploads_paused
+          = !config::shard_local_cfg().cloud_storage_enable_segment_uploads();
+        std::optional<batch_result> result;
+        auto track_paused = _probe->register_archiver_on_hold(uploads_paused);
+        if (!uploads_paused) {
+            result = co_await upload_next_candidates(archival_stm_fence{
+              .read_write_fence = fence,
+              // Only use the rw-fence if the feature is enabled which requires
+              // major version upgrade.
+              .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+            });
+        }
+        if (result.has_value()) {
+            auto [compacted_upload_result, non_compacted_upload_result]
+              = result.value();
+            if (non_compacted_upload_result.num_failed != 0) {
+                // The logic in class `remote` already does retries: if we get
+                // here, it means the upload failed after several retries,
+                // justifying a warning to the operator: something non-transient
+                // may be wrong, although we do also see this in practice on AWS
+                // S3 occasionally during normal operation.
+                vlog(
+                  _rtclog.warn,
+                  "Failed to upload {} segments out of {}",
+                  non_compacted_upload_result.num_failed,
+                  non_compacted_upload_result.num_succeeded
+                    + non_compacted_upload_result.num_failed
+                    + non_compacted_upload_result.num_cancelled);
+            } else if (non_compacted_upload_result.num_succeeded != 0) {
+                vlog(
+                  _rtclog.debug,
+                  "Successfully uploaded {} segments",
+                  non_compacted_upload_result.num_succeeded);
+            }
+
+            if (non_compacted_upload_result.num_cancelled != 0) {
+                vlog(
+                  _rtclog.debug,
+                  "Cancelled upload of {} segments",
+                  non_compacted_upload_result.num_cancelled);
+            }
         }
 
         if (ss::lowres_clock::now() >= _next_housekeeping) {
@@ -821,7 +864,9 @@ ss::future<> ntp_archiver::upload_until_term_change_legacy() {
           "upload_until_term_change: released units (current {})",
           _uploads_active.current());
 
-        if (non_compacted_upload_result.num_succeeded == 0) {
+        if (
+          !result.has_value()
+          || result.value().non_compacted_upload_result.num_succeeded == 0) {
             // The backoff algorithm here is used to prevent high CPU
             // utilization when redpanda is not receiving any data and there
             // is nothing to update. Also, we want to limit amount of
@@ -847,237 +892,6 @@ struct segment_size_limits {
     size_t target;
     size_t lowest;
 };
-
-static segment_size_limits get_segment_size_limits() {
-    auto opt_target
-      = config::shard_local_cfg().cloud_storage_segment_size_target();
-    auto opt_min = config::shard_local_cfg().cloud_storage_segment_size_min();
-    if (opt_target == std::nullopt) {
-        // Use defaults
-        auto log_segment_size = config::shard_local_cfg().log_segment_size();
-        auto min_size = log_segment_size * 100 / 80;
-        return segment_size_limits{
-          .target = log_segment_size, .lowest = min_size};
-    }
-    return segment_size_limits{
-      .target = opt_target.value(),
-      .lowest = opt_min.value_or(opt_target.value() * 100 / 80)};
-}
-
-namespace {
-static size_t num_put_requests_per_iter(std::optional<size_t> requests_quota) {
-    constexpr size_t max_requests_per_segment = 3;
-    constexpr size_t segments_per_iter = 4;
-    constexpr auto max_requests_per_iter = max_requests_per_segment
-                                           * segments_per_iter;
-    return std::min(
-      max_requests_per_iter, requests_quota.value_or(max_requests_per_iter));
-}
-static size_t num_uploaded_bytes_per_iter(std::optional<size_t> bytes_quota) {
-    constexpr size_t segments_per_iter = 4;
-    const size_t segment_size
-      = config::shard_local_cfg().log_segment_size.value();
-    const size_t bytes_per_iter = segment_size * segments_per_iter;
-    return std::min(bytes_per_iter, bytes_quota.value_or(bytes_per_iter));
-}
-} // namespace
-
-ss::future<> ntp_archiver::upload_until_term_change() {
-    vassert(_ops, "The method can't be called in legacy mode");
-
-    if (!_feature_table.local().is_active(
-          features::feature::cloud_storage_manifest_format_v2)) {
-        vlog(
-          _rtclog.warn,
-          "Cannot operate upload loop during upgrade, not all nodes "
-          "are upgraded yet.  Waiting...");
-        co_await _feature_table.local().await_feature(
-          features::feature::cloud_storage_manifest_format_v2, _as);
-        vlog(
-          _rtclog.info, "Upgrade complete, proceeding with the upload loop.");
-
-        // The cluster likely needed a bunch of restarts in order to
-        // reach this point, which means that leadership may have been
-        // transferred away (hence the explicit check).
-        if (!may_begin_uploads()) {
-            co_return;
-        }
-    }
-
-    // Before starting, upload the manifest if needed.  This makes our
-    // behavior more deterministic on first start (uploading the empty
-    // manifest) and after unclean leadership changes (flush dirty manifest
-    // as soon as we can, rather than potentially waiting for segment
-    // uploads).
-    {
-        auto units = co_await ss::get_units(_uploads_active, 1);
-        co_await maybe_upload_manifest(upload_loop_prologue_ctx_label);
-        co_await flush_manifest_clean_offset();
-    }
-
-    upload_resource_usage<ss::lowres_clock> usage{
-      .ntp = _ntp,
-      .put_requests_used = 0,
-      .uploaded_bytes = 0,
-      .errc = {},
-      .archiver_rtc = std::ref(_rtcnode),
-    };
-
-    while (may_begin_uploads()) {
-        // Handle backoff before acquiring units from the semaphore. This
-        // will allow housekeeping to continue working.
-        auto quota = co_await _sched->maybe_suspend_upload(usage);
-        if (quota.has_error()) {
-            // This error can't be handled because we will not be protected
-            // against resource usage spike.
-            vlog(
-              _rtclog.error,
-              "Upload loop can't be suspended due to scheduler failure: {}",
-              quota.error());
-            throw std::system_error(quota.error());
-        }
-
-        usage.errc = {};
-        usage.uploaded_bytes = 0;
-        usage.put_requests_used = 0;
-
-        // Hold semaphore units to enable other code to know that we are in
-        // the process of doing uploads + wait for us to drop out if they
-        // e.g. set _paused.
-        vassert(!_paused, "may_begin_uploads must ensure !_paused");
-        auto units = co_await ss::get_units(_uploads_active, 1);
-        vlog(
-          _rtclog.trace,
-          "upload_until_term_change: got units (current {}), paused={}",
-          _uploads_active.current(),
-          _paused);
-
-        // Bump up archival STM's state to make sure that it's not lagging
-        // behind too far. If the STM is lagging behind we will have to read a
-        // lot of data next time we upload something.
-        vassert(
-          _parent.archival_meta_stm(),
-          "Upload loop: archival metadata STM is not created for {} archiver",
-          _ntp.path());
-
-        if (_parent.ntp().tp.partition == 0 && _topic_manifest_dirty) {
-            co_await upload_topic_manifest();
-        }
-
-        auto sync_timeout = config::shard_local_cfg()
-                              .cloud_storage_metadata_sync_timeout_ms.value();
-        auto is_synced = co_await _parent.archival_meta_stm()->sync(
-          sync_timeout);
-        if (!is_synced.has_value()) {
-            // This can happen on leadership changes, or on timeouts waiting
-            // for stm to catch up: in either case, we should re-check our
-            // loop condition: we will drop out if lost leadership, otherwise
-            // we will end up back here to try the sync again.
-            continue;
-        }
-
-        auto [target_size, min_size] = get_segment_size_limits();
-        upload_candidate_search_parameters search_params(
-          _ntp,
-          _start_term,
-          target_size,
-          min_size,
-          num_uploaded_bytes_per_iter(quota.value().upload_size_quota),
-          num_put_requests_per_iter(quota.value().requests_quota),
-          false,
-          manifest_upload_required());
-
-        auto upload_candidate_list = co_await _ops->find_upload_candidates(
-          _rtcnode, search_params);
-
-        if (upload_candidate_list.has_error()) {
-            if (
-              upload_candidate_list.error() == error_outcome::not_enough_data) {
-                vlog(_rtclog.debug, "Not enough data to start upload");
-            } else {
-                vlog(
-                  _rtclog.error,
-                  "Upload candidate can't be created: {}",
-                  upload_candidate_list.error());
-            }
-            usage.errc = upload_candidate_list.error();
-            continue;
-        }
-
-        auto upload_list = co_await _ops->schedule_uploads(
-          _rtcnode,
-          std::move(upload_candidate_list.value()),
-          manifest_upload_required());
-        if (upload_list.has_error()) {
-            vlog(
-              _rtclog.error,
-              "Failed to schedule uploads: {}",
-              upload_list.error());
-            usage.errc = upload_list.error();
-            continue;
-        } else {
-            usage.put_requests_used = upload_list.value().num_put_requests;
-            usage.uploaded_bytes = upload_list.value().num_bytes_sent;
-        }
-
-        // If the manifest was uploaded in parallel with segments we want to
-        // update projected clean offset and last upload timestamp.
-        if (upload_list.value().manifest_clean_offset != model::offset{}) {
-            _projected_manifest_clean_at
-              = upload_list.value().manifest_clean_offset;
-            _last_manifest_upload_time = ss::lowres_clock::now();
-        }
-
-        const auto& upl_results = upload_list.value().results;
-        const auto all_failed = std::all_of(
-          upl_results.begin(),
-          upl_results.end(),
-          [](cloud_storage::upload_result r) {
-              return r != cloud_storage::upload_result::success;
-          });
-
-        if (all_failed) {
-            vlog(_rtclog.debug, "All uploads has failed");
-            continue;
-        }
-
-        auto admit_result = co_await _ops->admit_uploads(
-          _rtcnode, std::move(upload_list.value()));
-        if (admit_result.has_error()) {
-            vlog(
-              _rtclog.error,
-              "Failed to admit uploads: {}",
-              admit_result.error());
-            usage.errc = admit_result.error();
-            continue;
-        }
-
-        // At this point the upload is completed
-        if (ss::lowres_clock::now() >= _next_housekeeping) {
-            co_await housekeeping();
-            _next_housekeeping = _housekeeping_jitter();
-        }
-
-        if (!may_begin_uploads()) {
-            break;
-        }
-
-        // If flush is in progress complete it first.
-        co_await maybe_complete_flush();
-
-        // This is the fallback path for uploading manifest if it didn't
-        // happen inline with segment uploads: this path will be taken on
-        // e.g. restarts or unclean leadership changes.
-        if (co_await maybe_upload_manifest(upload_loop_epilogue_ctx_label)) {
-            co_await flush_manifest_clean_offset();
-        } else {
-            // No manifest upload, but if some background task had
-            // incremented the projected clean offset without flushing it,
-            // flush it for them.
-            co_await maybe_flush_manifest_clean_offset();
-        }
-    }
-}
 
 ss::future<> ntp_archiver::sync_manifest_until_term_change() {
     while (can_update_archival_metadata()) {
@@ -2086,11 +1900,15 @@ ntp_archiver::schedule_uploads(std::vector<upload_context> loop_contexts) {
     co_return scheduled_uploads;
 }
 
-ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
+ss::future<ntp_archiver::wait_uploads_complete_result>
+ntp_archiver::wait_uploads_complete(
   std::vector<scheduled_upload> scheduled,
   segment_upload_kind segment_kind,
   bool inline_manifest) {
-    ntp_archiver::upload_group_result total{};
+    wait_uploads_complete_result result{
+      .inline_manifest = inline_manifest,
+    };
+
     std::vector<ss::future<ntp_archiver_upload_result>> flist;
     std::vector<size_t> ixupload;
     for (size_t ix = 0; ix < scheduled.size(); ix++) {
@@ -2099,20 +1917,15 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
             ixupload.push_back(ix);
         }
     }
+
     if (flist.empty()) {
         vlog(
           _rtclog.debug,
           "no uploads started for segment upload kind: {}, returning",
           segment_kind);
-        co_return total;
+        // The result is empty at this point
+        co_return result;
     }
-
-    // Remember if we started with a clean STM: this will be used to decide
-    // whether to maybe do an extra flush of manifest after upload, to get back
-    // into a clean state.
-    auto stm_was_clean = _parent.archival_meta_stm()->get_dirty(
-                           _projected_manifest_clean_at)
-                         == cluster::archival_metadata_stm::state_dirty::clean;
 
     // We may upload manifest in parallel with segments when using time-based
     // (interval) manifest uploads.  If we aren't using an interval, then the
@@ -2139,6 +1952,11 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
     if (upload_manifest_in_parallel) {
         // Drop the upload_result from manifest upload, we do not want to
         // count it in the subsequent success/failure counts.
+        // The actual progress of the manifest uploads is tracked inside the
+        // 'maybe_upload_manifest' method. The method updates projected clean
+        // offset upon success. Later this value is used to replicate
+        // 'mark_clean' command so we don't need to propagate the actual error
+        // code.
         segment_results.pop_back();
     }
 
@@ -2146,7 +1964,7 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
         // We exit early even if we have successfully uploaded some segments to
         // avoid interfering with an archiver that could have started on another
         // node.
-        co_return upload_group_result{};
+        co_return wait_uploads_complete_result{};
     }
 
     absl::flat_hash_map<cloud_storage::upload_result, size_t> upload_results;
@@ -2154,17 +1972,47 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
         ++upload_results[result.result()];
     }
 
-    total.num_succeeded = upload_results[cloud_storage::upload_result::success];
-    total.num_cancelled
+    result.num_succeeded
+      = upload_results[cloud_storage::upload_result::success];
+    result.num_cancelled
       = upload_results[cloud_storage::upload_result::cancelled];
-    total.num_failed = segment_results.size()
-                       - (total.num_succeeded + total.num_cancelled);
+    result.num_failed = segment_results.size()
+                        - (result.num_succeeded + result.num_cancelled);
 
-    std::vector<cloud_storage::segment_meta> mdiff;
-    const bool checks_disabled
+    result.checks_disabled
       = config::shard_local_cfg()
           .cloud_storage_disable_upload_consistency_checks.value();
-    if (!checks_disabled) {
+    auto skip_metadata_check = [this] {
+        // Special handling of the situation when the gap was created
+        // while the archiver was paused with 'redpanda.remote.allowgaps'
+        // set to 'true'.
+        // If the property is set to true and the local start offset
+        // doesn't match the last uploaded offset we should skip the
+        // check.
+        auto manifest_last = manifest().get_last_offset();
+        auto local_first = _parent.raft_start_offset();
+        model::offset manifest_next = model::next_offset(manifest_last);
+        bool gaps_allowed
+          = _parent.log()->config().is_remote_allow_gaps_enabled();
+        return gaps_allowed && !manifest().empty()
+               && manifest_next < local_first;
+    }();
+    if (!skip_metadata_check && !result.checks_disabled) {
+        // With read-write-fence it's guaranteed that the concurrent
+        // updates are not a problem. But we still need this check
+        // to prevent certain bugs from corrupting the cloud storage
+        // metadata.
+        // Overall, we're checking that the update makes sense here
+        // (that the new segment lines up with the previous one). Then
+        // we're checking that the segment actually matches its
+        // metadata. And then we're replicating the metadata with the
+        // fence that guarantees that no updates are made to the STM
+        // state interim.
+        // In other words, we're basing the decision to start an upload
+        // on the precondition. Then we're validating the actual uploads
+        // against this precondition and then we're discarding the
+        // changes to the STM state if the precondition is no longer
+        // valid.
         std::vector<cloud_storage::segment_meta> meta;
         for (size_t i = 0; i < segment_results.size(); i++) {
             meta.push_back(scheduled[ixupload[i]].meta.value());
@@ -2195,7 +2043,7 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
             break;
         }
         const auto& upload = scheduled[ixupload[i]];
-        if (!checks_disabled && segment_results[i].has_record_stats()) {
+        if (!result.checks_disabled && segment_results[i].has_record_stats()) {
             // Validate metadata by comparing it to the segment stats
             // generated during index building process. The stats contains
             // "ground truth" about the uploaded segment because the code that
@@ -2228,7 +2076,41 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
             }
         }
 
-        mdiff.push_back(*upload.meta);
+        result.meta.push_back(*upload.meta);
+    }
+    co_return result;
+}
+
+/// Replicate archival metadata
+ss::future<ntp_archiver::upload_group_result>
+ntp_archiver::replicate_archival_metadata(
+  archival_stm_fence fence,
+  std::vector<wait_uploads_complete_result> finished_uploads) {
+    upload_group_result total{};
+    std::vector<cloud_storage::segment_meta> meta;
+    bool checks_disabled = true;
+    bool inline_manifest = false;
+    for (const auto& it : finished_uploads) {
+        total.num_cancelled += it.num_cancelled;
+        total.num_failed += it.num_failed;
+        total.num_succeeded += it.num_succeeded;
+        for (const auto& s : it.meta) {
+            meta.emplace_back(s);
+        }
+        checks_disabled = checks_disabled && it.checks_disabled;
+        inline_manifest = inline_manifest || it.inline_manifest;
+    }
+
+    // Remember if we started with a clean STM: this will be used to decide
+    // whether to maybe do an extra flush of manifest after upload, to get back
+    // into a clean state.
+    auto stm_was_clean = _parent.archival_meta_stm()->get_dirty(
+                           _projected_manifest_clean_at)
+                         == cluster::archival_metadata_stm::state_dirty::clean;
+
+    if (meta.empty()) {
+        vlog(_rtclog.debug, "No upload metadata collected, returning early");
+        co_return total;
     }
 
     if (total.num_succeeded != 0) {
@@ -2256,14 +2138,32 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
               ? _parent.highest_producer_id()
               : model::producer_id{};
 
+        auto is_validated = checks_disabled ? cluster::segment_validated::no
+                                            : cluster::segment_validated::yes;
+        cluster::emit_read_write_fence rw_fence = std::nullopt;
+        if (fence.emit_rw_fence_cmd) {
+            // The fence should be added first because it can only
+            // affect commands which are following it in the same record
+            // batch.
+            vlog(
+              archival_log.debug,
+              "add_segments, read-write fence: {}, manifest "
+              "last "
+              "applied offset: {}, manifest in-sync offset: {}",
+              fence.read_write_fence,
+              _parent.archival_meta_stm()->manifest().get_applied_offset(),
+              _parent.archival_meta_stm()->get_insync_offset());
+            rw_fence = fence.read_write_fence;
+        }
         auto error = co_await _parent.archival_meta_stm()->add_segments(
-          mdiff,
+          meta,
           manifest_clean_offset,
           highest_producer_id,
           deadline,
           _as,
-          checks_disabled ? cluster::segment_validated::no
-                          : cluster::segment_validated::yes);
+          is_validated,
+          rw_fence);
+
         if (
           error != cluster::errc::success
           && error != cluster::errc::not_leader) {
@@ -2302,7 +2202,19 @@ ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
     co_return total;
 }
 
+ss::future<ntp_archiver::upload_group_result> ntp_archiver::wait_uploads(
+  archival_stm_fence fence,
+  std::vector<scheduled_upload> scheduled,
+  segment_upload_kind segment_kind,
+  bool inline_manifest) {
+    auto wait_result = co_await wait_uploads_complete(
+      std::move(scheduled), segment_kind, inline_manifest);
+    co_return co_await replicate_archival_metadata(
+      fence, {std::move(wait_result)});
+}
+
 ss::future<ntp_archiver::batch_result> ntp_archiver::wait_all_scheduled_uploads(
+  archival_stm_fence fence,
   std::vector<ntp_archiver::scheduled_upload> scheduled) {
     // Split the set of scheduled uploads into compacted and non compacted
     // uploads, and then wait for them separately. They can also be waited on
@@ -2340,28 +2252,39 @@ ss::future<ntp_archiver::batch_result> ntp_archiver::wait_all_scheduled_uploads(
 
     auto [non_compacted_result, compacted_result]
       = co_await ss::when_all_succeed(
-        wait_uploads(
+        wait_uploads_complete(
           std::move(non_compacted_uploads),
           segment_upload_kind::non_compacted,
           inline_manifest_in_non_compacted_uploads),
-        wait_uploads(
+        wait_uploads_complete(
           std::move(compacted_uploads),
           segment_upload_kind::compacted,
           !inline_manifest_in_non_compacted_uploads));
 
-    auto total_successful_uploads = non_compacted_result.num_succeeded
-                                    + compacted_result.num_succeeded;
-    if (total_successful_uploads > 0) {
+    // Replicate the metadata
+    auto final_result = co_await replicate_archival_metadata(
+      fence, {non_compacted_result, compacted_result});
+
+    if (final_result.num_succeeded > 0) {
         _last_segment_upload_time = ss::lowres_clock::now();
     }
     vlog(
       _rtclog.trace,
       "Segment uploads complete: {} successful uploads",
-      total_successful_uploads);
+      final_result.num_succeeded);
 
     co_return batch_result{
-      .non_compacted_upload_result = non_compacted_result,
-      .compacted_upload_result = compacted_result};
+      .non_compacted_upload_result = {
+        .num_succeeded = non_compacted_result.num_succeeded,
+        .num_failed = non_compacted_result.num_failed,
+        .num_cancelled = non_compacted_result.num_cancelled,
+      },
+      .compacted_upload_result = {
+        .num_succeeded = compacted_result.num_succeeded,
+        .num_failed = compacted_result.num_failed,
+        .num_cancelled = compacted_result.num_cancelled,
+      },
+      };
 }
 
 model::offset ntp_archiver::max_uploadable_offset_exclusive() const {
@@ -2374,6 +2297,7 @@ model::offset ntp_archiver::max_uploadable_offset_exclusive() const {
 }
 
 ss::future<ntp_archiver::batch_result> ntp_archiver::upload_next_candidates(
+  archival_stm_fence fence,
   std::optional<model::offset> unsafe_max_offset_override_exclusive) {
     auto max_offset_exclusive = unsafe_max_offset_override_exclusive
                                   ? *unsafe_max_offset_override_exclusive
@@ -2389,7 +2313,7 @@ ss::future<ntp_archiver::batch_result> ntp_archiver::upload_next_candidates(
         auto scheduled_uploads = co_await schedule_uploads(
           max_offset_exclusive);
         co_return co_await wait_all_scheduled_uploads(
-          std::move(scheduled_uploads));
+          fence, std::move(scheduled_uploads));
     } catch (const ss::gate_closed_exception&) {
     } catch (const ss::abort_requested_exception&) {
     }
@@ -2575,6 +2499,15 @@ ss::future<> ntp_archiver::apply_archive_retention() {
         vlog(_rtclog.trace, "NTP is not collectable");
         co_return;
     }
+
+    archival_stm_fence fence = {
+      .read_write_fence
+      = _parent.archival_meta_stm()->manifest().get_applied_offset(),
+      // Only use the rw-fence if the feature is enabled which requires
+      // major version upgrade.
+      .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+    };
+
     std::optional<size_t> retention_bytes = ntp_conf.retention_bytes();
     std::optional<std::chrono::milliseconds> retention_ms
       = ntp_conf.retention_duration();
@@ -2611,6 +2544,13 @@ ss::future<> ntp_archiver::apply_archive_retention() {
     auto deadline = ss::lowres_clock::now() + sync_timeout;
 
     auto batch = _parent.archival_meta_stm()->batch_start(deadline, _as);
+    if (fence.emit_rw_fence_cmd) {
+        vlog(
+          _rtclog.debug,
+          "truncate_archive_init, read-write fence: {}",
+          fence.read_write_fence);
+        batch.read_write_fence(fence.read_write_fence);
+    }
     batch.truncate_archive_init(res.value().offset, res.value().delta);
     auto error = co_await batch.replicate();
 
@@ -2632,6 +2572,13 @@ ss::future<> ntp_archiver::garbage_collect_archive() {
     if (!may_begin_uploads()) {
         co_return;
     }
+    archival_stm_fence fence = {
+      .read_write_fence
+      = _parent.archival_meta_stm()->manifest().get_applied_offset(),
+      // Only use the rw-fence if the feature is enabled which requires
+      // major version upgrade.
+      .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+    };
     auto backlog = co_await _manifest_view->get_retention_backlog();
     if (backlog.has_failure()) {
         if (backlog.error() == cloud_storage::error_outcome::shutting_down) {
@@ -2814,8 +2761,16 @@ ss::future<> ntp_archiver::garbage_collect_archive() {
         auto sync_timeout = config::shard_local_cfg()
                               .cloud_storage_metadata_sync_timeout_ms.value();
         auto deadline = ss::lowres_clock::now() + sync_timeout;
-        auto error = co_await _parent.archival_meta_stm()->cleanup_archive(
-          new_clean_offset, bytes_to_remove, deadline, _as);
+        auto builder = _parent.archival_meta_stm()->batch_start(deadline, _as);
+        if (fence.emit_rw_fence_cmd) {
+            vlog(
+              _rtclog.debug,
+              "cleanup_archive, read-write fence: {}",
+              fence.read_write_fence);
+            builder.read_write_fence(fence.read_write_fence);
+        }
+        builder.cleanup_archive(new_clean_offset, bytes_to_remove);
+        auto error = co_await builder.replicate();
 
         if (error != cluster::errc::success) {
             vlog(
@@ -3001,6 +2956,8 @@ flush_result ntp_archiver::flush() {
 }
 
 ss::future<wait_result> ntp_archiver::wait(model::offset o) {
+    ss::gate::holder holder(_gate);
+
     if (_parent.is_read_replica_mode_enabled()) {
         vlog(
           _rtclog.debug,
@@ -3068,6 +3025,13 @@ ss::future<> ntp_archiver::apply_retention() {
     if (!may_begin_uploads()) {
         co_return;
     }
+    archival_stm_fence fence = {
+      .read_write_fence
+      = _parent.archival_meta_stm()->manifest().get_applied_offset(),
+      // Only use the rw-fence if the feature is enabled which requires
+      // major version upgrade.
+      .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+    };
     auto arch_so = manifest().get_archive_start_offset();
     auto stm_so = manifest().get_start_offset();
     if (arch_so != model::offset{} && arch_so != stm_so) {
@@ -3114,8 +3078,22 @@ ss::future<> ntp_archiver::apply_retention() {
         auto sync_timeout = config::shard_local_cfg()
                               .cloud_storage_metadata_sync_timeout_ms.value();
         auto deadline = ss::lowres_clock::now() + sync_timeout;
-        auto error = co_await _parent.archival_meta_stm()->truncate(
-          *next_start_offset, deadline, _as);
+
+        auto builder = _parent.archival_meta_stm()->batch_start(deadline, _as);
+        if (fence.emit_rw_fence_cmd) {
+            // Currently, the 'unsafe_add' is always set to 'false'
+            // because the fence is generated inside this method. It's still
+            // good to have this condition in case if this will be changed.
+            vlog(
+              _rtclog.debug,
+              "truncate, read-write fence: {}",
+              fence.read_write_fence);
+            builder.read_write_fence(fence.read_write_fence);
+        }
+        builder.truncate(*next_start_offset);
+
+        auto error = co_await builder.replicate();
+
         if (error != cluster::errc::success) {
             vlog(
               _rtclog.warn,
@@ -3143,6 +3121,14 @@ ss::future<> ntp_archiver::garbage_collect() {
     if (to_remove.size() == 0) {
         co_return;
     }
+
+    archival_stm_fence fence = {
+      .read_write_fence
+      = _parent.archival_meta_stm()->manifest().get_applied_offset(),
+      // Only use the rw-fence if the feature is enabled which requires
+      // major version upgrade.
+      .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+    };
 
     // If we are about to delete segments, we must ensure that the remote
     // manifest is fully up to date, so that it is definitely not referring
@@ -3204,8 +3190,17 @@ ss::future<> ntp_archiver::garbage_collect() {
         auto sync_timeout = config::shard_local_cfg()
                               .cloud_storage_metadata_sync_timeout_ms.value();
         auto deadline = ss::lowres_clock::now() + sync_timeout;
-        auto error = co_await _parent.archival_meta_stm()->cleanup_metadata(
-          deadline, _as);
+
+        auto builder = _parent.archival_meta_stm()->batch_start(deadline, _as);
+        if (fence.emit_rw_fence_cmd) {
+            vlog(
+              _rtclog.debug,
+              "cleanup_metadata, read-write fence: {}",
+              fence.read_write_fence);
+            builder.read_write_fence(fence.read_write_fence);
+        }
+        builder.cleanup_metadata();
+        auto error = co_await builder.replicate();
 
         if (error != cluster::errc::success) {
             vlog(
@@ -3251,18 +3246,25 @@ ntp_archiver::get_housekeeping_jobs() {
     return res;
 }
 
-ss::future<std::pair<
-  std::optional<ssx::semaphore_units>,
-  std::optional<upload_candidate_with_locks>>>
+ss::future<ntp_archiver::find_reupload_candidate_result>
 ntp_archiver::find_reupload_candidate(manifest_scanner_t scanner) {
     ss::gate::holder holder(_gate);
+    archival_stm_fence rw_fence{
+      .read_write_fence
+      = _parent.archival_meta_stm()->manifest().get_applied_offset(),
+      // Only use the rw-fence if the feature is enabled which requires
+      // major version upgrade.
+      .emit_rw_fence_cmd = emit_read_write_fence(_feature_table),
+    };
     if (!may_begin_uploads()) {
-        co_return std::make_pair(std::nullopt, std::nullopt);
+        co_return find_reupload_candidate_result{
+          std::nullopt, std::nullopt, {}};
     }
     auto run = scanner(_parent.raft_start_offset(), manifest());
     if (!run.has_value()) {
         vlog(_rtclog.debug, "Scan didn't resulted in upload candidate");
-        co_return std::make_pair(std::nullopt, std::nullopt);
+        co_return find_reupload_candidate_result{
+          std::nullopt, std::nullopt, {}};
     } else {
         vlog(_rtclog.debug, "Scan result: {}", run);
     }
@@ -3281,18 +3283,16 @@ ntp_archiver::find_reupload_candidate(manifest_scanner_t scanner) {
         auto candidate = co_await collector.make_upload_candidate(
           _conf->upload_io_priority, _conf->segment_upload_timeout());
 
-        using ret_t = std::pair<
-          std::optional<ssx::semaphore_units>,
-          std::optional<upload_candidate_with_locks>>;
         co_return ss::visit(
           candidate,
-          [](std::monostate) -> ret_t {
+          [](std::monostate) -> find_reupload_candidate_result {
               vassert(
                 false,
                 "unexpected default re-upload candidate creation result");
           },
-          [this, &run, units = std::move(units)](
-            upload_candidate_with_locks& upload_candidate) mutable -> ret_t {
+          [this, &run, &rw_fence, units = std::move(units)](
+            upload_candidate_with_locks& upload_candidate) mutable
+          -> find_reupload_candidate_result {
               if (
                 upload_candidate.candidate.content_length
                   != run->meta.size_bytes
@@ -3307,27 +3307,30 @@ ntp_archiver::find_reupload_candidate(manifest_scanner_t scanner) {
                     "{}, run: {}",
                     upload_candidate.candidate,
                     run->meta);
-                  return std::make_pair(std::nullopt, std::nullopt);
+                  return {std::nullopt, std::nullopt, {}};
               }
 
-              return std::make_pair(
-                std::move(units), std::move(upload_candidate));
+              return {std::move(units), std::move(upload_candidate), rw_fence};
           },
-          [this](skip_offset_range& skip_offsets) -> ret_t {
-              vlog(
-                _rtclog.warn,
+          [this](
+            skip_offset_range& skip_offsets) -> find_reupload_candidate_result {
+              const auto log_level = log_level_for_error(skip_offsets.reason);
+              vlogl(
+                _rtclog,
+                log_level,
                 "Failed to make reupload candidate: {}",
                 skip_offsets.reason);
-              return std::make_pair(std::nullopt, std::nullopt);
+              return {std::nullopt, std::nullopt, {}};
           },
-          [this](candidate_creation_error& error) -> ret_t {
+          [this](
+            candidate_creation_error& error) -> find_reupload_candidate_result {
               const auto log_level = log_level_for_error(error);
               vlogl(
                 _rtclog,
                 log_level,
                 "Failed to make reupload candidate: {}",
                 error);
-              return std::make_pair(std::nullopt, std::nullopt);
+              return {std::nullopt, std::nullopt, {}};
           });
     }
     // segment_name exposed_name;
@@ -3345,18 +3348,26 @@ ntp_archiver::find_reupload_candidate(manifest_scanner_t scanner) {
       = cloud_storage::partition_manifest::generate_remote_segment_name(
         run->meta);
     // Create a remote upload candidate
-    co_return std::make_pair(
-      std::move(units), upload_candidate_with_locks{std::move(candidate)});
+    co_return find_reupload_candidate_result{
+      std::move(units),
+      upload_candidate_with_locks{std::move(candidate)},
+      rw_fence};
 }
 
 ss::future<bool> ntp_archiver::upload(
-  ssx::semaphore_units archiver_units,
-  upload_candidate_with_locks upload_locks,
+  find_reupload_candidate_result find_res,
   std::optional<std::reference_wrapper<retry_chain_node>> source_rtc) {
     ss::gate::holder holder(_gate);
-    auto units = std::move(archiver_units);
-    if (upload_locks.candidate.sources.size() > 0) {
-        co_return co_await do_upload_local(std::move(upload_locks), source_rtc);
+    if (!find_res.locks.has_value() || !find_res.units.has_value()) {
+        // The method shouldn't be called if this is the case
+        co_return false;
+    }
+    auto units = std::move(find_res.units);
+    if (find_res.locks->candidate.sources.size() > 0) {
+        co_return co_await do_upload_local(
+          find_res.read_write_fence,
+          std::move(find_res.locks.value()),
+          source_rtc);
     }
     // Currently, the uploading of remote segments is disabled and
     // the only reason why the list of locks is empty is truncation.
@@ -3367,11 +3378,17 @@ ss::future<bool> ntp_archiver::upload(
 }
 
 ss::future<bool> ntp_archiver::do_upload_local(
+  archival_stm_fence fence,
   upload_candidate_with_locks upload_locks,
   std::optional<std::reference_wrapper<retry_chain_node>> source_rtc) {
     if (!may_begin_uploads()) {
         co_return false;
     }
+
+    if (!config::shard_local_cfg().cloud_storage_enable_segment_uploads()) {
+        co_return false;
+    }
+
     auto [upload, locks] = std::move(upload_locks);
 
     for (const auto& s : upload.sources) {
@@ -3481,14 +3498,29 @@ ss::future<bool> ntp_archiver::do_upload_local(
           ? _parent.highest_producer_id()
           : model::producer_id{};
     auto deadline = ss::lowres_clock::now() + _conf->manifest_upload_timeout();
+
+    auto is_validated = checks_disabled ? cluster::segment_validated::no
+                                        : cluster::segment_validated::yes;
+    cluster::emit_read_write_fence rw_fence = std::nullopt;
+    if (fence.emit_rw_fence_cmd) {
+        vlog(
+          archival_log.debug,
+          "(2) fence value is: {}, manifest last applied "
+          "offset: {}, manifest in-sync offset: {}",
+          fence.read_write_fence,
+          _parent.archival_meta_stm()->manifest().get_applied_offset(),
+          _parent.archival_meta_stm()->get_insync_offset());
+        rw_fence = fence.read_write_fence;
+    }
     auto error = co_await _parent.archival_meta_stm()->add_segments(
       {meta},
       std::nullopt,
       highest_producer_id,
       deadline,
       _as,
-      checks_disabled ? cluster::segment_validated::no
-                      : cluster::segment_validated::yes);
+      is_validated,
+      rw_fence);
+
     if (error != cluster::errc::success && error != cluster::errc::not_leader) {
         vlog(
           _rtclog.warn,

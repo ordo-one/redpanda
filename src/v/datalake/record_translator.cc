@@ -17,10 +17,12 @@
 #include "datalake/values_avro.h"
 #include "datalake/values_protobuf.h"
 #include "iceberg/avro_utils.h"
+#include "iceberg/compatibility_utils.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/values.h"
 #include "model/fundamental.h"
 
+#include <absl/container/flat_hash_set.h>
 #include <avro/Generic.hh>
 #include <avro/GenericDatum.hh>
 
@@ -34,8 +36,8 @@ struct value_translating_visitor {
     const iceberg::field_type& type;
 
     ss::future<optional_value_outcome>
-    operator()(const wrapped_protobuf_descriptor& d) {
-        return deserialize_protobuf(std::move(parsable_buf), d.descriptor);
+    operator()(const google::protobuf::Descriptor& d) {
+        return deserialize_protobuf(std::move(parsable_buf), d);
     }
     ss::future<optional_value_outcome> operator()(const avro::ValidSchema& s) {
         auto value = co_await deserialize_avro(std::move(parsable_buf), s);
@@ -188,6 +190,30 @@ structured_data_translator::build_type(std::optional<resolved_type> val_type) {
     if (val_type.has_value()) {
         val_id = std::move(val_type->id);
         auto& struct_type = std::get<iceberg::struct_type>(val_type->type);
+        // The various schema languages differ significantly in their semantics
+        // and best practices around required fields, and Iceberg has its own.
+        // By forcing all schema fields to non-required, we provide a maximally
+        // permissive allowance for schema evolution which is certainly a
+        // superset superset of what any particular schema language allows.
+        // TODO(iceberg): this behavior could be made configurable
+        //
+        // Keys must be marked as required per the Iceberg spec:
+        // https://iceberg.apache.org/spec/#nested-types.
+        // This approach of storing the `key` fields in a set below is
+        // guaranteed to work because `iceberg::for_each_field()` is a depth
+        // first traversal of the fields, i.e., the parent `map` field will be
+        // visited before the child `key` field.
+        absl::flat_hash_set<iceberg::nested_field*> map_keys;
+        std::ignore = iceberg::for_each_field(
+          struct_type, [&map_keys](iceberg::nested_field* f) {
+              f->required = map_keys.contains(f) ? iceberg::field_required::yes
+                                                 : iceberg::field_required::no;
+
+              if (std::holds_alternative<iceberg::map_type>(f->type)) {
+                  auto& kv = std::get<iceberg::map_type>(f->type);
+                  map_keys.insert(kv.key_field.get());
+              }
+          });
         for (auto& field : struct_type.fields) {
             if (field->name == rp_struct_name) {
                 // To avoid collisions, move user fields named "redpanda" into
@@ -239,7 +265,7 @@ structured_data_translator::translate_data(
 
     auto translated_val = co_await std::visit(
       value_translating_visitor{std::move(*parsable_val), val_type->type},
-      val_type->schema);
+      val_type->schema.get_schema_ref());
     if (translated_val.has_error()) {
         vlog(
           datalake_log.error,

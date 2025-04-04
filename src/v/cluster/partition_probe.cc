@@ -24,6 +24,8 @@ namespace cluster {
 static const ss::sstring cluster_metrics_name
   = prometheus_sanitize::metrics_name("cluster:partition");
 
+static constexpr int64_t follower_iceberg_lag_metric = 0;
+
 replicated_partition_probe::replicated_partition_probe(
   const partition& p) noexcept
   : _partition(p) {
@@ -44,6 +46,16 @@ void replicated_partition_probe::clear_metrics() {
 void replicated_partition_probe::setup_metrics(const model::ntp& ntp) {
     setup_internal_metrics(ntp);
     setup_public_metrics(ntp);
+}
+
+int64_t replicated_partition_probe::iceberg_translation_offset_lag() const {
+    return _partition.is_leader() ? _iceberg_translation_offset_lag
+                                  : follower_iceberg_lag_metric;
+}
+
+int64_t replicated_partition_probe::iceberg_commit_offset_lag() const {
+    return _partition.is_leader() ? _iceberg_commit_offset_lag
+                                  : follower_iceberg_lag_metric;
 }
 
 void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
@@ -128,6 +140,11 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
           [this] { return _records_produced; },
           sm::description("Total number of records produced"),
           labels),
+        sm::make_gauge(
+          "batches_produced",
+          [this] { return _batches_produced; },
+          sm::description("Total number of batches produced"),
+          labels),
         sm::make_counter(
           "records_fetched",
           [this] { return _records_fetched; },
@@ -168,6 +185,11 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
       {sm::shard_label, partition_label});
 
     if (model::is_user_topic(_partition.ntp())) {
+        // Metrics are reported as follows
+        // -2 (default initialized state)
+        // -1 (iceberg disabled state)
+        //  0 (iceberg enabled but follower replicas)
+        // <actual lag> leader replicas
         _metrics.add_group(
           cluster_metrics_name,
           {
@@ -175,21 +197,28 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
               "iceberg_offsets_pending_translation",
               [this] {
                   return _partition.log()->config().iceberg_enabled()
-                           ? _iceberg_translation_offset_lag
+                           ? iceberg_translation_offset_lag()
                            : metric_feature_disabled_state;
               },
-              sm::description("Total number of offsets that are pending "
-                              "translation to iceberg."),
+              sm::description(
+                "Total number of offsets that are pending "
+                "translation to iceberg. Lag is reported only on leader "
+                "replicas while followers report 0. -1 is reported if iceberg "
+                "is disabled while -2 indicates the lag is "
+                "not yet computed."),
               labels),
             sm::make_gauge(
               "iceberg_offsets_pending_commit",
               [this] {
                   return _partition.log()->config().iceberg_enabled()
-                           ? _iceberg_commit_offset_lag
+                           ? iceberg_commit_offset_lag()
                            : metric_feature_disabled_state;
               },
-              sm::description("Total number of offsets that are pending "
-                              "commit to iceberg catalog."),
+              sm::description(
+                "Total number of offsets that are pending "
+                "commit to iceberg catalog.  Lag is reported only on leader "
+                "while followers report 0. -1 is reported if iceberg is "
+                "disabled while -2 indicates the lag is not yet computed."),
               labels),
           },
           {},
@@ -230,6 +259,11 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
       topic_label(ntp.tp.topic()),
       partition_label(ntp.tp.partition()),
     };
+
+    const sm::description request_bytes_description(
+      "Total number of bytes read from or written to the partitions of a "
+      "topic. The total may include fetched bytes that are not returned to the "
+      "client.");
 
     _public_metrics.add_group(
       prometheus_sanitize::metrics_name("kafka"),
@@ -280,7 +314,7 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
         sm::make_total_bytes(
           "request_bytes_total",
           [this] { return _bytes_produced; },
-          sm::description("Total number of bytes produced per topic"),
+          request_bytes_description,
           {request_label("produce"),
            ns_label(ntp.ns()),
            topic_label(ntp.tp.topic()),
@@ -289,8 +323,7 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
         sm::make_total_bytes(
           "request_bytes_total",
           [this] { return _bytes_fetched; },
-          sm::description("Total number of bytes fetched (not all "
-                          "might be returned to the client)"),
+          request_bytes_description,
           {request_label("consume"),
            ns_label(ntp.ns()),
            topic_label(ntp.tp.topic()),

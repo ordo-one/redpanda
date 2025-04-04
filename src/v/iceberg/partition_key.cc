@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/partition_key.h"
 
 #include "iceberg/transform_utils.h"
@@ -33,7 +34,7 @@ partition_key partition_key::create(
         }
         const auto& field_val = *field_val_opt;
         const auto& transform = partition_field.transform;
-        ret_val->fields.emplace_back(apply_transform(field_val, transform));
+        ret_val->fields.push_back(apply_transform(field_val, transform));
     }
     return partition_key{std::move(ret_val)};
 }
@@ -62,6 +63,12 @@ partition_key partition_key::copy() const {
 
 bool operator==(const partition_key& lhs, const partition_key& rhs) {
     return lhs.val == rhs.val;
+}
+
+int get_hour(const iceberg::partition_key& pk) {
+    return std::get<iceberg::int_value>(
+             std::get<iceberg::primitive_value>(pk.val->fields.at(0).value()))
+      .val;
 }
 
 } // namespace iceberg

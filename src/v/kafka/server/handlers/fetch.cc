@@ -28,7 +28,7 @@
 #include "kafka/server/handlers/fetch/fetch_plan_executor.h"
 #include "kafka/server/handlers/fetch/fetch_planner.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
-#include "kafka/server/latency_probe.h"
+#include "kafka/server/kafka_probe.h"
 #include "kafka/server/read_distribution_probe.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -71,6 +71,7 @@ make_partition_response_error(model::partition_id p_id, error_code error) {
       .error_code = error,
       .high_watermark = model::offset(-1),
       .last_stable_offset = model::offset(-1),
+      .log_start_offset = model::offset(-1),
       .records = batch_reader(),
     };
 }
@@ -80,20 +81,17 @@ make_partition_response_error(model::partition_id p_id, error_code error) {
  */
 static ss::future<read_result> read_from_partition(
   kafka::partition_proxy part,
+  model::offset lso,
   fetch_config config,
   bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline) {
-    auto lso = part.last_stable_offset();
-    if (unlikely(!lso)) {
-        co_return read_result(lso.error());
-    }
     auto hw = part.high_watermark();
     auto start_o = part.start_offset();
     // if we have no data read, return fast
     if (
       hw < config.start_offset || config.skip_read
       || config.start_offset > config.max_offset) {
-        co_return read_result(start_o, hw, lso.value());
+        co_return read_result(start_o, hw, lso);
     }
 
     storage::log_reader_config reader_config(
@@ -154,7 +152,8 @@ static ss::future<read_result> read_from_partition(
                 co_return read_result(
                   error_code::offset_out_of_range,
                   start_o,
-                  part.high_watermark());
+                  part.high_watermark(),
+                  lso);
             }
         }
 
@@ -173,7 +172,7 @@ static ss::future<read_result> read_from_partition(
           ss::make_foreign<read_result::data_t>(std::move(data)),
           start_o,
           hw,
-          lso.value(),
+          lso,
           delta_from_tip_ms,
           std::move(aborted_transactions));
     }
@@ -182,7 +181,7 @@ static ss::future<read_result> read_from_partition(
       std::move(data),
       start_o,
       hw,
-      lso.value(),
+      lso,
       delta_from_tip_ms,
       std::move(aborted_transactions));
 }
@@ -345,15 +344,16 @@ static ss::future<read_result> do_read_from_ntp(
       ntp_config.cfg.read_from_follower,
       default_fetch_timeout + model::timeout_clock::now());
 
+    auto maybe_lso = kafka_partition->last_stable_offset();
+    if (unlikely(!maybe_lso)) {
+        // partition is still bootstrapping
+        co_return read_result(maybe_lso.error());
+    }
+
     if (config::shard_local_cfg().enable_transactions.value()) {
         if (
           ntp_config.cfg.isolation_level
           == model::isolation_level::read_committed) {
-            auto maybe_lso = kafka_partition->last_stable_offset();
-            if (unlikely(!maybe_lso)) {
-                // partition is still bootstrapping
-                co_return read_result(maybe_lso.error());
-            }
             ntp_config.cfg.max_offset = model::prev_offset(maybe_lso.value());
         }
     }
@@ -362,7 +362,8 @@ static ss::future<read_result> do_read_from_ntp(
         co_return read_result(
           offset_ec,
           kafka_partition->start_offset(),
-          kafka_partition->high_watermark());
+          kafka_partition->high_watermark(),
+          maybe_lso.value());
     }
     if (
       config::shard_local_cfg().enable_rack_awareness.value()
@@ -374,10 +375,6 @@ static ss::future<read_result> do_read_from_ntp(
         }
         auto p_info = std::move(p_info_res.value());
 
-        auto lso = kafka_partition->last_stable_offset();
-        if (unlikely(!lso)) {
-            co_return read_result(lso.error());
-        }
         auto preferred_replica = replica_selector.select_replica(
           consumer_info{
             .fetch_offset = ntp_config.cfg.start_offset,
@@ -392,12 +389,16 @@ static ss::future<read_result> do_read_from_ntp(
             co_return read_result(
               kafka_partition->start_offset(),
               kafka_partition->high_watermark(),
-              lso.value(),
+              maybe_lso.value(),
               preferred_replica);
         }
     }
     read_result result = co_await read_from_partition(
-      std::move(*kafka_partition), ntp_config.cfg, foreign_read, deadline);
+      std::move(*kafka_partition),
+      maybe_lso.value(),
+      ntp_config.cfg,
+      foreign_read,
+      deadline);
 
     adjust_memory_units(
       memory_sem, memory_fetch_sem, memory_units, result.data_size_bytes());
@@ -442,7 +443,7 @@ read_result::memory_units_t reserve_memory_units(
 static void fill_fetch_responses(
   op_context& octx,
   std::vector<read_result> results,
-  const std::vector<op_context::response_placeholder_ptr>& responses,
+  const chunked_vector<op_context::response_placeholder_ptr>& responses,
   op_context::latency_point start_time,
   bool record_latency = true) {
     auto range = boost::irange<size_t>(0, results.size());
@@ -466,10 +467,22 @@ static void fill_fetch_responses(
         auto& res = results[idx];
         const auto& resp_it = responses[idx];
 
+        fetch_response::partition_response resp;
+        resp.partition_index = res.partition;
+        resp.error_code = res.error;
+
+        // These are set to -1 in the general error case.
+        // Set to actual values in the success case or when the error is
+        // offset_out_of_range as the client can make use of the returned
+        // offsets.
+        resp.log_start_offset = res.start_offset;
+        resp.high_watermark = res.high_watermark;
+        resp.last_stable_offset = res.last_stable_offset;
+
         // error case
-        if (unlikely(res.error != error_code::none)) {
-            resp_it->set(
-              make_partition_response_error(res.partition, res.error));
+        if (unlikely(resp.error_code != error_code::none)) {
+            resp.records = batch_reader();
+            resp_it->set(std::move(resp));
             continue;
         }
 
@@ -485,12 +498,6 @@ static void fill_fetch_responses(
          * Over response budget, we will just waste this read, it will cause
          * data to be stored in the cache so next read is fast
          */
-        fetch_response::partition_response resp;
-        resp.partition_index = res.partition;
-        resp.error_code = error_code::none;
-        resp.log_start_offset = res.start_offset;
-        resp.high_watermark = res.high_watermark;
-        resp.last_stable_offset = res.last_stable_offset;
         if (res.preferred_replica) {
             resp.preferred_read_replica = *res.preferred_replica;
         }
@@ -553,7 +560,7 @@ static void fill_fetch_responses(
 static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
   cluster::partition_manager& cluster_pm,
   const replica_selector& replica_selector,
-  std::vector<ntp_fetch_config> ntp_fetch_configs,
+  chunked_vector<ntp_fetch_config> ntp_fetch_configs,
   read_distribution_probe& read_probe,
   bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
@@ -721,7 +728,7 @@ public:
         std::optional<model::timeout_clock::time_point> deadline;
         // The fetch sub-requests of partitions local to the shard this worker
         // is running on.
-        std::vector<ntp_fetch_config> requests;
+        chunked_vector<ntp_fetch_config> requests;
 
         // References to services local to the shard this worker is running on.
         // They are protected from deletion by the coordinator.
@@ -789,7 +796,7 @@ private:
     };
 
     ss::future<query_results>
-    query_requests(std::vector<ntp_fetch_config> requests) {
+    query_requests(chunked_vector<ntp_fetch_config> requests) {
         // The last visible indexes need to be populated before partitions
         // are read. If they are populated afterwards then the
         // last_visible_index could be updated after the partition is read,
@@ -910,10 +917,10 @@ private:
         size_t total_size{0};
 
         for (;;) {
-            std::vector<ntp_fetch_config> requests;
+            chunked_vector<ntp_fetch_config> requests;
 
             if (first_run) {
-                requests = _ctx.requests;
+                requests = _ctx.requests.copy();
             } else {
                 requests_map.clear();
 
@@ -1191,7 +1198,7 @@ private:
              shard = fetch.shard,
              min_fetch_bytes,
              foreign_read,
-             configs = fetch.requests,
+             configs = fetch.requests.copy(),
              &octx](cluster::partition_manager& mgr) mutable
             -> ss::future<fetch_worker::worker_result> {
                 // Although this and octx are captured by reference across
@@ -1536,32 +1543,27 @@ fetch_handler::handle(request_context rctx, ss::smp_service_group ssg) {
     return ss::do_with(
       std::make_unique<op_context>(std::move(rctx), ssg),
       [](std::unique_ptr<op_context>& octx_ptr) {
-          auto sg
-            = octx_ptr->rctx.connection()->server().fetch_scheduling_group();
-          return ss::with_scheduling_group(sg, [&octx_ptr] {
-              auto& octx = *octx_ptr;
-
-              log_request(octx.rctx.header(), octx.request);
-              // top-level error is used for session-level errors
-              if (octx.session_ctx.has_error()) {
-                  octx.response.data.error_code = octx.session_ctx.error();
-                  return std::move(octx).send_response();
+          auto& octx = *octx_ptr;
+          log_request(octx.rctx.header(), octx.request);
+          // top-level error is used for session-level errors
+          if (octx.session_ctx.has_error()) {
+              octx.response.data.error_code = octx.session_ctx.error();
+              return std::move(octx).send_response();
+          }
+          if (unlikely(octx.rctx.recovery_mode_enabled())) {
+              octx.response.data.error_code = error_code::policy_violation;
+              return std::move(octx).send_response();
+          }
+          octx.response.data.error_code = error_code::none;
+          return do_fetch(octx).then([&octx] {
+              // NOTE: Audit call doesn't happen until _after_ the fetch
+              // is done. This was done for the sake of simplicity and
+              // because fetch doesn't alter the state of the broker
+              if (!octx.rctx.audit()) {
+                  return std::move(octx).send_error_response(
+                    error_code::broker_not_available);
               }
-              if (unlikely(octx.rctx.recovery_mode_enabled())) {
-                  octx.response.data.error_code = error_code::policy_violation;
-                  return std::move(octx).send_response();
-              }
-              octx.response.data.error_code = error_code::none;
-              return do_fetch(octx).then([&octx] {
-                  // NOTE: Audit call doesn't happen until _after_ the fetch
-                  // is done. This was done for the sake of simplicity and
-                  // because fetch doesn't alter the state of the broker
-                  if (!octx.rctx.audit()) {
-                      return std::move(octx).send_error_response(
-                        error_code::broker_not_available);
-                  }
-                  return std::move(octx).send_response();
-              });
+              return std::move(octx).send_response();
           });
       });
 }
@@ -1870,8 +1872,15 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
         if (
           node_it->second.broker.rack() == c_info.rack_id
           && replica.log_end_offset >= c_info.fetch_offset) {
+            /**
+             * Select replica with highest high watermark in requested rack. If
+             * there is more than one use random choice to break the tie.
+             */
             if (replica.high_watermark >= highest_hw) {
-                highest_hw = replica.high_watermark;
+                if (replica.high_watermark > highest_hw) {
+                    highest_hw = replica.high_watermark;
+                    rack_replicas.clear();
+                }
                 rack_replicas.push_back(replica);
             }
         }
@@ -1883,6 +1892,11 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
     // if there are multiple replicas with the same high watermark in
     // requested rack, return random one
     return random_generators::random_choice(rack_replicas).id;
+}
+
+std::optional<ss::scheduling_group>
+fetch_scheduling_group_provider(const connection_context& conn_ctx) {
+    return conn_ctx.server().fetch_scheduling_group();
 }
 
 std::ostream& operator<<(std::ostream& o, const consumer_info& ci) {

@@ -71,6 +71,7 @@ const (
 	xAdminClientKey            = "admin.tls.key"
 	xCloudClientID             = "cloud.client_id"
 	xCloudClientSecret         = "cloud.client_secret"
+	xCloudEnvironment          = "cloud_environment"
 	xSchemaRegistryHosts       = "registry.hosts"
 	xSchemaRegistryTLSEnabled  = "registry.tls.enabled"
 	xSchemaRegistryTLSInsecure = "registry.tls.insecure_skip_verify"
@@ -85,7 +86,7 @@ const (
 	xkindGlobal           // configuration for rpk.yaml globals
 )
 
-const currentRpkYAMLVersion = 6
+const currentRpkYAMLVersion = 7
 
 type xflag struct {
 	path        string
@@ -389,6 +390,27 @@ var xflags = map[string]xflag{
 			return nil
 		},
 	},
+	xCloudEnvironment: {
+		"cloud_environment",
+		"production", // We don't want to document the values.
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			if p != nil {
+				switch strings.ToLower(v) {
+				case "integration", "ign":
+					p.CloudEnvironment = CloudEnvironmentIntegration
+				case "preprod", "ppd":
+					p.CloudEnvironment = CloudEnvironmentPreprod
+				case "production", "prod":
+					// Do nothing. Production is the default.
+				default:
+					return fmt.Errorf("invalid cloud environment %q", v)
+				}
+			}
+			return nil // TODO: check for an empty rpk.yaml
+		},
+	},
 
 	"globals.prompt": {
 		"globals.prompt",
@@ -464,6 +486,29 @@ var xflags = map[string]xflag{
 			y.Globals.KafkaProtocolReqClientID = v
 			return nil
 		},
+	},
+}
+
+var cloudEnvConfig = map[string]struct {
+	PublicAPIURL         string
+	CloudAPIURL          string
+	CloudAuthAppClientID string
+	CloudAuthURL         string
+	CloudAuthAudience    string
+}{
+	CloudEnvironmentIntegration: {
+		PublicAPIURL:         "https://api.ign.cloud.redpanda.com",
+		CloudAPIURL:          "https://cloud-api.ign.cloud.redpanda.com",
+		CloudAuthAppClientID: "OQJLrKFCXuCMfGfMfnIqzgiwiyDfoxEV",
+		CloudAuthURL:         "https://integration-cloudv2.us.auth0.com",
+		CloudAuthAudience:    "cloudv2-ign.redpanda.cloud",
+	},
+	CloudEnvironmentPreprod: {
+		PublicAPIURL:         "https://api.ppd.cloud.redpanda.com",
+		CloudAPIURL:          "https://cloud-api.ppd.cloud.redpanda.com",
+		CloudAuthAppClientID: "i6CrcBD8XX719XVeBtf574WSeAEdPjo7",
+		CloudAuthURL:         "https://preprod-cloudv2.us.auth0.com",
+		CloudAuthAudience:    "cloudv2-preprod.redpanda.cloud",
 	},
 }
 
@@ -966,6 +1011,7 @@ func (p *Params) Load(fs afero.Fs) (*Config, error) {
 	c.addUnsetRedpandaDefaults(false) // merge from Virtual redpanda.yaml redpanda section to rpk section (picks up original redpanda.yaml defaults)
 	c.mergeRedpandaIntoRpk()          // merge from redpanda.yaml rpk section back to rpk.yaml, picks up final redpanda.yaml defaults
 	c.fixSchemePorts()                // strip any scheme, default any missing ports
+	c.loadCloudEnvToOverrides()       // load cloud environment to overrides
 	c.parseDevOverrides()
 
 	if !c.rpkYaml.Globals.NoDefaultCluster {
@@ -1595,6 +1641,7 @@ func (c *Config) fixSchemePorts() error {
 		if port == "" {
 			port = strconv.Itoa(DefaultKafkaPort)
 		}
+		host = normalizeHost(host)
 		c.redpandaYaml.Rpk.KafkaAPI.Brokers[i] = net.JoinHostPort(host, port)
 	}
 	for i, a := range c.redpandaYaml.Rpk.AdminAPI.Addresses {
@@ -1602,6 +1649,7 @@ func (c *Config) fixSchemePorts() error {
 		if err != nil {
 			return fmt.Errorf("unable to fix admin address %v: %w", a, err)
 		}
+		host = normalizeHost(host)
 		switch scheme {
 		case "":
 			if port == "" {
@@ -1614,52 +1662,85 @@ func (c *Config) fixSchemePorts() error {
 			return fmt.Errorf("unable to fix admin address %v: unsupported scheme %q", a, scheme)
 		}
 	}
-	p := c.rpkYaml.Profile(c.rpkYaml.CurrentProfile)
-	for i, k := range p.KafkaAPI.Brokers {
-		_, host, port, err := rpknet.SplitSchemeHostPort(k)
-		if err != nil {
-			return fmt.Errorf("unable to fix broker address %v: %w", k, err)
-		}
-		if port == "" {
-			port = strconv.Itoa(DefaultKafkaPort)
-		}
-		p.KafkaAPI.Brokers[i] = net.JoinHostPort(host, port)
-	}
-	for i, a := range p.AdminAPI.Addresses {
-		scheme, host, port, err := rpknet.SplitSchemeHostPort(a)
-		if err != nil {
-			return fmt.Errorf("unable to fix admin address %v: %w", a, err)
-		}
-		switch scheme {
-		case "":
-			if port == "" {
-				port = strconv.Itoa(DefaultAdminPort)
-			}
-			p.AdminAPI.Addresses[i] = net.JoinHostPort(host, port)
-		case "http", "https":
-			continue // keep whatever port exists; empty ports will default to 80 or 443
-		default:
-			return fmt.Errorf("unable to fix admin address %v: unsupported scheme %q", a, scheme)
-		}
-	}
-	for i, a := range p.SR.Addresses {
+	for i, a := range c.redpandaYaml.Rpk.SR.Addresses {
 		scheme, host, port, err := rpknet.SplitSchemeHostPort(a)
 		if err != nil {
 			return fmt.Errorf("unable to fix schema registry address %v: %w", a, err)
 		}
+		host = normalizeHost(host)
 		switch scheme {
 		case "":
 			if port == "" {
 				port = strconv.Itoa(DefaultSchemaRegPort)
 			}
-			p.SR.Addresses[i] = net.JoinHostPort(host, port)
+			c.redpandaYaml.Rpk.SR.Addresses[i] = net.JoinHostPort(host, port)
 		case "http", "https":
 			continue // keep whatever port exists; empty ports will default to 80 or 443
 		default:
 			return fmt.Errorf("unable to fix schema registry address %v: unsupported scheme %q", a, scheme)
 		}
 	}
+
+	p := c.rpkYaml.Profile(c.rpkYaml.CurrentProfile)
+	if p != nil {
+		for i, k := range p.KafkaAPI.Brokers {
+			_, host, port, err := rpknet.SplitSchemeHostPort(k)
+			if err != nil {
+				return fmt.Errorf("unable to fix broker address %v: %w", k, err)
+			}
+			host = normalizeHost(host)
+			if port == "" {
+				port = strconv.Itoa(DefaultKafkaPort)
+			}
+			p.KafkaAPI.Brokers[i] = net.JoinHostPort(host, port)
+		}
+		for i, a := range p.AdminAPI.Addresses {
+			scheme, host, port, err := rpknet.SplitSchemeHostPort(a)
+			if err != nil {
+				return fmt.Errorf("unable to fix admin address %v: %w", a, err)
+			}
+			host = normalizeHost(host)
+			switch scheme {
+			case "":
+				if port == "" {
+					port = strconv.Itoa(DefaultAdminPort)
+				}
+				p.AdminAPI.Addresses[i] = net.JoinHostPort(host, port)
+			case "http", "https":
+				continue // keep whatever port exists; empty ports will default to 80 or 443
+			default:
+				return fmt.Errorf("unable to fix admin address %v: unsupported scheme %q", a, scheme)
+			}
+		}
+		for i, a := range p.SR.Addresses {
+			scheme, host, port, err := rpknet.SplitSchemeHostPort(a)
+			if err != nil {
+				return fmt.Errorf("unable to fix schema registry address %v: %w", a, err)
+			}
+			host = normalizeHost(host)
+			switch scheme {
+			case "":
+				if port == "" {
+					port = strconv.Itoa(DefaultSchemaRegPort)
+				}
+				p.SR.Addresses[i] = net.JoinHostPort(host, port)
+			case "http", "https":
+				continue // keep whatever port exists; empty ports will default to 80 or 443
+			default:
+				return fmt.Errorf("unable to fix schema registry address %v: unsupported scheme %q", a, scheme)
+			}
+		}
+	}
 	return nil
+}
+
+// normalizeHost remove surrounding brackets if present for ipv6,
+// net.JoinHostPort will add them back.
+func normalizeHost(host string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host[1 : len(host)-1]
+	}
+	return host
 }
 
 func (c *Config) addConfigToProfiles() {
@@ -1682,6 +1763,29 @@ func (c *Config) migrateProfileNamespace() {
 		if c.rpkYamlActual.Profiles[i].CloudCluster.Namespace != "" && c.rpkYamlActual.Profiles[i].CloudCluster.ResourceGroup == "" {
 			c.rpkYamlActual.Profiles[i].CloudCluster.ResourceGroup = c.rpkYamlActual.Profiles[i].CloudCluster.Namespace
 			c.rpkYamlActual.Profiles[i].CloudCluster.Namespace = ""
+		}
+	}
+}
+
+func (c *Config) loadCloudEnvToOverrides() {
+	if p := c.VirtualProfile(); p != nil {
+		if env := p.CloudEnvironment; env != "" {
+			switch env {
+			case "ign", CloudEnvironmentIntegration:
+				env = CloudEnvironmentIntegration
+			case "ppd", CloudEnvironmentPreprod:
+				env = CloudEnvironmentPreprod
+			}
+			if override, ok := cloudEnvConfig[env]; ok {
+				c.devOverrides.PublicAPIURL = override.PublicAPIURL
+				c.devOverrides.CloudAPIURL = override.CloudAPIURL
+				c.devOverrides.CloudAuthAppClientID = override.CloudAuthAppClientID
+				c.devOverrides.CloudAuthURL = override.CloudAuthURL
+				c.devOverrides.CloudAuthAudience = override.CloudAuthAudience
+				// The BYOC plugin uses a different environment var to set the
+				// cloud URL, and it's not part of the overrides.
+				os.Setenv("CLOUD_URL", fmt.Sprintf("%v/api/v1", override.CloudAPIURL))
+			}
 		}
 	}
 }
@@ -1893,7 +1997,7 @@ func Set[T any](p *T, key, value string) error {
 // getField deeply search in v for the value that reflect field tags.
 //
 // The parentRawTag is the previous tag, and includes an index if there is one.
-func getField(tags []string, parentRawTag string, v reflect.Value) (reflect.Value, reflect.Value, error) {
+func getField(tags []string, parentRawTag string, v reflect.Value) (field reflect.Value, other reflect.Value, err error) {
 	// *At* the last element, we check if it is a slice. The final tag can
 	// still index into the slice and if that happens, we want to return
 	// the index:
@@ -1962,7 +2066,7 @@ func getField(tags []string, parentRawTag string, v reflect.Value) (reflect.Valu
 //  1. if tag is found within the struct, return the field.
 //  2. if tag is not found _but_ the struct has "Other" field, return Other.
 //  3. Error if it can't find the given tag and "Other" field is unavailable.
-func getFieldByTag(tag string, v reflect.Value) (reflect.Value, reflect.Value, error) {
+func getFieldByTag(tag string, v reflect.Value) (newV reflect.Value, otherV reflect.Value, err error) {
 	var (
 		t       = v.Type()
 		other   bool

@@ -13,6 +13,7 @@
 #include "net/exceptions.h"
 #include "net/types.h"
 #include "ssx/abort_source.h"
+#include "strings/utf8.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/net/tls.hh>
@@ -38,7 +39,10 @@ bool is_reconnect_error(const std::system_error& e) {
       ss::tls::ERROR_NO_CIPHER_SUITES,
       ss::tls::ERROR_PREMATURE_TERMINATION,
       ss::tls::ERROR_DECRYPTION_FAILED,
-      ss::tls::ERROR_MAC_VERIFY_FAILED};
+      ss::tls::ERROR_MAC_VERIFY_FAILED,
+      ss::tls::ERROR_WRONG_VERSION_NUMBER,
+      ss::tls::ERROR_HTTP_REQUEST,
+      ss::tls::ERROR_HTTPS_PROXY_REQUEST};
 
     if (e.code().category() == ss::tls::error_category()) {
         return absl::c_any_of(
@@ -129,6 +133,16 @@ bool is_auth_error(std::exception_ptr e) {
     }
 
     __builtin_unreachable();
+}
+
+bool is_invalid_character_error(std::exception_ptr e) {
+    try {
+        std::rethrow_exception(e);
+    } catch (const invalid_character_exception&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 connection::connection(

@@ -201,6 +201,44 @@ void probe::setup_metrics(const model::ntp& ntp) {
           sm::description("Number of tombstone records removed by compaction "
                           "due to the delete.retention.ms setting."),
           labels),
+        sm::make_counter(
+          "cleanly_compacted_segment",
+          [this] { return _segment_cleanly_compacted; },
+          sm::description(
+            "Number of segments cleanly compacted (i.e, had their "
+            "keys de-duplicated with all previous segments "
+            "before them to the front of the log)"),
+          labels),
+        sm::make_counter(
+          "segments_marked_tombstone_free",
+          [this] { return _segments_marked_tombstone_free; },
+          sm::description("Number of segments that have been verified through "
+                          "the compaction process to be tombstone free."),
+          labels),
+        sm::make_counter(
+          "complete_sliding_window_rounds",
+          [this] { return _num_rounds_window_compaction; },
+          sm::description("Number of rounds of sliding window compaction that "
+                          "have been driven to completion."),
+          labels),
+        sm::make_counter(
+          "chunked_compaction_runs",
+          [this] { return _num_chunked_compaction_runs; },
+          sm::description(
+            "Number of times chunked compaction was ran. This metric also "
+            "corresponds to the number of times the compaction key-offset map "
+            "was unable to be built for a single segment."),
+          labels),
+        sm::make_gauge(
+          "dirty_segment_bytes",
+          [this] { return _dirty_segment_bytes; },
+          sm::description("Number of bytes within dirty segments of the log"),
+          labels),
+        sm::make_gauge(
+          "closed_segment_bytes",
+          [this] { return _closed_segment_bytes; },
+          sm::description("Number of bytes within closed segments of the log"),
+          labels),
       },
       {},
       {sm::shard_label, partition_label});

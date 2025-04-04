@@ -1,6 +1,6 @@
-load("@rules_proto//proto:defs.bzl", "proto_library")
 load("//bazel:build.bzl", "redpanda_cc_library")
 load("//bazel/thirdparty:seastar.bzl", "seastar_cc_swagger_library")
+load("//src/v/schema/protobuf:well_known.bzl", "well_known_cc_protos")
 
 seastar_cc_swagger_library(
     name = "rest_swagger",
@@ -10,120 +10,6 @@ seastar_cc_swagger_library(
 seastar_cc_swagger_library(
     name = "schema_registry_swagger",
     src = "api/api-doc/schema_registry.json",
-)
-
-proto_library(
-    name = "schema_registry_protos",
-    srcs = [
-        "schema_registry/protobuf/confluent/meta.proto",
-        "schema_registry/protobuf/confluent/types/decimal.proto",
-        "schema_registry/protobuf/google/type/calendar_period.proto",
-        "schema_registry/protobuf/google/type/color.proto",
-        "schema_registry/protobuf/google/type/date.proto",
-        "schema_registry/protobuf/google/type/datetime.proto",
-        "schema_registry/protobuf/google/type/dayofweek.proto",
-        "schema_registry/protobuf/google/type/decimal.proto",
-        "schema_registry/protobuf/google/type/expr.proto",
-        "schema_registry/protobuf/google/type/fraction.proto",
-        "schema_registry/protobuf/google/type/interval.proto",
-        "schema_registry/protobuf/google/type/latlng.proto",
-        "schema_registry/protobuf/google/type/localized_text.proto",
-        "schema_registry/protobuf/google/type/money.proto",
-        "schema_registry/protobuf/google/type/month.proto",
-        "schema_registry/protobuf/google/type/phone_number.proto",
-        "schema_registry/protobuf/google/type/postal_address.proto",
-        "schema_registry/protobuf/google/type/quaternion.proto",
-        "schema_registry/protobuf/google/type/timeofday.proto",
-    ],
-    deps = [
-        "@protobuf//:any_proto",
-        "@protobuf//:descriptor_proto",
-        "@protobuf//:duration_proto",
-        "@protobuf//:timestamp_proto",
-        "@protobuf//:wrappers_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "descriptor_cc_proto",
-    deps = [
-        "@protobuf//:descriptor_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "struct_cc_proto",
-    deps = [
-        "@protobuf//:struct_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "field_mask_cc_proto",
-    deps = [
-        "@protobuf//:field_mask_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "source_context_cc_proto",
-    deps = [
-        "@protobuf//:source_context_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "timestamp_cc_proto",
-    deps = [
-        "@protobuf//:timestamp_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "type_cc_proto",
-    deps = [
-        "@protobuf//:type_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "wrappers_cc_proto",
-    deps = [
-        "@protobuf//:wrappers_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "api_cc_proto",
-    deps = [
-        "@protobuf//:api_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "duration_cc_proto",
-    deps = [
-        "@protobuf//:duration_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "empty_cc_proto",
-    deps = [
-        "@protobuf//:empty_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "any_cc_proto",
-    deps = [
-        "@protobuf//:any_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "schema_registry_cc_proto",
-    deps = [":schema_registry_protos"],
 )
 
 redpanda_cc_library(
@@ -224,22 +110,10 @@ redpanda_cc_library(
     include_prefix = "pandaproxy",
     visibility = ["//visibility:public"],
     deps = [
-        ":any_cc_proto",
-        ":api_cc_proto",
         ":config",
-        ":descriptor_cc_proto",
-        ":duration_cc_proto",
-        ":empty_cc_proto",
-        ":field_mask_cc_proto",
         ":rest_swagger",
-        ":schema_registry_cc_proto",
         ":schema_registry_swagger",
-        ":source_context_cc_proto",
-        ":struct_cc_proto",
         ":subject_name_strategy",
-        ":timestamp_cc_proto",
-        ":type_cc_proto",
-        ":wrappers_cc_proto",
         "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
@@ -268,6 +142,8 @@ redpanda_cc_library(
         "//src/v/random:time_jitter",
         "//src/v/reflection:type_traits",
         "//src/v/rpc",
+        "//src/v/schema/protobuf:confluent_type_cc_proto",
+        "//src/v/schema/protobuf:google_type_cc_proto",
         "//src/v/security",
         "//src/v/security:request_auth",
         "//src/v/security/audit",
@@ -293,8 +169,10 @@ redpanda_cc_library(
         "@abseil-cpp//absl/container:flat_hash_set",
         "@abseil-cpp//absl/container:inlined_vector",
         "@abseil-cpp//absl/container:node_hash_map",
+        "@abseil-cpp//absl/strings",
         "@avro",
         "@boost//:algorithm",
+        "@boost//:container",
         "@boost//:graph",
         "@boost//:lexical_cast",
         "@boost//:math",
@@ -310,7 +188,7 @@ redpanda_cc_library(
         "@rapidjson",
         "@re2",
         "@seastar",
-    ],
+    ] + well_known_cc_protos,
 )
 
 redpanda_cc_library(

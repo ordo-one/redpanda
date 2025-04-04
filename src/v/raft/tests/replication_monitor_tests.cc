@@ -12,6 +12,7 @@
 #include "test_utils/async.h"
 
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/util/defer.hh>
 
 using namespace raft;
 
@@ -57,32 +58,47 @@ public:
         co_await ss::sleep(500ms);
         ASSERT_FALSE_CORO(wait_futures.available());
 
+        chunked_vector<ss::deferred_action<std::function<void()>>> cleanup;
+
         for (auto& [id, node] : nodes()) {
             if (id == leader.get_vnode().id()) {
-                node->on_dispatch(
-                  [](model::node_id, raft::msg_type) { return ss::sleep(3s); });
+                node->on_dispatch([](model::node_id, raft::msg_type mt) {
+                    /**
+                     * Drop all append entries messages from the leader to
+                     * followers
+                     */
+                    if (mt == raft::msg_type::append_entries) {
+                        throw std::runtime_error("dropping append entries");
+                    }
+                    return ss::now();
+                });
+                cleanup.emplace_back(
+                  [&node] { node->reset_dispatch_handlers(); });
             }
         }
 
-        std::vector<ss::future<result<replicate_result>>> replicate_f;
-        replicate_f.reserve(num_waiters());
+        std::vector<ss::future<result<raft::replicate_result>>> replicated;
         for (size_t i = 0; i < num_waiters(); i++) {
-            replicate_f.push_back(raft->replicate(
+            auto stages = raft->replicate_in_stages(
               make_batches({{"k", "v"}}),
-              replicate_options{raft::consistency_level::quorum_ack}));
-        }
-        auto repl_results = co_await ss::when_all(
-          replicate_f.begin(), replicate_f.end());
-        for (auto& r : repl_results) {
-            auto res = r.get();
-            ASSERT_TRUE_CORO(res.has_error());
-            if (res.error() == errc::not_leader) {
-                throw raft_not_leader_exception();
-            }
-            ASSERT_EQ_CORO(res.error(), errc::replicated_entry_truncated);
+              replicate_options{raft::consistency_level::leader_ack});
+            replicated.push_back(std::move(stages.replicate_finished));
         }
 
-        co_await tests::cooperative_spin_wait_with_timeout(2s, [&] {
+        auto repl_results = co_await ss::when_all(
+          replicated.begin(), replicated.end());
+
+        /**
+         * block new leadership and step down, this forces one of the other
+         * replicas to become a leader, since the current leader was not able to
+         * deliver any append entries messages to the replicas its log must be
+         * truncated by the new leader when it will try to replicate messages.
+         */
+        raft->block_new_leadership();
+        cleanup.emplace_back([raft] { raft->unblock_new_leadership(); });
+        co_await raft->step_down("test injected stepdown");
+
+        co_await tests::cooperative_spin_wait_with_timeout(10s, [&] {
             return wait_futures.available() && !wait_futures.failed();
         });
 
@@ -95,6 +111,7 @@ public:
               wait_results.at(i), errc::replicated_entry_truncated);
         }
     }
+
     ss::future<> replication_monitor_wait_test(raft_node_instance& leader) {
         auto raft = leader.raft();
 

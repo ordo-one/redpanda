@@ -31,6 +31,7 @@ class registry;
 
 namespace datalake::coordinator {
 class catalog_factory;
+class snapshot_remover;
 
 // Manages the lifecycle of datalake coordinators, each of which operate on a
 // single partition of the control topic.
@@ -38,6 +39,7 @@ class coordinator_manager {
 public:
     coordinator_manager(
       model::node_id self,
+      ss::sharded<storage::api>&,
       ss::sharded<raft::group_manager>&,
       ss::sharded<cluster::partition_manager>&,
       ss::sharded<cluster::topic_table>&,
@@ -49,7 +51,7 @@ public:
     ~coordinator_manager();
 
     ss::future<> start();
-    ss::future<> stop();
+    ss::future<> shutdown();
 
     ss::lw_shared_ptr<coordinator> get(const model::ntp&) const;
 
@@ -65,6 +67,7 @@ private:
 
     ss::gate gate_;
     model::node_id self_;
+    storage::api& storage_;
     raft::group_manager& gm_;
     cluster::partition_manager& pm_;
     cluster::topic_table& topics_;
@@ -77,8 +80,8 @@ private:
     std::unique_ptr<iceberg::catalog> catalog_;
     std::unique_ptr<schema_manager> schema_mgr_;
     std::unique_ptr<type_resolver> type_resolver_;
-    std::unique_ptr<table_creator> table_creator_;
     std::unique_ptr<file_committer> file_committer_;
+    std::unique_ptr<snapshot_remover> snapshot_remover_;
 
     std::optional<cluster::notification_id_type> manage_notifications_;
     std::optional<cluster::notification_id_type> unmanage_notifications_;

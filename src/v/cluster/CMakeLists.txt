@@ -97,6 +97,7 @@ v_cc_library(
     topic_configuration.cc
     topic_properties.cc
   DEPS
+    v::config
     v::model
     v::reflection
     v::serde
@@ -157,6 +158,7 @@ v_cc_library(
     cluster_recovery_table.cc
     cluster_recovery_reconciler.cc
     controller_api.cc
+    crash_reporter.cc
     members_frontend.cc
     members_backend.cc
     health_manager.cc
@@ -212,6 +214,7 @@ v_cc_library(
     archival/archival_metadata_stm.cc
     archival/archival_policy.cc
     archival/ntp_archiver_service.cc
+    archival/replica_state_validator.cc
     archival/probe.cc
     archival/types.cc
     archival/upload_controller.cc
@@ -224,10 +227,6 @@ v_cc_library(
     archival/scrubber.cc
     archival/archiver_manager.cc
     archival/async_data_uploader.cc
-    archival/archiver_operations_api.cc
-    archival/archiver_operations_impl.cc
-    archival/archiver_scheduler_api.cc
-    archival/archiver_scheduler_impl.cc
     cloud_metadata/cluster_manifest.cc
     cloud_metadata/cluster_recovery_backend.cc
     cloud_metadata/key_utils.cc
@@ -275,6 +274,7 @@ v_cc_library(
     v::cloud_storage
     v::cloud_topics_dl_stm
     v::cluster_topic_properties
+    v::crash_tracker
     v::features
     v::version
     v::enterprise_features

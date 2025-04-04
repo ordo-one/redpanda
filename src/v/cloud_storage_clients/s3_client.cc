@@ -22,6 +22,7 @@
 #include "config/types.h"
 #include "hashing/secure.h"
 #include "http/client.h"
+#include "http/utils.h"
 #include "net/types.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
@@ -115,6 +116,7 @@ result<http::client::request_header> request_creator::make_get_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -143,6 +145,7 @@ result<http::client::request_header> request_creator::make_head_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -181,6 +184,7 @@ request_creator::make_unsigned_put_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -232,6 +236,7 @@ request_creator::make_list_objects_v2_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -263,6 +268,7 @@ request_creator::make_delete_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -362,7 +368,7 @@ request_creator::make_delete_objects_request(
     if (ec) {
         return ec;
     }
-
+    util::url_encode_target(header);
     return {
       std::move(header),
       ss::input_stream<char>{ss::data_source{

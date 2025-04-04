@@ -188,7 +188,7 @@ def omb_runner(context: TestContext, redpanda: RedpandaServiceCloud,
     # On nodes with lower perf start takes longer than 60 sec
     bench.start(timeout_sec=120)
     try:
-        benchmark_time_min = bench.benchmark_time() + 1
+        benchmark_time_min = bench.benchmark_time_mins() + 1
         bench.wait(timeout_sec=benchmark_time_min * 60)
         yield bench
     except:
@@ -997,7 +997,7 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         return self.redpanda.kubectl.cmd([
             'wait', 'cluster', cluster_name, '-n=redpanda',
             "--for=jsonpath='{.status.readyReplicas}'=" + str(ready_replicas),
-            '--timeout=900s'
+            '--timeout=1200s'
         ])
 
     # operator V2
@@ -1756,7 +1756,7 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         consumer.stop()
         consumer.free()
 
-        benchmark_time_min = benchmark.benchmark_time() + 5
+        benchmark_time_min = benchmark.benchmark_time_mins() + 5
         benchmark.wait(timeout_sec=benchmark_time_min * 60)
         benchmark.check_succeed()
 

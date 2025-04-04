@@ -17,6 +17,7 @@
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/tx_utils.h"
 #include "config/configuration.h"
+#include "config/types.h"
 #include "container/fragmented_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/heartbeat.h"
@@ -30,6 +31,7 @@
 #include "kafka/protocol/wire.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/group_metadata.h"
+#include "kafka/server/group_probe.h"
 #include "kafka/server/logger.h"
 #include "kafka/server/member.h"
 #include "model/fundamental.h"
@@ -48,6 +50,8 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
+
+#include <functional>
 
 namespace kafka {
 
@@ -113,8 +117,7 @@ group::group(
   model::term_id term,
   ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
   ss::sharded<features::feature_table>& feature_table,
-  group_metadata_serializer serializer,
-  enable_group_metrics group_metrics)
+  group_metadata_serializer serializer)
   : _id(std::move(id))
   , _state(s)
   , _state_timestamp(model::timestamp::now())
@@ -124,19 +127,18 @@ group::group(
   , _conf(conf)
   , _catchup_lock(std::move(catchup_lock))
   , _partition(std::move(partition))
-  , _probe(_members, _static_members, _offsets)
-  , _ctxlog(klog, *this)
+  , _probe(_members, _static_members, _offsets, _lag_metrics)
+  , _ctxlog(cg_klog, *this)
   , _ctx_txlog(cluster::txlog, *this)
   , _md_serializer(std::move(serializer))
   , _term(term)
-  , _enable_group_metrics(group_metrics)
+  , _enable_group_metrics(conf.enable_consumer_group_metrics.bind(
+      std::function{enabled_metrics::from_vector}))
   , _abort_interval_ms(config::shard_local_cfg()
                          .abort_timed_out_transactions_interval_ms.value())
   , _tx_frontend(tx_frontend)
   , _feature_table(feature_table) {
-    if (_enable_group_metrics) {
-        _probe.setup_public_metrics(_id);
-    }
+    setup_metrics();
 
     start_abort_timer();
 }
@@ -150,8 +152,7 @@ group::group(
   model::term_id term,
   ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
   ss::sharded<features::feature_table>& feature_table,
-  group_metadata_serializer serializer,
-  enable_group_metrics group_metrics)
+  group_metadata_serializer serializer)
   : _id(std::move(id))
   , _state(md.members.empty() ? group_state::empty : group_state::stable)
   , _state_timestamp(
@@ -167,12 +168,13 @@ group::group(
   , _conf(conf)
   , _catchup_lock(std::move(catchup_lock))
   , _partition(std::move(partition))
-  , _probe(_members, _static_members, _offsets)
-  , _ctxlog(klog, *this)
+  , _probe(_members, _static_members, _offsets, _lag_metrics)
+  , _ctxlog(cg_klog, *this)
   , _ctx_txlog(cluster::txlog, *this)
   , _md_serializer(std::move(serializer))
   , _term(term)
-  , _enable_group_metrics(group_metrics)
+  , _enable_group_metrics(conf.enable_consumer_group_metrics.bind(
+      std::function{enabled_metrics::from_vector}))
   , _abort_interval_ms(config::shard_local_cfg()
                          .abort_timed_out_transactions_interval_ms.value())
   , _tx_frontend(tx_frontend)
@@ -193,9 +195,7 @@ group::group(
     // update when restoring from metadata value
     update_subscriptions();
 
-    if (_enable_group_metrics) {
-        _probe.setup_public_metrics(_id);
-    }
+    setup_metrics();
 
     start_abort_timer();
 }
@@ -225,11 +225,13 @@ bool group::valid_previous_state(group_state s) const {
 group::ongoing_transaction::ongoing_transaction(
   model::tx_seq tx_seq,
   model::partition_id coordinator_partition,
-  model::timeout_clock::duration tx_timeout)
+  model::timeout_clock::duration tx_timeout,
+  model::offset begin_offset)
   : tx_seq(tx_seq)
   , coordinator_partition(coordinator_partition)
   , timeout(tx_timeout)
-  , last_update(model::timeout_clock::now()) {}
+  , last_update(model::timeout_clock::now())
+  , begin_offset(begin_offset) {}
 
 group::tx_producer::tx_producer(model::producer_epoch epoch)
   : epoch(epoch) {}
@@ -266,6 +268,9 @@ model::record_batch make_tx_fence_batch(
     return make_tx_batch(
       batch_type, group::fence_control_record_version, pid, std::move(cmd));
 }
+
+bool need_lag_metrics(group_state s) { return s != group_state::dead; };
+
 } // namespace
 
 group_state group::set_state(group_state s) {
@@ -277,6 +282,9 @@ group_state group::set_state(group_state s) {
       s);
     vlog(_ctxlog.trace, "Changing state from {} to {}", _state, s);
     _state_timestamp = model::timestamp::now();
+    if (need_lag_metrics(s) != need_lag_metrics(_state)) {
+        setup_metrics();
+    }
     return std::exchange(_state, s);
 }
 
@@ -437,7 +445,7 @@ group::duration_type group::rebalance_timeout() const {
         return it->second->rebalance_timeout();
     } else {
         vlog(_ctxlog.trace, "Cannot compute rebalance timeout for empty group");
-        throw std::runtime_error("no members in group");
+        return 0s;
     }
 }
 
@@ -1366,7 +1374,15 @@ void group::remove_pending_member(kafka::member_id member_id) {
     }
 }
 
+void group::pre_shutdown() {
+    _probe.reset();
+    for (auto& p : _offsets) {
+        p.second->probe.reset();
+    }
+}
+
 ss::future<> group::shutdown() {
+    pre_shutdown();
     _auto_abort_timer.cancel();
     co_await _gate.close();
     // cancel join timer
@@ -1911,10 +1927,10 @@ group::begin_tx(cluster::begin_group_tx_request r) {
     // replicate fence batch - this is a transaction boundary
     model::record_batch batch = make_tx_fence_batch(
       r.pid, std::move(fence), use_dedicated_batch_type_for_fence());
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
+
     auto result = co_await _partition->raft()->replicate(
       _term,
-      std::move(reader),
+      std::move(batch),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
     if (!result) {
@@ -1934,7 +1950,8 @@ group::begin_tx(cluster::begin_group_tx_request r) {
       r.pid.get_id(), r.pid.get_epoch());
     producer_it->second.epoch = r.pid.get_epoch();
     producer_it->second.transaction = std::make_unique<ongoing_transaction>(
-      ongoing_transaction(r.tx_seq, r.tm_partition, r.timeout));
+      ongoing_transaction(
+        r.tx_seq, r.tm_partition, r.timeout, result.value().last_offset));
 
     try_arm(producer_it->second.transaction->deadline());
 
@@ -2056,11 +2073,10 @@ group::store_txn_offsets(txn_offset_commit_request r) {
       prepared_tx_record_version,
       pid,
       std::move(tx_entry));
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     auto result = co_await _partition->raft()->replicate(
       _term,
-      std::move(reader),
+      std::move(batch),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
     if (!result) {
@@ -2159,6 +2175,35 @@ void group::update_store_offset_builder(
       offset_metadata_kv{.key = std::move(key), .value = std::move(value)});
     builder.add_raw_kv(std::move(kv.key), std::move(kv.value));
 }
+bool group::try_upsert_offset(
+  const model::topic_partition& tp, offset_metadata md) {
+    if (auto o_it = _offsets.find(tp); o_it != _offsets.end()) {
+        if (o_it->second->metadata.log_offset < md.log_offset) {
+            if (o_it->second->metadata.offset > md.offset) [[unlikely]] {
+                vlog(
+                  _ctxlog.info,
+                  "Requested commited offset for {} to be smaller than "
+                  "previously committed value - previous: {} requested: {}",
+                  tp,
+                  o_it->second->metadata.offset,
+                  md.offset);
+            }
+            o_it->second->metadata = std::move(md);
+            return true;
+        }
+        return false;
+    } else {
+        _offsets.emplace(
+          tp,
+          std::make_unique<offset_metadata_with_probe>(
+            std::move(md),
+            _id,
+            tp,
+            _conf.enable_consumer_group_metrics.bind(
+              std::function{enabled_metrics::from_vector})));
+        return true;
+    }
+}
 
 group::offset_commit_stages group::store_offsets(offset_commit_request&& r) {
     cluster::simple_batch_builder builder(
@@ -2227,12 +2272,9 @@ group::offset_commit_stages group::store_offsets(offset_commit_request&& r) {
           offset_commit_response(r, error_code::none));
     }
 
-    auto batch = std::move(builder).build();
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
-
     auto replicate_stages = _partition->raft()->replicate_in_stages(
       _term,
-      std::move(reader),
+      chunked_vector<model::record_batch>::single(std::move(builder).build()),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
     auto f = replicate_stages.replicate_finished.then(
@@ -2583,12 +2625,20 @@ ss::future<error_code> group::remove() {
         co_return error_code::group_id_not_found;
 
     case group_state::empty:
-        set_state(group_state::dead);
         break;
 
     default:
         co_return error_code::non_empty_group;
     }
+
+    // check if there are any transactions in progress
+    // tombstoning a group with open transactions will result
+    // in hanging transactions in the log.
+    if (has_transactions_in_progress()) {
+        co_return error_code::non_empty_group;
+    }
+
+    set_state(group_state::dead);
 
     // build offset tombstones
     storage::record_batch_builder builder(
@@ -2602,27 +2652,26 @@ ss::future<error_code> group::remove() {
     add_group_tombstone_record(_id, builder);
 
     auto batch = std::move(builder).build();
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     try {
         auto result = co_await _partition->raft()->replicate(
           _term,
-          std::move(reader),
+          std::move(batch),
           raft::replicate_options(raft::consistency_level::quorum_ack));
         if (result) {
             vlog(
-              klog.trace,
+              cg_klog.trace,
               "Replicated group delete record {} at offset {}",
               _id,
               result.value().last_offset);
         } else if (result.error() == raft::errc::shutting_down) {
             vlog(
-              klog.debug,
+              cg_klog.debug,
               "Cannot replicate group {} delete records due to shutdown",
               _id);
         } else {
             vlog(
-              klog.warn,
+              cg_klog.warn,
               "Error occurred replicating group {} delete records {} ({})",
               _id,
               result.error().message(),
@@ -2630,7 +2679,7 @@ ss::future<error_code> group::remove() {
         }
     } catch (const std::exception& e) {
         vlog(
-          klog.error,
+          cg_klog.error,
           "Exception occurred replicating group {} delete records {}",
           _id,
           e);
@@ -2657,7 +2706,7 @@ ss::future<> group::remove_topic_partitions(
       in_state(group_state::empty) && _pending_offset_commits.empty()
       && _offsets.empty()) {
         vlog(
-          klog.debug,
+          cg_klog.debug,
           "Marking group {} as dead at {} generation",
           _id,
           generation());
@@ -2679,7 +2728,10 @@ ss::future<> group::remove_topic_partitions(
     // create deletion records for offsets from deleted partitions
     for (auto& offset : removed) {
         vlog(
-          klog.trace, "Removing offset for group {} tp {}", _id, offset.first);
+          cg_klog.trace,
+          "Removing offset for group {} tp {}",
+          _id,
+          offset.first);
         add_offset_tombstone_record(_id, offset.first, builder);
     }
 
@@ -2689,28 +2741,27 @@ ss::future<> group::remove_topic_partitions(
     }
 
     auto batch = std::move(builder).build();
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     try {
         auto result = co_await _partition->raft()->replicate(
           _term,
-          std::move(reader),
+          std::move(batch),
           raft::replicate_options(raft::consistency_level::quorum_ack));
         if (result) {
             vlog(
-              klog.trace,
+              cg_klog.trace,
               "Replicated group cleanup record {} at offset {}",
               _id,
               result.value().last_offset);
         } else if (result.error() == raft::errc::shutting_down) {
             vlog(
-              klog.debug,
+              cg_klog.debug,
               "Cannot replicate group {} cleanup records due to shutdown",
               _id);
         } else {
             // TODO: consider adding retries in this case
             vlog(
-              klog.warn,
+              cg_klog.warn,
               "Error occurred replicating group {} cleanup records {} ({})",
               _id,
               result.error().message(),
@@ -2718,7 +2769,7 @@ ss::future<> group::remove_topic_partitions(
         }
     } catch (const std::exception& e) {
         vlog(
-          klog.error,
+          cg_klog.error,
           "Exception occurred replicating group {} cleanup records {}",
           _id,
           e);
@@ -2729,7 +2780,7 @@ ss::future<result<raft::replicate_result>>
 group::store_group(model::record_batch batch) {
     return _partition->raft()->replicate(
       _term,
-      model::make_memory_record_batch_reader(std::move(batch)),
+      std::move(batch),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 }
 
@@ -2959,11 +3010,10 @@ ss::future<cluster::abort_group_tx_reply> group::do_abort(
       aborted_tx_record_version,
       pid,
       std::move(tx));
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
 
     auto result = co_await _partition->raft()->replicate(
       _term,
-      std::move(reader),
+      std::move(batch),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
     if (!result) {
@@ -3082,7 +3132,7 @@ ss::future<cluster::commit_group_tx_reply> group::do_commit(
     // tx_gateway_frontend). So redpanda will eventually finish commit and
     // complete write for both this events.
 
-    model::record_batch_reader::data_t batches;
+    chunked_vector<model::record_batch> batches;
     batches.reserve(2);
     // if pending offsets are empty, (there was no store_txn_offsets call, do
     // not replicate the offsets update batch)
@@ -3114,11 +3164,9 @@ ss::future<cluster::commit_group_tx_reply> group::do_commit(
 
     batches.push_back(std::move(batch));
 
-    auto reader = model::make_memory_record_batch_reader(std::move(batches));
-
     auto result = co_await _partition->raft()->replicate(
       _term,
-      std::move(reader),
+      std::move(batches),
       raft::replicate_options(raft::consistency_level::quorum_ack));
 
     if (!result) {
@@ -3415,7 +3463,7 @@ void group::update_subscriptions() {
             subs.merge(decode_consumer_subscriptions(std::move(data)));
         } catch (const std::out_of_range& e) {
             vlog(
-              klog.warn,
+              cg_klog.warn,
               "Parsing consumer:{} data for group {} member {} failed: {}",
               _protocol.value(),
               _id,
@@ -3557,14 +3605,18 @@ group::get_expired_offsets(std::chrono::seconds retention_period) {
     }
 }
 
+bool group::has_transactions_in_progress() const {
+    return std::any_of(
+      _producers.begin(),
+      _producers.end(),
+      [](const producers_map::value_type& p) {
+          return p.second.transaction != nullptr;
+      });
+}
+
 bool group::has_offsets() const {
     return !_offsets.empty() || !_pending_offset_commits.empty()
-           || std::any_of(
-             _producers.begin(),
-             _producers.end(),
-             [](const producers_map::value_type& p) {
-                 return p.second.transaction != nullptr;
-             });
+           || has_transactions_in_progress();
 }
 
 std::vector<model::topic_partition>
@@ -3612,6 +3664,27 @@ group::delete_offsets(std::vector<model::topic_partition> offsets) {
     }
 
     return deleted_offsets;
+}
+
+void group::set_lag_metrics(consumer_lag_metrics lag) { _lag_metrics = lag; }
+
+void group::setup_metrics() {
+    const auto metrics_registration = [this]() {
+        if (_enable_group_metrics().group) {
+            _probe.register_group_metrics(_id);
+        } else {
+            _probe.deregister_group_metrics();
+        }
+
+        if (_enable_group_metrics().consumer_lag && need_lag_metrics(_state)) {
+            _probe.register_consumer_lag_metrics(_id);
+        } else {
+            _probe.deregister_consumer_lag_metrics();
+        }
+    };
+
+    _enable_group_metrics.watch(metrics_registration);
+    metrics_registration();
 }
 
 } // namespace kafka

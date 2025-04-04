@@ -104,13 +104,18 @@ public:
 
     struct string_conversion_exception
       : public default_control_character_thrower {
-        using default_control_character_thrower::
-          default_control_character_thrower;
+        explicit string_conversion_exception(std::string_view parameter_name)
+          : default_control_character_thrower()
+          , _parameter_name(parameter_name) {}
+
         [[noreturn]] [[gnu::cold]] void conversion_error() override {
-            throw ss::httpd::bad_request_exception(
-              "Parameter contained invalid control characters: "
-              + get_sanitized_string());
+            throw ss::httpd::bad_request_exception(fmt::format(
+              "Parameter '{}' contained invalid control characters",
+              _parameter_name));
         }
+
+    private:
+        std::string _parameter_name;
     };
 
 private:
@@ -509,6 +514,10 @@ private:
       stop_broker_maintenance_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       reset_crash_tracking(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      pre_restart_probe(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      post_restart_probe(std::unique_ptr<ss::http::request>);
 
     /// Register partition routes
     ss::future<ss::json::json_return_type>
@@ -538,6 +547,9 @@ private:
     ss::future<ss::json::json_return_type>
       force_set_partition_replicas_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
+    toggle_append_entries_error_injection(
+      std::unique_ptr<ss::http::request>, bool inject);
+    ss::future<ss::json::json_return_type>
       set_partition_replica_core_handler(std::unique_ptr<ss::http::request>);
 
     ss::future<ss::json::json_return_type>
@@ -555,6 +567,8 @@ private:
       delete_partition_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       find_tx_coordinator_handler(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      unsafe_abort_group_transaction(std::unique_ptr<ss::http::request>);
 
     /// Cluster routes
     ss::future<ss::json::json_return_type>
@@ -562,6 +576,8 @@ private:
     ss::future<ss::json::json_return_type>
       cancel_all_partitions_reconfigs_handler(
         std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      get_metrics_uuid(std::unique_ptr<ss::http::request>);
 
     /// Cluster partition routes
     ss::future<ss::json::json_return_type>
@@ -617,6 +633,8 @@ private:
 
     ss::future<ss::json::json_return_type>
       get_partition_state_handler(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      get_producers_state_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       get_local_storage_usage_handler(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
@@ -685,6 +703,18 @@ private:
       std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
     ss::future<std::unique_ptr<ss::http::reply>> delete_debug_bundle_file(
       std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+
+    // Shard store message routes
+    ss::future<std::unique_ptr<ss::http::reply>> put_ctracker_va(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+
+    static constexpr bool is_store_message_enabled() {
+#ifndef NDEBUG
+        return true;
+#else
+        return false;
+#endif
+    }
 
     ss::future<> throw_on_error(
       ss::http::request& req,

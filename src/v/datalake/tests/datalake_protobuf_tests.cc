@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "datalake/schema_protobuf.h"
 #include "datalake/tests/proto_definitions.h"
@@ -175,6 +176,15 @@ TEST_CORO(SchemaProtobuf, TestMessageWithOneOfField) {
         IsField(2, "oneof_string", string_type{}),
         IsField(3, "oneof_bytes", binary_type{}),
         IsField(4, "oneof_bool", boolean_type{})));
+}
+
+TEST_CORO(SchemaProtobuf, TestMessageWithTimestamp) {
+    auto d = StructWithTimestamp::GetDescriptor();
+    auto result = datalake::type_to_iceberg(*d);
+    ASSERT_FALSE_CORO(result.has_error());
+    auto field = std::move(result.value());
+    EXPECT_THAT(
+      field.fields, ElementsAre(IsField(1, "timestamp", timestamp_type{})));
 }
 
 TEST_CORO(SchemaProtobuf, TestProtoTestMessages) {
@@ -552,6 +562,22 @@ TEST(values_protobuf, TestUInt64Fallback) {
             OptionalIcebergPrimitive<long_value>(-123),
             OptionalIcebergPrimitive<string_value>("123")));
     }
+}
+
+TEST(values_protobuf, TestTimestamp) {
+    StructWithTimestamp ts;
+    ts.mutable_timestamp()->set_seconds(1743540027);
+    ts.mutable_timestamp()->set_nanos(1635902);
+    auto result = serialize_and_convert(ts).get();
+    ASSERT_TRUE(result.has_value());
+    auto r_opt = std::move(result.value());
+    ASSERT_TRUE(r_opt.has_value());
+    auto struct_v = std::get<std::unique_ptr<iceberg::struct_value>>(
+      std::move(r_opt.value()));
+
+    ASSERT_THAT(
+      struct_v->fields,
+      ElementsAre(OptionalIcebergPrimitive<timestamp_value>(1743540027001635)));
 }
 
 TEST_CORO(values_protobuf, TestNotSupportedMessageType) {

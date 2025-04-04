@@ -25,7 +25,13 @@ enum class writer_error {
     parquet_conversion_error,
     file_io_error,
     no_data,
+    flush_error,
+    oom_error,
+    time_limit_exceeded,
+    shutting_down,
+    unknown_error,
 };
+std::ostream& operator<<(std::ostream&, const writer_error&);
 
 struct data_writer_error_category : std::error_category {
     const char* name() const noexcept final { return "Data Writer Error"; }
@@ -42,6 +48,47 @@ inline std::error_code make_error_code(writer_error e) noexcept {
     return {static_cast<int>(e), data_writer_error_category::error_category()};
 }
 
+enum reservation_error {
+    ok = 0,
+    shutting_down = 1,
+    out_of_memory = 2,
+    time_quota_exceeded = 3,
+    unknown = 4,
+};
+
+writer_error map_to_writer_error(reservation_error);
+/**
+ * Interface to track memory used by the parquet writers. The reservations are
+ * held until the tracker object is alive or release is explicitly called.
+ */
+class writer_mem_tracker {
+public:
+    writer_mem_tracker() = default;
+    writer_mem_tracker(const writer_mem_tracker&) = delete;
+    writer_mem_tracker(writer_mem_tracker&&) = default;
+    writer_mem_tracker& operator=(const writer_mem_tracker&) = delete;
+    writer_mem_tracker& operator=(writer_mem_tracker&&) = delete;
+
+    virtual ~writer_mem_tracker() = default;
+
+    /**
+     * Reserves passed input bytes.
+     */
+    virtual ss::future<reservation_error>
+    reserve_bytes(size_t bytes, ss::abort_source&) noexcept = 0;
+
+    /**
+     * Frees up passed input bytes.
+     */
+    virtual ss::future<> free_bytes(size_t bytes, ss::abort_source&) = 0;
+
+    /**
+     * Releases all the reservations. After this caller, the reserved bytes
+     * tracked is 0. May not be called concurrently with other methods.
+     */
+    virtual void release() = 0;
+};
+
 /**
  * Parquet writer interface. The writer should write parquet serialized data to
  * the output stream provided during its creation.
@@ -56,7 +103,21 @@ public:
     virtual ~parquet_ostream() = default;
 
     virtual ss::future<writer_error>
-      add_data_struct(iceberg::struct_value, size_t) = 0;
+    add_data_struct(iceberg::struct_value, size_t, ss::abort_source&) = 0;
+
+    /**
+     * Returns the total bytes buffered in the writer pending flush.
+     */
+    virtual size_t buffered_bytes() const = 0;
+    /**
+     * Returns the total bytes flushed to the ostream.
+     */
+    virtual size_t flushed_bytes() const = 0;
+    /**
+     * Forces a flush of bytes to ostream. Guarantees that all the buffered
+     * memory is released.
+     */
+    virtual ss::future<> flush() = 0;
 
     virtual ss::future<writer_error> finish() = 0;
 };
@@ -72,8 +133,9 @@ public:
 
     virtual ~parquet_ostream_factory() = default;
 
-    virtual ss::future<std::unique_ptr<parquet_ostream>>
-    create_writer(const iceberg::struct_type&, ss::output_stream<char>) = 0;
+    virtual ss::future<std::unique_ptr<parquet_ostream>> create_writer(
+      const iceberg::struct_type&, ss::output_stream<char>, writer_mem_tracker&)
+      = 0;
 };
 
 /**
@@ -93,8 +155,21 @@ public:
     virtual ~parquet_file_writer() = default;
 
     virtual ss::future<writer_error> add_data_struct(
-      iceberg::struct_value /* data */, int64_t /* approx_size */)
+      iceberg::struct_value /* data */,
+      int64_t /* approx_size */,
+      ss::abort_source&)
       = 0;
+
+    /**
+     * Returns the total bytes buffered in the writer pending flush.
+     */
+    virtual size_t buffered_bytes() const = 0;
+    /**
+     * Returns the total bytes flushed to the ostream.
+     */
+    virtual size_t flushed_bytes() const = 0;
+
+    virtual ss::future<writer_error> flush() = 0;
 
     virtual ss::future<result<local_file_metadata, writer_error>> finish() = 0;
 };
@@ -112,7 +187,8 @@ public:
 
     virtual ss::future<
       result<std::unique_ptr<parquet_file_writer>, writer_error>>
-    create_writer(const iceberg::struct_type& /* schema */) = 0;
+    create_writer(const iceberg::struct_type& /* schema */, ss::abort_source&)
+      = 0;
 };
 
 } // namespace datalake

@@ -1,16 +1,17 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "base/vlog.h"
 #include "cloud_io/remote.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/filesystem_catalog.h"
 #include "iceberg/logger.h"
@@ -41,6 +42,31 @@ public:
     std::unique_ptr<cloud_io::scoped_remote> sr;
     filesystem_catalog catalog;
 };
+
+TEST_F(FileSystemCatalogTest, TestEmptyTransaction) {
+    const table_identifier id{.ns = {"ns"}, .table = "table"};
+    auto create_res
+      = catalog.create_table(id, schema{}, partition_spec{}).get();
+    const auto v0_meta_path = table_metadata_path{
+      "test/ns/table/metadata/v0.metadata.json"};
+    const auto v1_meta_path = table_metadata_path{
+      "test/ns/table/metadata/v1.metadata.json"};
+
+    // Sanity check v0 is there.
+    table_io io(remote(), bucket_name);
+    auto v0_res = io.download_table_meta(v1_meta_path).get();
+    ASSERT_TRUE(v0_res.has_error());
+
+    // Commit an empty transaction.
+    transaction txn(std::move(create_res.value()));
+    auto tx_res = catalog.commit_txn(id, std::move(txn)).get();
+    ASSERT_FALSE(tx_res.has_error());
+
+    // v1 should not exist.
+    auto v1_res = io.download_table_meta(v1_meta_path).get();
+    ASSERT_TRUE(v1_res.has_error());
+    EXPECT_EQ(v1_res.error(), metadata_io::errc::failed);
+}
 
 TEST_F(FileSystemCatalogTest, TestLoadCreate) {
     const table_identifier id{.ns = {"ns"}, .table = "table"};

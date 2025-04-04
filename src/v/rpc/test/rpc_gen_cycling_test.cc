@@ -7,7 +7,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "bytes/random.h"
 #include "model/timeout_clock.h"
 #include "random/generators.h"
 #include "rpc/backoff_policy.h"
@@ -18,12 +17,11 @@
 #include "rpc/test/cycling_service.h"
 #include "rpc/test/echo_service.h"
 #include "rpc/test/echo_v2_service.h"
+#include "rpc/test/rpc_integration_fixture.h"
 #include "rpc/types.h"
-#include "rpc_gen_types.h"
-#include "rpc_integration_fixture.h"
-#include "serde/rw/iobuf.h"
 #include "test_utils/async.h"
 #include "test_utils/fixture.h"
+#include "test_utils/random_bytes.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/metrics_api.hh>
@@ -42,11 +40,52 @@
 
 using namespace std::chrono_literals; // NOLINT
 
+namespace rpc {
+
+template<typename Protocol>
+concept RpcClientProtocol
+  = std::constructible_from<Protocol, ss::lw_shared_ptr<rpc::transport>>;
+
+template<typename... Protocol>
+requires(RpcClientProtocol<Protocol> && ...)
+class client : public Protocol... {
+public:
+    explicit client(ss::lw_shared_ptr<rpc::transport> transport)
+      : Protocol(transport)...
+      , _transport(transport) {}
+
+    ss::future<> connect(rpc::clock_type::time_point connection_timeout) {
+        return _transport->connect(connection_timeout);
+    }
+    ss::future<> stop() { return _transport->stop(); };
+    void shutdown() { _transport->shutdown(); }
+
+    [[gnu::always_inline]] bool is_valid() const {
+        return _transport->is_valid();
+    }
+
+    const net::unresolved_address& server_address() const {
+        return _transport->server_address();
+    }
+
+private:
+    ss::lw_shared_ptr<rpc::transport> _transport{nullptr};
+};
+
+template<typename... Protocol>
+rpc::client<Protocol...> make_client(
+  transport_configuration cfg,
+  std::optional<connection_cache_label> label = std::nullopt,
+  const std::optional<model::node_id> node_id = std::nullopt) {
+    return client<Protocol...>(ss::make_lw_shared<rpc::transport>(
+      std::move(cfg), std::move(label), node_id));
+}
+} // namespace rpc
+
 // Test services
-template<typename Codec>
-struct movistar final : cycling::team_movistar_service_base<Codec> {
+struct movistar final : cycling::team_movistar_service {
     movistar(ss::scheduling_group& sc, ss::smp_service_group& ssg)
-      : cycling::team_movistar_service_base<Codec>(sc, ssg) {}
+      : cycling::team_movistar_service(sc, ssg) {}
     ss::future<cycling::mount_tamalpais>
     ibis_hakka(cycling::san_francisco, rpc::streaming_context&) final {
         return ss::make_ready_future<cycling::mount_tamalpais>(
@@ -59,10 +98,9 @@ struct movistar final : cycling::team_movistar_service_base<Codec> {
     }
 };
 
-template<typename Codec>
-struct echo_impl final : echo::echo_service_base<Codec> {
+struct echo_impl final : echo::echo_service {
     echo_impl(ss::scheduling_group& sc, ss::smp_service_group& ssg)
-      : echo::echo_service_base<Codec>(sc, ssg) {}
+      : echo::echo_service(sc, ssg) {}
     ss::future<echo::echo_resp>
     prefix_echo(echo::echo_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo::echo_resp>(
@@ -109,10 +147,9 @@ struct echo_impl final : echo::echo_service_base<Codec> {
     uint64_t cnt = 0;
 };
 
-template<typename Codec>
-struct echo_v2_impl final : echo_v2::echo_service_base<Codec> {
+struct echo_v2_impl final : echo_v2::echo_service {
     echo_v2_impl(ss::scheduling_group& sc, ss::smp_service_group& ssg)
-      : echo_v2::echo_service_base<Codec>(sc, ssg) {}
+      : echo_v2::echo_service(sc, ssg) {}
 
     ss::future<echo_v2::echo_resp>
     echo(echo_v2::echo_req req, rpc::streaming_context&) final {
@@ -127,13 +164,48 @@ public:
       : rpc_simple_integration_fixture(redpanda_rpc_port) {}
 
     void register_services() {
-        register_service<movistar<rpc::default_message_codec>>();
-        register_service<echo_impl<rpc::default_message_codec>>();
-        register_service<echo_v2_impl<rpc::default_message_codec>>();
+        register_service<movistar>();
+        register_service<echo_impl>();
+        register_service<echo_v2_impl>();
     }
 
     static constexpr uint16_t redpanda_rpc_port = 32147;
 };
+
+struct certificate {
+    ss::sstring key;
+    ss::sstring crt;
+    ss::sstring ca;
+};
+
+namespace {
+ss::sstring root_path() {
+    // if this file exists, we are running in cmake
+    if (std::filesystem::exists("redpanda.key")) {
+        return "";
+    }
+
+    // otherwise we are running in bazel and we need
+    // the full path
+    return "src/v/rpc/test/";
+}
+
+certificate redpanda_cert() {
+    const auto root = root_path();
+    return {
+      .key = root + "redpanda.key",
+      .crt = root + "redpanda.crt",
+      .ca = root + "root_certificate_authority.crt"};
+}
+
+certificate redpanda_other_cert() {
+    const auto root = root_path();
+    return {
+      .key = root + "redpanda.other.key",
+      .crt = root + "redpanda.other.crt",
+      .ca = root + "root_certificate_authority.other.crt"};
+}
+} // namespace
 
 FIXTURE_TEST(echo_round_trip, rpc_integration_fixture) {
     configure_server();
@@ -237,7 +309,7 @@ FIXTURE_TEST(echo_from_cache, rpc_integration_fixture) {
     // Check that we can create connections from a cache, and moreover that we
     // can run several clients targeted at the same server, if we provide
     // multiple node IDs to the cache.
-    constexpr const size_t num_nodes_ids = 10;
+    constexpr const int num_nodes_ids = 10;
     const auto ccfg = client_config();
     for (int i = 0; i < num_nodes_ids; ++i) {
         const auto payload = random_generators::gen_alphanum_string(100);
@@ -301,10 +373,11 @@ FIXTURE_TEST(rpc_abort_from_cache, rpc_integration_fixture) {
 }
 
 FIXTURE_TEST(echo_round_trip_tls, rpc_integration_fixture) {
+    const auto cert = redpanda_cert();
     auto creds_builder = config::tls_config(
                            true,
-                           config::key_cert{"redpanda.key", "redpanda.crt"},
-                           "root_certificate_authority.crt",
+                           config::key_cert{cert.key, cert.crt},
+                           cert.ca,
                            std::nullopt, /* CRL */
                            false)
                            .get_credentials_builder()
@@ -367,16 +440,18 @@ struct certificate_reload_ctx {
 };
 
 FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
+    const certificate cert = redpanda_cert();
+    const certificate other_cert = redpanda_other_cert();
+
     // Server starts with bad credentials, files are updated on disk and then
     // client connects. Expected behavior is that client can connect without
     // issues. Condition variable is used to wait for credentials to reload.
     auto context = ss::make_lw_shared<certificate_reload_ctx>();
     temporary_dir tmp;
     // client credentials
-    auto client_key = tmp.copy_file("redpanda.key", "client.key");
-    auto client_crt = tmp.copy_file("redpanda.crt", "client.crt");
-    auto client_ca = tmp.copy_file(
-      "root_certificate_authority.crt", "ca_client.pem");
+    auto client_key = tmp.copy_file(cert.key.c_str(), "client.key");
+    auto client_crt = tmp.copy_file(cert.crt.c_str(), "client.crt");
+    auto client_ca = tmp.copy_file(cert.ca.c_str(), "ca_client.pem");
     auto client_creds_builder = config::tls_config(
                                   true,
                                   config::key_cert{
@@ -387,10 +462,9 @@ FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
                                   .get_credentials_builder()
                                   .get();
     // server credentials
-    auto server_key = tmp.copy_file("redpanda.other.key", "server.key");
-    auto server_crt = tmp.copy_file("redpanda.other.crt", "server.crt");
-    auto server_ca = tmp.copy_file(
-      "root_certificate_authority.other.crt", "ca_server.pem");
+    auto server_key = tmp.copy_file(other_cert.key.c_str(), "server.key");
+    auto server_crt = tmp.copy_file(other_cert.crt.c_str(), "server.crt");
+    auto server_ca = tmp.copy_file(other_cert.ca.c_str(), "ca_server.pem");
     auto server_creds_builder = config::tls_config(
                                   true,
                                   config::key_cert{
@@ -432,9 +506,9 @@ FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
 
     // fix client credentials and reconnect
     info("replacing files");
-    tmp.copy_file("redpanda.key", "server.key");
-    tmp.copy_file("redpanda.crt", "server.crt");
-    tmp.copy_file("root_certificate_authority.crt", "ca_server.pem");
+    tmp.copy_file(cert.key.c_str(), "server.key");
+    tmp.copy_file(cert.crt.c_str(), "server.crt");
+    tmp.copy_file(cert.ca.c_str(), "ca_server.pem");
 
     context->cvar.wait([context] { return context->updated.size() == 3; })
       .get();
@@ -767,7 +841,7 @@ FIXTURE_TEST(corrupted_data_at_server, rpc_integration_fixture) {
     nb.set_compression(rpc::compression_type::none);
     nb.set_correlation_id(10);
     nb.set_service_method(echo::echo_service::echo_method);
-    auto bytes = random_generators::get_bytes();
+    auto bytes = tests::random_bytes();
     nb.buffer().append(bytes.data(), bytes.size());
 
     BOOST_TEST_MESSAGE("Request with invalid payload");
@@ -886,8 +960,8 @@ public:
       : rpc_fixture_swappable_proto(redpanda_rpc_port) {}
 
     void register_services() {
-        register_service<movistar<rpc::default_message_codec>>();
-        register_service<echo_impl<rpc::default_message_codec>>();
+        register_service<movistar>();
+        register_service<echo_impl>();
     }
 
     static constexpr uint16_t redpanda_rpc_port = 32147;
@@ -935,8 +1009,7 @@ FIXTURE_TEST(rpc_add_service, rpc_sharded_fixture) {
     server()
       .invoke_on_all([this](rpc::rpc_server& s) {
           std::vector<std::unique_ptr<rpc::service>> service;
-          service.emplace_back(
-            std::make_unique<echo_impl<rpc::default_message_codec>>(_sg, _ssg));
+          service.emplace_back(std::make_unique<echo_impl>(_sg, _ssg));
           s.add_services(std::move(service));
       })
       .get();
@@ -1080,9 +1153,7 @@ FIXTURE_TEST(rpc_mt_add_service, rpc_sharded_fixture) {
           server()
             .invoke_on_all([this](rpc::rpc_server& s) {
                 std::vector<std::unique_ptr<rpc::service>> service;
-                service.emplace_back(
-                  std::make_unique<echo_impl<rpc::default_message_codec>>(
-                    _sg, _ssg));
+                service.emplace_back(std::make_unique<echo_impl>(_sg, _ssg));
                 s.add_services(std::move(service));
             })
             .get();
@@ -1107,9 +1178,7 @@ FIXTURE_TEST(rpc_mt_add_service, rpc_sharded_fixture) {
           server()
             .invoke_on_all([this](rpc::rpc_server& s) {
                 std::vector<std::unique_ptr<rpc::service>> service;
-                service.emplace_back(
-                  std::make_unique<movistar<rpc::default_message_codec>>(
-                    _sg, _ssg));
+                service.emplace_back(std::make_unique<movistar>(_sg, _ssg));
                 s.add_services(std::move(service));
             })
             .get();

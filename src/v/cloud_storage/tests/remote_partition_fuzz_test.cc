@@ -9,10 +9,10 @@
  * by the Apache License, Version 2.0
  */
 
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/async_manifest_view.h"
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/tests/cloud_storage_fixture.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/tests/util.h"
 #include "model/record_batch_types.h"
 
@@ -362,7 +362,7 @@ FIXTURE_TEST(
     try {
         auto headers_read
           = scan_remote_partition_incrementally_with_closest_lso(
-            *this, base, max, 5, 5);
+            *this, base, max, 5, 25);
         vlog(test_log.debug, "{} record batches consumed", headers_read.size());
         model::offset expected_offset{0};
         size_t ix_header = 0;

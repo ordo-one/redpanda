@@ -10,18 +10,29 @@
 
 #include "iceberg/rest_client/retry_policy.h"
 
+#include "bytes/streambuf.h"
 #include "net/connection.h"
+
+#include <exception>
+#include <sstream>
 
 namespace {
 
 using iceberg::rest_client::failure;
 
+failure aborted(std::string_view msg) {
+    return failure{
+      .can_be_retried = false, .aborted = true, .err = ss::sstring{msg}};
+}
+
 failure unretriable(std::string_view msg) {
-    return failure{.can_be_retried = false, .err = ss::sstring{msg}};
+    return failure{
+      .can_be_retried = false, .aborted = false, .err = ss::sstring{msg}};
 }
 
 failure retriable(std::string_view msg) {
-    return failure{.can_be_retried = true, .err = ss::sstring{msg}};
+    return failure{
+      .can_be_retried = true, .aborted = false, .err = ss::sstring{msg}};
 }
 
 using enum boost::beast::http::status;
@@ -73,8 +84,13 @@ default_retry_policy::should_retry(http::downloaded_response response) const {
 
     const auto can_be_retried = std::ranges::find(retriable_statuses, status)
                                 != retriable_statuses.end();
-    return tl::unexpected(
-      failure{.can_be_retried = can_be_retried, .err = status});
+    constexpr size_t max_msg_size = 400;
+    iobuf_istream is{response.body.share(
+      0, std::min(max_msg_size, response.body.size_bytes()))};
+    std::stringstream s;
+    s << is.istream().rdbuf();
+    return tl::unexpected(failure{
+      .can_be_retried = can_be_retried, .err = status, .err_msg = s.str()});
 }
 
 failure default_retry_policy::should_retry(std::exception_ptr ex) const {
@@ -95,14 +111,14 @@ failure default_retry_policy::should_retry(std::exception_ptr ex) const {
         }
         return retriable(err.what());
     } catch (const ss::gate_closed_exception&) {
-        throw;
+        return aborted(fmt::format("{}", std::current_exception()));
     } catch (const ss::abort_requested_exception&) {
-        throw;
+        return aborted(fmt::format("{}", std::current_exception()));
     } catch (const ss::nested_exception& nested) {
         if (
           is_abort_or_gate_close_exception(nested.inner)
           || is_abort_or_gate_close_exception(nested.outer)) {
-            throw;
+            return aborted(fmt::format("{}", std::current_exception()));
         };
         return unretriable(fmt::format(
           "{} [outer: {}, inner: {}]",

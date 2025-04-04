@@ -5,7 +5,6 @@ redpanda_cc_library(
     srcs = [
         "base_property.cc",
         "broker_authn_endpoint.cc",
-        "client_group_byte_rate_quota.cc",
         "configuration.cc",
         "leaders_preference.cc",
         "node_config.cc",
@@ -21,7 +20,6 @@ redpanda_cc_library(
         "bounded_property.h",
         "broker_authn_endpoint.h",
         "broker_endpoint.h",
-        "client_group_byte_rate_quota.h",
         "config_store.h",
         "configuration.h",
         "convert.h",
@@ -42,6 +40,10 @@ redpanda_cc_library(
         "types.h",
         "validation_error.h",
         "validators.h",
+    ],
+    implementation_deps = [
+        "//src/v/cluster:topic_memory_per_partition_default",
+        "//src/v/datalake:partition_spec_parser",
     ],
     include_prefix = "config",
     visibility = ["//visibility:public"],

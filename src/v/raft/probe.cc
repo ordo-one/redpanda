@@ -162,6 +162,17 @@ void probe::setup_metrics(const model::ntp& ntp) {
           [this] { return _full_heartbeat_requests; },
           sm::description("Number of full heartbeats sent by the leader"),
           labels),
+        sm::make_counter(
+          "offset_translator_inconsistency_errors",
+          [this] { return _offset_translator_inconsistency_error; },
+          sm::description("Number of append entries requests that failed the "
+                          "offset translator consistency check"),
+          labels),
+        sm::make_counter(
+          "append_entries_buffer_flushes",
+          [this] { return _append_entries_buffer_flush; },
+          sm::description("Number of append entries buffer flushes"),
+          labels),
       },
       {},
       {sm::shard_label, sm::label("partition")});

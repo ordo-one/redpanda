@@ -25,6 +25,7 @@
 #include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
+#include "utils/notification_list.h"
 #include "utils/rwlock.h"
 
 #include <seastar/core/shared_ptr.hh>
@@ -80,8 +81,8 @@ public:
     /// after a configuration change.
     void maybe_construct_archiver();
 
-    ss::future<result<kafka_result>>
-    replicate(model::record_batch_reader&&, raft::replicate_options);
+    ss::future<result<kafka_result>> replicate(
+      chunked_vector<model::record_batch> batches, raft::replicate_options);
 
     /// Truncate the beginning of the log up until a given offset
     /// Can only be performed on logs that are deletable and non internal
@@ -90,7 +91,7 @@ public:
 
     kafka_stages replicate_in_stages(
       model::batch_identity,
-      model::record_batch_reader&&,
+      model::record_batch batch,
       raft::replicate_options);
 
     /**
@@ -171,6 +172,13 @@ public:
 
     ss::future<std::error_code>
       transfer_leadership(raft::transfer_leadership_request);
+
+    /**
+     * Returns the maximum offset that may not be delivered to the newly joining
+     * learners as claimed by the state machines implemented on top of this
+     * partition.
+     */
+    model::offset max_collectible_offset();
 
     ss::future<std::error_code> update_replica_set(
       std::vector<raft::broker_revision> brokers,
@@ -332,6 +340,11 @@ public:
     ss::sharded<features::feature_table>& feature_table() const;
 
     result<std::vector<raft::follower_metrics>> get_follower_metrics() const;
+    /**
+     * This method return a recovery state i.e. the offset and bytes that are
+     * left to be delivered to the recovering replica.
+     */
+    result<recovery_state> get_recovery_state() const;
 
     // Attempt to reset the partition manifest of a cloud storage partition
     // from an iobuf containing the JSON representation of the manifest.
@@ -361,9 +374,24 @@ public:
     ss::shared_ptr<cloud_storage::async_manifest_view>
     get_cloud_storage_manifest_view();
 
-    ss::future<std::error_code> set_writes_disabled(
+    ss::future<result<model::offset>> set_writes_disabled(
       partition_properties_stm::writes_disabled disable,
       model::timeout_clock::time_point deadline);
+
+    using flush_hook = ss::noncopyable_function<ss::future<errc>(
+      model::offset,
+      model::timeout_clock::time_point,
+      std::optional<std::reference_wrapper<ss::abort_source>>)>;
+
+    // Register and execute actions to make sure we leave partition belongings
+    // in up-to-date state. Used for unmount.
+    partition_flush_hook_id register_flush_hook(flush_hook&& cb);
+    void unregister_flush_hook(partition_flush_hook_id id);
+    ss::future<errc>
+    flush(model::offset, model::timeout_clock::time_point, ss::abort_source&);
+
+    // callers must not invoke it multiple times concurrently
+    ss::future<errc> flush_archiver();
 
     bool started() const noexcept { return _started; }
     void mark_started() noexcept { _started = true; }
@@ -390,7 +418,7 @@ private:
     // dirty so that it gets reuploaded
     ss::future<> restart_archiver(bool should_notify_topic_config);
 
-    consensus_ptr _raft;
+    consensus_ptr _raft; // never null
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;
@@ -430,6 +458,10 @@ private:
     // acquire shared ("read") for produce,
     // exclusive ("write") for enabling/disabling writes
     ssx::rwlock _produce_lock;
+
+    notification_list<flush_hook, partition_flush_hook_id> _flush_hooks;
+    partition_flush_hook_id _archiver_flush_subscription
+      = partition_flush_hook_id_invalid;
 
     bool _started{false};
 

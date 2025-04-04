@@ -11,9 +11,21 @@
 #pragma once
 
 #include "compat/json.h"
+#include "model/metadata.h"
 #include "model/record.h"
 
+#include <stdexcept>
+
 namespace json {
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::timestamp& v) {
+    rjson_serialize(wr, v.value());
+}
+
+inline void read_value(const json::Value& rd, model::timestamp& out) {
+    out = model::timestamp(rd.GetInt64());
+}
 
 inline void read_value(const json::Value& rd, model::compression& e) {
     std::underlying_type_t<model::compression> value;
@@ -180,6 +192,24 @@ inline void read_value(const json::Value& rd, model::partition_metadata& obj) {
 }
 
 inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const model::topic_namespace& t) {
+    w.StartObject();
+    w.Key("ns");
+    rjson_serialize(w, t.ns);
+    w.Key("tp");
+    rjson_serialize(w, t.tp);
+    w.EndObject();
+}
+
+inline void read_value(const json::Value& rd, model::topic_namespace& obj) {
+    model::ns ns;
+    model::topic tp;
+    read_member(rd, "ns", ns);
+    read_member(rd, "tp", tp);
+    obj = model::topic_namespace(std::move(ns), std::move(tp));
+}
+
+inline void rjson_serialize(
   json::Writer<json::StringBuffer>& w, const model::topic_metadata& tm) {
     w.StartObject();
     write_member(w, "tp_ns", tm.tp_ns);
@@ -264,6 +294,242 @@ inline void rjson_serialize_exceptional_type(
   json::Writer<json::StringBuffer>& w, const model::write_caching_mode& m) {
     using underlying_t = std::underlying_type_t<model::write_caching_mode>;
     rjson_serialize(w, static_cast<underlying_t>(m));
+}
+
+inline void rjson_serialize_exceptional_type(
+  json::Writer<json::StringBuffer>& w,
+  const model::iceberg_invalid_record_action& m) {
+    using underlying_t
+      = std::underlying_type_t<model::iceberg_invalid_record_action>;
+    rjson_serialize(w, static_cast<underlying_t>(m));
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr,
+  const model::record_batch_attributes& b) {
+    rjson_serialize(wr, b.value());
+}
+
+inline void
+read_value(const json::Value& rd, model::record_batch_attributes& out) {
+    out = model::record_batch_attributes(rd.GetInt());
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::record_attributes& b) {
+    rjson_serialize(wr, b.value());
+}
+
+inline void read_value(const json::Value& rd, model::record_attributes& out) {
+    out = model::record_attributes(rd.GetInt());
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::iceberg_mode& m) {
+    wr.StartObject();
+    wr.Key("kind");
+    rjson_serialize(wr, m.kind());
+    if (m.kind() == model::iceberg_mode::variant::value_schema_latest) {
+        wr.Key("protobuf_full_name");
+        rjson_serialize(wr, m.protobuf_full_name().value_or(""));
+        wr.Key("subject_name");
+        rjson_serialize(wr, m.subject_name().value_or(""));
+    }
+    wr.EndObject();
+}
+
+inline void read_value(const json::Value& rd, model::iceberg_mode& m) {
+    const auto& obj = rd.GetObject();
+    auto it = obj.FindMember("kind");
+    if (it == obj.MemberEnd()) {
+        throw std::runtime_error("missing kind member from iceberg_mode json");
+    }
+    model::iceberg_mode::variant v = model::iceberg_mode::variant::disabled;
+    read_value(it->value, v);
+    switch (v) {
+    case model::iceberg_mode::variant::disabled:
+        m = model::iceberg_mode::disabled;
+        break;
+    case model::iceberg_mode::variant::key_value:
+        m = model::iceberg_mode::key_value;
+        break;
+    case model::iceberg_mode::variant::value_schema_id_prefix:
+        m = model::iceberg_mode::value_schema_id_prefix;
+        break;
+    case model::iceberg_mode::variant::value_schema_latest:
+        it = obj.FindMember("protobuf_full_name");
+        if (it == obj.MemberEnd()) {
+            throw std::runtime_error(
+              "missing protobuf_full_name member from iceberg_mode json");
+        }
+        ss::sstring name;
+        read_value(it->value, name);
+        it = obj.FindMember("subject_name");
+        if (it == obj.MemberEnd()) {
+            throw std::runtime_error(
+              "missing subject_name member from iceberg_mode json");
+        }
+        ss::sstring subject;
+        read_value(it->value, subject);
+        m = model::iceberg_mode::value_schema_latest(name, subject);
+        break;
+    }
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::record_batch_header& obj) {
+    wr.StartObject();
+    json_write(header_crc);
+    json_write(size_bytes);
+    json_write(base_offset);
+    json_write(type);
+    json_write(crc);
+    json_write(attrs);
+    json_write(last_offset_delta);
+    json_write(first_timestamp);
+    json_write(max_timestamp);
+    json_write(producer_id);
+    json_write(producer_epoch);
+    json_write(base_sequence);
+    json_write(record_count);
+    wr.EndObject();
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::record_header& obj) {
+    wr.StartObject();
+    json::write_member(wr, "key_size", obj.key_size());
+    json::write_member(wr, "key", obj.key());
+    json::write_member(wr, "value_size", obj.value_size());
+    json::write_member(wr, "value", obj.value());
+    wr.EndObject();
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::record& obj) {
+    wr.StartObject();
+    json::write_member(wr, "size_bytes", obj.size_bytes());
+    json::write_member(wr, "attributes", obj.attributes());
+    json::write_member(wr, "timestamp_delta", obj.timestamp_delta());
+    json::write_member(wr, "offset_delta", obj.offset_delta());
+    json::write_member(wr, "key_size", obj.key_size());
+    json::write_member(wr, "key", obj.key());
+    json::write_member(wr, "value_size", obj.value_size());
+    json::write_member(wr, "value", obj.value());
+    json::write_member(wr, "headers", obj.headers());
+    wr.EndObject();
+}
+
+inline void rjson_serialize(
+  json::Writer<json::StringBuffer>& wr, const model::record_batch& b) {
+    wr.StartObject();
+    wr.Key("header");
+    rjson_serialize(wr, b.header());
+    wr.Key("records");
+    rjson_serialize(wr, b.copy_records());
+    wr.EndObject();
+}
+
+inline void read_value(const json::Value& rd, model::record_batch_header& out) {
+    model::record_batch_header obj;
+    json_read(header_crc);
+    json_read(size_bytes);
+    json_read(base_offset);
+    json_read(type);
+    json_read(crc);
+    json_read(attrs);
+    json_read(last_offset_delta);
+    json_read(first_timestamp);
+    json_read(max_timestamp);
+    json_read(producer_id);
+    json_read(producer_epoch);
+    json_read(base_sequence);
+    json_read(record_count);
+    out = obj;
+}
+
+/*
+ * specialized circular_buffer for record_batch type because record_batch
+ * doesn't support default constructor and the generic form for circular buffer
+ * of type T needs to build a structure to deserialize into.
+ *
+ * since the components of the record batch aren't default constructable we also
+ * circumvent the normal api to which requires default ctor is available.
+ */
+inline void read_value(
+  const json::Value& v, ss::circular_buffer<model::record_batch>& target) {
+    for (const auto& e : v.GetArray()) {
+        model::record_batch_header header;
+        std::vector<model::record> records;
+
+        /*
+         * header
+         */
+        json::read_member(e, "header", header);
+
+        /*
+         * records
+         */
+        vassert(
+          e.HasMember("records") && e["records"].IsArray(),
+          "invalid records field");
+        for (const auto& r : e["records"].GetArray()) {
+            vassert(r.IsObject(), "record is not an object");
+
+            int32_t size_bytes{};
+            model::record_attributes attributes;
+            int64_t timestamp_delta{};
+            int32_t offset_delta{};
+            int32_t key_size{};
+            iobuf key;
+            int32_t value_size{};
+            iobuf value;
+            std::vector<model::record_header> headers;
+
+            json::read_member(r, "size_bytes", size_bytes);
+            json::read_member(r, "attributes", attributes);
+            json::read_member(r, "timestamp_delta", timestamp_delta);
+            json::read_member(r, "offset_delta", offset_delta);
+            json::read_member(r, "key_size", key_size);
+            json::read_member(r, "key", key);
+            json::read_member(r, "value_size", value_size);
+            json::read_member(r, "value", value);
+
+            /*
+             * record headers
+             */
+            vassert(
+              r.HasMember("headers") && r["headers"].IsArray(),
+              "invalid headers field");
+            for (const auto& h : r["headers"].GetArray()) {
+                int32_t key_size{};
+                iobuf key;
+                int32_t value_size{};
+                iobuf value;
+
+                json::read_member(h, "key_size", key_size);
+                json::read_member(h, "key", key);
+                json::read_member(h, "value_size", value_size);
+                json::read_member(h, "value", value);
+
+                headers.emplace_back(
+                  key_size, std::move(key), value_size, std::move(value));
+            }
+
+            records.emplace_back(
+              size_bytes,
+              attributes,
+              timestamp_delta,
+              offset_delta,
+              key_size,
+              std::move(key),
+              value_size,
+              std::move(value),
+              std::move(headers));
+        }
+
+        target.emplace_back(header, std::move(records));
+    }
 }
 
 } // namespace json

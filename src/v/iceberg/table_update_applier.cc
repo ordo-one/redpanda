@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/table_update_applier.h"
 
 #include "base/vlog.h"
@@ -34,16 +35,13 @@ struct update_applying_visitor {
         }
         if (update.last_column_id.has_value()) {
             auto new_last_col_id = update.last_column_id.value();
-            if (new_last_col_id < meta.last_column_id) {
-                vlog(
-                  log.error,
-                  "Expected new last column id to be >= previous last column "
-                  "id: {} < {}",
-                  new_last_col_id,
-                  meta.last_column_id);
-                return outcome::unexpected_state;
-            }
-            meta.last_column_id = new_last_col_id;
+            // NOTE: we can drop fields, so new_last_col_id could be less
+            // than meta.last_column_id (e.g. if some field was dropped and
+            // no new fields were added). we should still enforce that
+            // meta.last_column_id is always increasing monotonically to avoid
+            // reusing column IDs on subsequent schema updates
+            meta.last_column_id = std::max(
+              meta.last_column_id, new_last_col_id);
         }
         meta.schemas.emplace_back(update.schema.copy());
         return outcome::success;
@@ -79,7 +77,39 @@ struct update_applying_visitor {
             vlog(log.error, "Partition spec id {} already exists", sid);
             return outcome::unexpected_state;
         }
+
         meta.partition_specs.emplace_back(update.spec.copy());
+
+        for (const auto& field : update.spec.fields) {
+            meta.last_partition_id = std::max(
+              meta.last_partition_id, field.field_id);
+        }
+
+        return outcome::success;
+    }
+    outcome operator()(const set_default_spec& update) {
+        auto sid = update.spec_id;
+        if (sid() == partition_spec::unassigned_id) {
+            // -1 indicates that we should set the spec to the latest added one.
+            if (meta.partition_specs.empty()) {
+                vlog(
+                  log.error, "Can't set -1 when there are no partition specs");
+                return outcome::unexpected_state;
+            }
+            auto max_id = meta.partition_specs.front().spec_id;
+            for (const auto& s : meta.partition_specs) {
+                max_id = std::max(max_id, s.spec_id);
+            }
+            meta.default_spec_id = max_id;
+            return outcome::success;
+        }
+        auto spec = std::ranges::find(
+          meta.partition_specs, sid, &partition_spec::spec_id);
+        if (spec == meta.partition_specs.end()) {
+            vlog(log.error, "Partition spec {} doesn't exist", sid);
+            return outcome::unexpected_state;
+        }
+        meta.default_spec_id = update.spec_id;
         return outcome::success;
     }
     outcome operator()(const add_snapshot& update) {
@@ -123,6 +153,20 @@ struct update_applying_visitor {
         }
         meta.snapshots = std::move(new_list);
         // TODO: once we add support for statistics, need to remove them too.
+        return outcome::success;
+    }
+    outcome operator()(const remove_snapshot_ref& update) {
+        if (update.ref_name == "main") {
+            meta.current_snapshot_id.reset();
+            // Intentional fallthrough to remove from the refs container.
+        }
+        if (!meta.refs.has_value() || meta.refs->empty()) {
+            return outcome::success;
+        }
+        auto ref_it = meta.refs->find(update.ref_name);
+        if (ref_it != meta.refs->end()) {
+            meta.refs->erase(ref_it);
+        }
         return outcome::success;
     }
     outcome operator()(const set_snapshot_ref& update) {

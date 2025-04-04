@@ -11,10 +11,8 @@
 
 #include "resource_mgmt/cpu_profiler.h"
 
-#include "random/generators.h"
+#include "container/chunked_hash_map.h"
 #include "resource_mgmt/logger.h"
-#include "ssx/future-util.h"
-#include "ssx/sformat.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/internal/cpu_profiler.hh>
@@ -24,7 +22,6 @@
 #include <seastar/util/later.hh>
 
 #include <chrono>
-#include <iterator>
 
 namespace resources {
 
@@ -90,35 +87,59 @@ ss::future<std::vector<cpu_profiler::shard_samples>> cpu_profiler::results(
                 std::move(shard_result.samples));
               return results;
           });
+        // sort by shard ID so the shard id lines up with the vector index
+        std::ranges::sort(
+          results, [](auto& l, auto& r) { return l.shard < r.shard; });
     }
 
     co_return results;
 }
 
+// hashable struct holding a single sample
+struct single_sample {
+    ss::simple_backtrace backtrace;
+    ss::sstring sg;
+
+    bool operator==(const single_sample&) const = default;
+
+    template<typename H>
+    friend H AbslHashValue(H h, const single_sample& s) {
+        return H::combine(std::move(h), s.backtrace, s.sg);
+    }
+};
+
 cpu_profiler::shard_samples cpu_profiler::shard_results(
   std::optional<ss::lowres_clock::time_point> filter_before) const {
-    size_t dropped_samples = 0;
-    absl::node_hash_map<ss::simple_backtrace, size_t> backtraces;
+    size_t dropped_samples = 0, total_samples = 0;
+    chunked_hash_map<single_sample, size_t> backtraces;
     for (auto& results_buffer : _results_buffers) {
         if (filter_before && results_buffer.polled_time < *filter_before) {
             continue;
         }
 
         dropped_samples += results_buffer.dropped_samples;
+        total_samples += results_buffer.samples.size();
         for (auto& result : results_buffer.samples) {
-            backtraces[result.user_backtrace]++;
+            ++backtraces[{result.user_backtrace, result.sg.name()}];
         }
     }
 
-    std::vector<sample> results{};
+    resourceslog.trace(
+      "shard_results returning {} total, {} unique results",
+      total_samples,
+      backtraces.size());
+
+    std::vector<sample> results;
     results.reserve(backtraces.size());
 
     for (auto& backtrace : backtraces) {
         results.emplace_back(
-          ssx::sformat("{}", backtrace.first), backtrace.second);
+          ssx::sformat("{}", backtrace.first.backtrace),
+          backtrace.first.sg,
+          backtrace.second);
     }
 
-    return {ss::this_shard_id(), dropped_samples, results};
+    return {ss::this_shard_id(), dropped_samples, std::move(results)};
 }
 
 void cpu_profiler::poll_samples() {

@@ -33,6 +33,7 @@
 #include "raft/fundamental.h"
 #include "raft/fwd.h"
 #include "raft/state_machine_manager.h"
+#include "ssx/when_all.h"
 #include "storage/ntp_config.h"
 #include "utils/rwlock.h"
 
@@ -338,15 +339,15 @@ ss::future<storage::translating_reader> partition::make_cloud_reader(
 }
 
 ss::future<result<kafka_result>> partition::replicate(
-  model::record_batch_reader&& r, raft::replicate_options opts) {
+  chunked_vector<model::record_batch> batches, raft::replicate_options opts) {
     using ret_t = result<kafka_result>;
-    auto reader = std::move(r);
 
     auto maybe_units = co_await hold_writes_enabled();
     if (!maybe_units) {
         co_return ret_t(maybe_units.error());
     }
-    auto res = co_await _raft->replicate(std::move(reader), opts);
+
+    auto res = co_await _raft->replicate(std::move(batches), opts);
     if (!res) {
         co_return ret_t(res.error());
     }
@@ -402,7 +403,7 @@ kafka_stages stages_with_units(
 
 kafka_stages partition::replicate_in_stages(
   model::batch_identity bid,
-  model::record_batch_reader&& r,
+  model::record_batch batch,
   raft::replicate_options opts) {
     using ret_t = result<kafka_result>;
 
@@ -430,12 +431,12 @@ kafka_stages partition::replicate_in_stages(
       hold_writes_enabled(),
       [this,
        bid = std::move(bid),
-       r = std::move(r),
+       batch = std::move(batch),
        opts = std::move(opts)]() mutable {
           if (_rm_stm) {
-              return _rm_stm->replicate_in_stages(bid, std::move(r), opts);
+              return _rm_stm->replicate_in_stages(bid, std::move(batch), opts);
           }
-          auto res = _raft->replicate_in_stages(std::move(r), opts);
+          auto res = _raft->replicate_in_stages(std::move(batch), opts);
           auto replicate_finished = res.replicate_finished.then(
             [this](result<raft::replicate_result> r) {
                 if (!r) {
@@ -544,12 +545,22 @@ ss::future<> partition::start(
         _dl_stm_api = ss::make_shared<experimental::cloud_topics::dl_stm_api>(
           clusterlog, std::move(dl_stm));
     }
+
+    _archiver_flush_subscription = register_flush_hook(
+      [this](
+        model::offset,
+        model::timeout_clock::time_point,
+        std::optional<std::reference_wrapper<ss::abort_source>>) {
+          return flush_archiver();
+      });
 }
 
 ss::future<> partition::stop() {
     auto partition_ntp = ntp();
     vlog(clusterlog.debug, "Stopping partition: {}", partition_ntp);
     _as.request_abort();
+
+    unregister_flush_hook(_archiver_flush_subscription);
 
     {
         // `partition_manager::do_shutdown` (caller of stop) will assert
@@ -583,6 +594,14 @@ ss::future<> partition::stop() {
           "Stopping cloud_storage_manifest_view on partition: {}",
           partition_ntp);
         co_await _cloud_storage_manifest_view->stop();
+    }
+
+    if (_dl_stm_api) {
+        vlog(
+          clusterlog.debug,
+          "Stopping dl_stm_api on partition: {}",
+          partition_ntp);
+        co_await _dl_stm_api->stop();
     }
 
     _probe.clear_metrics();
@@ -1024,12 +1043,15 @@ ss::future<> partition::finalize_remote_partition(ss::abort_source& as) {
         const auto finalize = co_await should_finalize(
           as, _raft->self(), group_configuration());
 
+        const bool remote_manifest_expected
+          = _archival_meta_stm->get_last_clean_at() != model::offset();
+
         if (finalize) {
             vlog(
               clusterlog.debug,
               "Finalizing remote metadata on partition delete {}",
               ntp());
-            _cloud_storage_partition->finalize();
+            _cloud_storage_partition->finalize(remote_manifest_expected);
         }
     }
 }
@@ -1132,6 +1154,32 @@ partition::get_follower_metrics() const {
         return errc::not_leader;
     };
     return _raft->get_follower_metrics();
+}
+
+result<recovery_state> partition::get_recovery_state() const {
+    if (!_raft->is_leader()) {
+        return errc::not_leader;
+    }
+    recovery_state r_state;
+    r_state.local_last_offset = _raft->dirty_offset();
+    r_state.local_size = _raft->log()->size_bytes();
+
+    const auto& f_stats = _raft->get_follower_stats();
+    r_state.replicas.reserve(f_stats.size());
+
+    for (auto& [follower_id, stats] : f_stats) {
+        if (!stats.is_recovering) {
+            continue;
+        }
+
+        replica_recovery_state replica_state{
+          .last_offset = stats.match_index,
+          .bytes_left = _raft->log()->size_bytes_after_offset(
+            stats.match_index),
+        };
+        r_state.replicas.emplace(follower_id.id(), replica_state);
+    }
+    return r_state;
 }
 
 ss::future<>
@@ -1531,6 +1579,10 @@ partition::archival_meta_stm() const {
     return _archival_meta_stm;
 }
 
+model::offset partition::max_collectible_offset() {
+    return _raft->log()->stm_manager()->max_collectible_offset();
+}
+
 std::optional<model::offset> partition::kafka_start_offset_override() const {
     if (_log_eviction_stm && !is_read_replica_mode_enabled()) {
         auto o = _log_eviction_stm->kafka_start_offset_override();
@@ -1691,7 +1743,7 @@ partition::force_abort_replica_set_update(model::revision_id rev) {
 }
 consensus_ptr partition::raft() const { return _raft; }
 
-ss::future<std::error_code> partition::set_writes_disabled(
+ss::future<result<model::offset>> partition::set_writes_disabled(
   partition_properties_stm::writes_disabled disable,
   model::timeout_clock::time_point deadline) {
     ssx::rwlock::holder holder;
@@ -1710,15 +1762,67 @@ ss::future<std::error_code> partition::set_writes_disabled(
     if (_partition_properties_stm == nullptr) {
         co_return errc::invalid_partition_operation;
     }
+
+    // abort active transactions
     if (disable && _rm_stm) {
         auto res = co_await _rm_stm->abort_all_txes();
         if (res != tx::errc::none) {
             co_return res;
         }
     }
+
     auto method = disable ? &partition_properties_stm::disable_writes
                           : &partition_properties_stm::enable_writes;
     co_return co_await (*_partition_properties_stm.*method)();
+}
+
+partition_flush_hook_id partition::register_flush_hook(flush_hook&& cb) {
+    return _flush_hooks.register_cb(std::move(cb));
+}
+
+void partition::unregister_flush_hook(partition_flush_hook_id id) {
+    _flush_hooks.unregister_cb(id);
+}
+
+ss::future<errc> partition::flush(
+  model::offset offset,
+  model::timeout_clock::time_point deadline,
+  ss::abort_source& as) {
+    // non-leader may lack some flush hooks
+    if (!is_leader()) {
+        co_return errc::not_leader;
+    }
+
+    vlog(clusterlog.info, "[{}] flushing offset {}", ntp(), offset);
+    auto futures = _flush_hooks.notify(offset, deadline, as);
+    using errs = std::vector<errc>;
+    errs results = co_await ssx::when_all_succeed<errs>(std::move(futures));
+    vlog(clusterlog.info, "[{}] flushed offset {}", ntp(), offset);
+    co_return *std::ranges::max_element(results);
+}
+
+ss::future<errc> partition::flush_archiver() {
+    vlog(clusterlog.debug, "[{}] flushing archiver", ntp());
+    if (!_archiver) {
+        co_return errc::invalid_partition_operation;
+    }
+    auto flush_res = _archiver->flush();
+    if (flush_res.response != archival::flush_response::accepted) {
+        co_return errc::partition_operation_failed;
+    }
+    auto res = co_await _archiver->wait(*flush_res.offset);
+    vlog(clusterlog.debug, "[{}] flushed archiver: {}", ntp(), res);
+    switch (res) {
+    case archival::wait_result::not_in_progress:
+        // is partition concurrently flushed/waited by smth else?
+        vassert(false, "Freshly accepted flush cannot be waited for");
+    case archival::wait_result::lost_leadership:
+        co_return errc::leadership_changed;
+    case archival::wait_result::failed:
+        co_return errc::partition_operation_failed;
+    case archival::wait_result::complete:
+        co_return errc::success;
+    }
 }
 
 ss::future<result<ssx::rwlock_unit>> partition::hold_writes_enabled() {

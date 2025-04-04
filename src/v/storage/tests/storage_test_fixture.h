@@ -27,6 +27,7 @@
 #include "storage/log_manager.h"
 #include "storage/types.h"
 #include "test_utils/fixture.h"
+#include "test_utils/test_macros.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/reactor.hh>
@@ -179,9 +180,9 @@ struct linear_int_kv_batch_generator {
       ss::circular_buffer<model::record_batch>&& batches) {
         int idx = 0;
         for (const auto& batch : batches) {
-            BOOST_REQUIRE_EQUAL(batch.record_count(), 1);
+            RPTEST_EXPECT_EQ(batch.record_count(), 1);
             batch.for_each_record([&idx](model::record rec) {
-                BOOST_REQUIRE_EQUAL(
+                RPTEST_EXPECT_EQ(
                   reflection::from_iobuf<int>(rec.release_key()), idx++);
             });
         }
@@ -282,7 +283,7 @@ public:
 
     struct batch_validating_consumer {
         ss::future<ss::stop_iteration> operator()(model::record_batch b) {
-            BOOST_REQUIRE_EQUAL(b.header().crc, model::crc_record_batch(b));
+            RPTEST_EXPECT_EQ(b.header().crc, model::crc_record_batch(b));
             batches.push_back(std::move(b));
             return ss::make_ready_future<ss::stop_iteration>(
               ss::stop_iteration::no);
@@ -362,8 +363,8 @@ public:
             // Check if after append offset was updated correctly
             auto expected_offset = model::offset(total_records - 1)
                                    + base_offset;
-            BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, res.last_offset);
-            BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, expected_offset);
+            RPTEST_EXPECT_EQ(log->offsets().dirty_offset, res.last_offset);
+            RPTEST_EXPECT_EQ(log->offsets().dirty_offset, expected_offset);
         }
 
         return headers;
@@ -393,8 +394,8 @@ public:
 
         log->flush().get();
 
-        BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, res.last_offset);
-        BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, expected_offset);
+        RPTEST_EXPECT_EQ(log->offsets().dirty_offset, res.last_offset);
+        RPTEST_EXPECT_EQ(log->offsets().dirty_offset, expected_offset);
     }
 
     // model::offset start_offset;
@@ -415,5 +416,33 @@ public:
         return std::move(reader)
           .consume(batch_validating_consumer(), model::no_timeout)
           .get();
+    }
+
+    std::pair<ssize_t, ssize_t> expected_dirty_and_closed_segment_bytes(
+      ss::shared_ptr<storage::log> log) const {
+        ssize_t dirty{0};
+        ssize_t closed{0};
+        for (const auto& segment : log->segments()) {
+            if (!segment->has_appender()) {
+                if (!segment->has_clean_compact_timestamp()) {
+                    dirty += segment->file_size();
+                }
+                closed += segment->file_size();
+            }
+        }
+        return {dirty, closed};
+    }
+
+    // Assert that the book-kept dirty and closed bytes reflect the contents of
+    // the log.
+    void check_dirty_and_closed_segment_bytes(
+      ss::shared_ptr<storage::log> log) const {
+        auto expected = expected_dirty_and_closed_segment_bytes(log);
+        tlog.trace(
+          "Expect dirty bytes: {}, expect closed bytes: {}",
+          expected.first,
+          expected.second);
+        RPTEST_EXPECT_EQ(log->dirty_segment_bytes(), expected.first);
+        RPTEST_EXPECT_EQ(log->closed_segment_bytes(), expected.second);
     }
 };

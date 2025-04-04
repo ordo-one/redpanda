@@ -13,7 +13,6 @@
 #include "model/record_batch_reader.h"
 #include "raft/tests/raft_fixture.h"
 #include "raft/tests/raft_fixture_retry_policy.h"
-#include "raft/tests/raft_group_fixture.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "storage/record_batch_builder.h"
@@ -63,19 +62,19 @@ TEST_F(raft_fixture, test_empty_writes) {
     create_simple_group(5).get();
     auto leader = wait_for_leader(10s).get();
 
-    auto replicate = [&](auto reader) {
+    auto replicate = [&](chunked_vector<model::record_batch> batches) {
         return node(leader).raft()->replicate(
-          std::move(reader), replicate_options{consistency_level::quorum_ack});
+          std::move(batches), replicate_options{consistency_level::quorum_ack});
     };
 
     // no records
     storage::record_batch_builder builder(
       model::record_batch_type::raft_data, model::offset(0));
-    auto reader = model::make_memory_record_batch_reader(
-      std::move(builder).build());
 
     // Catch the error when appending.
-    auto res = replicate(std::move(reader)).get();
+    auto res = replicate(chunked_vector<model::record_batch>::single(
+                           std::move(builder).build()))
+                 .get();
     ASSERT_TRUE(res.has_error());
     ASSERT_EQ(res.error(), errc::leader_append_failed);
 
@@ -576,12 +575,12 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
           .then([&](result<replicate_result> result) {
               if (result) {
                   vlog(
-                    tstlog.info,
+                    logger().info,
                     "replication result last offset: {}",
                     result.value().last_offset);
               } else {
                   vlog(
-                    tstlog.info,
+                    logger().info,
                     "replication error: {}",
                     result.error().message());
               }
@@ -684,7 +683,7 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
       std::move(request),
       rpc::client_opts(10s));
     ASSERT_TRUE_CORO(reply.has_value());
-    vlog(tstlog.info, "snapshot reply from follower: {}", reply.value());
+    vlog(logger().info, "snapshot reply from follower: {}", reply.value());
 
     // the snapshot contains a configuration with one node which is older than
     // the current one the follower has. latest configuration MUST remain
@@ -720,7 +719,7 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
       rpc::client_opts(10s));
 
     ASSERT_TRUE_CORO(leader_reply.has_value());
-    vlog(tstlog.info, "snapshot reply from leader: {}", leader_reply.value());
+    vlog(logger().info, "snapshot reply from leader: {}", leader_reply.value());
     co_await tests::cooperative_spin_wait_with_timeout(10s, [&] {
         return nodes().begin()->second->raft()->term() > term_snapshot;
     });
@@ -740,12 +739,12 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
           .then([&](result<replicate_result> result) {
               if (result) {
                   vlog(
-                    tstlog.info,
+                    logger().info,
                     "replication result last offset: {}",
                     result.value().last_offset);
               } else {
                   vlog(
-                    tstlog.info,
+                    logger().info,
                     "replication error: {}",
                     result.error().message());
               }
@@ -792,7 +791,7 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
     auto transfer_time = new_leader_reported_ev->timestamp
                          - events.begin()->timestamp;
     vlog(
-      tstlog.info,
+      logger().info,
       "leadership_transfer - new leader reported after: {} ms",
       (transfer_time) / 1ms);
     events.clear();
@@ -820,7 +819,7 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
     auto election_time = leader_reported_after_reconfiguration->timestamp
                          - events.begin()->timestamp;
     vlog(
-      tstlog.info,
+      logger().info,
       "reconfiguration - new leader reported after: {} ms",
       (election_time) / 1ms);
 
@@ -835,4 +834,219 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
      */
     ASSERT_LE_CORO(election_time * 1.0, transfer_time * tolerance_multiplier);
     ASSERT_GE_CORO(election_time * 1.0, transfer_time / tolerance_multiplier);
+}
+
+TEST_F_CORO(raft_fixture, test_no_stepdown_on_append_entries_timeout) {
+    config::shard_local_cfg().replicate_append_timeout_ms.set_value(1s);
+    co_await create_simple_group(3);
+    auto leader_id = co_await wait_for_leader(10s);
+    for (auto& [id, n] : nodes()) {
+        if (id != leader_id) {
+            n->f_injectable_log()->set_append_delay([]() { return 5s; });
+        }
+    }
+
+    auto& leader_node = node(leader_id);
+    auto term_before = leader_node.raft()->term();
+    auto r = co_await leader_node.raft()->replicate(
+      make_batches(1, 10, 128),
+      replicate_options(consistency_level::quorum_ack, 10s));
+    ASSERT_FALSE_CORO(r.has_error());
+    for (auto& [_, n] : nodes()) {
+        n->f_injectable_log()->set_append_delay(std::nullopt);
+    }
+
+    leader_id = co_await wait_for_leader(10s);
+    auto& new_leader_node = node(leader_id);
+    ASSERT_EQ_CORO(term_before, new_leader_node.raft()->term());
+    ASSERT_TRUE_CORO(new_leader_node.raft()->is_leader());
+}
+
+/**
+ * This synthetic test is there to trigger a situation in which follower
+ * receives an append entries request which contains only batches that matches
+ * its log. This trigger a condition in which the follower should reply with
+ * success to the leader so the leader can continue recovery process.
+ *
+ * The test uses reply interception to 'trick' the leader to send the append
+ * entries with the batches that the follower already has.
+ */
+TEST_F_CORO(raft_fixture, test_redelivery_of_matching_logs) {
+    co_await create_simple_group(3);
+    auto term_1_leader_id = co_await wait_for_leader(10s);
+    for (auto& [id, n] : nodes()) {
+        n->set_default_recovery_read_size(1);
+    }
+    auto term_1_follower_id = random_follower_id().value();
+    auto& t1_leader_node = node(term_1_leader_id);
+    /**
+     * Replicate data to all nodes
+     */
+    auto r = co_await t1_leader_node.raft()->replicate(
+      make_batches(200, 1, 10),
+      replicate_options(consistency_level::quorum_ack, 10s));
+    co_await wait_for_committed_offset(r.value().last_offset, 5s);
+    auto term_1_match_offset = node(term_1_follower_id).raft()->dirty_offset();
+
+    /**
+     * Prevent any nodes from receiveing append entry requests from the leader
+     */
+    t1_leader_node.on_dispatch([](model::node_id, raft::msg_type mt) {
+        if (mt == raft::msg_type::append_entries) {
+            throw std::runtime_error("error");
+        }
+        return ss::now();
+    });
+
+    /**
+     * Replicate some data with the leader ack consistency level so the current
+     * leader has the longest log
+     */
+    r = co_await t1_leader_node.raft()->replicate(
+      make_batches(20, 1, 10),
+      replicate_options(consistency_level::leader_ack, 10s));
+
+    ASSERT_FALSE_CORO(r.has_error());
+    // leader has longest log, prevent follower from sending vote requests to
+    // term 1 leader.
+    node(term_1_follower_id)
+      .on_dispatch([term_1_leader_id](model::node_id id, raft::msg_type) {
+          if (term_1_leader_id == id) {
+              throw std::runtime_error("error");
+          }
+          return ss::now();
+      });
+
+    // stepdown to trigger another leader election
+    t1_leader_node.raft()->block_new_leadership();
+    co_await t1_leader_node.raft()->step_down(
+      model::term_id(2), "test step down");
+
+    auto new_leader_id = co_await wait_for_leader(10s);
+    // this is the only candidate as the other one will receive information from
+    // term 1 leader that it has the longest log.
+    ASSERT_EQ_CORO(new_leader_id, term_1_follower_id);
+
+    auto& new_leader_node = node(new_leader_id);
+    logger().info(
+      "new leader offsets: {}, term_1_match: {}",
+      new_leader_node.raft()->log()->offsets(),
+      term_1_match_offset);
+
+    /**
+     * Trick the leader right at the offset where the leader and follower log
+     * would match
+     */
+    ss::condition_variable reply_intercepted;
+    size_t intercept_count = 0;
+    new_leader_node.set_reply_interceptor(
+      [&, term_1_match_offset](reply_variant reply, model::node_id) {
+          return ss::visit(
+            std::move(reply),
+            [&, term_1_match_offset](append_entries_reply& a_r) {
+                if (
+                  a_r.last_dirty_log_index
+                  == model::next_offset(term_1_match_offset)) {
+                    a_r.result = reply_result::failure;
+                    intercept_count++;
+                    reply_intercepted.signal();
+                }
+                return ss::make_ready_future<reply_variant>(a_r);
+            },
+            [](auto& r) {
+                return ss::make_ready_future<reply_variant>(std::move(r));
+            });
+      });
+    /**
+     * Recover communication and wait for the intercept to trigger
+     */
+    new_leader_node.reset_dispatch_handlers();
+    co_await reply_intercepted.wait([&] { return intercept_count > 5; });
+    new_leader_node.reset_reply_interceptor();
+
+    co_await wait_for_committed_offset(
+      new_leader_node.raft()->dirty_offset(), 5s);
+}
+
+TEST_F_CORO(raft_fixture, test_term_conditional_replication) {
+    co_await create_simple_group(3);
+    auto leader_id = co_await wait_for_leader(10s);
+    auto& leader_node = node(leader_id);
+    auto term = leader_node.raft()->term();
+    // this should succeed as there were no leadership changes
+    auto result = co_await leader_node.raft()->replicate(
+      term,
+      make_batches(10, 10, 128),
+      replicate_options(consistency_level::quorum_ack, 10s));
+
+    ASSERT_TRUE_CORO(result.has_value());
+    /**
+     * Make sure the current leader will be re-elected
+     */
+    for (auto& [id, node] : nodes()) {
+        if (id != leader_id) {
+            node->raft()->block_new_leadership();
+        }
+    }
+    co_await leader_node.raft()->step_down("test-step-down");
+
+    auto new_leader_id = co_await wait_for_leader(10s);
+    ASSERT_EQ_CORO(new_leader_id, leader_id);
+    auto result_with_term = co_await leader_node.raft()->replicate(
+      term,
+      make_batches(10, 10, 128),
+      replicate_options(consistency_level::quorum_ack, 10s));
+
+    // Replication must fail as the term was increased in leader election
+    ASSERT_TRUE_CORO(result_with_term.has_error());
+    // No term provided, replication will succeed
+    auto result_without_term = co_await leader_node.raft()->replicate(
+      make_batches(10, 10, 128),
+      replicate_options(consistency_level::quorum_ack, 10s));
+    ASSERT_FALSE_CORO(result_without_term.has_error());
+}
+
+TEST_F_CORO(raft_fixture, test_replicate_abort_source) {
+    co_await create_simple_group(3);
+    auto leader_id = co_await wait_for_leader(10s);
+    auto& leader_node = node(leader_id);
+    // this should succeed as there were no leadership changes
+    auto result = co_await leader_node.raft()->replicate(
+      make_batches(10, 10, 128),
+      replicate_options(consistency_level::quorum_ack));
+    ASSERT_FALSE_CORO(result.has_error());
+
+    /**
+     * Block all append entries from leader to followers to prevent any
+     * subsequent replicate calls from finishing
+     */
+    leader_node.on_dispatch([](model::node_id, raft::msg_type mt) {
+        if (mt == raft::msg_type::append_entries) {
+            throw std::runtime_error("error");
+        }
+        return ss::now();
+    });
+    /**
+     * Abort after replicate
+     */
+    ss::abort_source as_1;
+    auto as_1_f = leader_node.raft()->replicate(
+      make_batches(1, 1, 128),
+      replicate_options(consistency_level::quorum_ack, std::ref(as_1)));
+    co_await ss::sleep(500ms);
+    ASSERT_FALSE_CORO(as_1_f.available());
+
+    as_1.request_abort();
+    auto r_1 = co_await std::move(as_1_f);
+    ASSERT_TRUE_CORO(r_1.has_error());
+    ASSERT_EQ_CORO(r_1.error(), raft::errc::shutting_down);
+    /**
+     * Already aborted
+     */
+    auto r_2 = co_await leader_node.raft()->replicate(
+      make_batches(1, 1, 128),
+      replicate_options(consistency_level::quorum_ack, std::ref(as_1)));
+
+    ASSERT_TRUE_CORO(r_2.has_error());
+    ASSERT_EQ_CORO(r_2.error(), raft::errc::replicate_first_stage_exception);
 }

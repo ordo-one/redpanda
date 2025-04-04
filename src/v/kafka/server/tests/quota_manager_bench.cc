@@ -13,26 +13,26 @@
 #include "config/configuration.h"
 #include "kafka/server/quota_manager.h"
 
-#include <seastar/core/sleep.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/testing/perf_tests.hh>
 #include <seastar/util/later.hh>
 
 #include <fmt/format.h>
 
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <vector>
 
+namespace kafka {
+
 static const auto fixed_client_id = "shared-client-id";
-static const size_t total_requests{10 << 20};
+static const size_t total_requests{3 << 20};
 static const size_t unique_client_id_count = 1000;
 
 std::vector<ss::sstring> initialize_client_ids() {
     std::vector<ss::sstring> client_ids;
     client_ids.reserve(unique_client_id_count);
-    for (int i = 0; i < unique_client_id_count; ++i) {
+    for (size_t i = 0; i < unique_client_id_count; ++i) {
         client_ids.push_back("client-id-" + std::to_string(i));
     }
     return client_ids;
@@ -40,8 +40,7 @@ std::vector<ss::sstring> initialize_client_ids() {
 
 std::vector<ss::sstring> unique_client_ids = initialize_client_ids();
 
-ss::future<>
-send_requests(kafka::quota_manager& qm, size_t count, bool use_unique) {
+ss::future<> send_requests(quota_manager& qm, size_t count, bool use_unique) {
     auto offset = ss::this_shard_id() * count;
     for (size_t i = 0; i < count; ++i) {
         auto cid_idx = (offset + i) % unique_client_id_count;
@@ -51,12 +50,14 @@ send_requests(kafka::quota_manager& qm, size_t count, bool use_unique) {
         // Have a mixed workload of produce and fetch to highlight any cache
         // contention on produce/fetch token buckets for the same client id
         if (ss::this_shard_id() % 2 == 0) {
-            co_await qm.record_fetch_tp(client_id, 1);
-            auto delay = co_await qm.throttle_fetch_tp(client_id);
+            co_await qm.record_fetch_tp(
+              client_id, 1, quota_manager::clock::now());
+            auto delay = co_await qm.throttle_fetch_tp(
+              client_id, quota_manager::clock::now());
             perf_tests::do_not_optimize(delay);
         } else {
             auto delay = co_await qm.record_produce_tp_and_throttle(
-              client_id, 1);
+              client_id, 1, quota_manager::clock::now());
             perf_tests::do_not_optimize(delay);
         }
         co_await maybe_yield();
@@ -66,13 +67,13 @@ send_requests(kafka::quota_manager& qm, size_t count, bool use_unique) {
 
 ss::future<> test_quota_manager(size_t count, bool use_unique) {
     ss::sharded<cluster::client_quota::store> quota_store;
-    ss::sharded<kafka::quota_manager> sqm;
+    ss::sharded<quota_manager> sqm;
     co_await quota_store.start();
     co_await sqm.start(std::ref(quota_store));
-    co_await sqm.invoke_on_all(&kafka::quota_manager::start);
+    co_await sqm.invoke_on_all(&quota_manager::start);
 
     perf_tests::start_measuring_time();
-    co_await sqm.invoke_on_all([count, use_unique](kafka::quota_manager& qm) {
+    co_await sqm.invoke_on_all([count, use_unique](quota_manager& qm) {
         return send_requests(qm, count, use_unique);
     });
     perf_tests::stop_measuring_time();
@@ -150,12 +151,12 @@ static const size_t n_repeats = 100;
 
 future<size_t> run_latency_test(latency_test_case tc) {
     ss::sharded<cluster::client_quota::store> quota_store;
-    ss::sharded<kafka::quota_manager> sqm;
+    ss::sharded<quota_manager> sqm;
     co_await quota_store.start();
     co_await sqm.start(std::ref(quota_store));
-    co_await sqm.invoke_on_all(&kafka::quota_manager::start);
+    co_await sqm.invoke_on_all(&quota_manager::start);
 
-    auto shard = tc.on_shard_0 ? 0 : 1;
+    unsigned shard = tc.on_shard_0 ? 0 : 1;
     BOOST_ASSERT_MSG(
       shard < ss::smp::count, "Not enough cores available for the benchmark");
 
@@ -178,7 +179,7 @@ future<size_t> run_latency_test(latency_test_case tc) {
                 });
           }
 
-          auto now = kafka::quota_manager::clock::now();
+          auto now = quota_manager::clock::now();
 
           // Have a non-trivial number of existing clients in the map
           for (int i = 0; i < tc.n_other_clients; i++) {
@@ -190,11 +191,11 @@ future<size_t> run_latency_test(latency_test_case tc) {
           auto client_ids = std::vector<ss::sstring>{};
           client_ids.reserve(n_repeats);
           if (tc.is_new_client) {
-              for (int i = 0; i < n_repeats; i++) {
+              for (size_t i = 0; i < n_repeats; i++) {
                   client_ids.emplace_back(fmt::format("new-client-{}", i));
               }
           } else {
-              for (int i = 0; i < n_repeats; i++) {
+              for (size_t i = 0; i < n_repeats; i++) {
                   client_ids.emplace_back(fixed_client_id);
               }
               // Ensure that the client id used is already "known"
@@ -205,7 +206,7 @@ future<size_t> run_latency_test(latency_test_case tc) {
           perf_tests::start_measuring_time();
 
           // Run repeatedly to reduce the overhead of start/stop_measuring_time
-          for (int i = 0; i < n_repeats; i++) {
+          for (size_t i = 0; i < n_repeats; i++) {
               if (tc.is_produce_not_fetch) {
                   // Produce
                   auto res = co_await qm.record_produce_tp_and_throttle(
@@ -465,3 +466,4 @@ PERF_TEST_CN(latency_group, default_configs_fetch_worst) {
       .no_quotas = true,
     });
 }
+} // namespace kafka

@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
 
 #include "iceberg/datatypes.h"
@@ -13,6 +14,10 @@
 #include "iceberg/partition.h"
 #include "iceberg/schema.h"
 #include "utils/uuid.h"
+
+namespace iceberg {
+struct table_metadata;
+}
 
 namespace iceberg::table_requirement {
 
@@ -34,6 +39,10 @@ struct assert_last_assigned_partition_id {
     partition_field::id_t last_assigned_partition_id;
 };
 
+struct assert_default_spec_id {
+    partition_spec::id_t default_spec_id;
+};
+
 struct assert_ref_snapshot_id {
     ss::sstring ref;
     std::optional<snapshot_id> snapshot_id;
@@ -49,6 +58,13 @@ using requirement = std::variant<
   assert_ref_snapshot_id,
   assert_table_uuid,
   last_assigned_field_match,
-  assert_last_assigned_partition_id>;
+  assert_last_assigned_partition_id,
+  assert_default_spec_id>;
+
+// Check if the requirement is satisfied. If the requirement fails, return a
+// string describing the problem. nullptr opt_metadata means that there is no
+// table yet.
+checked<std::nullopt_t, ss::sstring>
+check(const requirement&, const table_metadata* opt_metadata);
 
 } // namespace iceberg::table_requirement

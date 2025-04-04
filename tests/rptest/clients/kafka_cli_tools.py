@@ -64,14 +64,16 @@ class KafkaCliTools:
     Wrapper around the Kafka admin command line tools.
     """
 
-    # See tests/docker/Dockerfile to add new versions
-    VERSIONS = ("3.0.0", "2.7.0", "2.5.0", "2.4.1", "2.3.1")
+    # See tests/docker/ducktape-deps/kafka-tools to add new versions
+    VERSIONS = ("3.9.0", "3.8.0", "3.7.0", "3.0.0", "2.7.0", "2.5.0", "2.4.1",
+                "2.3.1")
 
     def __init__(self,
                  redpanda: RedpandaServiceForClients,
                  version: str | None = None,
                  user: str | None = None,
                  passwd: str | None = None,
+                 algorithm: str | None = 'SCRAM-SHA-256',
                  protocol: str = 'SASL_PLAINTEXT',
                  oauth_cfg: OAuthConfig | None = None):
         self._redpanda = redpanda
@@ -94,7 +96,7 @@ class KafkaCliTools:
             if user:
                 security = security.override(user,
                                              passwd,
-                                             'SCRAM-SHA-256',
+                                             algorithm,
                                              tls_enabled=None)
 
             if sasl := security.simple_credentials():
@@ -152,6 +154,15 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
             args += ["--config", f"retention.ms={spec.retention_ms}"]
         if spec.max_message_bytes:
             args += ["--config", f"max.message.bytes={spec.max_message_bytes}"]
+        if spec.delete_retention_ms:
+            args += [
+                "--config", f"delete.retention.ms={spec.delete_retention_ms}"
+            ]
+        if spec.min_cleanable_dirty_ratio is not None:
+            args += [
+                "--config",
+                f"min.cleanable.dirty.ratio={spec.min_cleanable_dirty_ratio}"
+            ]
         return self._run("kafka-topics.sh", args, desc="create_topic")
 
     def create_topic_partitions(self, topic: str, partitions: int):
@@ -241,13 +252,16 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
 
         assert configs is not None, "didn't find Configs: section"
 
-        def maybe_int(key: str, value: str):
+        def maybe_convert_value(key: str, value: str):
             if key in [
                     "retention_ms", "retention_bytes", 'segment_bytes',
                     'delete_retention_ms'
             ]:
                 return int(value)
-            return value
+            elif key in ['min_cleanable_dirty_ratio']:
+                return float(value)
+            else:
+                return value
 
         def fix_key(key: str):
             return key.replace(".", "_")
@@ -259,7 +273,10 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         ]
 
         configs = {fix_key(kv[0].strip()): kv[1].strip() for kv in configs}
-        configs = {kv[0]: maybe_int(kv[0], kv[1]) for kv in configs.items()}
+        configs = {
+            kv[0]: maybe_convert_value(kv[0], kv[1])
+            for kv in configs.items()
+        }
         configs["replication_factor"] = replication_factor
         configs["partition_count"] = partitions
         # The cast below is needed because a dict cannot be unpacked as keyword args
@@ -324,7 +341,8 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
                 acks: int = -1,
                 throughput: int = -1,
                 batch_size: int = 81960,
-                linger_ms: int = 0):
+                linger_ms: int = 0,
+                enable_idempotence: bool = True):
         self._redpanda.logger.debug("Producing to topic: %s", topic)
         cmd = [self._script("kafka-producer-perf-test.sh")]
         cmd += ["--topic", topic]
@@ -339,6 +357,8 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
             "bootstrap.servers=%s" % self._redpanda.brokers(),
             "linger.ms=%d" % linger_ms,
         ]
+        if enable_idempotence is False:
+            cmd += ["enable.idempotence=false"]
         if self._command_config:
             cmd += ["--producer.config", self._command_config.name]
         return self._execute(cmd, "produce")
@@ -382,6 +402,8 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         assert split_str[-1] == ""
         partition_watermark_lines = split_str[2:-1]
         for partition_watermark_line in partition_watermark_lines:
+            if not partition_watermark_line.startswith("partition: "):
+                continue
             topic_partition_str, result_str = partition_watermark_line.strip(
             ).split('\t')
             topic_partition_str_split = topic_partition_str.split(
@@ -481,7 +503,7 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         split_str = res.split("\n")
         info_str = split_str[0]
         info_key = info_str.strip().split("\t")
-        assert info_key == expected_columns, f"{info_key}"
+        assert info_key == expected_columns, f"{info_key} vs {expected_columns}"
 
         assert split_str[-1] == ""
 

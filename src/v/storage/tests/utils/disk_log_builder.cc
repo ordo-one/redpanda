@@ -158,14 +158,25 @@ disk_log_builder::apply_retention(gc_config cfg) {
     return get_disk_log_impl().do_gc(cfg);
 }
 
-ss::future<> disk_log_builder::apply_compaction(
+ss::future<> disk_log_builder::apply_adjacent_merge_compaction(
   compaction_config cfg, std::optional<model::offset> new_start_offset) {
     return get_disk_log_impl().adjacent_merge_compact(cfg, new_start_offset);
+}
+
+ss::future<bool> disk_log_builder::apply_sliding_window_compaction(
+  compaction_config cfg, std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().sliding_window_compact(cfg, new_start_offset);
 }
 
 ss::future<bool>
 disk_log_builder::update_start_offset(model::offset start_offset) {
     return get_disk_log_impl().update_start_offset(start_offset);
+}
+void disk_log_builder::add_dirty_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_dirty_segment_bytes(bytes);
+}
+void disk_log_builder::add_closed_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_closed_segment_bytes(bytes);
 }
 
 ss::future<> disk_log_builder::stop() {

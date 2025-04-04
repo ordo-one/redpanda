@@ -12,6 +12,19 @@ v_cc_library(
     value_generator.cc
   DEPS
     v::iceberg
+    v::test_random_bytes
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME iceberg_compatibility
+  SOURCES
+    compatibility_test.cc
+    compatibility_utils_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::iceberg_test_utils
 )
 
 rp_test(
@@ -31,6 +44,7 @@ rp_test(
     partition_key_test.cc
     partition_key_type_test.cc
     partition_test.cc
+    remove_snapshots_action_test.cc
     schema_avro_test.cc
     schema_json_test.cc
     schema_test.cc
@@ -38,10 +52,12 @@ rp_test(
     struct_accessor_test.cc
     table_metadata_json_test.cc
     table_requests_json_test.cc
+    table_requirements_test.cc
     table_update_applier_test.cc
     test_table_metadata.cc
     transform_json_test.cc
     transform_utils_test.cc
+    update_partition_spec_action_test.cc
     update_schema_action_test.cc
     values_test.cc
     values_avro_test.cc
@@ -60,9 +76,22 @@ rp_test(
     v::cloud_io_utils
     v::s3_imposter
     v::iceberg_test_utils
+    v::test_random_bytes
   INPUT_FILES
     "${testdata_dir}/nested_manifest.avro"
   ARGS "-- -c1"
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME iceberg_values_json
+  SOURCES
+    values_json_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::iceberg_test_utils
+    v::test_random_bytes
 )
 
 rp_test(
@@ -72,4 +101,14 @@ rp_test(
   LIBRARIES
     Seastar::seastar_perf_testing
     v::iceberg
+)
+
+rp_test(
+  BENCHMARK_TEST
+  BINARY_NAME iceberg_compatibility
+  SOURCES compatibility_bench.cc
+  LIBRARIES
+    Seastar::seastar_perf_testing
+    v::iceberg
+    v::iceberg_test_utils
 )

@@ -11,6 +11,7 @@
 
 #include "iceberg/catalog.h"
 #include "iceberg/datatypes.h"
+#include "iceberg/partition.h"
 #include "iceberg/table_identifier.h"
 
 namespace datalake {
@@ -29,25 +30,52 @@ public:
     friend std::ostream& operator<<(std::ostream&, const errc&);
 
     virtual ss::future<checked<std::nullopt_t, errc>> ensure_table_schema(
-      const model::topic&, const iceberg::struct_type& desired_type)
+      const iceberg::table_identifier&,
+      const iceberg::struct_type& desired_type,
+      const iceberg::unresolved_partition_spec&)
       = 0;
-    virtual ss::future<checked<std::nullopt_t, errc>>
-    get_registered_ids(const model::topic&, iceberg::struct_type& desired_type)
-      = 0;
-    virtual ~schema_manager() = default;
 
-    iceberg::table_identifier table_id_for_topic(const model::topic& t) const;
+    struct table_info {
+        iceberg::table_identifier id;
+        iceberg::schema schema;
+        iceberg::partition_spec partition_spec;
+        iceberg::uri location;
+
+        // Fills the field IDs of the given type with those in the current
+        // schema. Returns true on success.
+        bool fill_registered_ids(iceberg::struct_type&);
+    };
+
+    virtual ss::future<checked<table_info, errc>> get_table_info(
+      const iceberg::table_identifier&,
+      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type
+      = std::nullopt)
+      = 0;
+
+    virtual ~schema_manager() = default;
 };
 
+// Used in unit tests
 class simple_schema_manager : public schema_manager {
+public:
+    explicit simple_schema_manager(iceberg::uri table_location_prefix = {})
+      : table_location_prefix_(std::move(table_location_prefix)) {}
+
 public:
     ss::future<checked<std::nullopt_t, schema_manager::errc>>
     ensure_table_schema(
-      const model::topic&, const iceberg::struct_type& desired_type) override;
-    ss::future<checked<std::nullopt_t, schema_manager::errc>>
-    get_registered_ids(
-      const model::topic&, iceberg::struct_type& desired_type) override;
-    ~simple_schema_manager() override = default;
+      const iceberg::table_identifier&,
+      const iceberg::struct_type& desired_type,
+      const iceberg::unresolved_partition_spec&) override;
+
+    ss::future<checked<table_info, schema_manager::errc>> get_table_info(
+      const iceberg::table_identifier&,
+      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type
+      = std::nullopt) override;
+
+private:
+    iceberg::uri table_location_prefix_;
+    chunked_hash_map<iceberg::table_identifier, table_info> table_info_by_id;
 };
 
 // Manages interactions with the catalog when reconciling the current schema of
@@ -64,13 +92,15 @@ public:
     // schema is updated to the desired type.
     ss::future<checked<std::nullopt_t, schema_manager::errc>>
     ensure_table_schema(
-      const model::topic&, const iceberg::struct_type& desired_type) override;
+      const iceberg::table_identifier&,
+      const iceberg::struct_type& desired_type,
+      const iceberg::unresolved_partition_spec&) override;
 
-    // Loads the table metadata for the given topic and fills the field IDs of
-    // the given type with those in the current schema.
-    ss::future<checked<std::nullopt_t, schema_manager::errc>>
-    get_registered_ids(
-      const model::topic&, iceberg::struct_type& desired_type) override;
+    // Loads the table metadata for the given topic.
+    ss::future<checked<table_info, schema_manager::errc>> get_table_info(
+      const iceberg::table_identifier&,
+      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type
+      = std::nullopt) override;
 
 private:
     // Attempts to fill the field ids in the given type with those from the

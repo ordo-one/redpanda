@@ -57,6 +57,21 @@ ss::future<ensure_table_exists_reply> do_ensure_table_exists(
     }
     co_return ensure_table_exists_reply{errc::ok};
 }
+ss::future<ensure_dlq_table_exists_reply> do_ensure_dlq_table_exists(
+  coordinator_manager& mgr,
+  model::ntp coordinator_ntp,
+  ensure_dlq_table_exists_request req) {
+    auto crd = mgr.get(coordinator_ntp);
+    if (!crd) {
+        co_return ensure_dlq_table_exists_reply{errc::not_leader};
+    }
+    auto ret = co_await crd->sync_ensure_dlq_table_exists(
+      req.topic, req.topic_revision);
+    if (ret.has_error()) {
+        co_return to_rpc_errc(ret.error());
+    }
+    co_return ensure_dlq_table_exists_reply{errc::ok};
+}
 ss::future<add_translated_data_files_reply> add_files(
   coordinator_manager& mgr,
   model::ntp coordinator_ntp,
@@ -109,13 +124,14 @@ auto frontend::remote_dispatch(req_t request, model::node_id leader_id) {
               ::rpc::client_opts{model::timeout_clock::now() + rpc_timeout});
         })
       .then(&::rpc::get_ctx_data<resp_t>)
-      .then([leader_id](result<resp_t> r) {
+      .then([leader_id, self = _self](result<resp_t> r) {
           if (r.has_error()) {
               vlog(
                 datalake::datalake_log.warn,
-                "got error {} on coordinator {}",
+                "got error {} sending to coordinator leader {} from node {}",
                 r.error().message(),
-                leader_id);
+                leader_id,
+                self);
               return resp_t{errc::timeout};
           }
           return r.value();
@@ -300,6 +316,33 @@ ss::future<ensure_table_exists_reply> frontend::ensure_table_exists(
     co_return co_await process<
       &frontend::ensure_table_exists_locally,
       &client::ensure_table_exists>(std::move(request), bool(local_only_exec));
+}
+
+ss::future<ensure_dlq_table_exists_reply>
+frontend::ensure_dlq_table_exists_locally(
+  ensure_dlq_table_exists_request request,
+  const model::ntp& coordinator_partition,
+  ss::shard_id shard) {
+    co_return co_await _coordinator_mgr->invoke_on(
+      shard,
+      [coordinator_partition,
+       req = std::move(request)](coordinator_manager& mgr) mutable {
+          auto partition = mgr.get(coordinator_partition);
+          if (!partition) {
+              return ssx::now(ensure_dlq_table_exists_reply{errc::not_leader});
+          }
+          return do_ensure_dlq_table_exists(
+            mgr, coordinator_partition, std::move(req));
+      });
+}
+
+ss::future<ensure_dlq_table_exists_reply> frontend::ensure_dlq_table_exists(
+  ensure_dlq_table_exists_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &frontend::ensure_dlq_table_exists_locally,
+      &client::ensure_dlq_table_exists>(
+      std::move(request), bool(local_only_exec));
 }
 
 ss::future<add_translated_data_files_reply>

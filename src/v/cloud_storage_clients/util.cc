@@ -12,10 +12,16 @@
 
 #include "base/vlog.h"
 #include "bytes/streambuf.h"
+#include "http/utils.h"
 #include "net/connection.h"
 #include "utils/retry_chain_node.h"
 
+#include <seastar/core/future.hh>
+
 #include <boost/property_tree/xml_parser.hpp>
+
+#include <exception>
+#include <system_error>
 
 namespace {
 
@@ -38,6 +44,28 @@ namespace cloud_storage_clients::util {
 bool has_abort_or_gate_close_exception(const ss::nested_exception& ex) {
     return is_abort_or_gate_close_exception(ex.inner)
            || is_abort_or_gate_close_exception(ex.outer);
+}
+
+bool is_nested_reconnect_error(const ss::nested_exception& ex) {
+    try {
+        std::rethrow_exception(ex.inner);
+    } catch (const std::system_error& e) {
+        if (!net::is_reconnect_error(e)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    try {
+        std::rethrow_exception(ex.outer);
+    } catch (const std::system_error& e) {
+        if (!net::is_reconnect_error(e)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
 }
 
 template<typename Logger>
@@ -103,10 +131,12 @@ error_outcome handle_client_transport_error(
         if (has_abort_or_gate_close_exception(ex)) {
             vlog(logger.debug, "Nested abort or gate closed: {}", ex);
             throw;
+        } else if (is_nested_reconnect_error(ex)) {
+            vlog(logger.warn, "Connection error {}", std::current_exception());
+        } else {
+            vlog(logger.error, "Unexpected error {}", std::current_exception());
+            outcome = error_outcome::fail;
         }
-
-        vlog(logger.error, "Unexpected error {}", std::current_exception());
-        outcome = error_outcome::fail;
     } catch (...) {
         vlog(logger.error, "Unexpected error {}", std::current_exception());
         outcome = error_outcome::fail;
@@ -224,6 +254,24 @@ std::vector<object_key> all_paths_to_file(const object_key& path) {
     }
 
     return paths;
+}
+
+void url_encode_target(http::client::request_header& header) {
+    auto query_pos = header.target().find_first_of("?");
+    // encode full target as there are no query parameters
+    if (query_pos == std::string::npos) {
+        header.target(std::string(
+          http::uri_encode(header.target(), http::uri_encode_slash::no)));
+    } else {
+        // encode only the path part of the target
+        // TODO: add individual query parameters encoding here as well.
+        header.target(fmt::format(
+          "{}{}",
+          http::uri_encode(
+            std::string_view(header.target().begin(), query_pos),
+            http::uri_encode_slash::no),
+          header.target().substr(query_pos)));
+    }
 }
 
 } // namespace cloud_storage_clients::util

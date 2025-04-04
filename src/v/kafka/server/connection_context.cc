@@ -19,6 +19,7 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "kafka/protocol/sasl_authenticate.h"
+#include "kafka/server/datalake_throttle_manager.h"
 #include "kafka/server/handlers/fetch.h"
 #include "kafka/server/handlers/handler_interface.h"
 #include "kafka/server/handlers/produce.h"
@@ -36,12 +37,14 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/scattered_message.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/switch_to.hh>
 
 #include <chrono>
 #include <cstdint>
@@ -355,6 +358,7 @@ ss::future<> connection_context::revoke_credentials(std::string_view name) {
 }
 
 ss::future<> connection_context::process() {
+    co_await ss::coroutine::switch_to(_server.get_request_handler_sg());
     while (true) {
         if (is_finished_parsing()) {
             break;
@@ -558,6 +562,12 @@ connection_context::record_tp_and_calculate_throttle(
         auto produce_delay
           = co_await _server.quota_mgr().record_produce_tp_and_throttle(
             r_data.client_id, request_size, now);
+        auto datalake_produce_delay
+          = co_await _server.get_datalake_producer_throttle(r_data.client_id);
+
+        produce_delay = std::max(
+          produce_delay,
+          std::chrono::duration_cast<clock::duration>(datalake_produce_delay));
         auto produce_enforced = _throttling_state.update_produce_delay(
           produce_delay, now);
         client_quota_delay = delay_t{
@@ -673,6 +683,16 @@ connection_context::reserve_request_units(api_key key, size_t size) {
     }
     return fut;
 }
+// Returns handler specific connection override if available.
+std::optional<ss::scheduling_group>
+connection_context::get_scheduling_group_override(api_key api_key) const {
+    auto handler = handler_for_key(api_key);
+    if (!handler) {
+        return std::nullopt;
+    }
+
+    return (*handler)->scheduling_group_override(*this);
+}
 
 ss::future<>
 connection_context::dispatch_method_once(request_header hdr, size_t size) {
@@ -682,6 +702,17 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
                      ? std::make_optional<ss::sstring>(*hdr.client_id)
                      : std::nullopt,
     };
+
+    auto sg_override = get_scheduling_group_override(hdr.key);
+    // If handler provides an override, swith scheduling group
+    if (sg_override) {
+        co_await ss::coroutine::switch_to(*sg_override);
+    } else if (!_server.get_request_handler_sg().active()) {
+        // if a handler does not provide an override, check if the default
+        // scheduling group is active, and switch the group if needed
+        co_await ss::coroutine::switch_to(_server.get_request_handler_sg());
+    }
+
     auto sres_in = co_await throttle_request(std::move(r_data), size);
     if (abort_requested()) {
         // protect against shutdown behavior
@@ -891,6 +922,12 @@ ss::future<> connection_context::client_protocol_state::handle_response(
 ss::future<ss::stop_iteration>
 connection_context::client_protocol_state::do_process_responses(
   ss::lw_shared_ptr<connection_context> connection_ctx) {
+    // Because this method may be called from multiple background fibres
+    // concurrently, this semaphore ensures that scheduling points inside this
+    // method cannot lead to responses being writtent to the connection out of
+    // order.
+    auto units = co_await ss::get_units(_resp_sem, 1);
+
     auto it = _responses.find(_next_response);
     if (it == _responses.end()) {
         co_return ss::stop_iteration::yes;
@@ -909,7 +946,9 @@ connection_context::client_protocol_state::do_process_responses(
     auto msg = response_as_scattered(std::move(resp_and_res.response));
     if (resp_and_res.resources->request_data.request_key == fetch_api::key) {
         co_await connection_ctx->_server.quota_mgr().record_fetch_tp(
-          resp_and_res.resources->request_data.client_id, msg.size());
+          resp_and_res.resources->request_data.client_id,
+          msg.size(),
+          quota_manager::clock::now());
     }
     // Respose sizes only take effect on throttling at the next
     // request processing. The better way was to measure throttle

@@ -18,6 +18,10 @@
 #include "serde/parquet/metadata.h"
 #include "serde/parquet/shredder.h"
 
+#include <absl/container/flat_hash_set.h>
+
+#include <algorithm>
+
 namespace serde::parquet {
 
 namespace {
@@ -62,58 +66,90 @@ public:
         co_await write_iobuf(iobuf::from("PAR1"));
     }
 
-    ss::future<> write_row(group_value row) {
+    ss::future<file_stats> write_row(group_value row) {
         co_await shred_record(
           _opts.schema, std::move(row), [this](shredded_value sv) {
               return write_value(std::move(sv));
           });
-        ++_stats.current_row_group.rows;
+        file_stats stats;
+        stats.buffered_size = 0;
+        for (auto& [_, col] : _columns) {
+            int64_t usage = col.writer.current_page_memory_usage();
+            if (usage > _opts.page_buffer_size) {
+                co_await col.writer.next_page();
+            }
+            stats.buffered_size += col.writer.current_page_memory_usage();
+        }
+        stats.flushed_size = _flushed_bytes;
+        co_return stats;
     }
 
-    file_stats stats() const { return _stats; }
+    file_stats stats() const {
+        int64_t buffered = 0;
+        for (const auto& [_, col] : _columns) {
+            buffered += col.writer.memory_usage();
+        }
+        return {
+          .flushed_size = _flushed_bytes,
+          .buffered_size = buffered,
+        };
+    }
 
     ss::future<> flush_row_group() {
-        if (_stats.current_row_group.rows == 0) {
-            co_return;
-        }
         row_group rg{
           .total_byte_size = 0, // Computed incrementally below
-          .num_rows = _stats.current_row_group.rows,
-          .file_offset = static_cast<int64_t>(_stats.size),
+          .num_rows = 0,        // computed below
+          .file_offset = _flushed_bytes,
           .total_compressed_size = 0, // Computed incrementally below
           .ordinal = static_cast<int16_t>(_row_groups.size()),
         };
+        size_t page_count = 0;
         for (auto& [pos, col] : _columns) {
-            auto page = co_await col.writer.flush_page();
-            auto& data_header = std::get<data_page_header>(page.header.type);
-            auto uncompressed_size = page.header.uncompressed_page_size
-                                     + page.serialized_header_size;
-            auto compressed_size = page.header.compressed_page_size
-                                   + page.serialized_header_size;
-            rg.total_byte_size += uncompressed_size;
-            rg.total_compressed_size += compressed_size;
-            rg.columns.push_back(column_chunk{
-              .meta_data = column_meta_data{
-                .type = col.leaf->type,
-                .encodings = {data_header.data_encoding},
-                .path_in_schema = path_in_schema(*col.leaf),
-                .codec = _opts.compress ? compression_codec::zstd : compression_codec::uncompressed,
-                .num_values = data_header.num_values,
-                .total_uncompressed_size = uncompressed_size,
-                .total_compressed_size = compressed_size,
-                .key_value_metadata = {},
-                .data_page_offset = static_cast<int64_t>(_stats.size),
-                // Because we only write a single page per row group at the moment,
-                // a column chunk's stats are trivially the same as it's page.
-                // When we have multiple pages in a row group we'll have to 
-                // calculate these dynamically.
-                .stats = std::move(data_header.stats),
-              },
-            });
-            co_await write_iobuf(std::move(page.serialized));
+            auto flushed = co_await col.writer.flush_pages();
+            page_count += flushed.pages.size();
+            column_chunk chunk {
+                .meta_data = column_meta_data{
+                  .type = col.leaf->type,
+                  .encodings = {}, // computed below
+                  .path_in_schema = path_in_schema(*col.leaf),
+                  .codec = _opts.compress ? compression_codec::zstd
+                                          : compression_codec::uncompressed,
+                  .num_values = 0,              // computed below
+                  .total_uncompressed_size = 0, // computed below
+                  .total_compressed_size = 0,   // computed below
+                  .key_value_metadata = {},
+                  .data_page_offset = _flushed_bytes,
+                  .stats = std::move(flushed.stats),
+                },
+            };
+            int64_t row_count = 0;
+            // Only collect unique encodings
+            absl::flat_hash_set<encoding> encodings;
+            for (auto& page : flushed.pages) {
+                auto& data_header = std::get<data_page_header>(
+                  page.header.type);
+                encodings.insert(data_header.data_encoding);
+                row_count += data_header.num_rows;
+                chunk.meta_data.num_values += data_header.num_values;
+                auto uncompressed_size = page.header.uncompressed_page_size
+                                         + page.serialized_header_size;
+                chunk.meta_data.total_uncompressed_size += uncompressed_size;
+                auto compressed_size = page.header.compressed_page_size
+                                       + page.serialized_header_size;
+                chunk.meta_data.total_compressed_size += compressed_size;
+                co_await write_iobuf(std::move(page.serialized));
+            }
+            chunk.meta_data.encodings.append_range(std::move(encodings));
+            // sort encodings so that our output is deterministic
+            std::ranges::sort(chunk.meta_data.encodings);
+            rg.num_rows = row_count;
+            rg.total_byte_size += chunk.meta_data.total_uncompressed_size;
+            rg.total_compressed_size += chunk.meta_data.total_compressed_size;
+            rg.columns.push_back(std::move(chunk));
         }
-        _stats.rows += _stats.current_row_group.rows;
-        _stats.current_row_group = {};
+        if (page_count == 0) {
+            co_return;
+        }
         _row_groups.push_back(std::move(rg));
     }
 
@@ -157,15 +193,13 @@ private:
 
     ss::future<> write_value(shredded_value sv) {
         auto& col = _columns.at(sv.schema_element_position);
-        auto stats = col.writer.add(
-          std::move(sv.val), sv.rep_level, sv.def_level);
-        _stats.current_row_group.memory_usage += stats.memory_usage;
+        col.writer.add(std::move(sv.val), sv.rep_level, sv.def_level);
         return ss::now();
     }
 
     ss::future<> write_iobuf(iobuf b) {
-        _stats.size += b.size_bytes();
-        co_await write_iobuf_to_output_stream(std::move(b), _output);
+        _flushed_bytes += static_cast<int64_t>(b.size_bytes());
+        return write_iobuf_to_output_stream(std::move(b), _output);
     }
 
     struct column {
@@ -177,7 +211,7 @@ private:
     ss::output_stream<char> _output;
     contiguous_range_map<int32_t, column> _columns;
     chunked_vector<row_group> _row_groups;
-    file_stats _stats;
+    int64_t _flushed_bytes = 0;
 };
 
 writer::writer(options opts, ss::output_stream<char> output)
@@ -189,7 +223,7 @@ writer::~writer() noexcept = default;
 
 ss::future<> writer::init() { return _impl->init(); }
 
-ss::future<> writer::write_row(group_value row) {
+ss::future<file_stats> writer::write_row(group_value row) {
     return _impl->write_row(std::move(row));
 }
 

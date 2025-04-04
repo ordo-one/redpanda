@@ -19,6 +19,7 @@
 #include "http/client.h"
 #include "model/metadata.h"
 #include "security/fwd.h"
+#include "storage/fwd.h"
 #include "utils/prefix_logger.h"
 #include "utils/unresolved_address.h"
 
@@ -41,6 +42,28 @@ struct address {
 };
 
 address parse_url(const ss::sstring&);
+
+class metrics_http_client {
+public:
+    struct configs {
+        address& addr;
+        prefix_logger& logger;
+        ss::abort_source& as;
+    };
+
+    static ss::future<> send_metrics(configs conf, iobuf);
+
+private:
+    ss::future<http::client> make_http_client();
+    ss::future<> do_send_metrics(http::client&);
+
+    metrics_http_client(configs conf, iobuf out)
+      : _conf(conf)
+      , _out(std::move(out)) {};
+
+    configs _conf;
+    iobuf _out;
+};
 
 }; // namespace details
 
@@ -66,9 +89,14 @@ public:
         static constexpr int16_t version = 1;
 
         ss::sstring cluster_uuid;
+        ss::sstring storage_uuid;
         uint64_t cluster_creation_epoch{0};
         uint32_t topic_count{0};
         uint32_t partition_count{0};
+
+        uint32_t topics_with_iceberg_kv{0};
+        uint32_t topics_with_iceberg_sr{0};
+        uint32_t topics_with_iceberg_pb{0};
 
         cluster_version active_logical_version{invalid_version};
         cluster_version original_logical_version{invalid_version};
@@ -105,23 +133,25 @@ public:
       ss::sharded<security::role_store>& role_store,
       ss::sharded<plugin_table>*,
       ss::sharded<feature_manager>*,
+      ss::sharded<storage::api>*,
       ss::sharded<ss::abort_source>&);
 
     ss::future<> start();
     ss::future<> stop();
+
+    ss::future<> wait_cluster_info_initialized(ss::abort_source&);
 
 private:
     void report_metrics();
     ss::future<> do_report_metrics();
     ss::future<result<metrics_snapshot>> build_metrics_snapshot();
 
-    ss::future<http::client> make_http_client();
-    ss::future<> do_send_metrics(http::client&, iobuf body);
     ss::future<> try_initialize_cluster_info();
     ss::future<> propagate_cluster_id();
 
     consensus_ptr _raft0;
     metrics_reporter_cluster_info& _cluster_info; // owned by controller_stm
+    ss::condition_variable _cluster_info_initialized_cvar;
     ss::sharded<controller_stm>& _controller_stm;
     ss::sharded<members_table>& _members_table;
     ss::sharded<topic_table>& _topics;
@@ -131,6 +161,7 @@ private:
     ss::sharded<security::role_store>& _role_store;
     ss::sharded<plugin_table>* _plugin_table;
     ss::sharded<feature_manager>* _feature_manager;
+    ss::sharded<storage::api>* _storage;
     ss::sharded<ss::abort_source>& _as;
     prefix_logger _logger;
     ss::timer<> _tick_timer;

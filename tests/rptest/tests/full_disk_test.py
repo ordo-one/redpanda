@@ -147,7 +147,7 @@ class WriteRejectTest(RedpandaTest):
             # Looking for a log statement about a change in disk space.
             # This is a check for the health monitor frontend because
             # that structure logs disk space alerts.
-            pattern = f"Update disk health cache {disk_space_change}"
+            pattern = f"Update data disk health cache {disk_space_change}"
             wait_until(
                 lambda: self.redpanda.search_log_any(pattern),
                 timeout_sec=5,
@@ -319,7 +319,7 @@ class FullDiskReclaimTest(RedpandaTest):
             metric_name=
             "vectorized_storage_manager_housekeeping_log_processed_total",
             metrics_endpoint=MetricsEndpoint.METRICS
-        ) == 0, "Housekeeping should not have run yet"
+        ) == 0, "Housekeeping should not have run"
 
         assert self.redpanda.metric_sum(
             metric_name="vectorized_storage_manager_urgent_gc_runs_total",
@@ -342,11 +342,12 @@ class FullDiskReclaimTest(RedpandaTest):
             timeout_sec=10,
             backoff_sec=2)
 
+        # Disk space alerts only triggers urgent gc, not housekeeping.
         assert self.redpanda.metric_sum(
             metric_name=
             "vectorized_storage_manager_housekeeping_log_processed_total",
             metrics_endpoint=MetricsEndpoint.METRICS
-        ) > 0, "Housekeeping should have run"
+        ) == 0, "Housekeeping should not have run"
 
         assert self.redpanda.metric_sum(
             metric_name="vectorized_storage_manager_urgent_gc_runs_total",
@@ -378,7 +379,8 @@ class LocalDiskReportTimeTest(RedpandaTest):
                             1024,
                             throughput=500,
                             acks=-1,
-                            linger_ms=50)
+                            linger_ms=50,
+                            enable_idempotence=False)
 
         node = self.redpanda.nodes[0]
         reported = admin.get_local_storage_usage(

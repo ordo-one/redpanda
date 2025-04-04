@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
 
 #include "container/fragmented_vector.h"
@@ -84,6 +85,35 @@ struct table_metadata {
 
     // TODO: (optional) statistics
     // TODO: (optional) partition_statistics
+
+    const partition_spec* get_partition_spec(partition_spec::id_t id) const {
+        auto it = std::ranges::find(
+          partition_specs, id, &partition_spec::spec_id);
+        return it != partition_specs.end() ? &*it : nullptr;
+    }
+
+    const schema* get_schema(schema::id_t id) const {
+        auto it = std::ranges::find(schemas, id, &schema::schema_id);
+        return it != schemas.end() ? &*it : nullptr;
+    }
+
+    // Search for a schema that matches the provided type. Start from the end of
+    // the list to short circuit on the common case (desired type is current,
+    // latest schema)
+    const schema* get_equivalent_schema(const struct_type& type) const;
+
+    // TODO: consider making this a lazy data member if it gets used by many
+    // callers for the same metadata.
+    chunked_hash_map<snapshot_id, snapshot> get_snapshots_by_id() const {
+        chunked_hash_map<snapshot_id, snapshot> snaps_by_id;
+        if (!snapshots.has_value()) {
+            return snaps_by_id;
+        }
+        for (const auto& s : *snapshots) {
+            snaps_by_id.emplace(s.id, s);
+        }
+        return snaps_by_id;
+    }
 
     friend bool operator==(const table_metadata&, const table_metadata&)
       = default;

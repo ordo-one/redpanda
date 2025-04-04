@@ -374,7 +374,47 @@ create_topic_properties_update(
                   update.properties.iceberg_delete, cfg.value, op);
                 continue;
             }
+            if (cfg.name == topic_property_iceberg_partition_spec) {
+                // Use std::identity as the "parser function" (i.e. pass through
+                // the raw string) because boost::lexical_cast<ss::sstring> (the
+                // default) doesn't allow spaces in the config value.
+                parse_and_set_optional(
+                  update.properties.iceberg_partition_spec,
+                  cfg.value,
+                  op,
+                  iceberg_partition_spec_validator{},
+                  std::identity{});
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_invalid_record_action) {
+                parse_and_set_optional(
+                  update.properties.iceberg_invalid_record_action,
+                  cfg.value,
+                  op);
+                continue;
+            }
+            if (cfg.name == topic_property_remote_allow_gaps) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.remote_allow_gaps, cfg.value, op);
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_target_lag_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.iceberg_target_lag_ms,
+                  cfg.value,
+                  op,
+                  iceberg_target_lag_ms_validator{});
+                continue;
+            }
 
+            if (cfg.name == topic_property_min_cleanable_dirty_ratio) {
+                parse_and_set_tristate(
+                  update.properties.min_cleanable_dirty_ratio,
+                  cfg.value,
+                  op,
+                  min_cleanable_dirty_ratio_validator{});
+                continue;
+            }
         } catch (const validation_error& e) {
             vlog(
               klog.debug,
@@ -455,7 +495,8 @@ static ss::future<chunked_vector<resp_resource_t>> alter_broker_configuration(
             //   compression.type=producer sensitive=false
             //   synonyms={DEFAULT_CONFIG:log_compression_type=producer}
             // (configuration.cc doesn't know `compression.type` but known
-            // `log_compression_type`) but for redpanda's properties it returns
+            // `log_compression_type`) but for redpanda's properties it
+            // returns
             //   redpanda.remote.read=false sensitive=false
             //   synonyms={DEFAULT_CONFIG:redpanda.remote.read=false}
             // which looks wrong because configuration.cc doesn't know

@@ -304,6 +304,11 @@ get_schemas_ids_id(server::request_t rq, server::reply_t rp) {
     auto id = parse::request_param<schema_id>(*rq.req, "id");
     rq.req.reset();
 
+    // With deferred schema validation, there might be a schema that
+    // had invalid references. These might have already been posted, so
+    // we need to sync
+    co_await rq.service().writer().read_sync();
+
     auto def = co_await get_or_load(rq, [&rq, id]() {
         return rq.service().schema_store().get_schema_definition(id);
     });
@@ -437,7 +442,7 @@ post_subject(server::request_t rq, server::reply_t rp) {
     }
 
     auto sub_schema = co_await rq.service().schema_store().has_schema(
-      std::move(schema), inc_del);
+      std::move(schema), inc_del, norm);
 
     rp.rep->write_body(
       "json",
@@ -466,6 +471,17 @@ post_subject_versions(server::request_t rq, server::reply_t rp) {
     auto unparsed = co_await ppj::rjson_parse(
       std::move(rq.req), post_subject_versions_request_handler<>{sub});
 
+    // If presented with a non-positive integer for version, set it to
+    // invalid_schema_version so that the version number can be projected
+    if (unparsed.version.has_value() && unparsed.version.value() < 1) {
+        unparsed.version = invalid_schema_version;
+    }
+
+    // Upstream permits IDs of 0 on 'import'
+    if (unparsed.id.has_value() && unparsed.id.value() < 0) {
+        unparsed.id = invalid_schema_id;
+    }
+
     subject_schema schema{
       co_await rq.service().schema_store().make_canonical_schema(
         std::move(unparsed.def), norm),
@@ -474,7 +490,7 @@ post_subject_versions(server::request_t rq, server::reply_t rp) {
       is_deleted::no};
 
     auto ids = co_await rq.service().schema_store().get_schema_version(
-      schema.share());
+      schema.share(), norm);
 
     schema_id schema_id{ids.id.value_or(invalid_schema_id)};
     if (!ids.version.has_value()) {

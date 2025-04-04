@@ -28,9 +28,12 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/io_priority_class.hh>
+#include <seastar/core/shared_ptr.hh>
 
 #include <absl/container/flat_hash_map.h>
 
+struct storage_e2e_fixture;
+struct reupload_fixture;
 namespace storage {
 
 /// \brief offset boundary type
@@ -136,6 +139,9 @@ public:
     std::optional<model::offset>
     get_term_last_offset(model::term_id term) const final;
     std::optional<model::offset> index_lower_bound(model::offset o) const final;
+    std::optional<model::offset>
+    index_batch_base_offset_lower_bound(model::offset o) const final;
+
     std::ostream& print(std::ostream&) const final;
 
     // Must be called while _segments_rolling_lock is held.
@@ -232,6 +238,18 @@ public:
       const compaction_config& cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
 
+    ss::future<> rewrite_segment_with_offset_map(
+      const compaction_config& cfg,
+      ss::lw_shared_ptr<segment> seg,
+      key_offset_map& map,
+      bool is_finished_window_compaction,
+      bool is_clean_compacted);
+
+    ss::future<bool> chunked_sliding_window_compact(
+      const compaction_config& cfg,
+      const segment_set& segs,
+      key_offset_map& map);
+
     const auto& compaction_ratio() const { return _compaction_ratio; }
 
     static ss::future<> copy_kvstore_state(
@@ -245,9 +263,20 @@ public:
 
     size_t max_segment_size() const;
 
+    ssize_t dirty_segment_bytes() const final { return _dirty_segment_bytes; }
+
+    ssize_t closed_segment_bytes() const final { return _closed_segment_bytes; }
+
+    // Returns the dirty ratio of the log.
+    // The dirty ratio is the ratio of bytes in closed, dirty segments to the
+    // total number of bytes in all closed segments in the log.
+    double dirty_ratio() final;
+
 private:
     friend class disk_log_appender; // for multi-term appends
     friend class disk_log_builder;  // for tests
+    friend ::storage_e2e_fixture;
+    friend ::reupload_fixture; // for tests
     friend std::ostream& operator<<(std::ostream& o, const disk_log_impl& d);
 
     /// Compute file offset of the batch inside the segment
@@ -331,7 +360,7 @@ private:
     // specified offest.
     //
     // Returns the new start offset of the log.
-    ss::future<model::offset> request_eviction_until_offset(model::offset);
+    model::offset request_eviction_until_offset(model::offset);
 
     // These methods search the log for the offset to evict at such that
     // the retention policy is satisfied. If no such offset is found
@@ -440,7 +469,59 @@ private:
     std::optional<model::offset> _last_compaction_window_start_offset;
 
     size_t _reclaimable_size_bytes{0};
+
+    ssize_t _dirty_segment_bytes{0};
+    ssize_t _closed_segment_bytes{0};
+
+    // Update the number of bytes in dirty segments.
+    //
+    // Dirty segments are closed segments which have not yet been cleanly
+    // compacted- i.e, duplicates for keys in this segment _could_ be found in
+    // the prefix of the log up to this segment.
+    //
+    // This value can increase AND decrease. It increases
+    // when a new segment is rolled, and decreases when the segment is marked as
+    // cleanly compacted, closed segments are evicted from the log, or when
+    // bytes are removed by compaction. For that reason, one of the tags add_tag
+    // or subtract_tag must be used.
+    void add_dirty_segment_bytes(ssize_t bytes);
+    void subtract_dirty_segment_bytes(ssize_t bytes);
+
+    // Update the number of bytes in closed segments.
+    //
+    // This value can increase AND decrease. It increases when a new
+    // segment is rolled, and decreases when closed segments are evicted from
+    // the log, or when bytes are removed by compaction. For that reason, one of
+    // the tags add_tag or subtract_tag must be used.
+    void add_closed_segment_bytes(ssize_t bytes);
+    void subtract_closed_segment_bytes(ssize_t bytes);
+
+    // Updates the number of closed & dirty bytes on segment roll (i.e when a
+    // segment's appender is released) or when recovering existing segments from
+    // a set. The argument `bytes` is added to closed_segment_bytes, and
+    // conditionally added to dirty_segment_bytes.
+    void add_segment_bytes(ss::lw_shared_ptr<segment> s, ssize_t bytes);
+
+    // Updates the number of closed & dirty bytes on data removal, e.g
+    // compaction or truncation. The argument `bytes` is removed from
+    // closed_segment_bytes, and conditionally removed from dirty_segment_bytes.
+    void subtract_segment_bytes(ss::lw_shared_ptr<segment> s, ssize_t bytes);
+
+    // Performs a manual O(n) reset of the dirty and closed bytes in the log by
+    // iterating over segment in the log. Used as a safety hatch in
+    // dirty_ratio() to prevent returning a bogus value due to improper
+    // book-keeping.
+    void reset_dirty_and_closed_bytes();
+
     bool _compaction_enabled;
+
+    // The counter for the number of self compactions that have occured in
+    // adjacent_merge_compact() since the last adjacent merge operation was
+    // triggered. Used in combination with the cluster tunable
+    // `log_compaction_adjacent_merge_self_compaction_count`, which sets the
+    // number of self compactions that must occur before attempting to
+    // compaction adjacent segments.
+    size_t _adjacent_merge_counter{0};
 };
 
 } // namespace storage

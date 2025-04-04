@@ -9,6 +9,7 @@
 # by the Apache License, Version 2.0
 
 from dataclasses import dataclass
+import pytest
 import random
 import threading
 import time
@@ -16,17 +17,19 @@ from typing import Dict, List
 
 from rptest.clients.default import DefaultClient
 from rptest.clients.offline_log_viewer import OfflineLogViewer
+from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
 
+from rptest.clients.kcl import RawKCL
 from rptest.clients.rpk import RpkException, RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.kafka_cli_consumer import KafkaCliConsumer
 from rptest.services.kgo_verifier_services import KgoVerifierProducer
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, RedpandaService
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, RedpandaService, MetricsEndpoint
 from rptest.services.rpk_producer import RpkProducer
 from rptest.services.verifiable_consumer import VerifiableConsumer
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.util import wait_until_result
+from rptest.util import expect_exception, wait_until_result
 from rptest.utils.mode_checks import skip_debug_mode
 
 from ducktape.utils.util import wait_until
@@ -39,7 +42,7 @@ from kafka.protocol.api import Request, Response
 import kafka.protocol.types as types
 from confluent_kafka.admin import AdminClient
 from confluent_kafka import ConsumerGroupState
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, Producer
 
 
 class ConsumerGroupTest(RedpandaTest):
@@ -56,6 +59,9 @@ class ConsumerGroupTest(RedpandaTest):
                 "default_topic_replications": 3
             },
             **kwargs)
+
+        self.rpk = RpkTool(self.redpanda)
+        self.kcl = RawKCL(self.redpanda)
 
     def make_consumer_properties(base_properties, instance_id=None):
         properties = {}
@@ -91,7 +97,8 @@ class ConsumerGroupTest(RedpandaTest):
                          topic,
                          group,
                          static_members,
-                         consumer_properties={}):
+                         consumer_properties={},
+                         err_msg=""):
 
         consumers = []
         for i in range(0, consumer_count):
@@ -111,7 +118,7 @@ class ConsumerGroupTest(RedpandaTest):
             gr = rpk.group_describe(group=group, summary=True)
             return gr.members == consumer_count and gr.state == "Stable"
 
-        wait_until(group_is_ready, 60, 1)
+        wait_until(group_is_ready, 60, 1, err_msg)
         return consumers
 
     def consumed_at_least(consumers, count):
@@ -157,6 +164,7 @@ class ConsumerGroupTest(RedpandaTest):
         """
         self.create_topic(20)
         group = 'test-gr-1'
+
         # use 2 consumers
         consumers = self.create_consumers(2,
                                           self.topic_spec.name,
@@ -657,6 +665,455 @@ class ConsumerGroupTest(RedpandaTest):
 
         self.producer.wait()
         self.producer.free()
+
+    @cluster(num_nodes=5)
+    def test_last_member_expiry_with_pending_member(self):
+        """
+        Regression test to demonstrate the behaviour in the case when the last
+        member of the consumer group expires while there are pending members in
+        the group
+        """
+        self.create_topic(20)
+        group = 'test-gr-1'
+
+        self.redpanda._admin.set_log_level("kafka", "trace")
+
+        self.redpanda.logger.info("Starting my-consumer-1")
+        consumer1 = self.create_consumer(topic=self.topic_spec.name,
+                                         group=group,
+                                         instance_name="static-consumer",
+                                         instance_id="panda-instance",
+                                         consumer_properties={
+                                             "client.id": "client-1",
+                                             "session.timeout.ms": 10000
+                                         })
+        consumer1.start()
+
+        self.redpanda.logger.info("Starting producer")
+        self.start_producer()
+
+        self.redpanda.logger.info(
+            "Waiting for the consumer group to become Stable and make progress"
+        )
+        self.wait_for_members(group, 1)
+        wait_until(
+            lambda: ConsumerGroupTest.consumed_at_least([consumer1], 50),
+            timeout_sec=30,
+            backoff_sec=2,
+            err_msg="consumer-1 did not consume messages")
+
+        self.redpanda.logger.info(
+            "Stop consumer-1, without sending LeaveGroupReq since it is a static consumer"
+        )
+        consumer1.stop()
+        consumer1.wait()
+        consumer1.free()
+
+        self.redpanda.logger.info(
+            "Send a JoinGroupReq without completing the join")
+        # This simulates the first JoinGroupRequest a new consumer sends. It
+        # does not include a member id, so the broker responds with a
+        # member_id_required error and **adds this consumer to the list of
+        # pending members**
+        resp = self.kcl.raw_join_group({
+            "Version": 5,
+            "Group": group,
+            "SessionTimeoutMillis": 60000,
+            "RebalanceTimeoutMillis": 60000,
+            "ProtocolType": "consumer",
+            "Protocols": [{
+                "Name": "range"
+            }]
+        })
+        self.redpanda.logger.debug(f"JoinGroupResponse: {resp}")
+        member_id_required = 79
+        assert resp['ErrorCode'] == member_id_required,\
+            f"Unexpected response ErrorCode: {resp}"
+
+        self.redpanda.logger.info("Wait out the session timeout of consumer-1")
+        time.sleep(10)
+
+        self.redpanda.logger.info(
+            "Verify that there is no regression: removing the expiring consumer doesn't lead to an error log, and transitions the group to Empty"
+        )
+        # ERROR ... seastar - Timer callback failed: std::runtime_error (no members in group)
+        assert self.redpanda.search_log_any("Removing member panda-instance-")
+        assert not self.redpanda.search_log_any("Timer callback failed")
+
+        self.redpanda.logger.info("Verify that the group became Empty")
+
+        def group_is_empty():
+            res = self.rpk.group_describe(group)
+            return res.members == 0 and res.state == "Empty"
+
+        wait_until(
+            group_is_empty,
+            timeout_sec=30,
+            backoff_sec=2,
+            err_msg=
+            "The consumer group should become Empty when the last member expires"
+        )
+
+        self.producer.wait()
+        self.producer.free()
+
+    @cluster(num_nodes=6)
+    @parametrize(metrics=[])
+    @parametrize(metrics=["group"])
+    @parametrize(metrics=["partition"])
+    @parametrize(metrics=["consumer_lag"])
+    @parametrize(metrics=["group", "partition"])
+    @parametrize(metrics=["group", "consumer_lag"])
+    @parametrize(metrics=["partition", "consumer_lag"])
+    @parametrize(metrics=["group", "partition", "consumer_lag"])
+    def test_group_metrics(self, metrics):
+        """
+        Test validating the behavior of group metrics
+        """
+        #Make a copy as we modify it later
+        enabled_group_metrics = metrics[:]
+
+        def flip_option(option):
+            if option in enabled_group_metrics:
+                enabled_group_metrics.remove(option)
+            else:
+                enabled_group_metrics.append(option)
+
+        self.redpanda.set_cluster_config(
+            {"enable_consumer_group_metrics": enabled_group_metrics})
+
+        self.create_topic(20)
+        group = f'test-gr-{"-".join(metrics)}-{random.randint(1, 1000)}'
+        # use 2 consumers
+        consumers = self.create_consumers(
+            2,
+            self.topic_spec.name,
+            group,
+            static_members=False,
+            err_msg=f"Failed to create consumers for group {group}")
+
+        self.start_producer()
+        # wait for some messages
+        wait_until(
+            lambda: ConsumerGroupTest.group_consumed_at_least(
+                consumers, 50 * len(consumers)), 30, 2,
+            "Test setup failed. Waiting on consumers timed out.")
+        self.validate_group_state(group,
+                                  expected_state="Stable",
+                                  static_members=False)
+
+        metrics = {
+            "group": [
+                "redpanda_kafka_consumer_group_consumers",
+                "redpanda_kafka_consumer_group_topics"
+            ],
+            "partition": ["redpanda_kafka_consumer_group_committed_offset"],
+            "consumer_lag": [
+                "redpanda_kafka_consumer_group_lag_max",
+                "redpanda_kafka_consumer_group_lag_sum"
+            ]
+        }
+
+        def get_group_metrics_from_nodes(patterns):
+            samples = self.redpanda.metrics_samples(
+                patterns, self.redpanda.started_nodes(),
+                MetricsEndpoint.PUBLIC_METRICS)
+            success = samples is not None and set(
+                samples.keys()) == set(patterns)
+            return success
+
+        for option, patterns in metrics.items():
+            expected_value = option in enabled_group_metrics
+            wait_until(
+                lambda: get_group_metrics_from_nodes(patterns
+                                                     ) == expected_value,
+                30,
+                1,
+                err_msg=
+                f"Looking for metrics in '{option}'. Timed-out while expecting value '{expected_value}'"
+            )
+
+        for option in metrics.keys():
+            flip_option(option)
+
+        self.redpanda.set_cluster_config(
+            {"enable_consumer_group_metrics": enabled_group_metrics})
+
+        for option, patterns in metrics.items():
+            expected_value = option in enabled_group_metrics
+            wait_until(
+                lambda: get_group_metrics_from_nodes(patterns
+                                                     ) == expected_value,
+                30,
+                1,
+                err_msg=
+                f"Looking for metrics in '{option}'. Timed-out while expecting value '{expected_value}'"
+            )
+
+        self.producer.wait()
+        self.producer.free()
+
+        for c in consumers:
+            c.stop()
+            c.wait()
+            c.free()
+
+    @cluster(num_nodes=3)
+    def test_group_lag_metrics(self):
+        """
+        Test validating the behavior of group lag metrics
+        """
+        lag_collection_interval = 5
+        topic_count = 1
+        partition_count = 20
+        consumer_count = 4
+        group = 'test-lag-metrics-group'
+        # Use a small batch size to ensure that fetches are distributed across all partitions
+        batch_size = 1
+        produce_msg_cnt_min = 1000
+        consume_count = (topic_count * partition_count *
+                         produce_msg_cnt_min) // (2 * consumer_count)
+
+        self.redpanda.set_cluster_config({
+            "enable_consumer_group_metrics":
+            ["group", "partition", "consumer_lag"],
+            "consumer_group_lag_collection_interval_sec":
+            lag_collection_interval,
+        })
+
+        self.admin_client = AdminClient(
+            {"bootstrap.servers": self.redpanda.brokers()})
+
+        topics = [f"test-lag-metrics-topic-{i}" for i in range(topic_count)]
+
+        self.client().create_topic(specs=[
+            TopicSpec(name=name,
+                      partition_count=partition_count,
+                      replication_factor=3) for name in topics
+        ])
+
+        def create_consumer(instance_id: int) -> Consumer:
+            return Consumer(
+                {
+                    "group.id": group,
+                    "group.instance.id": f"consumer-{instance_id}",
+                    'bootstrap.servers': self.redpanda.brokers(),
+                    "session.timeout.ms": 10000,
+                    'auto.offset.reset': 'earliest',
+                    'enable.auto.offset.store': True,
+                    'enable.auto.commit': False,
+                    'max.partition.fetch.bytes': batch_size,
+                    'log_level': 7,
+                    'debug': 'cgrp',
+                },
+                logger=self.logger)
+
+        consumers = [create_consumer(i) for i in range(consumer_count)]
+        for consumer in consumers:
+            consumer.subscribe(topics)
+
+        self.logger.info("Waiting for group to become stable")
+        wait_until(lambda: self.admin_client
+                   .describe_consumer_groups(group_ids=[group])[group].result(
+                   ).state == ConsumerGroupState.STABLE,
+                   20,
+                   1,
+                   retry_on_exc=True,
+                   err_msg="Timeout waiting on group to reach stable state")
+
+        produced_offsets = {
+            TopicPartition(topic, partition):
+            random.randint(produce_msg_cnt_min, produce_msg_cnt_min * 2)
+            for topic in topics
+            for partition in range(partition_count)
+        }
+
+        self.logger.info("Producing")
+
+        producer = Producer({
+            "bootstrap.servers": self.redpanda.brokers(),
+            'batch.size': batch_size,
+            'acks': 'all',
+        })
+        for tp, offset in produced_offsets.items():
+            self.logger.debug(
+                f"  Producing {tp.topic}/{tp.partition} ({offset} msgs)")
+            for i in range(offset):
+                producer.produce(tp.topic,
+                                 partition=tp.partition,
+                                 key=None,
+                                 value=f"message-{i}")
+            producer.flush()
+            self.logger.debug(f"  Produced {tp} - flushed {offset} msgs")
+
+        self.logger.info("Consuming")
+        for consumer in consumers:
+            consumer.consume(num_messages=consume_count, timeout=10)
+            assert len(consumer.assignment()
+                       ) != 0, "Consumer was not assigned any partitions"
+            self.logger.debug("  Consumed")
+
+        self.logger.info("Waiting for lag_metrics")
+        time.sleep(lag_collection_interval + 1)
+
+        def get_group_metrics_from_nodes():
+            metrics = [
+                "redpanda_kafka_max_offset",
+                "redpanda_kafka_consumer_group_committed_offset",
+                "redpanda_kafka_consumer_group_lag_max",
+                "redpanda_kafka_consumer_group_lag_sum"
+            ]
+            return self.redpanda.metrics_samples(
+                metrics, self.redpanda.started_nodes(),
+                MetricsEndpoint.PUBLIC_METRICS)
+
+        def metrics_committed(metrics):
+            return [
+                s.value for s in
+                metrics["redpanda_kafka_consumer_group_committed_offset"].
+                label_filter({
+                    "redpanda_group": group
+                }).samples
+            ]
+
+        def metrics_hwm(metrics):
+            hwm_by_tp = {}
+            for s in metrics["redpanda_kafka_max_offset"].samples:
+                if s.labels["redpanda_topic"] in topics:
+                    key = tuple(
+                        (k, v) for k, v in s.labels.items() if k != "node")
+                    hwm_by_tp.setdefault(key, []).append(s.value)
+            return [max(hwm) for hwm in hwm_by_tp.values()]
+
+        def metrics_lag_sum(metrics):
+            # Arbitrarily reduce across nodes with max, there should be only one
+            return max(
+                s.value
+                for s in metrics["redpanda_kafka_consumer_group_lag_sum"].
+                label_filter({
+                    "redpanda_group": group
+                }).samples)
+
+        def metrics_lag_max(metrics):
+            # Arbitrarily reduce across nodes with max, there should be only one
+            return max(
+                s.value
+                for s in metrics["redpanda_kafka_consumer_group_lag_max"].
+                label_filter({
+                    "redpanda_group": group
+                }).samples)
+
+        expected_hwm_sum = sum(produced_offsets.values())
+        expected_hwm_len = len(produced_offsets)
+        metrics = get_group_metrics_from_nodes()
+        hwm_metrics = metrics_hwm(metrics)
+        hwm_len = len(hwm_metrics)
+        hwm_sum = sum(hwm_metrics)
+
+        assert expected_hwm_len == hwm_len, f"Expected {expected_hwm_len}, got {hwm_len}"
+        assert expected_hwm_sum == hwm_sum, f"Expected {0}, got {hwm_sum}"
+
+        # Nothing committed yet, expect no metrics
+        with pytest.raises(KeyError):
+            metrics_committed(metrics)
+
+        # Consumers that have not committed yet should have no lag
+        assert metrics_lag_sum(metrics) == 0
+        assert metrics_lag_max(metrics) == 0
+
+        self.logger.info("Committing")
+        for consumer in consumers:
+            consumer.commit(asynchronous=False)
+            self.logger.debug(
+                f"  Committed: {consumer.committed(consumer.assignment())}")
+
+        self.logger.info("Waiting for lag_metrics")
+        time.sleep(lag_collection_interval + 1)
+
+        expected_committed_sum = sum(
+            max(0, tp.offset) for consumer in consumers
+            for tp in consumer.committed(consumer.assignment()) or [])
+        expected_lag_max = max(
+            produced_offsets[TopicPartition(tp.topic, tp.partition)] -
+            tp.offset for consumer in consumers
+            for tp in (consumer.committed(consumer.assignment()) or []))
+
+        def check_metrics():
+            metrics = get_group_metrics_from_nodes()
+            committed_metrics = metrics_committed(metrics)
+            committed_sum = sum(committed_metrics)
+            committed_len = len(committed_metrics)
+            hwm_metrics = metrics_hwm(metrics)
+            hwm_sum = sum(hwm_metrics)
+            hwm_len = len(hwm_metrics)
+            lag_sum = metrics_lag_sum(metrics)
+            lag_max = metrics_lag_max(metrics)
+
+            self.logger.debug(f"Expected HWM sum: {expected_hwm_sum}")
+            self.logger.debug(
+                f"Expected committed sum: {expected_committed_sum}")
+            self.logger.debug(f"Metrics HWM sum: {hwm_sum}")
+            self.logger.debug(f"Metrics committed sum: {committed_sum}")
+            self.logger.debug(
+                f"Expected lag: {expected_hwm_sum - expected_committed_sum}")
+            self.logger.debug(f"Calculated lag: {hwm_sum - committed_sum}")
+            self.logger.debug(f"Metrics lag sum: {lag_sum}")
+            self.logger.debug(f"Metrics lag max: {lag_max}")
+
+            assert expected_hwm_len == committed_len, f"Expected {expected_hwm_len}, got {committed_len}. Not all partitions were consumed, tweak the produce and consume counts"
+            assert expected_hwm_len == hwm_len, f"Expected {expected_hwm_len}, got {hwm_len}. Not all partitions were consumed, tweak the produce and consume counts"
+
+            # Check redpanda_kafka_max_offset
+            assert expected_hwm_sum == hwm_sum, f"Expected {expected_hwm_sum}, got {hwm_sum}"
+            #Check redpanda_kafka_consumer_group_committed_offset
+            assert expected_committed_sum == committed_sum, f"Expected {expected_committed_sum}, got {committed_sum}"
+            # Check redpanda_kafka_consumer_group_lag_sum
+            assert hwm_sum - committed_sum == lag_sum, f"Expected {hwm_sum - committed_sum}, got {lag_sum}"
+            # Check redpanda_kafka_consumer_group_lag_max
+            assert expected_lag_max == lag_max, f"Expected {expected_lag_max}, got {lag_max}"
+
+        check_metrics()
+
+        admin = Admin(self.redpanda)
+
+        def move_partition(topic, partition):
+            moved = admin.transfer_leadership_to(namespace="kafka",
+                                                 topic=topic,
+                                                 partition=partition,
+                                                 target_id=None)
+            assert moved, "Failed to move leader"
+            return moved
+
+        def get_coordinator():
+            return self.admin_client.describe_consumer_groups(
+                group_ids=[group])[group].result().coordinator
+
+        coordinator = get_coordinator()
+        moved = move_partition(topic="__consumer_offsets", partition=0)
+        assert moved, "Failed to move coordinator"
+        wait_until(lambda: self.admin_client
+                   .describe_consumer_groups(group_ids=[group])[group].result(
+                   ).state == ConsumerGroupState.STABLE,
+                   20,
+                   1,
+                   retry_on_exc=True,
+                   err_msg="Timeout waiting on group to reach stable state")
+
+        assert get_coordinator() != coordinator, "Coordinator did not change"
+
+        self.logger.info("Waiting for lag_metrics after coordinator move")
+        time.sleep(lag_collection_interval + 1)
+        check_metrics()
+
+        moved = move_partition(topic=topics[0], partition=0)
+        assert moved, "Failed to move partition leader"
+
+        self.logger.info("Waiting for lag_metrics after partition leader move")
+        time.sleep(lag_collection_interval + 1)
+        check_metrics()
+
+        for consumer in consumers:
+            consumer.close()
 
 
 @dataclass

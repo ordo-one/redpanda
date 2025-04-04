@@ -13,8 +13,10 @@
 #include "cluster/errc.h"
 #include "cluster/types.h"
 #include "compat/model_generator.h"
+#include "model/metadata.h"
 #include "model/tests/randoms.h"
 #include "random/generators.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/randoms.h"
 #include "utils/tristate.h"
 
@@ -406,11 +408,11 @@ template<>
 struct instance_generator<cluster::reconciliation_state_request> {
     static cluster::reconciliation_state_request random() {
         auto f = []() { return model::random_ntp(); };
-        return {.ntps = tests::random_vector(std::move(f))};
+        return {.ntps = tests::random_chunked_vector(std::move(f))};
     }
 
     static std::vector<cluster::reconciliation_state_request> limits() {
-        return {{}};
+        return {};
     }
 };
 
@@ -561,7 +563,7 @@ template<>
 struct instance_generator<cluster::reconciliation_state_reply> {
     static cluster::reconciliation_state_reply random() {
         return {
-          .results = tests::random_vector([] {
+          .results = tests::random_chunked_vector([] {
               return instance_generator<
                 cluster::ntp_reconciliation_state>::random();
           }),
@@ -587,7 +589,7 @@ struct instance_generator<cluster::remote_topic_properties> {
 template<>
 struct instance_generator<cluster::topic_properties> {
     static xid random_xid() {
-        auto data = random_generators::get_bytes(12);
+        auto data = tests::random_bytes(12);
         xid::data_t array;
         std::copy(std::begin(data), std::end(data), array.begin());
 
@@ -655,7 +657,17 @@ struct instance_generator<cluster::topic_properties> {
           std::nullopt,
           false,
           tristate<std::chrono::milliseconds>{disable_tristate},
-          std::nullopt};
+          std::nullopt,
+          std::nullopt,
+          tests::random_optional([] {
+              return random_generators::random_choice(
+                {model::iceberg_invalid_record_action::drop,
+                 model::iceberg_invalid_record_action::dlq_table});
+          }),
+          tests::random_optional([] { return tests::random_duration_ms(); }),
+          tristate<double>{disable_tristate},
+          std::nullopt,
+        };
     }
 
     static std::vector<cluster::topic_properties> limits() { return {}; }

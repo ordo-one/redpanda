@@ -8,9 +8,9 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/produce_utils.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "config/configuration.h"
@@ -417,7 +417,9 @@ FIXTURE_TEST(
     while (produced_kafka_base_offset > stm_manifest.get_next_kafka_offset()) {
         BOOST_REQUIRE(archiver->sync_for_tests().get());
         BOOST_REQUIRE_EQUAL(
-          archiver->upload_next_candidates()
+          archiver
+            ->upload_next_candidates(
+              archival::archival_stm_fence{.emit_rw_fence_cmd = false})
             .get()
             .non_compacted_upload_result.num_failed,
           0);
@@ -497,7 +499,9 @@ FIXTURE_TEST(test_delete_from_stm_truncation, delete_records_e2e_fixture) {
     // Upload more and truncate the manifest past the override.
     BOOST_REQUIRE(archiver->sync_for_tests().get());
     BOOST_REQUIRE_EQUAL(
-      archiver->upload_next_candidates()
+      archiver
+        ->upload_next_candidates(
+          archival::archival_stm_fence{.emit_rw_fence_cmd = false})
         .get()
         .non_compacted_upload_result.num_failed,
       0);

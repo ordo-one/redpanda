@@ -11,6 +11,7 @@ v_cc_library(
     Seastar::seastar
     v::ssx
     v::config
+    v::crash_tracker
   )
 
 v_cc_library(
@@ -21,6 +22,7 @@ v_cc_library(
     Seastar::seastar
     v::cloud_storage
     v::cluster
+    v::datalake_manager
   )
 
 add_subdirectory(tests)

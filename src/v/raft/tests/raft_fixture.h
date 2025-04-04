@@ -11,7 +11,6 @@
  */
 
 #pragma once
-#include "bytes/random.h"
 #include "config/mock_property.h"
 #include "config/property.h"
 #include "features/feature_table.h"
@@ -24,10 +23,13 @@
 #include "raft/fwd.h"
 #include "raft/heartbeat_manager.h"
 #include "raft/recovery_memory_quota.h"
+#include "raft/service.h"
 #include "raft/state_machine_manager.h"
+#include "raft/tests/failure_injectable_log.h"
 #include "raft/types.h"
 #include "ssx/sformat.h"
 #include "storage/api.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/test.h"
 #include "utils/prefix_logger.h"
 
@@ -60,6 +62,20 @@ struct msg {
     ss::promise<iobuf> resp_data;
 };
 class raft_node_instance;
+/**
+ * Dummy shard and group managers for the fixture to be used
+ * with Raft rpc service implementation.
+ */
+struct fixture_group_manager {
+    ss::lw_shared_ptr<consensus> consensus_for(raft::group_id) { return raft; }
+    ss::lw_shared_ptr<consensus> raft;
+};
+
+struct fixture_shard_manager {
+    std::optional<ss::shard_id> shard_for(raft::group_id) {
+        return ss::this_shard_id();
+    }
+};
 
 struct channel {
     explicit channel(raft_node_instance&);
@@ -73,7 +89,8 @@ struct channel {
     bool is_valid() const;
 
 private:
-    ss::lw_shared_ptr<consensus> raft();
+    ss::future<> do_dispatch_message(msg);
+    raft::service<fixture_group_manager, fixture_shard_manager>& get_service();
     ss::weak_ptr<raft_node_instance> _node;
     ss::chunked_fifo<msg> _messages;
     ss::gate _gate;
@@ -86,6 +103,18 @@ struct raft_node_map {
     virtual std::optional<std::reference_wrapper<raft_node_instance>>
       node_for(model::node_id) = 0;
 };
+
+using reply_variant = std::variant<
+  vote_reply,
+  append_entries_reply,
+  heartbeat_reply,
+  heartbeat_reply_v2,
+  install_snapshot_reply,
+  timeout_now_reply,
+  transfer_leadership_reply>;
+
+using reply_interceptor_t = ss::noncopyable_function<ss::future<reply_variant>(
+  reply_variant, model::node_id)>;
 
 using dispatch_callback_t
   = ss::noncopyable_function<ss::future<>(model::node_id, msg_type)>;
@@ -126,16 +155,26 @@ public:
 
     void on_dispatch(dispatch_callback_t f);
 
+    void reset_dispatch_handlers();
+
+    void set_reply_interceptor(reply_interceptor_t interceptor) {
+        _reply_interceptor.emplace(std::move(interceptor));
+    }
+
+    void reset_reply_interceptor() { _reply_interceptor.reset(); }
+
     ss::future<> stop();
 
 private:
     template<typename ReqT, typename RespT>
-    ss::future<result<RespT>> dispatch(model::node_id, ReqT req);
+    ss::future<result<RespT>>
+    dispatch(model::node_id, ReqT req, rpc::client_opts);
     ss::gate _gate;
     absl::flat_hash_map<model::node_id, std::unique_ptr<channel>> _channels;
     std::vector<dispatch_callback_t> _on_dispatch_handlers;
     raft_node_map& _nodes;
     prefix_logger& _logger;
+    std::optional<reply_interceptor_t> _reply_interceptor;
 };
 
 inline model::timeout_clock::time_point default_timeout() {
@@ -147,6 +186,8 @@ inline model::timeout_clock::time_point default_timeout() {
  */
 class raft_node_instance : public ss::weakly_referencable<raft_node_instance> {
 public:
+    using service_t
+      = raft::service<fixture_group_manager, fixture_shard_manager>;
     using leader_update_clb_t
       = ss::noncopyable_function<void(leadership_status)>;
     raft_node_instance(
@@ -158,7 +199,8 @@ public:
       leader_update_clb_t leader_update_clb,
       bool enable_longest_log_detection,
       config::binding<std::chrono::milliseconds> election_timeout,
-      config::binding<std::chrono::milliseconds> heartbeat_interval);
+      config::binding<std::chrono::milliseconds> heartbeat_interval,
+      bool with_offset_translation = false);
 
     raft_node_instance(
       model::node_id id,
@@ -168,7 +210,8 @@ public:
       leader_update_clb_t leader_update_clb,
       bool enable_longest_log_detection,
       config::binding<std::chrono::milliseconds> election_timeout,
-      config::binding<std::chrono::milliseconds> heartbeat_interval);
+      config::binding<std::chrono::milliseconds> heartbeat_interval,
+      bool with_offset_translation = false);
 
     raft_node_instance(const raft_node_instance&) = delete;
     raft_node_instance(raft_node_instance&&) noexcept = delete;
@@ -236,6 +279,18 @@ public:
     //// \param f The callback function to be invoked when a message is
     /// dispatched.
     void on_dispatch(dispatch_callback_t);
+    void reset_dispatch_handlers();
+
+    /**
+     * Sets the reply interceptor for this node, the interceptor will be called
+     * for each service reply on this node. It can be used to inject failures or
+     * modify the reply to trigger specific behaviors.
+     */
+    void set_reply_interceptor(reply_interceptor_t interceptor) {
+        _protocol->set_reply_interceptor(std::move(interceptor));
+    }
+
+    void reset_reply_interceptor() { _protocol->reset_reply_interceptor(); }
 
     ss::shared_ptr<in_memory_test_protocol> get_protocol() { return _protocol; }
     ss::shared_ptr<buffered_protocol> get_buffered_protocol() {
@@ -244,6 +299,14 @@ public:
 
     storage::kvstore& get_kvstore() { return _storage.local().kvs(); }
 
+    ss::shared_ptr<failure_injectable_log> f_injectable_log() { return _f_log; }
+
+    service_t& get_service() { return _service; }
+
+    void set_default_recovery_read_size(size_t bytes) {
+        _default_recovery_read_size.update(std::move(bytes));
+    }
+
 private:
     model::node_id _id;
     model::revision_id _revision;
@@ -251,6 +314,7 @@ private:
     ss::sstring _base_directory;
     config::mock_property<size_t> _max_inflight_requests{16};
     config::mock_property<size_t> _max_queued_bytes{1_MiB};
+    config::mock_property<size_t> _default_recovery_read_size{128_KiB};
     ss::shared_ptr<in_memory_test_protocol> _protocol;
     ss::shared_ptr<buffered_protocol> _buffered_protocol;
     ss::sharded<storage::api> _storage;
@@ -265,6 +329,11 @@ private:
     bool _enable_longest_log_detection;
     config::binding<std::chrono::milliseconds> _election_timeout;
     config::binding<std::chrono::milliseconds> _heartbeat_interval;
+    bool _with_offset_translation;
+    ss::sharded<fixture_group_manager> _group_manager;
+    fixture_shard_manager _shard_manager{};
+    service_t _service;
+    ss::shared_ptr<raft::failure_injectable_log> _f_log;
 };
 
 class raft_fixture
@@ -303,6 +372,8 @@ public:
     ss::future<model::node_id> wait_for_leader(std::chrono::milliseconds);
     ss::future<model::node_id>
       wait_for_leader(model::timeout_clock::time_point);
+
+    std::optional<model::node_id> random_follower_id() const;
     ss::future<model::node_id> wait_for_leader_change(
       model::timeout_clock::time_point deadline, model::term_id term);
     seastar::future<> TearDownAsync() override;
@@ -329,7 +400,7 @@ public:
 
     ss::future<> create_simple_group(size_t number_of_nodes);
 
-    model::record_batch_reader
+    chunked_vector<model::record_batch>
     make_batches(std::vector<std::pair<ss::sstring, ss::sstring>> batch_spec) {
         const auto sz = batch_spec.size();
         return make_batches(sz, [spec = std::move(batch_spec)](size_t idx) {
@@ -343,21 +414,21 @@ public:
     }
 
     template<typename Generator>
-    model::record_batch_reader
+    chunked_vector<model::record_batch>
     make_batches(size_t batch_count, Generator&& generator) {
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_vector<model::record_batch> batches;
         batches.reserve(batch_count);
         for (auto b_idx : boost::irange(batch_count)) {
             batches.push_back(generator(b_idx));
         }
 
-        return model::make_memory_record_batch_reader(std::move(batches));
+        return batches;
     }
-    model::record_batch_reader make_batches(
+    chunked_vector<model::record_batch> make_batches(
       size_t batch_count,
       size_t batch_record_count,
       size_t record_payload_size) {
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_vector<model::record_batch> batches;
         batches.reserve(batch_count);
         for (auto b_idx : boost::irange(batch_count)) {
             storage::record_batch_builder builder(
@@ -365,13 +436,12 @@ public:
             for (int r_idx : boost::irange(batch_record_count)) {
                 builder.add_raw_kv(
                   serde::to_iobuf(ssx::sformat("r-{}-{}", b_idx, r_idx)),
-                  serde::to_iobuf(
-                    random_generators::get_bytes(record_payload_size)));
+                  serde::to_iobuf(tests::random_bytes(record_payload_size)));
             }
             batches.push_back(std::move(builder).build());
         }
 
-        return model::make_memory_record_batch_reader(std::move(batches));
+        return batches;
     }
 
     ss::future<>
@@ -530,6 +600,12 @@ public:
         _heartbeat_interval.update(std::move(timeout));
     }
 
+    void enable_offset_translation() { _with_offset_translation = true; }
+
+    std::chrono::milliseconds get_election_timeout() const {
+        return _election_timeout();
+    }
+
 protected:
     class raft_not_leader_exception : std::exception {};
 
@@ -561,6 +637,7 @@ private:
     std::optional<leader_update_clb_t> _leader_clb;
     config::mock_property<std::chrono::milliseconds> _election_timeout{500ms};
     config::mock_property<std::chrono::milliseconds> _heartbeat_interval{50ms};
+    bool _with_offset_translation = false;
 };
 
 template<class... STM>

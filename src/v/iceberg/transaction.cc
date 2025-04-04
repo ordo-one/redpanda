@@ -1,17 +1,20 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/transaction.h"
 
 #include "iceberg/merge_append_action.h"
+#include "iceberg/remove_snapshots_action.h"
 #include "iceberg/schema.h"
 #include "iceberg/table_requirement.h"
 #include "iceberg/table_update_applier.h"
+#include "iceberg/update_partition_spec_action.h"
 #include "iceberg/update_schema_action.h"
 
 namespace iceberg {
@@ -67,12 +70,32 @@ ss::future<transaction::txn_outcome> transaction::set_schema(schema s) {
     co_return co_await apply(std::move(a));
 }
 
+ss::future<transaction::txn_outcome>
+transaction::set_partition_spec(unresolved_partition_spec pspec) {
+    auto a = std::make_unique<update_partition_spec_action>(
+      table_, std::move(pspec));
+    co_return co_await apply(std::move(a));
+}
+
 ss::future<transaction::txn_outcome> transaction::merge_append(
   manifest_io& io,
-  chunked_vector<data_file> files,
-  chunked_vector<std::pair<ss::sstring, ss::sstring>> snapshot_props) {
+  chunked_vector<file_to_append> files,
+  chunked_vector<std::pair<ss::sstring, ss::sstring>> snapshot_props,
+  std::optional<ss::sstring> tag_name,
+  std::optional<int64_t> tag_expiration_ms) {
     auto a = std::make_unique<merge_append_action>(
-      io, table_, std::move(files), std::move(snapshot_props));
+      io,
+      table_,
+      std::move(files),
+      std::move(snapshot_props),
+      std::move(tag_name),
+      tag_expiration_ms);
+    co_return co_await apply(std::move(a));
+}
+
+ss::future<transaction::txn_outcome>
+transaction::remove_expired_snapshots(model::timestamp now) {
+    auto a = std::make_unique<remove_snapshots_action>(table_, now);
     co_return co_await apply(std::move(a));
 }
 

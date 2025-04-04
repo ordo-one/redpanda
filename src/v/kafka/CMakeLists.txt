@@ -1,6 +1,15 @@
 add_subdirectory(protocol)
 add_subdirectory(data)
 
+include(rpcgen)
+
+rpcgen(
+  TARGET consumer_lag_metrics_rpc
+  IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/server/consumer_group_lag_metrics_rpc.json
+  OUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/server/consumer_group_lag_metrics_rpc_service.h
+  INCLUDES ${CMAKE_BINARY_DIR}/src/v
+)
+
 set(handlers_srcs
   server/handlers/api_versions.cc
   server/handlers/metadata.cc
@@ -35,8 +44,11 @@ v_cc_library(
   NAME kafka
   SRCS
     ${handlers_srcs}
+    server/consumer_group_lag_metrics_frontend.cc
+    server/consumer_group_lag_metrics_service.cc
     server/requests.cc
     server/member.cc
+    server/datalake_throttle_manager.cc
     server/group_stm.cc
     server/group.cc
     server/group_router.cc
@@ -58,10 +70,12 @@ v_cc_library(
     server/logger.cc
     server/app.cc
  DEPS
+    consumer_lag_metrics_rpc
     Seastar::seastar
     v::bytes
     v::rpc
     v::cluster
+    v::datalake_partition_spec_parser
     v::kafka_partition_proxy
     v::kafka_protocol
     v::security

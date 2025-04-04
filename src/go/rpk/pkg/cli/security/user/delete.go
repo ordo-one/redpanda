@@ -12,9 +12,12 @@ package user
 import (
 	"fmt"
 
+	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
+	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -37,10 +40,6 @@ delete any ACLs that may exist for this user.
 			}
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
-			config.CheckExitNotServerlessAdmin(p)
-
-			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
-			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// Backwards compat: we favor the new format (an
 			// argument), but if that is empty, we use the old
@@ -54,8 +53,20 @@ delete any ACLs that may exist for this user.
 				out.Die("missing required username argument")
 			}
 
-			err = cl.DeleteUser(cmd.Context(), user)
-			out.MaybeDie(err, "unable to delete user %q: %s", user, err)
+			if p.FromCloud && !p.CloudCluster.IsServerless() {
+				cl, err := publicapi.DataplaneClientFromRpkProfile(p)
+				out.MaybeDie(err, "unable to initialize cloud client: %v", err)
+
+				req := connect.NewRequest(&dataplanev1.DeleteUserRequest{Name: user})
+				_, err = cl.User.DeleteUser(cmd.Context(), req)
+				out.MaybeDie(err, "unable to delete user %q: %s", user, err)
+			} else {
+				cl, err := adminapi.NewClient(cmd.Context(), fs, p)
+				out.MaybeDie(err, "unable to initialize admin client: %v", err)
+
+				err = cl.DeleteUser(cmd.Context(), user)
+				out.MaybeDie(err, "unable to delete user %q: %s", user, err)
+			}
 			if isText, _, s, err := f.Format(credentials{user, "", ""}); !isText {
 				out.MaybeDie(err, "unable to print response in the required format %q: %v", f.Kind, err)
 				out.Exit(s)

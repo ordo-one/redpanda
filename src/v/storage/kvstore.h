@@ -14,6 +14,7 @@
 #include "bytes/bytes.h"
 #include "bytes/iobuf.h"
 #include "container/chunked_hash_map.h"
+#include "container/fragmented_vector.h"
 #include "metrics/metrics.h"
 #include "storage/fwd.h"
 #include "storage/ntp_config.h"
@@ -103,6 +104,7 @@ public:
         stms = 6,
         shard_placement = 7,
         debug_bundle = 8,
+        crash_tracker = 9,
         /* your sub-system here */
     };
 
@@ -168,7 +170,7 @@ private:
      * when the segment reaches a threshold size a snapshot is saved a new
      * segment is created.
      */
-    std::vector<op> _ops;
+    chunked_vector<op> _ops;
     ss::timer<> _timer;
     ssx::semaphore _sem{0, "s/kvstore"};
     ss::lw_shared_ptr<segment> _segment;

@@ -43,7 +43,7 @@ rp_test(
   UNIT_TEST
   BINARY_NAME ${test_name}
   SOURCES ${cluster_test_src}
-  LIBRARIES v::seastar_testing_main v::application v::storage_test_utils v::cluster v::http_test_utils
+  LIBRARIES v::seastar_testing_main v::application v::storage_test_utils v::cluster v::http_test_utils v::test_random_bytes
   LABELS cluster
 )
 endforeach()
@@ -53,6 +53,8 @@ set(srcs
     id_allocator_stm_test.cc
     tm_stm_tests.cc
     data_migration_table_test.cc
+    manual_log_deletion_test.cc
+    eviction_stm_test.cc
     )
 
 foreach(cluster_test_src ${srcs})
@@ -74,12 +76,10 @@ rp_test(
 endforeach()
 
 set(srcs
-        manual_log_deletion_test.cc
         cluster_tests.cc
         configuration_change_test.cc
         autocreate_test.cc
         controller_api_tests.cc
-        eviction_stm_test.cc
         controller_state_test.cc
         create_partitions_test.cc
         decommissioning_tests.cc
@@ -87,7 +87,8 @@ set(srcs
         health_monitor_test.cc
         metadata_dissemination_test.cc
         replicas_rebalancing_tests.cc
-        security_frontend_test.cc)
+        security_frontend_test.cc
+        crash_reporter_test.cc)
 
 foreach(cluster_test_src ${srcs})
     get_filename_component(test_name ${cluster_test_src} NAME_WE)
@@ -251,5 +252,31 @@ rp_test(
     v::gtest_main
     v::cluster
   ARGS "-- -c 4"
+  LABELS cluster
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME topic_properties_test
+  SOURCES
+     topic_properties_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::cluster_topic_properties
+  ARGS "-- -c 1"
+  LABELS cluster
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME types_test
+  SOURCES
+     types_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::cluster
+  ARGS "-- -c 1"
   LABELS cluster
 )

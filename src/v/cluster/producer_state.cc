@@ -240,7 +240,7 @@ void requests::shutdown() { reset(cluster::errc::shutting_down); }
 
 producer_state::producer_state(
   prefix_logger& logger,
-  ss::noncopyable_function<void()> post_eviction_hook,
+  ss::noncopyable_function<void(model::producer_identity)> post_eviction_hook,
   producer_state_snapshot snapshot) noexcept
   : _logger(logger)
   , _id(snapshot.id)
@@ -294,12 +294,13 @@ std::ostream& operator<<(std::ostream& o, const producer_state& state) {
     fmt::print(
       o,
       "{{ id: {}, group: {}, requests: {}, "
-      "ms_since_last_update: {}, evicted: {}, ",
+      "ms_since_last_update: {}, evicted: {}, last_known_sequence: {}, ",
       state._id,
       state._group,
       state._requests,
       state.ms_since_last_update(),
-      state._evicted);
+      state._evicted,
+      state.last_sequence_number());
     if (state._transaction_state) {
         fmt::print(o, "transaction_state: {}", *state._transaction_state);
     } else {

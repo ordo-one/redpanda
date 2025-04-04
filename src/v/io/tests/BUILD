@@ -30,16 +30,6 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
-    name = "cache_test",
-    timeout = "short",
-    srcs = ["cache_test.cc"],
-    deps = [
-        "//src/v/io",
-        "//src/v/test_utils:gtest",
-    ],
-)
-
-redpanda_cc_gtest(
     name = "interval_map_test",
     timeout = "short",
     srcs = ["interval_map_test.cc"],
@@ -91,7 +81,7 @@ redpanda_cc_gtest(
     name = "io_queue_test",
     timeout = "moderate",
     srcs = ["io_queue_test.cc"],
-    # scheduler test is memory hungary since it track copies of all dispatched
+    # io queue test is memory hungary since it track copies of all dispatched
     # and completed ios. scaling down cpus give each core more breathing room.
     cpu = 2,
     deps = [
@@ -99,25 +89,6 @@ redpanda_cc_gtest(
         "//src/v/base",
         "//src/v/io",
         "//src/v/random:generators",
-        "@googletest//:gtest",
-        "@seastar",
-    ],
-)
-
-redpanda_cc_gtest(
-    name = "scheduler_test",
-    timeout = "moderate",
-    srcs = ["scheduler_test.cc"],
-    # scheduler test is memory hungary since it track copies of all dispatched
-    # and completed ios. scaling down cpus give each core more breathing room.
-    cpu = 2,
-    deps = [
-        ":testing",
-        "//src/v/base",
-        "//src/v/io",
-        "//src/v/random:generators",
-        "//src/v/test_utils:gtest",
-        "@boost//:range",
         "@googletest//:gtest",
         "@seastar",
     ],

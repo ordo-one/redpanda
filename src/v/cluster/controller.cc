@@ -153,7 +153,6 @@ ss::future<> controller::wire_up() {
           return _partition_allocator.start_single(
             std::ref(_members_table),
             std::ref(_feature_table),
-            config::shard_local_cfg().topic_memory_per_partition.bind(),
             config::shard_local_cfg().topic_fds_per_partition.bind(),
             config::shard_local_cfg().topic_partitions_per_shard.bind(),
             config::shard_local_cfg().topic_partitions_reserve_shard0.bind(),
@@ -586,14 +585,16 @@ ss::future<> controller::start(
     _tp_frontend.local().print_rf_warning_message();
 
     co_await cluster_creation_hook(discovery);
-
-    // start shard_balancer before controller_backend so that it bootstraps
-    // shard_placement_table and controller_backend can start with already
-    // initialized table.
-    co_await _shard_balancer.invoke_on(
-      shard_balancer::shard_id,
-      &shard_balancer::start,
-      conf_invariants.core_count);
+    {
+        auto u = _stm.local().lock_apply();
+        // start shard_balancer before controller_backend so that it bootstraps
+        // shard_placement_table and controller_backend can start with already
+        // initialized table.
+        co_await _shard_balancer.invoke_on(
+          shard_balancer::shard_id,
+          &shard_balancer::start,
+          conf_invariants.core_count);
+    }
 
     if (conf_invariants.core_count > ss::smp::count) {
         // Successfully starting shard_balancer with reduced core count means
@@ -624,6 +625,7 @@ ss::future<> controller::start(
       std::ref(_hm_frontend),
       std::ref(_members_table),
       std::ref(_partition_balancer),
+      std::ref(_partition_manager),
       std::ref(_as));
 
     co_await _members_backend.invoke_on(
@@ -715,8 +717,17 @@ ss::future<> controller::start(
       std::ref(_roles),
       std::addressof(_plugin_table),
       std::addressof(_feature_manager),
+      std::addressof(_storage),
       std::ref(_as));
     co_await _metrics_reporter.invoke_on(0, &metrics_reporter::start);
+
+    co_await _crash_reporter.start_single(
+      std::ref(_storage.local().kvs()),
+      std::ref(_stm),
+      std::ref(_as),
+      std::ref(_metrics_reporter));
+    co_await _crash_reporter.invoke_on(
+      crash_reporter::shard, &crash_reporter::start);
 
     co_await _partition_balancer.start_single(
       _raft0,
@@ -863,6 +874,7 @@ ss::future<> controller::stop() {
     co_await _recovery_manager.stop();
     co_await _recovery_table.stop();
     co_await _partition_balancer.stop();
+    co_await _crash_reporter.stop();
     co_await _metrics_reporter.stop();
     co_await _feature_manager.stop();
     co_await _hm_frontend.stop();

@@ -151,4 +151,80 @@ inline std::istream& operator>>(std::istream& is, datalake_catalog_type& ct) {
     return is;
 }
 
+enum class datalake_catalog_auth_mode { none, bearer, oauth2 };
+
+constexpr std::string_view to_string_view(datalake_catalog_auth_mode cam) {
+    switch (cam) {
+    case datalake_catalog_auth_mode::none:
+        return "none";
+    case datalake_catalog_auth_mode::bearer:
+        return "bearer";
+    case datalake_catalog_auth_mode::oauth2:
+        return "oauth2";
+    }
+}
+
+static constexpr auto acceptable_datalake_catalog_auth_modes() {
+    return std::to_array(
+      {to_string_view(datalake_catalog_auth_mode::none),
+       to_string_view(datalake_catalog_auth_mode::bearer),
+       to_string_view(datalake_catalog_auth_mode::oauth2)});
+}
+
+inline std::ostream&
+operator<<(std::ostream& os, datalake_catalog_auth_mode cam) {
+    return os << to_string_view(cam);
+}
+
+inline std::istream&
+operator>>(std::istream& is, datalake_catalog_auth_mode& cam) {
+    ss::sstring s;
+    is >> s;
+    cam = string_switch<datalake_catalog_auth_mode>(s)
+            .match(
+              to_string_view(datalake_catalog_auth_mode::none),
+              datalake_catalog_auth_mode::none)
+            .match(
+              to_string_view(datalake_catalog_auth_mode::bearer),
+              datalake_catalog_auth_mode::bearer)
+            .match(
+              to_string_view(datalake_catalog_auth_mode::bearer),
+              datalake_catalog_auth_mode::bearer);
+    return is;
+}
+
+enum class tls_name_format { legacy, rfc2253 };
+
+constexpr std::string_view to_string_view(tls_name_format format) {
+    switch (format) {
+    case tls_name_format::legacy:
+        return "legacy";
+    case tls_name_format::rfc2253:
+        return "rfc2253";
+    }
+}
+
+static constexpr auto acceptable_tls_name_format_values() {
+    return std::to_array(
+      {to_string_view(tls_name_format::legacy),
+       to_string_view(tls_name_format::rfc2253)});
+}
+
+inline std::ostream& operator<<(std::ostream& os, tls_name_format format) {
+    return os << to_string_view(format);
+}
+
+inline std::istream& operator>>(std::istream& is, tls_name_format& format) {
+    ss::sstring s;
+    is >> s;
+    format = string_switch<tls_name_format>(s)
+               .match(
+                 to_string_view(tls_name_format::legacy),
+                 tls_name_format::legacy)
+               .match(
+                 to_string_view(tls_name_format::rfc2253),
+                 tls_name_format::rfc2253);
+    return is;
+}
+
 } // namespace config

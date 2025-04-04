@@ -11,10 +11,9 @@
 
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
-#include "bytes/random.h"
-#include "random/generators.h"
 #include "serde/avro/parser.h"
 #include "serde/avro/tests/data_generator.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/runfiles.h"
 #include "utils/file_io.h"
 
@@ -24,8 +23,10 @@
 #include <avro/Encoder.hh>
 #include <avro/Generic.hh>
 #include <avro/Schema.hh>
+#include <boost/range/irange.hpp>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
 using namespace testing;
 
 void parsed_to_avro(
@@ -305,9 +306,9 @@ TEST_P(AvroParserTest, RoundtripTest) {
 
     for (int i = 0; i < 500; ++i) {
         // Generate random value
-        generator_state state;
-        ::avro::GenericDatum random_value = generate_datum(
-          valid_schema.root(), state, 10);
+        avro_generator gen({});
+        ::avro::GenericDatum random_value = gen.generate_datum(
+          valid_schema.root());
         // serialize data with AVRO library
         iobuf buffer = serialize_with_avro(random_value, valid_schema);
         // read using serde::avro
@@ -358,12 +359,11 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST_F(AvroParserTest, TestTooManyBytes) {
     auto valid_schema = load_json_schema("record2");
-    generator_state state;
-    ::avro::GenericDatum random_value = generate_datum(
-      valid_schema.root(), state, 10);
+    avro_generator gen({});
+    ::avro::GenericDatum random_value = gen.generate_datum(valid_schema.root());
 
     iobuf buffer = serialize_with_avro(random_value, valid_schema);
-    buffer.append(random_generators::make_iobuf(128));
+    buffer.append(tests::random_iobuf(128));
 
     ASSERT_THROW(
       serde::avro::parse(std::move(buffer), valid_schema).get(),
@@ -374,8 +374,7 @@ TEST_F(AvroParserTest, TestRandomBytes) {
     auto valid_schema = load_json_schema("record2");
     // check if parser is safe to parse completely random bytes
     ASSERT_THROW(
-      serde::avro::parse(random_generators::make_iobuf(512), valid_schema)
-        .get(),
+      serde::avro::parse(tests::random_iobuf(512), valid_schema).get(),
       std::invalid_argument);
 }
 
@@ -415,9 +414,8 @@ bool try_deserialize_with_avro_lib(
 
 TEST_F(AvroParserTest, TestIncorrectSchema) {
     auto valid_schema = load_json_schema("record2");
-    generator_state state;
-    ::avro::GenericDatum random_value = generate_datum(
-      valid_schema.root(), state, 10);
+    avro_generator gen({});
+    ::avro::GenericDatum random_value = gen.generate_datum(valid_schema.root());
     iobuf buffer = serialize_with_avro(random_value, valid_schema);
     auto invalid_schema = load_json_schema("tree2");
     auto success = try_deserialize_with_avro_lib(invalid_schema, buffer);

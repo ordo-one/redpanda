@@ -19,7 +19,9 @@ namespace kafka {
 seastar::future<> server_app::init(
   seastar::sharded<net::server_configuration>* conf,
   seastar::smp_service_group smp,
-  seastar::scheduling_group sched,
+  seastar::scheduling_group fetch_sched,
+  seastar::scheduling_group prod_sched,
+  seastar::scheduling_group handler_sched,
   seastar::sharded<cluster::metadata_cache>& mdc,
   seastar::sharded<cluster::topics_frontend>& tf,
   seastar::sharded<cluster::config_frontend>& cf,
@@ -40,13 +42,16 @@ seastar::future<> server_app::init(
   seastar::sharded<cluster::security_frontend>& sec,
   seastar::sharded<cluster::controller_api>& ctrl,
   seastar::sharded<cluster::tx_gateway_frontend>& tx,
+  seastar::sharded<datalake_throttle_manager>& dtm,
   std::optional<qdc_monitor_config> qdc,
   ssx::singleton_thread_worker& worker,
   const std::unique_ptr<pandaproxy::schema_registry::api>& pp) {
     return _server.start(
       conf,
       smp,
-      sched,
+      fetch_sched,
+      prod_sched,
+      handler_sched,
       std::ref(mdc),
       std::ref(tf),
       std::ref(cf),
@@ -67,6 +72,7 @@ seastar::future<> server_app::init(
       std::ref(sec),
       std::ref(ctrl),
       std::ref(tx),
+      std::ref(dtm),
       qdc,
       std::ref(worker),
       std::ref(pp));

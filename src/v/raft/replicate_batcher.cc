@@ -23,6 +23,65 @@
 #include <optional>
 
 namespace raft {
+
+replicate_batcher::item::item(
+  size_t record_count,
+  chunked_vector<model::record_batch> batches,
+  ssx::semaphore_units u,
+  std::optional<model::term_id> expected_term,
+  replicate_options opts)
+  : _record_count(record_count)
+  , _data(std::move(batches))
+  , _units(std::move(u))
+  , _expected_term(expected_term)
+  , _replicate_opts(opts) {
+    _timeout_timer.set_callback([this] { expire_with_timeout(); });
+    if (_replicate_opts.timeout) {
+        _timeout_timer.arm(_replicate_opts.timeout.value());
+    }
+    if (_replicate_opts.as) [[unlikely]] {
+        _abort_sub = _replicate_opts.as->get().subscribe(
+          [this] noexcept { mark_as_aborted(); });
+        if (!_abort_sub) {
+            mark_as_aborted();
+        }
+    }
+}
+
+void replicate_batcher::item::set_value(result<replicate_result> r) {
+    if (!_ready) {
+        _timeout_timer.cancel();
+        _ready = true;
+        _promise.set_value(r);
+    }
+}
+
+void replicate_batcher::item::set_exception(const std::exception_ptr& e) {
+    if (!_ready) {
+        _timeout_timer.cancel();
+        _ready = true;
+        _promise.set_exception(e);
+    }
+}
+
+void replicate_batcher::item::expire_with_timeout() {
+    if (!_ready) {
+        _ready = true;
+        _data.clear();
+        _units.return_all();
+        _promise.set_value(errc::timeout);
+    }
+}
+
+void replicate_batcher::item::mark_as_aborted() {
+    if (!_ready) {
+        _ready = true;
+        _data.clear();
+        _units.return_all();
+        _promise.set_value(errc::shutting_down);
+    }
+}
+
 using namespace std::chrono_literals; // NOLINT
 replicate_batcher::replicate_batcher(consensus* ptr, size_t cache_size)
   : _ptr(ptr)
@@ -31,13 +90,21 @@ replicate_batcher::replicate_batcher(consensus* ptr, size_t cache_size)
 
 replicate_stages replicate_batcher::replicate(
   std::optional<model::term_id> expected_term,
-  model::record_batch_reader r,
+  chunked_vector<model::record_batch> batches,
   replicate_options opts) {
+    if (opts.as) [[unlikely]] {
+        if (opts.as->get().abort_requested()) {
+            return replicate_stages{
+              ss::make_exception_future<>(ss::abort_requested_exception()),
+              ss::make_ready_future<result<replicate_result>>(
+                errc::shutting_down)};
+        }
+    }
     ss::promise<> enqueued;
     auto enqueued_f = enqueued.get_future();
 
     auto f = cache_and_wait_for_result(
-      std::move(enqueued), expected_term, std::move(r), opts);
+      std::move(enqueued), expected_term, std::move(batches), opts);
     return {std::move(enqueued_f), std::move(f)};
 }
 
@@ -45,7 +112,7 @@ ss::future<result<replicate_result>>
 replicate_batcher::cache_and_wait_for_result(
   ss::promise<> enqueued,
   std::optional<model::term_id> expected_term,
-  model::record_batch_reader r,
+  chunked_vector<model::record_batch> r,
   replicate_options opts) {
     item_ptr item;
     try {
@@ -109,13 +176,8 @@ ss::future<> replicate_batcher::stop() {
 
 ss::future<replicate_batcher::item_ptr> replicate_batcher::do_cache(
   std::optional<model::term_id> expected_term,
-  model::record_batch_reader r,
+  chunked_vector<model::record_batch> batches,
   replicate_options opts) {
-    auto batches = co_await model::consume_reader_to_chunked_vector(
-      std::move(r),
-      opts.timeout ? model::timeout_clock::now() + opts.timeout.value()
-                   : model::no_timeout);
-
     size_t bytes = std::accumulate(
       batches.cbegin(),
       batches.cend(),
@@ -157,14 +219,11 @@ replicate_batcher::do_cache_with_backpressure(
     }
 
     size_t record_count = 0;
-    chunked_vector<model::record_batch> data;
-    data.reserve(batches.size());
     for (auto& b : batches) {
         record_count += b.record_count();
-        data.push_back(std::move(b));
     }
     auto i = ss::make_lw_shared<item>(
-      record_count, std::move(data), std::move(u), expected_term, opts);
+      record_count, std::move(batches), std::move(u), expected_term, opts);
 
     _item_cache.emplace_back(i);
     co_return i;
@@ -208,7 +267,7 @@ ss::future<> replicate_batcher::flush(
 
         auto meta = _ptr->meta();
         const auto term = model::term_id(meta.term);
-        ss::circular_buffer<model::record_batch> data;
+        chunked_vector<model::record_batch> data;
         std::vector<item_ptr> notifications;
         ssx::semaphore_units item_memory_units(_max_batch_size_sem, 0);
         auto force_flush_requested = false;
@@ -259,7 +318,7 @@ ss::future<> replicate_batcher::flush(
         append_entries_request req(
           _ptr->_self,
           meta,
-          model::make_memory_record_batch_reader(std::move(data)),
+          std::move(data),
           item_memory_units.count(),
           needs_flush);
 

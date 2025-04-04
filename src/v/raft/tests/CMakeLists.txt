@@ -8,17 +8,6 @@ rp_test(
     ARGS "-- -c 8"
 )
 
-rp_test(
-    UNIT_TEST
-    BINARY_NAME group_configuration_tests
-    SOURCES group_configuration_tests.cc
-    DEFINITIONS BOOST_TEST_DYN_LINK
-    LIBRARIES Boost::unit_test_framework v::raft
-    LABELS raft
-    ARGS "-- -c 8"
-)
-
-
 set(srcs
     jitter_tests.cc
     bootstrap_configuration_test.cc
@@ -26,12 +15,9 @@ set(srcs
     configuration_serialization_test.cc
     type_serialization_tests.cc
     term_assigning_reader_test.cc
-    membership_test.cc
-    leadership_test.cc
-    append_entries_test.cc
+
     offset_monitor_test.cc
     mutex_buffer_test.cc
-    state_removal_test.cc
     configuration_manager_test.cc
     coordinated_recovery_throttle_test.cc
     heartbeats_test.cc
@@ -46,8 +32,14 @@ rp_test(
   ARGS "-- -c 8"
 )
 
+
+v_cc_library(
+    NAME raft_fixture
+    SRCS raft_fixture.cc
+         failure_injectable_log.cc
+    DEPS Seastar::seastar v::raft v::gtest_main v::test_random_bytes)
+
 set(gsrcs
-    raft_fixture.cc
     basic_raft_fixture_test.cc
     stm_manager_test.cc
     raft_reconfiguration_test.cc
@@ -55,6 +47,10 @@ set(gsrcs
     replication_monitor_tests.cc
     mux_state_machine_test.cc
     snapshot_recovery_test.cc
+    state_removal_test.cc
+    group_configuration_tests.cc
+    leadership_test.cc
+    membership_test.cc
 )
 
 rp_test(
@@ -63,9 +59,9 @@ rp_test(
   TIMEOUT 2000
   BINARY_NAME gtest_raft
   SOURCES ${gsrcs}
-  LIBRARIES  v::raft v::storage_test_utils v::model_test_utils v::features v::gtest_main
+  LIBRARIES  v::raft v::storage_test_utils v::model_test_utils v::features v::gtest_main v::raft_fixture v::test_random_bytes
   LABELS raft
-  ARGS "-- -c 8 -m 2G"
+  ARGS "-- -c 8 -m 4G"
 )
 
 rp_test(
@@ -78,7 +74,3 @@ rp_test(
   LABELS raft
 )
 
-v_cc_library(
-    NAME raft_fixture
-    SRCS raft_fixture.cc
-    DEPS Seastar::seastar v::raft v::gtest_main)

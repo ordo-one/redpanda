@@ -8,19 +8,27 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 #include "cloud_io/remote.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
-#include "cloud_storage/tests/s3_imposter.h"
+#include "config/property.h"
+#include "datalake/catalog_schema_manager.h"
+#include "datalake/coordinator/commit_offset_metadata.h"
 #include "datalake/coordinator/iceberg_file_committer.h"
 #include "datalake/coordinator/tests/state_test_utils.h"
 #include "datalake/table_definition.h"
+#include "datalake/table_id_provider.h"
+#include "datalake/tests/test_utils.h"
+#include "features/feature_table.h"
 #include "iceberg/filesystem_catalog.h"
 #include "iceberg/manifest_entry.h"
 #include "iceberg/manifest_io.h"
 #include "iceberg/metadata_query.h"
+#include "iceberg/table_identifier.h"
 #include "iceberg/transaction.h"
 #include "iceberg/values_bytes.h"
+#include "model/fundamental.h"
+#include "storage/api.h"
 #include "test_utils/async.h"
-#include "test_utils/test.h"
 
 #include <seastar/util/defer.hh>
 
@@ -30,32 +38,7 @@ using namespace datalake::coordinator;
 
 namespace {
 const model::topic topic{"test-topic"};
-using pairs_t = std::vector<std::pair<int64_t, int64_t>>;
-void add_partition_state(
-  std::vector<pairs_t> offset_bounds_by_pid,
-  topic_state& state,
-  model::offset added_at,
-  bool with_files) {
-    for (size_t i = 0; i < offset_bounds_by_pid.size(); i++) {
-        auto pid = static_cast<model::partition_id>(i);
-        partition_state p_state;
-        for (auto& f :
-             make_pending_files(offset_bounds_by_pid[i], with_files)) {
-            p_state.pending_entries.emplace_back(pending_entry{
-              .data = std::move(f), .added_pending_at = added_at});
-        }
-        state.pid_to_pending_files[pid] = std::move(p_state);
-    }
-}
-topic_state make_topic_state(
-  std::vector<pairs_t> offset_bounds_by_pid,
-  model::offset added_at = model::offset{1000},
-  bool with_files = false) {
-    topic_state state;
-    add_partition_state(
-      std::move(offset_bounds_by_pid), state, added_at, with_files);
-    return state;
-}
+const iceberg::table_identifier table_ident{.ns = {"redpanda"}, .table = topic};
 
 // Simulates a coordinator repeatedly committing a fixed sequence of data
 // files.
@@ -80,6 +63,20 @@ file_committer_loop(file_committer& committer, size_t num_chunks, bool& done) {
     done = true;
     co_return;
 }
+storage::api
+dummy_storage(ss::sharded<features::feature_table>& feature_table) {
+    return storage::api{
+      []() {
+          return storage::kvstore_config(
+            1_MiB,
+            config::mock_binding(10ms),
+            "dummy.dir",
+            storage::make_sanitized_file_config());
+      },
+      []() { return storage::log_config("dummy.dir", 1_GiB); },
+      feature_table};
+}
+const model::cluster_uuid cluster_uuid{uuid_t::create()};
 } // namespace
 
 class FileCommitterTest
@@ -89,23 +86,67 @@ public:
     static constexpr std::string_view base_location{"test"};
     FileCommitterTest()
       : sr(cloud_io::scoped_remote::create(10, conf))
+      , storage(dummy_storage(feature_table))
       , catalog(remote(), bucket_name, ss::sstring(base_location))
       , schema_mgr(catalog)
       , manifest_io(remote(), bucket_name)
-      , committer(catalog, manifest_io) {
+      , committer(storage, catalog, manifest_io, config::mock_binding(false)) {
+        feature_table.start().get();
+        feature_table
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
+        storage.start().get();
+        storage.set_cluster_uuid(cluster_uuid);
         set_expectations_and_listen({});
+    }
+    void TearDown() override {
+        storage.stop().get();
+        feature_table.stop().get();
     }
     cloud_io::remote& remote() { return sr->remote.local(); }
 
     void create_table() {
         auto res = schema_mgr
                      .ensure_table_schema(
-                       topic, datalake::schemaless_struct_type())
+                       table_ident,
+                       datalake::schemaless_struct_type(),
+                       datalake::hour_partition_spec())
                      .get();
         ASSERT_FALSE(res.has_error());
     }
 
+    void get_snap_data_files(
+      const iceberg::snapshot& snap, chunked_vector<ss::sstring>* uris) {
+        const auto& mlist_uri = snap.manifest_list_path;
+        auto mlist_res = manifest_io.download_manifest_list(mlist_uri).get();
+        ASSERT_TRUE(mlist_res.has_value());
+        const auto& mlist = mlist_res.value();
+
+        // Collect all the data files for this snapshot.
+        for (const auto& m : mlist.files) {
+            auto m_res = manifest_io.download_manifest(m.manifest_path).get();
+            ASSERT_TRUE(m_res.has_value());
+            for (const auto& e : m_res.value().entries) {
+                uris->emplace_back(e.data_file.file_path());
+            }
+        }
+    }
+
+    // Populates `uris` with the data files referenced by the current snapshot.
+    void get_current_data_files(chunked_vector<ss::sstring>* uris) {
+        auto load_res = catalog.load_table(table_ident).get();
+        ASSERT_FALSE(load_res.has_error());
+        const auto& table = load_res.value();
+        ASSERT_TRUE(table.current_snapshot_id.has_value());
+        auto cur_snap = table.get_snapshots_by_id().at(
+          *table.current_snapshot_id);
+        ASSERT_NO_FATAL_FAILURE(get_snap_data_files(cur_snap, uris));
+    }
+
     std::unique_ptr<cloud_io::scoped_remote> sr;
+    ss::sharded<features::feature_table> feature_table;
+    storage::api storage;
     iceberg::filesystem_catalog catalog;
     datalake::catalog_schema_manager schema_mgr;
     iceberg::manifest_io manifest_io;
@@ -137,10 +178,7 @@ TEST_F(FileCommitterTest, TestCommit) {
 }
 
 TEST_F(FileCommitterTest, TestMissingTable) {
-    auto load_res = catalog
-                      .load_table(
-                        iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                      .get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_TRUE(load_res.has_error());
     ASSERT_EQ(load_res.error(), iceberg::catalog::errc::not_found);
 
@@ -159,13 +197,11 @@ TEST_F(FileCommitterTest, TestMissingTable) {
     res = committer.commit_topic_files_to_catalog(topic, state).get();
     ASSERT_FALSE(res.has_error());
     ASSERT_TRUE(res.value().empty());
-    load_res = catalog
-                 .load_table(
-                   iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                 .get();
+    load_res = catalog.load_table(table_ident).get();
     // The table should be created.
     ASSERT_FALSE(load_res.has_error());
-    ASSERT_FALSE(load_res.value().snapshots.has_value());
+    ASSERT_TRUE(load_res.value().snapshots.has_value());
+    ASSERT_EQ(0, load_res.value().snapshots->size());
 
     // Now try again with some data.
     state.topic_to_state[topic] = make_topic_state({{{0, 100}}});
@@ -173,10 +209,7 @@ TEST_F(FileCommitterTest, TestMissingTable) {
     ASSERT_FALSE(res.has_error());
     ASSERT_EQ(1, res.value().size());
 
-    load_res = catalog
-                 .load_table(
-                   iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                 .get();
+    load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
 
     // Simple check for the schema.
@@ -194,15 +227,18 @@ TEST_F(FileCommitterTest, TestMissingTopic) {
     ASSERT_TRUE(res.value().empty());
 
     // If our state didn't have the topic, we won't bother creating a table.
-    auto load_res = catalog
-                      .load_table(
-                        iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                      .get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_TRUE(load_res.has_error());
     ASSERT_EQ(load_res.error(), iceberg::catalog::errc::not_found);
 }
 
-TEST_F(FileCommitterTest, TestFilesGetPartitionKey) {
+class FileCommitterPartitionTest
+  : public FileCommitterTest
+  , public testing::WithParamInterface<bool> {};
+
+TEST_P(FileCommitterPartitionTest, TestFilesGetPartitionKey) {
+    const bool use_legacy_format = GetParam();
+
     create_table();
 
     using namespace iceberg;
@@ -215,13 +251,25 @@ TEST_F(FileCommitterTest, TestFilesGetPartitionKey) {
             std::move(offsets),
           },
           added_at_counter++);
+
         for (auto& e : t_state.pid_to_pending_files[model::partition_id{0}]
                          .pending_entries) {
-            e.data.files.emplace_back(datalake::coordinator::data_file{
+            datalake::coordinator::data_file file{
               .row_count = 100,
               .file_size_bytes = 1024,
-              .hour = hour,
-            });
+            };
+
+            if (use_legacy_format) {
+                file.hour_deprecated = hour;
+            } else {
+                chunked_vector<std::optional<bytes>> pk;
+                pk.push_back(value_to_bytes(int_value{hour}));
+                file.table_schema_id = 0;
+                file.partition_spec_id = 0;
+                file.partition_key = std::move(pk);
+            }
+
+            e.data.files.emplace_back(std::move(file));
         }
         state.topic_to_state[topic] = std::move(t_state);
         return state;
@@ -289,6 +337,9 @@ TEST_F(FileCommitterTest, TestFilesGetPartitionKey) {
     ASSERT_EQ(100, mfiles[1].added_rows_count);
 }
 
+INSTANTIATE_TEST_SUITE_P(
+  WithLegacyFormat, FileCommitterPartitionTest, testing::Bool());
+
 // Test that deduplication happens when all of the pending files are already
 // committed to Iceberg.
 TEST_F(FileCommitterTest, TestDeduplicateAllFiles) {
@@ -304,10 +355,7 @@ TEST_F(FileCommitterTest, TestDeduplicateAllFiles) {
 
     auto res = committer.commit_topic_files_to_catalog(topic, state).get();
     ASSERT_FALSE(res.has_error());
-    auto load_res = catalog
-                      .load_table(
-                        iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                      .get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(1, load_res.value().snapshots.value().size());
@@ -323,10 +371,7 @@ TEST_F(FileCommitterTest, TestDeduplicateAllFiles) {
     ASSERT_FALSE(res.has_error());
 
     // There should be no update to Iceberg.
-    load_res = catalog
-                 .load_table(
-                   iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                 .get();
+    load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(1, load_res.value().snapshots.value().size());
@@ -352,10 +397,7 @@ TEST_F(FileCommitterTest, TestDeduplicateSomeFiles) {
 
     auto res = committer.commit_topic_files_to_catalog(topic, state).get();
     ASSERT_FALSE(res.has_error());
-    auto load_res = catalog
-                      .load_table(
-                        iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                      .get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(1, load_res.value().snapshots.value().size());
@@ -375,10 +417,7 @@ TEST_F(FileCommitterTest, TestDeduplicateSomeFiles) {
 
     // There should be an update to Iceberg, since there were new files
     // committed.
-    load_res = catalog
-                 .load_table(
-                   iceberg::table_identifier{{"redpanda"}, "test-topic"})
-                 .get();
+    load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(2, load_res.value().snapshots.value().size());
@@ -413,8 +452,7 @@ TEST_F(FileCommitterTest, TestDeduplicateFromAncestor) {
       updates[0].tp, model::topic_partition(topic, model::partition_id{0}));
     ASSERT_EQ(updates[0].new_committed(), 199);
 
-    const auto table_id = iceberg::table_identifier{{"redpanda"}, "test-topic"};
-    auto load_res = catalog.load_table(table_id).get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(1, load_res.value().snapshots.value().size());
@@ -425,19 +463,25 @@ TEST_F(FileCommitterTest, TestDeduplicateFromAncestor) {
     // Add a new snapshot to the table by appending some data. Explicitly
     // _don't_ add the commit metadata property.
     iceberg::transaction tx(std::move(load_res.value()));
-    chunked_vector<iceberg::data_file> new_files;
+    chunked_vector<iceberg::file_to_append> new_files;
     iceberg::partition_key pk;
     pk.val = std::make_unique<iceberg::struct_value>();
     pk.val->fields.emplace_back(iceberg::int_value{0});
-    new_files.emplace_back(iceberg::data_file{
+    iceberg::data_file icb_file{
       .file_path = iceberg::uri("foobar"),
       .partition = std::move(pk),
       .file_size_bytes = 1024,
+    };
+    new_files.emplace_back(iceberg::file_to_append{
+      .file = std::move(icb_file),
+      .schema_id = tx.table().current_schema_id,
+      .partition_spec_id = tx.table().default_spec_id,
     });
     auto append_res = tx.merge_append(manifest_io, std::move(new_files)).get();
     ASSERT_FALSE(append_res.has_error());
-    EXPECT_FALSE(catalog.commit_txn(table_id, std::move(tx)).get().has_error());
-    load_res = catalog.load_table(table_id).get();
+    EXPECT_FALSE(
+      catalog.commit_txn(table_ident, std::move(tx)).get().has_error());
+    load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(2, load_res.value().snapshots.value().size());
@@ -456,10 +500,104 @@ TEST_F(FileCommitterTest, TestDeduplicateFromAncestor) {
       updates[0].tp, model::topic_partition(topic, model::partition_id{0}));
     ASSERT_EQ(updates[0].new_committed(), 199);
 
-    load_res = catalog.load_table(table_id).get();
+    load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     ASSERT_TRUE(load_res.value().snapshots.has_value());
     ASSERT_EQ(2, load_res.value().snapshots.value().size());
+}
+
+TEST_F(FileCommitterTest, TestDontDeduplicateFromOtherCluster) {
+    create_table();
+
+    // Create some offset ranges with file paths.
+    topics_state state;
+    state.topic_to_state[topic] = make_topic_state(
+      /*offset_bounds_by_pid=*/{{{0, 99}, {100, 199}}},
+      /*added_at=*/model::offset{1000},
+      /*with_files=*/true);
+    auto res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_FALSE(res.has_error());
+    chunked_vector<ss::sstring> uris;
+    ASSERT_NO_FATAL_FAILURE(get_current_data_files(&uris));
+    ASSERT_EQ(2, uris.size());
+
+    // Now commit some data, but with a new cluster UUID. Even though the
+    // files were added at a lower offset than above, since it's from a new
+    // cluster UUID, the files should still be added.
+    topics_state new_cluster_state;
+    new_cluster_state.topic_to_state[topic] = make_topic_state(
+      // NOTE: deduplication is based on the added_at offset rather than offset
+      // ranges, so it doesn't matter we're adding the same ranges here.
+      /*offset_bounds_by_pid=*/{{{0, 99}, {100, 199}}},
+      /*added_at=*/model::offset{0},
+      /*with_files=*/true);
+
+    model::cluster_uuid new_cluster{uuid_t::create()};
+    auto new_storage = dummy_storage(feature_table);
+    new_storage.set_cluster_uuid(new_cluster);
+    iceberg_file_committer new_cluster_committer(
+      new_storage, catalog, manifest_io, config::mock_binding(false));
+    res = new_cluster_committer
+            .commit_topic_files_to_catalog(topic, new_cluster_state)
+            .get();
+    ASSERT_FALSE(res.has_error());
+
+    uris.clear();
+    ASSERT_NO_FATAL_FAILURE(get_current_data_files(&uris));
+    ASSERT_EQ(4, uris.size());
+}
+
+TEST_F(FileCommitterTest, TestDeduplicateWithMissingClusterUUID) {
+    create_table();
+
+    // Create some offset ranges with file paths.
+    topics_state state;
+    state.topic_to_state[topic] = make_topic_state(
+      /*offset_bounds_by_pid=*/{{{0, 99}, {100, 199}}},
+      /*added_at=*/model::offset{1000},
+      /*with_files=*/true);
+    auto res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_FALSE(res.has_error());
+    chunked_vector<ss::sstring> uris;
+    ASSERT_NO_FATAL_FAILURE(get_current_data_files(&uris));
+    ASSERT_EQ(2, uris.size());
+
+    auto load_res = catalog.load_table(table_ident).get();
+    ASSERT_FALSE(load_res.has_error());
+    auto& table = load_res.value();
+    for (auto& snap : table.snapshots.value()) {
+        auto& props = snap.summary.other;
+        auto prop_it = props.find("redpanda.commit-metadata");
+        if (prop_it != props.end()) {
+            auto res = parse_commit_offset_json(prop_it->second);
+            ASSERT_FALSE(res.has_error());
+            auto& meta = res.value();
+            // Reset the cluster field, to simulate an version of Redpanda that
+            // didn't write this field.
+            meta.cluster = std::nullopt;
+
+            prop_it->second = to_json_str(meta);
+        }
+    }
+    auto rewrite_res
+      = catalog.rewrite_table_meta_for_tests(table_ident, table).get();
+    ASSERT_FALSE(rewrite_res.has_error());
+
+    topics_state new_cluster_state;
+    new_cluster_state.topic_to_state[topic] = make_topic_state(
+      /*offset_bounds_by_pid=*/{{{0, 99}, {100, 199}}},
+      /*added_at=*/model::offset{0},
+      /*with_files=*/true);
+
+    res
+      = committer.commit_topic_files_to_catalog(topic, new_cluster_state).get();
+    ASSERT_FALSE(res.has_error());
+
+    // Redpanda should assume that the cluster-UUID-less metadata belongs to
+    // the current cluster and the files should be deduplicated.
+    uris.clear();
+    ASSERT_NO_FATAL_FAILURE(get_current_data_files(&uris));
+    ASSERT_EQ(2, uris.size());
 }
 
 TEST_F(FileCommitterTest, TestDeduplicateConcurrently) {
@@ -486,8 +624,7 @@ TEST_F(FileCommitterTest, TestDeduplicateConcurrently) {
     }
     stop.cancel();
 
-    const auto table_id = iceberg::table_identifier{{"redpanda"}, "test-topic"};
-    auto load_res = catalog.load_table(table_id).get();
+    auto load_res = catalog.load_table(table_ident).get();
     ASSERT_FALSE(load_res.has_error());
     const auto& table = load_res.value();
     ASSERT_TRUE(table.snapshots.has_value());
@@ -495,30 +632,67 @@ TEST_F(FileCommitterTest, TestDeduplicateConcurrently) {
     // Check that each snapshot does not contain duplicates.
     size_t max_num_files = 0;
     for (const auto& snap : *table.snapshots) {
-        const auto& mlist_uri = snap.manifest_list_path;
-        auto mlist_res = manifest_io.download_manifest_list(mlist_uri).get();
-        ASSERT_TRUE(mlist_res.has_value());
-        const auto& mlist = mlist_res.value();
-
         chunked_vector<ss::sstring> uris;
-        chunked_hash_set<ss::sstring> uris_deduped;
-        auto pk_type = iceberg::partition_key_type::create(
-          datalake::hour_partition_spec(), datalake::default_schema());
+        ASSERT_NO_FATAL_FAILURE(get_snap_data_files(snap, &uris));
 
-        // Collect all the data files for this snapshot.
-        for (const auto& m : mlist.files) {
-            auto m_res
-              = manifest_io.download_manifest(m.manifest_path, pk_type).get();
-            ASSERT_TRUE(m_res.has_value());
-            for (const auto& e : m_res.value().entries) {
-                uris.emplace_back(e.data_file.file_path());
-                uris_deduped.emplace(e.data_file.file_path());
-            }
-        }
         // Ensure no duplicates.
+        chunked_hash_set<ss::sstring> uris_deduped;
+        uris_deduped.insert(uris.begin(), uris.end());
         ASSERT_EQ(uris.size(), uris_deduped.size());
         max_num_files = std::max(uris.size(), max_num_files);
     }
     // The total number of data files should match the number of chunks.
     ASSERT_EQ(max_num_files, num_chunks);
+}
+
+TEST_F(FileCommitterTest, TestDontLoadDLQTable) {
+    create_table();
+    topics_state state;
+    state.topic_to_state[topic] = make_topic_state(
+      {
+        {{0, 99}, {100, 199}},
+      },
+      /*added_at=*/model::offset{1000},
+      /*with_files=*/true,
+      /*dlq=*/false);
+    auto res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_FALSE(res.has_error());
+
+    // In committing data to the main table, we should send no requests asking
+    // about the DLQ table.
+    auto is_dlq_request = [](const http_test_utils::request_info& req) {
+        return req.url.contains("/test-topic~dlq/");
+    };
+    auto dlq_reqs = get_requests(is_dlq_request);
+    ASSERT_EQ(0, dlq_reqs.size());
+}
+
+TEST_F(FileCommitterTest, TestDontLoadMainTable) {
+    // Create a DLQ table.
+    auto create_res = schema_mgr
+                        .ensure_table_schema(
+                          datalake::table_id_provider::dlq_table_id(topic),
+                          datalake::schemaless_struct_type(),
+                          datalake::hour_partition_spec())
+                        .get();
+    ASSERT_FALSE(create_res.has_error());
+    topics_state state;
+
+    // Commit data to the DLQ.
+    state.topic_to_state[topic] = make_topic_state(
+      {
+        {{0, 99}, {100, 199}},
+      },
+      /*added_at=*/model::offset{1000},
+      /*with_files=*/true,
+      /*dlq=*/true);
+    auto res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_FALSE(res.has_error());
+
+    // We should send no requests asking about the main table.
+    auto is_main_request = [](const http_test_utils::request_info& req) {
+        return req.url.contains("/test-topic/");
+    };
+    auto main_reqs = get_requests(is_main_request);
+    ASSERT_EQ(0, main_reqs.size());
 }

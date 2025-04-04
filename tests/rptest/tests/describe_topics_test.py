@@ -301,6 +301,40 @@ class DescribeTopicsTest(RedpandaTest):
                 doc_string=
                 "If true, delete the corresponding Iceberg table when deleting the topic."
             ),
+            "redpanda.iceberg.partition.spec":
+            ConfigProperty(
+                config_type="STRING",
+                value="",
+                doc_string="Partition spec of the corresponding Iceberg table."
+            ),
+            "redpanda.iceberg.invalid.record.action":
+            ConfigProperty(
+                config_type="STRING",
+                value="dlq_table",
+                doc_string=
+                "Action to take when an invalid record is encountered."),
+            "min.cleanable.dirty.ratio":
+            ConfigProperty(
+                config_type="DOUBLE",
+                value="0.2",
+                doc_string=
+                "The minimum ratio between the number of bytes in \"dirty\" segments and "
+                "the total number of bytes in closed segments that must be reached "
+                "before a partition's log is eligible for compaction in a compact topic. "
+                "The topic property `min.cleanable.dirty.ratio` overrides the value of "
+                "`min_cleanable_dirty_ratio` at the topic level."),
+            "redpanda.remote.allowgaps":
+            ConfigProperty(
+                config_type="BOOLEAN",
+                value="false",
+                doc_string=
+                "controls the eviction of locally-stored log segments when "
+                "tiered storage uploads are paused. set to `false` (default) to "
+                "only evict data that has already been uploaded to cloud storage. "
+                "if the retained data fills the local volume, redpanda will "
+                "throttle producers. set to `true` to allow the eviction of "
+                "locally-stored log segments, which may create gaps in "
+                "offsets."),
         }
 
         tp_spec = TopicSpec()
@@ -339,11 +373,11 @@ class DescribeTopicsTest(RedpandaTest):
             self.logger.debug(
                 f"name: {name}, type: {config_type}, value: {value}, src: {source_type}"
             )
-            assert name in properties
+            assert name in properties, f"{name} not in {properties.keys()}"
             prop = properties[name]
-            assert config_type == prop.config_type
-            assert value == prop.value
-            assert source_type == prop.source_type
+            assert config_type == prop.config_type, f"{config_type=} != {prop.config_type=}"
+            assert value == prop.value, f"{value=} != {prop.value=}"
+            assert source_type == prop.source_type, f"{source_type=} != {prop.source_type=}"
 
         # The first empty line is where the table ends and the doc section begins
         assert last_pos is not None, "Something went wrong with property match"

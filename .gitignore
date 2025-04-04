@@ -45,6 +45,8 @@ _helm_e2e_artifacts/
 
 # bazel
 bazel-*
+user.bazelrc
+/external
 
 # Vagrant
 .vagrant/
@@ -135,6 +137,7 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+genhtml/
 
 # Translations
 *.mo
@@ -243,6 +246,7 @@ results
 .ducktape
 tests/docker/build
 vbuild/
+tests/java/iceberg-rest-catalog/.gradle
 
 /.vtools.yml
 /vtools
@@ -264,8 +268,6 @@ vbuild/
 #asdf tool version file
 .tool-versions
 
-# bazel
-user.bazelrc
-
 # Ctest
 /Testing
+

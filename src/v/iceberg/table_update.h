@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
 
 #include "container/fragmented_vector.h"
@@ -49,6 +50,11 @@ struct add_spec {
     }
 };
 
+struct set_default_spec {
+    partition_spec::id_t spec_id;
+    set_default_spec copy() const { return *this; }
+};
+
 struct add_snapshot {
     snapshot snapshot;
     add_snapshot copy() const {
@@ -63,6 +69,11 @@ struct remove_snapshots {
     remove_snapshots copy() const {
         return {.snapshot_ids = snapshot_ids.copy()};
     }
+};
+
+struct remove_snapshot_ref {
+    ss::sstring ref_name;
+    remove_snapshot_ref copy() const { return {.ref_name = ref_name}; }
 };
 
 struct set_snapshot_ref {
@@ -80,10 +91,8 @@ struct set_snapshot_ref {
 // TODO: not yet implemented
 // - assign_uuid
 // - upgrade_format_version
-// - set_default_spec
 // - add_sort_order
 // - set_default_sort_order
-// - remove_snapshot_ref
 // - set_location
 // - set_properties
 // - remove_properties
@@ -93,8 +102,10 @@ using update = std::variant<
   add_schema,
   set_current_schema,
   add_spec,
+  set_default_spec,
   add_snapshot,
   remove_snapshots,
+  remove_snapshot_ref,
   set_snapshot_ref>;
 
 } // namespace iceberg::table_update

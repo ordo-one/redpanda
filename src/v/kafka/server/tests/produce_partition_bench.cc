@@ -9,33 +9,29 @@
  * by the Apache License, Version 2.0
  */
 #include "container/fragmented_vector.h"
-#include "kafka/client/types.h"
-#include "kafka/protocol/fetch.h"
 #include "kafka/protocol/schemata/produce_request.h"
-#include "kafka/protocol/types.h"
 #include "kafka/server/handlers/produce.h"
 #include "model/fundamental.h"
-#include "model/record.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
-#include "test_utils/fixture.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/testing/perf_tests.hh>
-#include <seastar/testing/thread_test_case.hh>
 
-#include <boost/range/iterator_range_core.hpp>
-#include <boost/test/tools/interface.hpp>
-#include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test_log.hpp>
-#include <fmt/ostream.h>
-
-#include <tuple>
 
 using namespace std::chrono_literals; // NOLINT
 
 ss::logger plog("produce_partition_bench");
+
+namespace {
+enum class measured_region {
+    submitted,
+    dispatched,
+    produced,
+};
+} // namespace
 
 struct produce_partition_fixture : redpanda_thread_fixture {
     static constexpr size_t topic_name_length = 30;
@@ -62,10 +58,11 @@ struct produce_partition_fixture : redpanda_thread_fixture {
         wait_for_leader(ntp).get();
         BOOST_TEST_CHECKPOINT("HERE");
     }
-    ss::future<> run_test(size_t data_size);
+    ss::future<> run_test(size_t data_size, measured_region region);
 };
 
-ss::future<> produce_partition_fixture::run_test(size_t data_size) {
+ss::future<>
+produce_partition_fixture::run_test(size_t data_size, measured_region region) {
     BOOST_TEST_CHECKPOINT("HERE");
 
     model::topic_partition tp = model::topic_partition(
@@ -119,10 +116,17 @@ ss::future<> produce_partition_fixture::run_test(size_t data_size) {
     auto& topic = pctx.request.data.topics.front();
     auto& partition = topic.partitions.front();
 
+    // Drain task queue before running the measured region in order to
+    // reduce noise from unrelated tasks.
+    co_await tests::drain_task_queue();
+
     perf_tests::start_measuring_time();
     auto stages = kafka::testing::produce_single_partition(
       pctx, topic, partition);
-    perf_tests::stop_measuring_time();
+
+    if (region == measured_region::submitted) {
+        perf_tests::stop_measuring_time();
+    }
 
     auto fut = co_await ss::coroutine::as_future(std::move(stages.dispatched));
     if (fut.failed()) {
@@ -131,6 +135,10 @@ ss::future<> produce_partition_fixture::run_test(size_t data_size) {
           "unable to dispatch produce request: {}",
           fut.get_exception());
         co_return;
+    }
+
+    if (region == measured_region::dispatched) {
+        perf_tests::stop_measuring_time();
     }
 
     auto produced_fut = co_await ss::coroutine::as_future(
@@ -143,20 +151,50 @@ ss::future<> produce_partition_fixture::run_test(size_t data_size) {
         co_return;
     }
 
+    if (region == measured_region::produced) {
+        perf_tests::stop_measuring_time();
+    }
+
     auto p = produced_fut.get();
     vassert(
       p.error_code == kafka::error_code::none, "error_code: {}", p.error_code);
 }
 
-PERF_TEST_C(produce_partition_fixture, 1) {
-    co_return co_await this->run_test(1);
+PERF_TEST_C(produce_partition_fixture, 1_submitted) {
+    co_return co_await this->run_test(1, measured_region::submitted);
 }
-PERF_TEST_C(produce_partition_fixture, 1_KiB) {
-    co_return co_await this->run_test(1024);
+PERF_TEST_C(produce_partition_fixture, 1_KiB_submitted) {
+    co_return co_await this->run_test(1024, measured_region::submitted);
 }
-PERF_TEST_C(produce_partition_fixture, 4_KiB) {
-    co_return co_await this->run_test(4_KiB);
+PERF_TEST_C(produce_partition_fixture, 4_KiB_submitted) {
+    co_return co_await this->run_test(4_KiB, measured_region::submitted);
 }
-PERF_TEST_C(produce_partition_fixture, 8_KiB) {
-    co_return co_await this->run_test(8_KiB);
+PERF_TEST_C(produce_partition_fixture, 8_KiB_submitted) {
+    co_return co_await this->run_test(8_KiB, measured_region::submitted);
+}
+
+PERF_TEST_C(produce_partition_fixture, 1_dispatched) {
+    co_return co_await this->run_test(1, measured_region::dispatched);
+}
+PERF_TEST_C(produce_partition_fixture, 1_KiB_dispatched) {
+    co_return co_await this->run_test(1024, measured_region::dispatched);
+}
+PERF_TEST_C(produce_partition_fixture, 4_KiB_dispatched) {
+    co_return co_await this->run_test(4_KiB, measured_region::dispatched);
+}
+PERF_TEST_C(produce_partition_fixture, 8_KiB_dispatched) {
+    co_return co_await this->run_test(8_KiB, measured_region::dispatched);
+}
+
+PERF_TEST_C(produce_partition_fixture, 1_produced) {
+    co_return co_await this->run_test(1, measured_region::produced);
+}
+PERF_TEST_C(produce_partition_fixture, 1_KiB_produced) {
+    co_return co_await this->run_test(1024, measured_region::produced);
+}
+PERF_TEST_C(produce_partition_fixture, 4_KiB_produced) {
+    co_return co_await this->run_test(4_KiB, measured_region::produced);
+}
+PERF_TEST_C(produce_partition_fixture, 8_KiB_produced) {
+    co_return co_await this->run_test(8_KiB, measured_region::produced);
 }

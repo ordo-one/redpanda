@@ -162,8 +162,6 @@ void finalize_worker_thread(OSSL_LIB_CTX* orig_ctx) {
 }
 } // namespace
 
-ossl_context_service::~ossl_context_service() noexcept = default;
-
 class ossl_context_service::impl final {
     friend class ossl_context_test_class;
 
@@ -328,6 +326,8 @@ private:
     OSSL_LIB_CTX* _old_context{nullptr};
 };
 
+ossl_context_service::~ossl_context_service() noexcept = default;
+
 ossl_context_service::ossl_context_service(
   ssx::singleton_thread_worker& thread_worker,
   ss::sstring config_file,
@@ -364,7 +364,8 @@ is_fips_mode ossl_context_service::fips_mode() const {
 }
 
 bool ossl_context_service::in_rp_fixture_test() const {
-    return ::getenv("RP_FIXTURE_ENV") != nullptr;
+    char* val = ::getenv("RP_FIXTURE_ENV");
+    return val != nullptr && val == std::string{"1"};
 }
 
 } // namespace crypto

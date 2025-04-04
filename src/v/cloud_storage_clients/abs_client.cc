@@ -205,7 +205,7 @@ result<http::client::request_header> abs_request_creator::make_get_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -235,7 +235,7 @@ result<http::client::request_header> abs_request_creator::make_put_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -260,7 +260,7 @@ abs_request_creator::make_get_blob_metadata_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -286,7 +286,7 @@ abs_request_creator::make_delete_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -336,7 +336,7 @@ abs_request_creator::make_list_blobs_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -355,6 +355,7 @@ abs_request_creator::make_get_account_info_request() {
     if (error_code) {
         return error_code;
     }
+    util::url_encode_target(header);
 
     return header;
 }
@@ -388,6 +389,7 @@ abs_request_creator::make_set_expiry_to_blob_request(
         error_code != std::error_code{}) {
         return error_code;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -414,7 +416,7 @@ abs_request_creator::make_delete_file_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -858,7 +860,7 @@ ss::future<abs_client::list_bucket_result> abs_client::do_list_objects(
   std::optional<ss::sstring> marker,
   ss::lowres_clock::duration timeout,
   std::optional<char> delimiter,
-  std::optional<item_filter>) {
+  std::optional<item_filter> collect_item_if) {
     auto header = _requestor.make_list_blobs_request(
       name,
       _adls_client.has_value(),
@@ -891,8 +893,9 @@ ss::future<abs_client::list_bucket_result> abs_client::do_list_objects(
     co_return co_await ss::do_with(
       response_stream->as_input_stream(),
       xml_sax_parser{},
-      [](ss::input_stream<char>& stream, xml_sax_parser& p) mutable {
-          p.start_parse(std::make_unique<abs_parse_impl>());
+      [pred = std::move(collect_item_if)](
+        ss::input_stream<char>& stream, xml_sax_parser& p) mutable {
+          p.start_parse(std::make_unique<abs_parse_impl>(std::move(pred)));
           return ss::do_until(
                    [&stream] { return stream.eof(); },
                    [&stream, &p] {

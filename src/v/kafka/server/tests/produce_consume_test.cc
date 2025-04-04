@@ -12,12 +12,11 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/produce.h"
-#include "kafka/protocol/wire.h"
 #include "kafka/server/handlers/produce.h"
 #include "kafka/server/snc_quota_manager.h"
 #include "kafka/server/tests/delete_records_utils.h"
-#include "kafka/server/tests/offset_for_leader_epoch_utils.h"
 #include "kafka/server/tests/produce_consume_utils.h"
+#include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/timeout_clock.h"
 #include "random/generators.h"
@@ -163,6 +162,18 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
 
     ss::future<kafka::fetch_response> fetch_next() {
         return fetch_next(consumers.front(), model::partition_id{0});
+    }
+
+    kafka::kafka_probe& kafka_probe() {
+        return app._kafka_server.local().kafka_probe();
+    }
+
+    uint32_t produce_bad_ts_count() {
+        return kafka_probe()._produce_bad_create_time;
+    };
+
+    uint64_t bytes_by_compression(model::compression compression_type) {
+        return kafka_probe()._bytes_by_compression.at((size_t)compression_type);
     }
 
     std::vector<model::offset> fetch_offsets;
@@ -858,51 +869,82 @@ FIXTURE_TEST(test_produce_bad_timestamps, prod_consume_fixture) {
     };
 
     BOOST_TEST_INFO("expect produce_bad_create_time to be 0");
-    auto bad_timestamps_metric
-      = app._kafka_server.local().probe().get_produce_bad_create_time();
+    auto bad_timestamps_metric = produce_bad_ts_count();
     BOOST_CHECK_EQUAL(0, bad_timestamps_metric);
 
     BOOST_TEST_INFO("messages with no skew do not trigger the probe");
     produce_messages(0s);
-    BOOST_CHECK_EQUAL(
-      0, app._kafka_server.local().probe().get_produce_bad_create_time());
+    BOOST_CHECK_EQUAL(0, produce_bad_ts_count());
 
     BOOST_TEST_INFO(
       "messages with a skew towards the future trigger the probe");
     config::shard_local_cfg().log_message_timestamp_alert_after_ms.set_value(
       std::chrono::duration_cast<std::chrono::milliseconds>(1h));
     produce_messages(2h);
-    BOOST_CHECK_LT(
-      bad_timestamps_metric,
-      app._kafka_server.local().probe().get_produce_bad_create_time());
+    BOOST_CHECK_LT(bad_timestamps_metric, produce_bad_ts_count());
 
-    bad_timestamps_metric
-      = app._kafka_server.local().probe().get_produce_bad_create_time();
+    bad_timestamps_metric = produce_bad_ts_count();
 
     BOOST_TEST_INFO("messages with a skew towards the past trigger the probe");
     config::shard_local_cfg().log_message_timestamp_alert_before_ms.set_value(
       std::optional{std::chrono::duration_cast<std::chrono::milliseconds>(1h)});
     produce_messages(-2h);
-    BOOST_CHECK_LT(
-      bad_timestamps_metric,
-      app._kafka_server.local().probe().get_produce_bad_create_time());
+    BOOST_CHECK_LT(bad_timestamps_metric, produce_bad_ts_count());
 
-    bad_timestamps_metric
-      = app._kafka_server.local().probe().get_produce_bad_create_time();
+    bad_timestamps_metric = produce_bad_ts_count();
 
     BOOST_TEST_INFO("messages within the bounds to not trigger the probe");
     produce_messages(-30min);
     produce_messages(30min);
-    BOOST_CHECK_EQUAL(
-      bad_timestamps_metric,
-      app._kafka_server.local().probe().get_produce_bad_create_time());
+    BOOST_CHECK_EQUAL(bad_timestamps_metric, produce_bad_ts_count());
 
     BOOST_TEST_INFO("disabling the alert for the past allows messages in the "
                     "past without triggering the probe");
     config::shard_local_cfg().log_message_timestamp_alert_before_ms.set_value(
       std::optional<std::chrono::milliseconds>{});
     produce_messages(-365 * 24h);
-    BOOST_CHECK_EQUAL(
-      bad_timestamps_metric,
-      app._kafka_server.local().probe().get_produce_bad_create_time());
+    BOOST_CHECK_EQUAL(bad_timestamps_metric, produce_bad_ts_count());
+}
+
+FIXTURE_TEST(test_compression_metrics, prod_consume_fixture) {
+    using ctype = model::compression;
+
+    wait_for_controller_leadership().get();
+    start();
+    auto ntp = model::ntp(test_tp_ns.ns, test_tp_ns.tp, model::partition_id(0));
+
+    auto producer = tests::kafka_produce_transport(make_kafka_client().get());
+    producer.start().get();
+
+    auto produce_messages = [&](ctype compression) {
+        producer
+          .produce_to_partition(
+            ntp.tp.topic,
+            ntp.tp.partition,
+            {{"key0", "val0"}},
+            std::nullopt,
+            compression)
+          .get();
+    };
+
+    for (auto c : model::all_batch_compression_types) {
+        BOOST_TEST_INFO("initially all bytes zero for " << c);
+        BOOST_CHECK_EQUAL(0, bytes_by_compression(c));
+    }
+
+    // this compression type and those greater are expected to have zero bytes
+    // produced, but lower ones should have non-zero bytes produced
+    for (ctype last_nonzero : model::all_batch_compression_types) {
+        produce_messages(last_nonzero);
+        for (auto ctype : model::all_batch_compression_types) {
+            if (ctype <= last_nonzero) {
+                BOOST_TEST_INFO(
+                  "testing non-zero bytes in metric for " << ctype);
+                BOOST_CHECK_GT(bytes_by_compression(ctype), 0);
+            } else {
+                BOOST_TEST_INFO("testing zero bytes in metric for " << ctype);
+                BOOST_CHECK_EQUAL(0, bytes_by_compression(ctype));
+            }
+        }
+    }
 }

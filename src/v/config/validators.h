@@ -12,7 +12,8 @@
 #pragma once
 
 #include "base/seastarx.h"
-#include "config/client_group_byte_rate_quota.h"
+#include "config/configuration.h"
+#include "config/types.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -26,9 +27,6 @@ parse_connection_rate_override(const ss::sstring& raw_option);
 
 std::optional<ss::sstring>
 validate_connection_rate(const std::vector<ss::sstring>& ips_with_limit);
-
-std::optional<ss::sstring> validate_client_groups_byte_rate_quota(
-  const std::unordered_map<ss::sstring, config::client_group_quota>&);
 
 std::optional<ss::sstring>
 validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms);
@@ -58,5 +56,14 @@ validate_api_endpoint(const std::optional<ss::sstring>& os);
 
 std::optional<ss::sstring> validate_tombstone_retention_ms(
   const std::optional<std::chrono::milliseconds>& ms);
+
+std::optional<ss::sstring>
+validate_iceberg_partition_spec(const ss::sstring& spec);
+
+std::optional<ss::sstring>
+validate_iceberg_rest_catalog_auth_mode(const configuration& config);
+
+std::optional<ss::sstring>
+validate_consumer_group_metrics(const std::vector<ss::sstring>& metrics);
 
 }; // namespace config

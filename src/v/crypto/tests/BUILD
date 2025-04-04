@@ -97,9 +97,9 @@ expand_template(
 
 genrule(
     name = "fipsmodule_cnf",
-    srcs = ["@openssl-fips//:gen_dir"],
+    srcs = ["@openssl-fips//:fipsmodule_cnf"],
     outs = ["etc/ssl/fipsmodule.cnf"],
-    cmd = "cp -L $(SRCS)/ssl/fipsmodule.cnf $@",
+    cmd = "cp -L $(SRCS) $@",
 )
 
 common_data_deps = [
@@ -114,8 +114,7 @@ common_env = {
 }
 
 redpanda_cc_bench(
-    name = "crypto_bench",
-    timeout = "short",
+    name = "crypto_bench_rpbench",
     srcs = ["crypto_bench.cc"],
     data = common_data_deps,
     env = common_env,
@@ -131,8 +130,7 @@ redpanda_cc_bench(
 )
 
 redpanda_cc_bench(
-    name = "crypto_bench_fips",
-    timeout = "short",
+    name = "crypto_bench_fips_rpbench",
     srcs = ["crypto_bench.cc"],
     data = common_data_deps,
     defines = ["PERF_FIPS_MODE"],
@@ -170,7 +168,7 @@ redpanda_cc_gtest(
     cpu = 2,
     data = common_data_deps,
     defines = ["FIPS_MODULE_REQUIRED"],
-    env = common_env,
+    env = common_env | {"RP_FIXTURE_ENV": ""},
     deps = [
         ":crypto_test_utils",
         ":ossl_context_service_test_base",
@@ -194,7 +192,7 @@ redpanda_cc_gtest(
     cpu = 2,
     data = common_data_deps,
     defines = ["FIPS_MODULE_REQUIRED"],
-    env = common_env,
+    env = common_env | {"RP_FIXTURE_ENV": ""},
     deps = [
         ":crypto_test_utils",
         ":ossl_context_service_test_base",

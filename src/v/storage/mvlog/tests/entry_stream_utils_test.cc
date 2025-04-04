@@ -8,11 +8,11 @@
 // by the Apache License, Version 2.0
 
 #include "bytes/iostream.h"
-#include "bytes/random.h"
 #include "random/generators.h"
 #include "storage/mvlog/entry.h"
 #include "storage/mvlog/entry_stream.h"
 #include "storage/mvlog/entry_stream_utils.h"
+#include "test_utils/random_bytes.h"
 
 #include <gtest/gtest.h>
 
@@ -98,7 +98,7 @@ TEST(EntryStream, TestShortHeader) {
     entry_header hdr{0, 0, entry_type::record_batch};
     hdr_buf.append(entry_header_to_iobuf(hdr));
     ASSERT_GT(hdr_buf.size_bytes(), 1);
-    for (int i = 1; i < hdr_buf.size_bytes(); i++) {
+    for (size_t i = 1; i < hdr_buf.size_bytes(); i++) {
         auto copy_buf = hdr_buf.copy();
         copy_buf.trim_back(i);
         auto short_stream = make_iobuf_input_stream(std::move(copy_buf));
@@ -133,7 +133,7 @@ TEST(EntryStream, TestShortBody) {
     hdr_buf.append(entry_header_to_iobuf(hdr));
     for (int i = 0; i < expected_body_size; i++) {
         auto copy_buf = hdr_buf.copy();
-        copy_buf.append(random_generators::make_iobuf(i));
+        copy_buf.append(tests::random_iobuf(i));
         auto short_stream = make_iobuf_input_stream(std::move(copy_buf));
         entry_stream entries(std::move(short_stream));
         auto entry = entries.next().get();
@@ -155,7 +155,7 @@ TEST(EntryStream, TestRandom) {
         iobuf hdr_buf;
         auto hdr = make_checksummed_header(body_size, entry_type::record_batch);
         entries_buf.append(entry_header_to_iobuf(hdr));
-        entries_buf.append(random_generators::make_iobuf(body_size));
+        entries_buf.append(tests::random_iobuf(body_size));
     }
     auto istream = make_iobuf_input_stream(std::move(entries_buf));
     entry_stream entries(std::move(istream));

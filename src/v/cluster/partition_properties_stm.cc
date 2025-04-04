@@ -89,12 +89,13 @@ ss::future<iobuf> partition_properties_stm::take_snapshot(model::offset o) {
       raft_snapshot{.writes_disabled = it->writes_disabled});
 }
 
-ss::future<> partition_properties_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied>
+partition_properties_stm::apply_local_snapshot(
   raft::stm_snapshot_header header, iobuf&& buffer) {
     vlog(_log.debug, "Applying local snapshot with offset {}", header.offset);
     auto snapshot = serde::from_iobuf<local_snapshot>(std::move(buffer));
     _state_snapshots = std::move(snapshot.state_updates);
-    co_return;
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot> partition_properties_stm::take_local_snapshot(
@@ -195,7 +196,7 @@ partition_properties_stm::apply_raft_snapshot(const iobuf& buffer) {
     co_return;
 }
 
-ss::future<std::error_code>
+ss::future<result<model::offset>>
 partition_properties_stm::replicate_properties_update(
   model::timeout_clock::duration timeout, update_writes_disabled_cmd cmd) {
     if (!co_await sync(timeout)) {
@@ -210,10 +211,7 @@ partition_properties_stm::replicate_properties_update(
       raft::consistency_level::quorum_ack,
       std::chrono::milliseconds(timeout / 1ms));
     r_opts.set_force_flush();
-    auto r = co_await _raft->replicate(
-      _insync_term,
-      model::make_memory_record_batch_reader(std::move(b)),
-      r_opts);
+    auto r = co_await _raft->replicate(_insync_term, std::move(b), r_opts);
 
     if (r.has_error()) {
         vlog(
@@ -226,11 +224,11 @@ partition_properties_stm::replicate_properties_update(
         co_return r.error();
     }
 
-    auto applied = co_await wait_no_throw(r.value().last_offset, deadline);
-    if (!applied) {
+    auto message_offset = r.value().last_offset;
+    if (!co_await wait_no_throw(message_offset, deadline)) {
         co_return errc::timeout;
     }
-    co_return errc::success;
+    co_return message_offset;
 }
 
 partition_properties_stm::writes_disabled
@@ -252,14 +250,14 @@ model::record_batch partition_properties_stm::make_update_partitions_batch(
     return std::move(builder).build();
 }
 
-ss::future<std::error_code> partition_properties_stm::disable_writes() {
+ss::future<result<model::offset>> partition_properties_stm::disable_writes() {
     vlog(_log.info, "disabling partition writes");
     return replicate_properties_update(
       _sync_timeout(),
       update_writes_disabled_cmd{.writes_disabled = writes_disabled::yes});
 }
 
-ss::future<std::error_code> partition_properties_stm::enable_writes() {
+ss::future<result<model::offset>> partition_properties_stm::enable_writes() {
     vlog(_log.info, "enabling partition writes");
     return replicate_properties_update(
       _sync_timeout(),

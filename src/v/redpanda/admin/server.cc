@@ -49,6 +49,7 @@
 #include "config/base_property.h"
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
+#include "config/validators.h"
 #include "container/fragmented_vector.h"
 #include "container/lw_shared_container.h"
 #include "features/enterprise_features.h"
@@ -103,6 +104,7 @@
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
@@ -1361,7 +1363,7 @@ void admin_server::register_config_routes() {
                 "Invalid parameter 'name' got {{{}}}",
                 req->get_path_param("name")));
           }
-          validate_no_control(name, string_conversion_exception{name});
+          validate_no_control(name, string_conversion_exception{"name"});
 
           ss::log_level cur_level;
           try {
@@ -1401,7 +1403,7 @@ void admin_server::register_config_routes() {
                 "Invalid parameter 'name' got {{{}}}",
                 req->get_path_param("name")));
           }
-          validate_no_control(name, string_conversion_exception{name});
+          validate_no_control(name, string_conversion_exception{"name"});
 
           // current level: will be used revert after a timeout (optional)
           ss::log_level cur_level;
@@ -1599,10 +1601,18 @@ void config_multi_property_validation(
             // Some superusers must be defined, or nobody will be able
             // to use the admin API after this request.
             errors["admin_api_require_auth"] = "No superusers defined";
-        } else if (!superusers_set.contains(username) && !auth_was_enabled) {
-            // When enabling auth, user making the change must be in the list of
-            // superusers, or they would be locking themselves out.
-            errors["admin_api_require_auth"] = "May only be set by a superuser";
+        } else if (!superusers_set.contains(username)) {
+            if (!auth_was_enabled) {
+                // When enabling auth, user making the change must be in the
+                // list of superusers, or they would be locking themselves out.
+                errors["admin_api_require_auth"]
+                  = "May only be set by a superuser";
+            } else {
+                // When auth is enabled, user making the change must be in the
+                // list of superusers, or they would be locking themselves out.
+                errors["superusers"] = "superusers must contain the user "
+                                       "making the change when auth is enabled";
+            }
         }
     }
 
@@ -1742,6 +1752,15 @@ void config_multi_property_validation(
           updated_config.cloud_storage_enabled.name(),
           updated_config.cloud_storage_enable_remote_read.name(),
           updated_config.cloud_storage_enable_remote_write.name());
+    }
+
+    // Validate iceberg authentication mode properties
+    auto opt_err = config::validate_iceberg_rest_catalog_auth_mode(
+      updated_config);
+    if (opt_err.has_value()) {
+        errors[ss::sstring{
+          updated_config.iceberg_rest_catalog_authentication_mode.name()}]
+          = opt_err.value();
     }
 }
 } // namespace
@@ -2421,9 +2440,11 @@ void admin_server::register_features_routes() {
           return put_feature_handler(std::move(req));
       });
 
-    register_route<user>(
+    register_route<publik, true>(
       ss::httpd::features_json::get_license,
-      [this](std::unique_ptr<ss::http::request>) {
+      [this](
+        std::unique_ptr<ss::http::request>,
+        const request_auth_result& auth_result) {
           ss::httpd::features_json::license_response res;
           res.loaded = false;
           const auto& ft = _controller->get_feature_table().local();
@@ -2431,8 +2452,10 @@ void admin_server::register_features_routes() {
           if (license) {
               res.loaded = true;
               ss::httpd::features_json::license_contents lc;
-              lc.format_version = license->format_version;
-              lc.org = license->organization;
+              if (auth_result.is_authenticated()) {
+                  lc.format_version = license->format_version;
+                  lc.org = license->organization;
+              }
               lc.type = security::license_type_to_string(license->type);
               lc.expires = license->expiry.count();
               lc.sha256 = license->checksum;
@@ -2573,9 +2596,9 @@ admin_server::get_decommission_progress_handler(
         status.moving_to = moving_to;
         size_t left_to_move = 0;
         size_t already_moved = 0;
-        for (auto replica_status : p.already_transferred_bytes) {
-            left_to_move += (p.current_partition_size - replica_status.bytes);
-            already_moved += replica_status.bytes;
+        for (auto replica_status : p.replicas) {
+            left_to_move += replica_status.bytes_left;
+            already_moved += replica_status.bytes_transferred;
         }
         status.bytes_left_to_move = left_to_move;
         status.bytes_moved = already_moved;
@@ -2642,6 +2665,62 @@ admin_server::reset_crash_tracking(std::unique_ptr<ss::http::request>) {
     co_await ss::sync_directory(config::node().data_directory().as_sstring());
     vlog(adminlog.info, "Deleted crash loop tracker file: {}", file);
     co_return ss::json::json_void();
+}
+
+namespace {
+void format_affected_partitions(
+  const cluster::restart_risk_report::partitions_t& src,
+  ss::json::json_list<ss::sstring>& dest) {
+    dest = src | std::views::transform([](const model::ntp& ntp) {
+               return fmt::format(
+                 "{}/{}/{}", ntp.ns(), ntp.tp.topic(), ntp.tp.partition());
+           });
+    dest._set = true; // even if empty
+}
+} // namespace
+
+ss::future<ss::json::json_return_type>
+admin_server::pre_restart_probe(std::unique_ptr<ss::http::request> req) {
+    vlog(adminlog.debug, "Requested broker pre-restart probe");
+    auto limit = get_integer_query_param(*req, "limit");
+    auto maybe_res = co_await _controller->get_health_monitor()
+                       .local()
+                       .get_current_node_restart_risks(
+                         limit.value_or(128),
+                         model::time_from_now(std::chrono::seconds(5)));
+
+    if (!maybe_res.has_value()) {
+        co_await throw_on_error(*req, maybe_res.error(), model::controller_ntp);
+        vassert(false, "the line above should have thrown");
+    }
+    const auto& res = maybe_res.value();
+    ss::httpd::broker_json::restart_risks risks;
+    format_affected_partitions(res.rf1_offline, risks.rf1_offline);
+    format_affected_partitions(
+      res.full_acks_produce_unavailable, risks.full_acks_produce_unavailable);
+    format_affected_partitions(res.unavailable, risks.unavailable);
+    format_affected_partitions(res.acks1_data_loss, risks.acks1_data_loss);
+
+    ss::httpd::broker_json::pre_restart_check_result ret;
+    ret.risks = risks;
+    co_return ss::json::json_return_type(ret);
+}
+
+ss::future<ss::json::json_return_type>
+admin_server::post_restart_probe(std::unique_ptr<ss::http::request> req) {
+    vlog(adminlog.debug, "Requested broker post-restart probe");
+    auto maybe_res = co_await _controller->get_health_monitor()
+                       .local()
+                       .get_current_node_in_sync_replicas_share(
+                         model::time_from_now(std::chrono::seconds(5)));
+    if (!maybe_res.has_value()) {
+        co_await throw_on_error(*req, maybe_res.error(), model::controller_ntp);
+        vassert(false, "the line above should have thrown");
+    }
+    ss::httpd::broker_json::post_restart_check_result ret;
+    // placeholder, to be implemented
+    ret.load_reclaimed_pc = 100 * maybe_res.value();
+    co_return ss::json::json_return_type(ret);
 }
 
 void admin_server::register_broker_routes() {
@@ -2766,6 +2845,16 @@ void admin_server::register_broker_routes() {
       ss::httpd::broker_json::reset_crash_tracking,
       [this](std::unique_ptr<ss::http::request> req) {
           return reset_crash_tracking(std::move(req));
+      });
+    register_route<publik>(
+      ss::httpd::broker_json::pre_restart_probe,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return pre_restart_probe(std::move(req));
+      });
+    register_route<publik>(
+      ss::httpd::broker_json::post_restart_probe,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return post_restart_probe(std::move(req));
       });
 }
 
@@ -3261,6 +3350,17 @@ admin_server::cancel_all_partitions_reconfigs_handler(
       co_await map_partition_results(std::move(res.value())));
 }
 
+ss::future<ss::json::json_return_type>
+admin_server::get_metrics_uuid(std::unique_ptr<ss::http::request>) {
+    vlog(adminlog.debug, "Requested metrics UUID");
+    ss::httpd::cluster_json::metrics_uuid ret;
+    ret.uuid = co_await _controller->get_controller_stm().invoke_on(
+      0, ([](cluster::controller_stm& s) {
+          return s.get_metrics_reporter_cluster_info().uuid;
+      }));
+    co_return ss::json::json_return_type(std::move(ret));
+}
+
 static json::validator make_post_cluster_partitions_validator() {
     const std::string schema = R"(
 {
@@ -3345,6 +3445,7 @@ struct cluster_partition_info {
     ss::lw_shared_ptr<model::topic_namespace> ns_tp;
     model::partition_id id;
     std::vector<model::broker_shard> replicas;
+    std::optional<model::node_id> leader_id;
     bool disabled = false;
 
     ss::httpd::cluster_json::cluster_partition to_json() const {
@@ -3357,6 +3458,9 @@ struct cluster_partition_info {
             a.node_id = r.node_id;
             a.core = r.shard;
             ret.replicas.push(a);
+        }
+        if (leader_id) {
+            ret.leader_id = leader_id.value();
         }
         ret.disabled = disabled;
         return ret;
@@ -3371,6 +3475,7 @@ using cluster_partitions_t
 cluster_partitions_t topic2cluster_partitions(
   model::topic_namespace ns_tp,
   const cluster::assignments_set& assignments,
+  const cluster::metadata_cache& md_cache,
   const cluster::topic_disabled_partitions_set* disabled_set,
   std::optional<bool> disabled_filter) {
     cluster_partitions_t ret;
@@ -3412,6 +3517,7 @@ cluster_partitions_t topic2cluster_partitions(
                 .ns_tp = shared_ns_tp,
                 .id = id,
                 .replicas = as_it->second.replicas,
+                .leader_id = md_cache.get_leader_id(*shared_ns_tp, id),
                 .disabled = true,
               });
         }
@@ -3429,6 +3535,7 @@ cluster_partitions_t topic2cluster_partitions(
                 .ns_tp = shared_ns_tp,
                 .id = p_as.id,
                 .replicas = p_as.replicas,
+                .leader_id = md_cache.get_leader_id(*shared_ns_tp, p_as.id),
                 .disabled = disabled,
               });
         }
@@ -3534,6 +3641,7 @@ admin_server::get_cluster_partitions_handler(
         auto topic_partitions = topic2cluster_partitions(
           ns_tp,
           topic_it->second.get_assignments(),
+          _metadata_cache.local(),
           topics_state.get_topic_disabled_set(ns_tp),
           disabled_filter);
 
@@ -3577,6 +3685,7 @@ admin_server::get_cluster_partitions_topic_handler(
     auto partitions = topic2cluster_partitions(
       ns_tp,
       topic_it->second.get_assignments(),
+      _metadata_cache.local(),
       topics_state.get_topic_disabled_set(ns_tp),
       disabled_filter);
 
@@ -3682,6 +3791,12 @@ void admin_server::register_cluster_routes() {
               return ss::json::json_return_type(std::move(ret));
           }
           return ss::json::json_return_type(ss::json::json_void());
+      });
+
+    register_route<publik>(
+      ss::httpd::cluster_json::get_metrics_uuid,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return get_metrics_uuid(std::move(req));
       });
 
     register_cluster_partitions_routes();
@@ -4338,6 +4453,14 @@ admin_server::delete_cloud_storage_lifecycle(
 ss::future<ss::json::json_return_type>
 admin_server::post_cloud_storage_cache_trim(
   std::unique_ptr<ss::http::request> req) {
+    co_await ss::smp::submit_to(ss::shard_id{0}, [this] {
+        if (!_cloud_storage_cache.local_is_initialized()) {
+            throw ss::httpd::bad_request_exception(
+              "Cloud Storage Cache is not available. Is cloud storage "
+              "enabled?");
+        }
+    });
+
     auto max_objects = get_integer_query_param(*req, "objects");
     auto max_bytes = static_cast<std::optional<size_t>>(
       get_integer_query_param(*req, "bytes"));

@@ -138,14 +138,38 @@ def read_topic_properties_serde(rdr: Reader, version):
         }
     if version >= 10:
         topic_properties |= {
-            'iceberg_mode': rdr.read_serde_enum(),
+            'iceberg_mode': read_iceberg_mode(rdr),
             'leaders_preference': rdr.read_optional(read_leaders_preference),
             'cloud_topic_enabled': rdr.read_bool(),
             'delete_retention_ms': rdr.read_tristate(Reader.read_int64),
             'iceberg_delete': rdr.read_optional(Reader.read_bool),
         }
+    if version >= 11:
+        topic_properties |= {
+            'iceberg_partition_spec':
+            rdr.read_optional(Reader.read_string),
+            'iceberg_invalid_record_action':
+            rdr.read_optional(Reader.read_serde_enum),
+            'iceberg_target_lag_ms':
+            rdr.read_optional(Reader.read_int64),
+            'min_cleanable_dirty_ratio':
+            rdr.read_tristate(Reader.read_double),
+        }
+
+    if version >= 11:
+        topic_properties |= {
+            'remote_topic_allow_gaps': rdr.read_optional(Reader.read_bool),
+        }
 
     return topic_properties
+
+
+def read_iceberg_mode(rdr: Reader):
+    variant = rdr.read_serde_enum()
+    protobuf_value = None
+    if variant == 3:
+        protobuf_value = rdr.read_string()
+    return {"variant": variant, "protobuf_value": protobuf_value}
 
 
 def read_topic_config(rdr: Reader, version):
@@ -159,7 +183,7 @@ def read_topic_config(rdr: Reader, version):
         'replication_factor':
         rdr.read_int16(),
         'properties':
-        rdr.read_envelope(read_topic_properties_serde, reader_version=10),
+        rdr.read_envelope(read_topic_properties_serde, reader_version=11),
     }
     if version < 1:
         # see https://github.com/redpanda-data/redpanda/pull/6613
@@ -303,10 +327,15 @@ def read_incremental_topic_update_serde(rdr: Reader):
             }
         if version >= 7:
             incr_obj |= {
-                'iceberg_mode': rdr.read_serde_enum(),
+                'iceberg_mode': read_iceberg_mode(rdr),
                 'leaders_preference':
                 rdr.read_optional(read_leaders_preference),
                 'iceberg_delete': rdr.read_optional(Reader.read_bool),
+            }
+        if version >= 8:
+            incr_obj |= {
+                'iceberg_partition_spec':
+                rdr.read_optional(Reader.read_string),
             }
 
         return incr_obj

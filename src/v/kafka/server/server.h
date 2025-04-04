@@ -22,7 +22,7 @@
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler_probe.h"
-#include "kafka/server/latency_probe.h"
+#include "kafka/server/kafka_probe.h"
 #include "kafka/server/queue_depth_monitor.h"
 #include "kafka/server/queue_depth_monitor_config.h"
 #include "kafka/server/read_distribution_probe.h"
@@ -55,7 +55,9 @@ public:
     server(
       ss::sharded<net::server_configuration>*,
       ss::smp_service_group,
-      ss::scheduling_group,
+      ss::scheduling_group fetch_sg,
+      ss::scheduling_group produce_sg,
+      ss::scheduling_group handler_sg,
       ss::sharded<cluster::metadata_cache>&,
       ss::sharded<cluster::topics_frontend>&,
       ss::sharded<cluster::config_frontend>&,
@@ -76,6 +78,7 @@ public:
       ss::sharded<cluster::security_frontend>&,
       ss::sharded<cluster::controller_api>&,
       ss::sharded<cluster::tx_gateway_frontend>&,
+      ss::sharded<datalake_throttle_manager>&,
       std::optional<qdc_monitor_config>,
       ssx::singleton_thread_worker&,
       const std::unique_ptr<pandaproxy::schema_registry::api>&) noexcept;
@@ -101,6 +104,8 @@ public:
      * them with most other tasks in the default scheduling group.
      */
     ss::scheduling_group fetch_scheduling_group() const;
+
+    ss::scheduling_group produce_scheduling_group() const;
 
     cluster::topics_frontend& topics_frontend() {
         return _topics_frontend.local();
@@ -182,7 +187,7 @@ public:
         return _gssapi_principal_mapper;
     }
 
-    latency_probe& latency_probe() { return *_probe; }
+    kafka_probe& kafka_probe() { return *_probe; }
 
     sasl_probe& sasl_probe() { return *_sasl_probe; }
 
@@ -223,11 +228,30 @@ public:
 
     ss::future<> revoke_credentials(std::string_view name);
 
+    // Returns a default scheduling group that is intended to be used for
+    // processing incoming requests.
+    ss::scheduling_group get_request_handler_sg() const;
+
+    /**
+     * Returns a throttle for a producer that may be producing to datalake
+     * enabled topics.
+     */
+    ss::future<std::chrono::milliseconds>
+    get_datalake_producer_throttle(std::optional<std::string_view> client_id);
+    /**
+     * Marks producer as datalake producer. I.e. a producer that produced to the
+     * datalake enabled topics.
+     */
+    void
+    mark_datalake_producer(const std::optional<std::string_view>& client_id);
+
 private:
     void setup_metrics();
 
     ss::smp_service_group _smp_group;
     ss::scheduling_group _fetch_scheduling_group;
+    ss::scheduling_group _produce_scheduling_group;
+    ss::scheduling_group _request_handler_scheduling_group;
     ss::sharded<cluster::topics_frontend>& _topics_frontend;
     ss::sharded<cluster::config_frontend>& _config_frontend;
     ss::sharded<features::feature_table>& _feature_table;
@@ -253,6 +277,7 @@ private:
     ss::sharded<cluster::security_frontend>& _security_frontend;
     ss::sharded<cluster::controller_api>& _controller_api;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
+    ss::sharded<kafka::datalake_throttle_manager>& _datalake_throttle_manager;
     std::optional<qdc_monitor> _qdc_mon;
     kafka::fetch_metadata_cache _fetch_metadata_cache;
     security::tls::principal_mapper _mtls_principal_mapper;
@@ -262,7 +287,7 @@ private:
 
     handler_probe_manager _handler_probes;
     metrics::internal_metric_groups _metrics;
-    std::unique_ptr<class latency_probe> _probe;
+    std::unique_ptr<class kafka_probe> _probe;
     std::unique_ptr<class sasl_probe> _sasl_probe;
     std::unique_ptr<read_distribution_probe> _read_dist_probe;
     ssx::singleton_thread_worker& _thread_worker;

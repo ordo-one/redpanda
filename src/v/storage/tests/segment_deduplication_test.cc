@@ -70,6 +70,12 @@ void add_segments(
         if (seg->has_appender()) {
             seg->appender().close().get();
             seg->release_appender();
+            // Since we're "rolling" the segment manually here (releasing the
+            // appender), increment closed/dirty bytes in the log.
+            if (!seg->has_clean_compact_timestamp()) {
+                b.add_dirty_segment_bytes(seg->file_size());
+            }
+            b.add_closed_segment_bytes(seg->file_size());
         }
     }
 }
@@ -382,23 +388,6 @@ TEST(BuildOffsetMap, TestBuildSimpleMap) {
           .get();
     }
 
-    // Build a map, configuring it to hold too little data for even a single
-    // segment.
-    simple_key_offset_map too_small_map(5);
-    ASSERT_THAT(
-      [&] {
-          build_offset_map(
-            cfg,
-            segs,
-            disk_log.stm_manager(),
-            disk_log.resources(),
-            disk_log.get_probe(),
-            too_small_map)
-            .get();
-      },
-      testing::ThrowsMessage<std::runtime_error>(
-        testing::HasSubstr("Couldn't index")));
-
     // Now configure a map to index some segments.
     simple_key_offset_map partial_map(15);
     auto partial_o = build_offset_map(
@@ -511,7 +500,7 @@ TEST(DeduplicateSegmentsTest, TestBadReader) {
       disk_log.resources(),
       cfg.sanitizer_config);
     auto close = ss::defer([&] {
-        compacted_idx_writer.close().get();
+        compacted_idx_writer->close().get();
         appender->close().get();
     });
 
@@ -522,7 +511,7 @@ TEST(DeduplicateSegmentsTest, TestBadReader) {
         all_segs_map,
         first_seg,
         *appender,
-        compacted_idx_writer,
+        *compacted_idx_writer,
         disk_log.get_probe(),
         storage::internal::should_apply_delta_time_offset(b.feature_table()),
         b.feature_table(),

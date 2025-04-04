@@ -24,15 +24,13 @@ go_library(
     deps = [
         "//src/go/rpk/pkg/adminapi",
         "//src/go/rpk/pkg/cli/container/common",
-        "//src/go/rpk/pkg/cloudapi",
         "//src/go/rpk/pkg/config",
-        "//src/go/rpk/pkg/httpapi",
         "//src/go/rpk/pkg/oauth",
         "//src/go/rpk/pkg/oauth/providers/auth0",
         "//src/go/rpk/pkg/os",
         "//src/go/rpk/pkg/out",
         "//src/go/rpk/pkg/publicapi",
-        "@build_buf_gen_go_redpandadata_cloud_protocolbuffers_go//redpanda/api/controlplane/v1beta2",
+        "@build_buf_gen_go_redpandadata_cloud_protocolbuffers_go//redpanda/api/controlplane/v1:controlplane",
         "@com_github_fatih_color//:color",
         "@com_github_rs_xid//:xid",
         "@com_github_spf13_afero//:afero",
@@ -44,7 +42,14 @@ go_library(
 go_test(
     name = "profile_test",
     size = "small",
-    srcs = ["prompt_test.go"],
+    srcs = [
+        "create_test.go",
+        "prompt_test.go",
+    ],
     embed = [":profile"],
-    deps = ["@com_github_fatih_color//:color"],
+    deps = [
+        "@build_buf_gen_go_redpandadata_cloud_protocolbuffers_go//redpanda/api/controlplane/v1:controlplane",
+        "@com_github_fatih_color//:color",
+        "@com_github_stretchr_testify//require",
+    ],
 )

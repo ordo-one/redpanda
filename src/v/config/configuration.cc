@@ -10,9 +10,11 @@
 #include "config/configuration.h"
 
 #include "base/units.h"
+#include "cluster/scheduling/topic_memory_per_partition_default.h"
 #include "config/base_property.h"
 #include "config/bounded_property.h"
 #include "config/node_config.h"
+#include "config/types.h"
 #include "config/validators.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -288,18 +290,26 @@ configuration::configuration()
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",
-      "Required memory per partition when creating topics.",
+      "Required memory in bytes per partition replica when creating or "
+      "altering topics. The total size of the memory pool for partitions is "
+      "the total memory available to Redpanda times "
+      "topic_partitions_memory_allocation_percent, and then each partition "
+      "created requires "
+      "topic_memory_per_partition bytes from that pool. If insufficent memory "
+      "is available, topic creation or alternation will fail.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      4_MiB,
+      cluster::DEFAULT_TOPIC_MEMORY_PER_PARTITION,
       {
         .min = 1,      // Must be nonzero, it's a divisor
         .max = 100_MiB // Rough 'sanity' limit: a machine with 1GB RAM must be
-                       // able to create at least 10 partitions})
+                       // able to create at least 10 partitions
       })
   , topic_fds_per_partition(
       *this,
       "topic_fds_per_partition",
-      "Required file handles per partition when creating topics.",
+      "File descriptors required per partition replica: topic creation is "
+      "prevented if it would result in the ratio of file descriptor limit to "
+      "partition replicas being lower than this value.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       5,
       {
@@ -310,10 +320,13 @@ configuration::configuration()
   , topic_partitions_per_shard(
       *this,
       "topic_partitions_per_shard",
-      "Maximum number of partitions which may be allocated to one shard (CPU "
-      "core).",
+      "Maximum partition replicas per shard: topic creation is prevented if "
+      "it would result in the ratio of partition replicas to shards being "
+      "higher than this value.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      1000,
+      // default value must be synced with
+      // scale_parameters.py::DEFAULT_PARTITIONS_PER_SHARD
+      5000,
       {
         .min = 16,    // Forbid absurdly small values that would prevent most
                       // practical workloads from running
@@ -334,6 +347,19 @@ configuration::configuration()
       {
         .min = 0,     // It is not mandatory to reserve any capacity
         .max = 131072 // Same max as topic_partitions_per_shard
+      })
+  , topic_partitions_memory_allocation_percent(
+      *this,
+      "topic_partitions_memory_allocation_percent",
+      "Percentage of total memory to reserve for topic partitions. See "
+      "topic_memory_per_partition for details.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      // default value must be synced with
+      // scale_parameters.py::DEFAULT_PARTITIONS_MEMORY_ALLOCATION_PERCENT
+      10,
+      {
+        .min = 1,
+        .max = 80,
       })
   , partition_manager_shutdown_watchdog_timeout(
       *this,
@@ -478,7 +504,7 @@ configuration::configuration()
       "cannot change. When the total size of cached requests reaches the set "
       "limit, back pressure is applied to throttle producers.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      5_MiB,
+      0,
       {.min = 0, .max = 100_MiB})
   , enable_usage(
       *this,
@@ -535,35 +561,16 @@ configuration::configuration()
       *this,
       "quota_manager_gc_sec",
       "Quota manager GC frequency in milliseconds.",
-      {.visibility = visibility::tunable},
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       std::chrono::milliseconds(30000))
-  , target_quota_byte_rate(
-      *this,
-      "target_quota_byte_rate",
-      "Target request size quota byte rate (bytes per second)",
-      {.needs_restart = needs_restart::no,
-       .example = "1073741824",
-       .visibility = visibility::user},
-      target_produce_quota_byte_rate_default,
-      {.min = 0})
-  , target_fetch_quota_byte_rate(
-      *this,
-      "target_fetch_quota_byte_rate",
-      "Target fetch size quota byte rate (bytes per second) - disabled default",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      std::nullopt)
-  , kafka_admin_topic_api_rate(
-      *this,
-      "kafka_admin_topic_api_rate",
-      "Target quota rate (partition mutations per default_window_sec)",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      std::nullopt,
-      {.min = 1})
+  , target_quota_byte_rate(*this, "target_quota_byte_rate")
+  , target_fetch_quota_byte_rate(*this, "target_fetch_quota_byte_rate")
+  , kafka_admin_topic_api_rate(*this, "kafka_admin_topic_api_rate")
   , cluster_id(
       *this,
       "cluster_id",
       "Cluster identifier.",
-      {.needs_restart = needs_restart::no},
+      {.needs_restart = needs_restart::no, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , disable_metrics(
@@ -590,6 +597,21 @@ configuration::configuration()
       "sense by the shard and/or partition labels.",
       {.needs_restart = needs_restart::no},
       false)
+  , enable_consumer_group_metrics(
+      *this,
+      "enable_consumer_group_metrics",
+      "List of enabled consumer group metrics. Accepted "
+      "Values: `group`, `partition`, `consumer_lag`",
+      {.needs_restart = needs_restart::no},
+      std::vector<ss::sstring>{"group", "partition"},
+      validate_consumer_group_metrics)
+  , consumer_group_lag_collection_interval(
+      *this,
+      "consumer_group_lag_collection_interval_sec",
+      "How often to run the collection loop when enable_consumer_group_metrics "
+      "contains consumer_lag",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      60s)
   , group_min_session_timeout_ms(
       *this,
       "group_min_session_timeout_ms",
@@ -843,6 +865,18 @@ configuration::configuration()
       "Use a separate scheduler group for fetch processing.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       true)
+  , use_produce_scheduler_group(
+      *this,
+      "use_produce_scheduler_group",
+      "Use a separate scheduler group for kafka produce requests processing.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
+  , use_kafka_handler_scheduler_group(
+      *this,
+      "use_kafka_handler_scheduler_group",
+      "Use separate scheduler group to handle parsing Kafka protocol requests",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
   , metadata_status_wait_timeout_ms(
       *this,
       "metadata_status_wait_timeout_ms",
@@ -975,6 +1009,19 @@ configuration::configuration()
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       std::nullopt,
       validate_tombstone_retention_ms)
+  , min_cleanable_dirty_ratio(
+      *this,
+      "min_cleanable_dirty_ratio",
+      "The minimum ratio between the number of bytes in \"dirty\" segments and "
+      "the total number of bytes in closed segments that must be reached "
+      "before a partition's log is eligible for compaction in a compact topic. "
+      "The topic property `min.cleanable.dirty.ratio` overrides the value of "
+      "`min_cleanable_dirty_ratio` at the topic level.",
+      {.needs_restart = needs_restart::no,
+       .example = "0.2",
+       .visibility = visibility::user},
+      0.2,
+      {.min = 0.0, .max = 1.0})
   , log_disable_housekeeping_for_tests(
       *this,
       "log_disable_housekeeping_for_tests",
@@ -988,6 +1035,15 @@ configuration::configuration()
       "Use sliding window compaction.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
       true)
+  , log_compaction_adjacent_merge_self_compaction_count(
+      *this,
+      "log_compaction_adjacent_merge_self_compaction_count",
+      "The number of self compactions that must occur before an adjacent "
+      "compaction is attempted in the log. If set to `std::nullopt`, every "
+      "segment in the log must be self-compacted before an adjacent compaction "
+      "is attempted.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10)
   , retention_bytes(
       *this,
       "retention_bytes",
@@ -1340,7 +1396,7 @@ configuration::configuration()
       {.needs_restart = needs_restart::no,
        .example = "1",
        .visibility = visibility::tunable},
-      10)
+      1)
   , segment_fallocation_step(
       *this,
       "segment_fallocation_step",
@@ -1500,7 +1556,8 @@ configuration::configuration()
       std::vector<ss::sstring>{"GSSAPI", "OAUTHBEARER"},
       "sasl_mechanisms",
       "A list of supported SASL mechanisms. Accepted values: `SCRAM`, "
-      "`GSSAPI`, `OAUTHBEARER`.",
+      "`GSSAPI`, `OAUTHBEARER`, `PLAIN`.  Note that in order to enable PLAIN, "
+      "you must also enable SCRAM.",
       meta{
         .needs_restart = needs_restart::no,
         .visibility = visibility::user,
@@ -1556,6 +1613,17 @@ configuration::configuration()
       "authorization is disabled.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       std::nullopt)
+  , tls_certificate_name_format(
+      *this,
+      "tls_certificate_name_format",
+      "The format of the certificates's distinguished name to use for mTLS "
+      "principal mapping.  Legacy format would appear as "
+      "'C=US,ST=California,L=San Francisco,O=Redpanda,CN=redpanda', while "
+      "rfc2253 format would appear as 'CN=redpanda,O=Redpanda,L=San "
+      "Francisco,ST=California,C=US'.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      tls_name_format::legacy,
+      {tls_name_format::legacy, tls_name_format::rfc2253})
   , kafka_mtls_principal_mapping_rules(
       *this,
       "kafka_mtls_principal_mapping_rules",
@@ -1689,28 +1757,9 @@ configuration::configuration()
       {},
       validate_connection_rate)
   , kafka_client_group_byte_rate_quota(
-      *this,
-      "kafka_client_group_byte_rate_quota",
-      "Per-group target produce quota byte rate (bytes per second). Client is "
-      "considered part of the group if client_id contains clients_prefix.",
-      {.needs_restart = needs_restart::no,
-       .example
-       = R"([{'group_name': 'first_group','clients_prefix': 'group_1','quota': 10240}])",
-       .visibility = visibility::user},
-      {},
-      validate_client_groups_byte_rate_quota)
+      *this, "kafka_client_group_byte_rate_quota")
   , kafka_client_group_fetch_byte_rate_quota(
-      *this,
-      "kafka_client_group_fetch_byte_rate_quota",
-      "Per-group target fetch quota byte rate (bytes per second). "
-      "Client is considered part of the group if client_id contains "
-      "clients_prefix",
-      {.needs_restart = needs_restart::no,
-       .example
-       = R"([{'group_name': 'first_group','clients_prefix': 'group_1','quota': 10240}])",
-       .visibility = visibility::user},
-      {},
-      validate_client_groups_byte_rate_quota)
+      *this, "kafka_client_group_fetch_byte_rate_quota")
   , kafka_rpc_server_tcp_recv_buf(
       *this,
       "kafka_rpc_server_tcp_recv_buf",
@@ -1882,14 +1931,16 @@ configuration::configuration()
       "<<cloud_storage_secret_key>> to form the complete credentials required "
       "for authentication. To authenticate using IAM roles, see "
       "cloud_storage_credentials_source.",
-      {.visibility = visibility::user},
+      {.visibility = visibility::user, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_secret_key(
       *this,
       "cloud_storage_secret_key",
       "Cloud provider secret key.",
-      {.visibility = visibility::user, .secret = is_secret::yes},
+      {.visibility = visibility::user,
+       .secret = is_secret::yes,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_region(
@@ -1897,14 +1948,14 @@ configuration::configuration()
       "cloud_storage_region",
       "Cloud provider region that houses the bucket or container used for "
       "storage.",
-      {.visibility = visibility::user},
+      {.visibility = visibility::user, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_bucket(
       *this,
       "cloud_storage_bucket",
       "AWS or GCP bucket or container that should be used to store data.",
-      {.visibility = visibility::user},
+      {.visibility = visibility::user, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_api_endpoint(
@@ -1914,7 +1965,7 @@ configuration::configuration()
       "generated using <<cloud_storage_region,region>> and "
       "<<cloud_storage_bucket,bucket>>. Otherwise, this uses the value "
       "assigned. - GCP: Uses `storage.googleapis.com`.",
-      {.visibility = visibility::user},
+      {.visibility = visibility::user, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_api_endpoint)
   , cloud_storage_url_style(
@@ -1946,7 +1997,8 @@ configuration::configuration()
       "`azure_aks_oidc_federation` ",
       {.needs_restart = needs_restart::yes,
        .example = "config_file",
-       .visibility = visibility::user},
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       model::cloud_credentials_source::config_file,
       {
         model::cloud_credentials_source::config_file,
@@ -2011,7 +2063,7 @@ configuration::configuration()
       "cloud_storage_trust_file",
       "Path to certificate that should be used to validate server certificate "
       "during TLS handshake.",
-      {.visibility = visibility::user},
+      {.visibility = visibility::user, .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_crl_file(
@@ -2320,7 +2372,8 @@ configuration::configuration()
       "`google_s3_compat`, `azure`, `minio`]",
       {.needs_restart = needs_restart::yes,
        .example = "aws",
-       .visibility = visibility::user},
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       model::cloud_storage_backend::unknown,
       {model::cloud_storage_backend::aws,
        model::cloud_storage_backend::google_s3_compat,
@@ -2335,7 +2388,9 @@ configuration::configuration()
       "Derived from cloud_storage_credentials_source if not set. Only required "
       "when using IAM role based access. To authenticate using access keys, "
       "see `cloud_storage_access_key`.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      {.needs_restart = needs_restart::yes,
+       .visibility = visibility::tunable,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_spillover_manifest_size(
@@ -2399,13 +2454,15 @@ configuration::configuration()
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
   , cloud_storage_disable_metadata_consistency_checks(
+      *this, "cloud_storage_disable_metadata_consistency_checks")
+  , cloud_storage_disable_archival_stm_rw_fence(
       *this,
-      "cloud_storage_disable_metadata_consistency_checks",
-      "Disable all metadata consistency checks. This will allow redpanda to "
-      "replay logs with inconsistent tiered-storage metadata. Normally, this "
-      "option should be disabled.",
+      "cloud_storage_disable_archival_stm_rw_fence",
+      "Disable concurrency control mechanism in the Tiered-Storage. This could "
+      "potentially break the metadata consistency and shouldn't be used in "
+      "production systems. It should only be used for testing.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      true)
+      false)
   , cloud_storage_hydration_timeout_ms(
       *this,
       "cloud_storage_hydration_timeout_ms",
@@ -2423,12 +2480,38 @@ configuration::configuration()
       "and shouldn't be set in production.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       false)
+  , cloud_storage_enable_segment_uploads(
+      *this,
+      "cloud_storage_enable_segment_uploads",
+      "Controls the upload of log segments to Tiered Storage. "
+      "If set to false, this property temporarily pauses all log segment "
+      "uploads from the Redpanda cluster. When the uploads are paused, the "
+      "'cloud_storage_enable_remote_allow_gaps' cluster configuration and "
+      "'redpanda.remote.allowgaps' topic properties control local retention "
+      "behavior.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
+  , cloud_storage_enable_remote_allow_gaps(
+      *this,
+      "cloud_storage_enable_remote_allow_gaps",
+      "Controls the eviction of locally-stored log segments when Tiered "
+      "Storage uploads are paused. "
+      "Set to `false` (default) to only evict data that has already been "
+      "uploaded to cloud storage. If the retained data fills the local volume, "
+      "Redpanda will throttle producers. "
+      "Set to `true` to allow the eviction of locally-stored log segments, "
+      "which "
+      "may create gaps in offsets.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , cloud_storage_azure_storage_account(
       *this,
       "cloud_storage_azure_storage_account",
       "The name of the Azure storage account to use with Tiered Storage. If "
       "`null`, the property is disabled.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      {.needs_restart = needs_restart::yes,
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_azure_container(
@@ -2437,7 +2520,9 @@ configuration::configuration()
       "The name of the Azure container to use with Tiered Storage. If `null`, "
       "the property is disabled. The container must belong to "
       "cloud_storage_azure_storage_account.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      {.needs_restart = needs_restart::yes,
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_azure_shared_key(
@@ -2449,7 +2534,8 @@ configuration::configuration()
       "disabled. Redpanda expects this key string to be Base64 encoded.",
       {.needs_restart = needs_restart::no,
        .visibility = visibility::user,
-       .secret = is_secret::yes},
+       .secret = is_secret::yes,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_azure_adls_endpoint(
@@ -2458,7 +2544,9 @@ configuration::configuration()
       "Azure Data Lake Storage v2 endpoint override. Use when hierarchical "
       "namespaces are enabled on your storage account and you have set up a "
       "custom endpoint.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      {.needs_restart = needs_restart::yes,
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       std::nullopt,
       &validate_non_empty_string_opt)
   , cloud_storage_azure_adls_port(
@@ -2468,7 +2556,9 @@ configuration::configuration()
       "`cloud_storage_azure_adls_endpoint`. Use when Hierarchical Namespaces "
       "are enabled on your storage account and you have set up a custom "
       "endpoint.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      {.needs_restart = needs_restart::yes,
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       std::nullopt)
   , cloud_storage_azure_hierarchical_namespace_enabled(
       *this,
@@ -2678,7 +2768,9 @@ configuration::configuration()
       "Maximum size of object storage cache. If both this property and "
       "cloud_storage_cache_size_percent are set, Redpanda uses the minimum of "
       "the two.",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::user,
+       .gets_restored = gets_restored::no},
       0,
       property<uint64_t>::noop_validator,
       legacy_default<uint64_t>(20_GiB, legacy_version{9}))
@@ -3509,12 +3601,17 @@ configuration::configuration()
       "Per-shard capacity of the cache for validating schema IDs.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       128)
-  , schema_registry_normalize_on_startup(
+  , schema_registry_always_normalize(
       *this,
-      "schema_registry_normalize_on_startup",
-      "Normalize schemas as they are read from the topic on startup.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      "schema_registry_always_normalize",
+      "Always normalize schemas. If set, this overrides the "
+      "normalize parameter in API requests.",
+      {.needs_restart = needs_restart::no,
+       .visibility = visibility::user,
+       .aliases = {"schema_registry_normalize_on_startup"}},
       false)
+  , schema_registry_protobuf_renderer_v2(
+      *this, "schema_registry_protobuf_renderer_v2")
   , pp_sr_smp_max_non_local_requests(
       *this,
       "pp_sr_smp_max_non_local_requests",
@@ -3680,6 +3777,15 @@ configuration::configuration()
        tls_version::v1_1,
        tls_version::v1_2,
        tls_version::v1_3})
+  , tls_enable_renegotiation(
+      *this,
+      "tls_enable_renegotiation",
+      "TLS client-initiated renegotiation is considered unsafe and is by "
+      "default disabled.  Only re-enable it if you are experiencing issues "
+      "with your TLS-enabled client.  This option has no effect on TLSv1.3 "
+      "connections as client-initiated renegotiation was removed.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
   , iceberg_enabled(
       *this,
       true,
@@ -3704,7 +3810,15 @@ configuration::configuration()
       "individual commits.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       std::chrono::milliseconds(1min),
-      {.min = 10ms})
+      {.min = std::chrono::milliseconds{10s}})
+  , iceberg_latest_schema_cache_ttl_ms(
+      *this,
+      "iceberg_latest_schema_cache_ttl_ms",
+      "The TTL for the cache in translation that stores the latest schema when "
+      "using the `latest_protobuf_value` iceberg mode.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::chrono::milliseconds(5min),
+      {.min = std::chrono::milliseconds{1ms}})
   , iceberg_catalog_base_location(
       *this,
       "iceberg_catalog_base_location",
@@ -3743,14 +3857,16 @@ configuration::configuration()
       "iceberg_rest_catalog_client_id",
       "Iceberg REST catalog user ID. This ID is used to query "
       "the catalog API for the OAuth token. Required if catalog type is set to "
-      "`rest`",
+      "`rest` and `iceberg_rest_catalog_authentication_mode` is set to "
+      "`oauth2`.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
       std::nullopt)
   , iceberg_rest_catalog_client_secret(
       *this,
       "iceberg_rest_catalog_client_secret",
       "Secret to authenticate against Iceberg REST catalog. Required if "
-      "catalog type is set to `rest`",
+      "catalog type is set to `rest` and "
+      "`iceberg_rest_catalog_authentication_mode` is set to `oauth2`.",
       {.needs_restart = needs_restart::yes,
        .visibility = visibility::user,
        .secret = is_secret::yes},
@@ -3758,9 +3874,8 @@ configuration::configuration()
   , iceberg_rest_catalog_token(
       *this,
       "iceberg_rest_catalog_token",
-      "Token used to access the REST Iceberg catalog. If the token is present, "
-      "Redpanda ignores credentials stored in the properties "
-      "iceberg_rest_catalog_client_id and iceberg_rest_catalog_client_secret",
+      "Token used to access the REST Iceberg catalog. Required if "
+      "`iceberg_rest_catalog_authentication_mode` is set to `bearer`.",
       {.needs_restart = needs_restart::yes,
        .visibility = visibility::user,
        .secret = is_secret::yes},
@@ -3780,6 +3895,15 @@ configuration::configuration()
       {.visibility = visibility::user},
       std::nullopt,
       &validate_non_empty_string_opt)
+  , iceberg_rest_catalog_trust(
+      *this,
+      "iceberg_rest_catalog_trust",
+      "The contents of a certificate chain to trust for the REST "
+      "Iceberg catalog. Takes precedence over "
+      "`iceberg_rest_catalog_trust_file`.",
+      {.visibility = visibility::user, .secret = is_secret::yes},
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , iceberg_rest_catalog_crl_file(
       *this,
       "iceberg_rest_catalog_crl_file",
@@ -3788,14 +3912,93 @@ configuration::configuration()
       {.visibility = visibility::user},
       std::nullopt,
       &validate_non_empty_string_opt)
-  , iceberg_rest_catalog_prefix(
+  , iceberg_rest_catalog_crl(
       *this,
-      "iceberg_rest_catalog_prefix",
-      "Prefix part of the Iceberg REST catalog URL. Prefix is appended to the "
-      "catalog path f.e. '/v1/{prefix}/namespaces'",
+      "iceberg_rest_catalog_crl",
+      "The contents of a certificate revocation list for "
+      "`iceberg_rest_catalog_trust`. Takes precedence over "
+      "`iceberg_rest_catalog_crl_file`.",
+      {.visibility = visibility::user, .secret = is_secret::yes},
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , iceberg_rest_catalog_warehouse(
+      *this,
+      "iceberg_rest_catalog_warehouse",
+      "Warehouse to use for the Iceberg REST catalog. Redpanda will query the "
+      "catalog for configurations specific to the warehouse, for example, "
+      "using it to automatically configure the appropriate prefix.",
+      {.visibility = visibility::user,
+       .aliases = {"iceberg_rest_catalog_prefix"}},
+      std::nullopt,
+      &validate_non_empty_string_opt)
+  , iceberg_rest_catalog_oauth2_server_uri(
+      *this,
+      "iceberg_rest_catalog_oauth2_server_uri",
+      "The OAuth URI used to retrieve access tokens for Iceberg catalog "
+      "authentication. If left undefined, the deprecated Iceberg catalog "
+      "endpoint `/v1/oauth/tokens` is used instead.",
       {.visibility = visibility::user},
       std::nullopt,
       &validate_non_empty_string_opt)
+  , iceberg_rest_catalog_oauth2_scope(
+      *this,
+      "iceberg_rest_catalog_oauth2_scope",
+      "The OAuth scope used to retrieve access tokens for Iceberg catalog "
+      "authentication. Only meaningful when "
+      "`iceberg_rest_catalog_authentication_mode` is set to `oauth2`",
+      {.visibility = visibility::user},
+      "PRINCIPAL_ROLE:ALL")
+  , iceberg_rest_catalog_authentication_mode(
+      *this,
+      "iceberg_rest_catalog_authentication_mode",
+      "The authentication mode for client requests made to the Iceberg "
+      "catalog. Choose from: `none`, `bearer`, and `oauth2`. In `bearer` mode, "
+      "the token specified in `iceberg_rest_catalog_token` is used "
+      "unconditonally, and no attempts are made to refresh the token. In "
+      "`oauth2` mode, the credentials specified in "
+      "`iceberg_rest_catalog_client_id` and "
+      "`iceberg_rest_catalog_client_secret` are used to obtain a bearer token "
+      "from the URI defined by `iceberg_rest_catalog_oauth2_server_uri.`",
+      {.needs_restart = needs_restart::yes,
+       .example = "none",
+       .visibility = visibility::user},
+      datalake_catalog_auth_mode::none,
+      {datalake_catalog_auth_mode::none,
+       datalake_catalog_auth_mode::bearer,
+       datalake_catalog_auth_mode::oauth2})
+  , iceberg_backlog_controller_p_coeff(
+      *this,
+      "iceberg_backlog_controller_p_coeff",
+      "Proportional coefficient for the Iceberg backlog controller. Number of "
+      "shares assigned to the datalake scheduling group will be proportional "
+      "to the backlog size error.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      0.00001)
+  , iceberg_backlog_controller_i_coeff(
+      *this,
+      "iceberg_backlog_controller_i_coeff",
+      "Integral coefficient for the Iceberg backlog controller. The error is "
+      "integrated (accumulated) over time and the aggregated value contributes "
+      "to the datalake translation priority with this coefficient.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      0.005)
+  , iceberg_target_backlog_size(
+      *this,
+      "iceberg_target_backlog_size",
+      "Total size of the datalake translation backlog that "
+      "the backlog controller will try to maintain. When a backlog size is "
+      "larger than the setpoint a backlog controller will increase the "
+      "translation scheduling group priority.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      100_MiB,
+      {.min = 0, .max = std::numeric_limits<uint32_t>::max()})
+  , iceberg_throttle_backlog_size_ratio(
+      *this,
+      "iceberg_throttle_backlog_size_ratio",
+      "Ration of the total backlog size to the disk space at which the "
+      "throttle to iceberg producers is applied",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      0.3)
   , iceberg_delete(
       *this,
       "iceberg_delete",
@@ -3804,6 +4007,134 @@ configuration::configuration()
       "the topic.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       true)
+  , iceberg_default_partition_spec(
+      *this,
+      "iceberg_default_partition_spec",
+      "Default value for the redpanda.iceberg.partition.spec topic property "
+      "that determines the partition spec for the Iceberg table corresponding "
+      "to the topic.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      "(hour(redpanda.timestamp))",
+      &validate_iceberg_partition_spec)
+  , iceberg_invalid_record_action(
+      *this,
+      "iceberg_invalid_record_action",
+      "Default value for the redpanda.iceberg.invalid.record.action topic "
+      "property.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      model::iceberg_invalid_record_action::dlq_table,
+      {
+        model::iceberg_invalid_record_action::drop,
+        model::iceberg_invalid_record_action::dlq_table,
+      })
+  , iceberg_target_lag_ms(
+      *this,
+      "iceberg_target_lag_ms",
+      "Default value for the redpanda.iceberg.target.lag.ms topic property, "
+      "which controls how often data in an Iceberg table is refreshed with new "
+      "data from the corresponding Redpanda topic. Redpanda attempts to commit "
+      "all the data produced to the topic within the lag target in a best "
+      "effort fashion, subject to resource availability.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::chrono::milliseconds{1min},
+      {.min = std::chrono::milliseconds{10s},
+       .max = serde::max_serializable_ms})
+  , iceberg_disable_snapshot_tagging(
+      *this,
+      "iceberg_disable_snapshot_tagging",
+      "Whether to disable tagging of Iceberg snapshots. These tags are "
+      "used to ensure that the snapshots that Redpanda writes are retained "
+      "during snapshot removal, which in turn, helps Redpanda ensure exactly "
+      "once delivery of records. Disabling tags is therefore not recommended, "
+      "but may be useful if the Iceberg catalog does not support tags.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      false)
+  , iceberg_disable_automatic_snapshot_expiry(
+      *this,
+      "iceberg_disable_automatic_snapshot_expiry",
+      "Whether to disable automatic Iceberg snapshot expiry. This may be "
+      "useful if the Iceberg catalog expects to perform snapshot expiry on "
+      "its own.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      false)
+  , enable_host_metrics(
+      *this,
+      "enable_host_metrics",
+      "Enable exporting of some host metrics like /proc/diskstats, /proc/snmp "
+      "and /proc/net/netstat",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      true)
+  , datalake_scheduler_block_size_bytes(
+      *this,
+      "datalake_scheduler_block_size_bytes",
+      "Size, in bytes, of each memory block reserved for record translation, "
+      "as tracked by the datalake scheduler.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      4_MiB,
+      {.min = 1_MiB, .max = 8_MiB})
+  , datalake_scheduler_max_concurrent_translations(
+      *this,
+      "datalake_scheduler_max_concurrent_translations",
+      "The maximum number of translations that the datalake scheduler will "
+      "allow to run at a given time. If a translation is requested but the "
+      "number of running translations exceeds this value, the request will be "
+      "put to sleep temporarily, polling until capacity becomes available.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      4,
+      {.min = 1, .max = 8})
+  , datalake_scheduler_time_slice_ms(
+      *this,
+      "datalake_scheduler_time_slice_ms",
+      "Time, in milliseconds, for a datalake translation as scheduled by the "
+      "datalake scheduler. After a translation is scheduled, it will run until "
+      "either a) the time specified has elapsed or b) all pending records on "
+      "its source partition have been translated.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      30s,
+      {.min = 1s, .max = 60s})
+  , datalake_translator_flush_bytes(
+      *this,
+      "datalake_translator_flush_bytes",
+      "Size, in bytes, of the amount of per translator data that may be "
+      "flushed to disk before the translator will upload and remove its "
+      "current on disk data.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      32_MiB,
+      {.min = 1_MiB})
+  , datalake_disk_space_monitor_enable(
+      *this,
+      "datalake_disk_space_monitor_enable",
+      "Option to explicitly disable enforcement of datalake disk space usage",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      true)
+  , datalake_disk_space_monitor_interval(
+      *this,
+      "datalake_disk_space_monitor_interval",
+      "The amount of time between invocations of the datalake disk space usage "
+      "monitor which examines disk usage and dispatches requests to "
+      "translators to reduce their usage if it is above the configured "
+      "threshold.",
+      {.needs_restart = needs_restart::no,
+       .example = "3600000",
+       .visibility = visibility::tunable},
+      30s,
+      {.min = 2s})
+  , datalake_scratch_space_size_bytes(
+      *this,
+      "datalake_scratch_space_size_bytes",
+      "Size, in bytes, of the amount of scratch space datalake should use.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5_GiB)
+  , datalake_disk_usage_overage_coeff(
+      *this,
+      "datalake_disk_usage_overage_coeff",
+      "The datalake disk usage monitor reclaims the overage multiplied by "
+      "this this coefficient to compensate for data that is written during the "
+      "idle period between control loop invocations.",
+      {.needs_restart = needs_restart::no,
+       .example = "1.8",
+       .visibility = visibility::tunable},
+      2.0)
   , development_enable_cloud_topics(
       *this,
       "development_enable_cloud_topics",

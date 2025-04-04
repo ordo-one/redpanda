@@ -128,7 +128,7 @@ public:
     ss::future<install_snapshot_reply>
     install_snapshot(install_snapshot_request&& r);
 
-    ss::future<timeout_now_reply> timeout_now(timeout_now_request&& r);
+    ss::future<timeout_now_reply> timeout_now(timeout_now_request r);
 
     /// This method adds member to a group
     ss::future<std::error_code>
@@ -205,7 +205,7 @@ public:
     protocol_metadata meta() const;
     raft::group_id group() const { return _group; }
     model::term_id term() const { return _term; }
-    group_configuration config() const;
+    const group_configuration& config() const;
     const model::ntp& ntp() const { return _log->config().ntp(); }
     clock_type::time_point last_heartbeat() const { return _hbeat; };
     clock_type::time_point became_leader_at() const {
@@ -248,9 +248,13 @@ public:
       model::offset);
 
     ss::future<result<replicate_result>>
-    replicate(model::record_batch_reader&&, replicate_options);
+      replicate(chunked_vector<model::record_batch>, replicate_options);
+    ss::future<result<replicate_result>>
+      replicate(model::record_batch, replicate_options);
+    replicate_stages replicate_in_stages(
+      chunked_vector<model::record_batch>, replicate_options);
     replicate_stages
-    replicate_in_stages(model::record_batch_reader&&, replicate_options);
+      replicate_in_stages(model::record_batch, replicate_options);
     uint64_t get_snapshot_size() const { return _snapshot_size; }
 
     std::optional<state_machine_manager>& stm_manager() { return _stm_manager; }
@@ -278,10 +282,14 @@ public:
      *      d. cache the term
      *      e. continue with step #1
      */
+    ss::future<result<replicate_result>> replicate(
+      model::term_id, chunked_vector<model::record_batch>, replicate_options);
     ss::future<result<replicate_result>>
-    replicate(model::term_id, model::record_batch_reader&&, replicate_options);
+      replicate(model::term_id, model::record_batch, replicate_options);
     replicate_stages replicate_in_stages(
-      model::term_id, model::record_batch_reader&&, replicate_options);
+      model::term_id, chunked_vector<model::record_batch>, replicate_options);
+    replicate_stages replicate_in_stages(
+      model::term_id, model::record_batch, replicate_options);
     ss::future<model::record_batch_reader> make_reader(
       storage::log_reader_config,
       std::optional<clock_type::time_point> = std::nullopt);
@@ -462,7 +470,7 @@ public:
     size_t get_follower_count() const;
     bool has_followers() const { return _fstats.size() > 0; }
 
-    offset_monitor& visible_offset_monitor() {
+    offset_monitor<model::offset>& visible_offset_monitor() {
         return _consumable_offset_monitor;
     }
 
@@ -535,6 +543,15 @@ public:
         return _configuration_manager.has_configuration_override();
     }
 
+    // start/stop simulating failed requests (for debug purposes)
+    void toggle_append_entries_error_injection(bool inject_error) {
+        vlog(
+          _ctxlog.warn,
+          "toggle_append_entries_error_injection block={}",
+          inject_error);
+        _inject_error_in_append_entries = inject_error;
+    }
+
 private:
     friend replication_monitor;
     friend replicate_entries_stm;
@@ -588,13 +605,13 @@ private:
 
     replicate_stages do_replicate(
       std::optional<model::term_id>,
-      model::record_batch_reader&&,
+      chunked_vector<model::record_batch>,
       replicate_options);
 
     ss::future<result<replicate_result>> chain_stages(replicate_stages);
 
-    ss::future<storage::append_result>
-    disk_append(model::record_batch_reader&&, update_last_quorum_index);
+    ss::future<storage::append_result> disk_append(
+      chunked_vector<model::record_batch>, update_last_quorum_index);
 
     using success_reply = ss::bool_class<struct successfull_reply_tag>;
 
@@ -662,6 +679,8 @@ private:
     template<typename Func>
     ss::future<std::error_code> change_configuration(Func&&);
 
+    model::offset_delta
+    get_offset_delta(const storage::offset_stats&, model::offset) const;
     template<typename Func>
     ss::future<std::error_code>
       interrupt_configuration_change(model::revision_id, Func);
@@ -776,13 +795,21 @@ private:
 
     std::optional<model::offset> get_learner_start_offset() const;
 
-    bool use_serde_configuration() const {
-        return _features.is_active(features::feature::raft_config_serde);
-    }
-
     flush_delay_t compute_max_flush_delay() const;
     ss::future<> do_flush();
 
+    bool supports_symmetric_reconfiguration_cancel() const {
+        return _features.is_active(
+          features::feature::raft_symmetric_reconfiguration_cancel);
+    }
+
+    void try_updating_configuration_version(group_configuration& cfg);
+
+    void validate_offset_translator_delta(
+      const protocol_metadata&, const storage::offset_stats& lstats);
+
+    std::optional<model::offset>
+      adjust_learner_initial_offset(std::optional<model::offset>);
     // args
     vnode _self;
     raft::group_id _group;
@@ -861,7 +888,7 @@ private:
     /// used for notifying when commits happened to log
     event_manager _event_manager;
     std::unique_ptr<probe> _probe;
-    ctx_log _ctxlog;
+    mutable ctx_log _ctxlog;
     ss::condition_variable _commit_index_updated;
 
     std::chrono::milliseconds _replicate_append_timeout;
@@ -901,7 +928,7 @@ private:
     model::offset _last_quorum_replicated_index_with_flush;
     model::offset _last_leader_visible_offset;
     flush_after_append _last_write_flushed;
-    offset_monitor _consumable_offset_monitor;
+    offset_monitor<model::offset> _consumable_offset_monitor;
     ss::condition_variable _follower_reply;
     append_entries_buffer _append_requests_buffer;
     std::optional<state_machine_manager> _stm_manager;
@@ -930,6 +957,9 @@ private:
     ss::timer<ss::lowres_clock> _deferred_flusher;
 
     replication_monitor _replication_monitor;
+
+    // simulate storage issues
+    bool _inject_error_in_append_entries = false;
 
     friend std::ostream& operator<<(std::ostream&, const consensus&);
 };

@@ -66,7 +66,7 @@ admin_server::get_transactions_inner_handler(
     auto partition = pm.get(ntp);
     if (!partition) {
         throw ss::httpd::server_error_exception(
-          fmt_with_ctx(fmt::format, "Can not find partition {}", partition));
+          fmt_with_ctx(fmt::format, "Can not find partition {}", ntp));
     }
 
     auto rm_stm_ptr = partition->rm_stm();
@@ -174,8 +174,8 @@ admin_server::mark_transaction_expired_handler(
           auto partition = pm.get(ntp);
           if (!partition) {
               return ss::make_exception_future<ss::json::json_return_type>(
-                ss::httpd::server_error_exception(fmt_with_ctx(
-                  fmt::format, "Can not find partition {}", partition)));
+                ss::httpd::server_error_exception(
+                  fmt_with_ctx(fmt::format, "Can not find partition {}", ntp)));
           }
 
           auto rm_stm_ptr = partition->rm_stm();
@@ -204,7 +204,7 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
     auto& in_progress
       = _controller->get_topics_state().local().updates_in_progress();
 
-    std::vector<model::ntp> ntps;
+    chunked_vector<model::ntp> ntps;
     ntps.reserve(in_progress.size());
 
     for (auto& [ntp, status] : in_progress) {
@@ -238,9 +238,13 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
     auto reconciliations_ptr
       = ss::make_lw_shared<cluster::global_reconciliation_state>(
         std::move(reconciliations));
+    auto reconfiguration_states_value = std::move(
+      reconfiguration_states.value());
+
     co_return ss::json::json_return_type(ss::json::stream_range_as_array(
-      std::move(reconfiguration_states.value()),
-      [reconciliations = std::move(reconciliations_ptr)](auto& s) {
+      lw_shared_container(std::move(reconfiguration_states_value)),
+      [reconciliations = std::move(reconciliations_ptr)](
+        const cluster::partition_reconfiguration_state& s) -> reconfiguration {
           reconfiguration r;
           r.ns = s.ntp.ns;
           r.topic = s.ntp.tp.topic;
@@ -262,9 +266,9 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
 
           size_t left_to_move = 0;
           size_t already_moved = 0;
-          for (auto replica_status : s.already_transferred_bytes) {
-              left_to_move += (s.current_partition_size - replica_status.bytes);
-              already_moved += replica_status.bytes;
+          for (auto replica_status : s.replicas) {
+              left_to_move += replica_status.bytes_left;
+              already_moved += replica_status.bytes_transferred;
           }
           r.bytes_left_to_move = left_to_move;
           r.bytes_moved = already_moved;
@@ -533,6 +537,31 @@ admin_server::force_set_partition_replicas_handler(
 }
 
 ss::future<ss::json::json_return_type>
+admin_server::toggle_append_entries_error_injection(
+  std::unique_ptr<ss::http::request> req, bool inject) {
+    auto ntp = parse_ntp_from_request(req->param);
+    auto shard = _shard_table.local().shard_for(ntp);
+    if (!shard) {
+        throw ss::httpd::bad_request_exception(fmt_with_ctx(
+          fmt::format, "Partition {} not found on this node", ntp));
+    }
+
+    co_return co_await _partition_manager.invoke_on(
+      *shard,
+      [ntp = std::move(ntp), inject](cluster::partition_manager& pm) mutable
+      -> ss::future<ss::json::json_return_type> {
+          auto partition = pm.get(ntp);
+          if (!partition) {
+              return ss::make_exception_future<ss::json::json_return_type>(
+                ss::httpd::bad_request_exception(fmt_with_ctx(
+                  fmt::format, "Partition {} not found on this node", ntp)));
+          }
+          partition->raft()->toggle_append_entries_error_injection(inject);
+          return ssx::now<ss::json::json_return_type>(ss::json::json_void());
+      });
+}
+
+ss::future<ss::json::json_return_type>
 admin_server::set_partition_replicas_handler(
   std::unique_ptr<ss::http::request> req) {
     auto ntp = parse_ntp_from_request(req->param);
@@ -587,7 +616,6 @@ admin_server::set_partition_replicas_handler(
 }
 
 namespace {
-
 json::validator make_set_replica_core_validator() {
     const std::string schema = R"(
 {
@@ -724,7 +752,7 @@ void admin_server::register_partition_routes() {
                       if (it.second->get_leader_id() == std::nullopt) {
                           s.leaderless += 1;
                       }
-                      if (it.second->get_under_replicated() == std::nullopt) {
+                      if (it.second->get_under_replicated() > 0) {
                           s.under_replicated += 1;
                       }
                   }
@@ -798,6 +826,18 @@ void admin_server::register_partition_routes() {
       ss::httpd::debug_json::force_update_partition_replicas,
       [this](std::unique_ptr<ss::http::request> req) {
           return force_set_partition_replicas_handler(std::move(req));
+      });
+
+    register_route<superuser>(
+      ss::httpd::debug_json::enable_append_entries_error_injection,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return toggle_append_entries_error_injection(std::move(req), true);
+      });
+
+    register_route<superuser>(
+      ss::httpd::debug_json::disable_append_entries_error_injection,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return toggle_append_entries_error_injection(std::move(req), false);
       });
 
     register_route<superuser>(
@@ -1085,7 +1125,6 @@ admin_server::get_majority_lost_partitions(
 }
 
 namespace {
-
 json::validator make_node_id_array_validator() {
     const std::string schema = R"(
     {

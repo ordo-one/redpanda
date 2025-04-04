@@ -98,6 +98,18 @@ public:
     }
 
     void add_removed_tombstone() { ++_tombstones_removed; }
+    void add_cleanly_compacted_segment() { ++_segment_cleanly_compacted; }
+    void add_segment_marked_tombstone_free() {
+        ++_segments_marked_tombstone_free;
+    }
+    void add_sliding_window_round_complete() {
+        ++_num_rounds_window_compaction;
+    }
+
+    void add_chunked_compaction_run() { ++_num_chunked_compaction_runs; }
+    auto get_chunked_compaction_runs() const {
+        return _num_chunked_compaction_runs;
+    }
 
     void batch_parse_error() { ++_batch_parse_errors; }
 
@@ -120,6 +132,14 @@ public:
         _bytes_prefix_truncated += bytes;
     }
 
+    void set_dirty_segment_bytes(uint64_t bytes) {
+        _dirty_segment_bytes = bytes;
+    }
+
+    void set_closed_segment_bytes(uint64_t bytes) {
+        _closed_segment_bytes = bytes;
+    }
+
 private:
     uint64_t _partition_bytes = 0;
     uint64_t _bytes_written = 0;
@@ -138,8 +158,16 @@ private:
     uint32_t _log_segments_active = 0;
     uint32_t _batch_parse_errors = 0;
     uint32_t _batch_write_errors = 0;
+
     double _compaction_ratio = 1.0;
     uint64_t _tombstones_removed = 0;
+    uint64_t _segment_cleanly_compacted = 0;
+    uint64_t _segments_marked_tombstone_free = 0;
+    uint64_t _num_rounds_window_compaction = 0;
+    uint64_t _num_chunked_compaction_runs = 0;
+
+    ssize_t _dirty_segment_bytes = 0;
+    ssize_t _closed_segment_bytes = 0;
 
     ssize_t _compaction_removed_bytes = 0;
 

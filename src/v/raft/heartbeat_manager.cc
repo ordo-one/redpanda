@@ -213,13 +213,15 @@ bool heartbeat_manager::needs_full_heartbeat(
 }
 
 heartbeat_manager::heartbeat_manager(
+  ss::scheduling_group sched_group,
   config::binding<std::chrono::milliseconds> interval,
   consensus_client_protocol proto,
   model::node_id self,
   config::binding<std::chrono::milliseconds> heartbeat_timeout,
   config::binding<bool> enable_lw_heartbeat,
   features::feature_table& ft)
-  : _heartbeat_interval(std::move(interval))
+  : _scheduling_group(sched_group)
+  , _heartbeat_interval(std::move(interval))
   , _heartbeat_timeout(std::move(heartbeat_timeout))
   , _client_protocol(std::move(proto))
   , _self(self)
@@ -373,14 +375,18 @@ void heartbeat_manager::process_reply(
               n);
             return;
         }
-
-        if (unlikely(result == reply_result::timeout)) {
+        /**
+         * This is here for completeness, it should never be triggered as the
+         * follower do not reply with busy error code when processing
+         * lightweight heartbeats
+         */
+        if (unlikely(result == reply_result::follower_busy)) {
             vlog(
-              hbeatlog.debug,
-              "Heartbeat request for group {} timed out on the node {}",
+              hbeatlog.error,
+              "Follower reported busy for group {} on node {} when processing "
+              "lightweight heartbeat",
               group,
               n);
-            return;
         }
         if (unlikely(target != consensus->self().id())) {
             vlog(
@@ -438,14 +444,17 @@ void heartbeat_manager::process_reply(
               n);
             continue;
         }
-
-        if (unlikely(m.result == reply_result::timeout)) {
+        /**
+         * Follower being busy is updating the last received reply timestamp as
+         * it is indicating the receiving replica is alive and is able to
+         * process request, it may simply be slow and its oplock is contended.
+         */
+        if (unlikely(m.result == reply_result::follower_busy)) {
             vlog(
-              hbeatlog.debug,
-              "Heartbeat request for group {} timed out on the node {}",
+              hbeatlog.trace,
+              "Follower busy when processing full heartbeat for group {} on {}",
               m.group,
               n);
-            continue;
         }
 
         if (unlikely(reply.target() != consensus->self().id())) {
@@ -555,7 +564,7 @@ void heartbeat_manager::process_reply(
             continue;
         }
 
-        if (unlikely(m.result == reply_result::timeout)) {
+        if (unlikely(m.result == reply_result::follower_busy)) {
             vlog(
               hbeatlog.debug,
               "Heartbeat request for group {} timed out on the node {}",

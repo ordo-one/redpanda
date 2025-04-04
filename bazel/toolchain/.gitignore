@@ -1,1 +1,2 @@
-llvm-*.tar.gz
+*.tar.gz
+*.tar.zst

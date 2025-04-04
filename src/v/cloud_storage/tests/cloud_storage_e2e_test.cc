@@ -8,12 +8,12 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/manual_fixture.h"
 #include "cloud_storage/tests/produce_utils.h"
 #include "cloud_storage/tests/read_replica_e2e_fixture.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/tests/manual_mixin.h"
@@ -247,7 +247,10 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloudWithSpillover) {
         log->force_roll(ss::default_priority_class()).get();
 
         ASSERT_TRUE(archiver.sync_for_tests().get());
-        archiver.upload_next_candidates().get();
+        archiver
+          .upload_next_candidates(
+            archival::archival_stm_fence{.emit_rw_fence_cmd = false})
+          .get();
     }
     ASSERT_EQ(
       cloud_storage::upload_result::success,
@@ -737,7 +740,10 @@ TEST_F(CloudStorageManualMultiNodeTestBase, ReclaimableReportedInHealthReport) {
         // drive the uploading
         auto& archiver = prt_l->archiver()->get();
         archiver.sync_for_tests().get();
-        archiver.upload_next_candidates().get();
+        archiver
+          .upload_next_candidates(
+            archival::archival_stm_fence{.emit_rw_fence_cmd = false})
+          .get();
 
         // not for synchronization... just to give the system time to propogate
         // all the state changes are are happening so that this overall loop

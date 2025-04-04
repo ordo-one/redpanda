@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
 
 #include "base/seastarx.h"
@@ -93,6 +94,15 @@ public:
 
     ss::future<checked<std::nullopt_t, errc>>
     commit_txn(const table_identifier& table_ident, transaction) final;
+
+    ss::future<> stop() final { return ss::make_ready_future(); }
+
+    // Rewrites a new version of the table with the given metadata. This is not
+    // safe and should only be used for tests -- production updates to the
+    // table should be performed with a transaction.
+    // Expects the table already exists.
+    ss::future<checked<std::nullopt_t, errc>> rewrite_table_meta_for_tests(
+      const table_identifier& table_ident, const table_metadata&);
 
 private:
     // Constructs a path suitable for the table's location: a prefix to be used

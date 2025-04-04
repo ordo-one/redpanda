@@ -48,6 +48,10 @@ from rptest.utils.si_utils import (
 
 CLOUD_STORAGE_SEGMENT_MAX_UPLOAD_INTERVAL_SEC = 10
 
+ALLOWED_REPLICA_VALIDATOR_ERRORS = [
+    "anomaly detected: Offset translation anomaly detected for offset",
+]
+
 
 class BaseCase:
     """Base class for all test cases. The template method inside the test
@@ -205,7 +209,10 @@ class BaseCase:
             err_msg=
             f'failed to get high watermark before produce for {topic_spec}')
 
-        self._kafka_tools.produce(topic_spec.name, 10000, 1024)
+        self._kafka_tools.produce(topic_spec.name,
+                                  10000,
+                                  1024,
+                                  enable_idempotence=False)
 
         new_state = PartitionState(self._rpk, topic_spec.name)
         wait_until(
@@ -1204,6 +1211,7 @@ class TopicRecoveryTest(RedpandaTest):
             extra_rp_conf={
                 'cloud_storage_recovery_topic_validation_mode':
                 'check_manifest_existence',
+                'cloud_storage_disable_upload_consistency_checks': 'true',
             },
             **kwargs)
 
@@ -1272,9 +1280,13 @@ class TopicRecoveryTest(RedpandaTest):
         def included(path):
             controller_log_prefix = os.path.join(RedpandaService.DATA_DIR,
                                                  "redpanda")
+            internal_log_prefix = os.path.join(RedpandaService.DATA_DIR,
+                                               "kafka_internal")
             log_segment_extension = ".log"
             return not path.startswith(
-                controller_log_prefix) and path.endswith(log_segment_extension)
+                controller_log_prefix) and path.endswith(
+                    log_segment_extension
+                ) and not path.startswith(internal_log_prefix)
 
         return self._get_log_segment_checksums(node, included)
 
@@ -1628,7 +1640,8 @@ class TopicRecoveryTest(RedpandaTest):
         self.do_run(test_case)
 
     @cluster(num_nodes=4,
-             log_allow_list=MISSING_DATA_ERRORS + TRANSIENT_ERRORS)
+             log_allow_list=MISSING_DATA_ERRORS + TRANSIENT_ERRORS +
+             ALLOWED_REPLICA_VALIDATOR_ERRORS)
     @matrix(cloud_storage_type=get_cloud_storage_type())
     def test_missing_segment(self, cloud_storage_type):
         """Test the handling of the missing segment. The segment is

@@ -1,17 +1,18 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/tests/value_generator.h"
 
-#include "bytes/random.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/values.h"
 #include "random/generators.h"
+#include "test_utils/random_bytes.h"
 #include "test_utils/randoms.h"
 
 namespace iceberg::tests {
@@ -82,8 +83,7 @@ struct generating_primitive_value_visitor {
         case value_pattern::zeros:
             return string_value{iobuf{}};
         case value_pattern::random:
-            return string_value{
-              random_generators::make_iobuf(spec_.max_strlen)};
+            return string_value{::tests::random_iobuf(spec_.max_strlen)};
         }
     }
     value operator()(const uuid_type&) {
@@ -103,7 +103,7 @@ struct generating_primitive_value_visitor {
             return fixed_value{
               bytes_to_iobuf(bytes::from_string(std::string(t.length, 0)))};
         case value_pattern::random:
-            return fixed_value{random_generators::make_iobuf(t.length)};
+            return fixed_value{::tests::random_iobuf(t.length)};
         }
     }
     value operator()(const binary_type&) {
@@ -111,8 +111,7 @@ struct generating_primitive_value_visitor {
         case value_pattern::zeros:
             return binary_value{iobuf{}};
         case value_pattern::random:
-            return binary_value{
-              random_generators::make_iobuf(spec_.max_strlen)};
+            return binary_value{::tests::random_iobuf(spec_.max_strlen)};
         }
     }
 };

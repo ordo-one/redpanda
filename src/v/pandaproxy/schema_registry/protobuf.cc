@@ -18,40 +18,29 @@
 #include "pandaproxy/schema_registry/compatibility.h"
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/confluent/meta.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/confluent/types/decimal.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/calendar_period.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/color.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/date.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/datetime.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/dayofweek.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/decimal.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/expr.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/fraction.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/interval.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/latlng.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/localized_text.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/money.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/month.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/phone_number.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/postal_address.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/quaternion.pb.h"
-#include "src/v/pandaproxy/schema_registry/protobuf/google/type/timeofday.pb.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "ssx/sformat.h"
-#include "thirdparty/protobuf/descriptor.h"
-#include "thirdparty/protobuf/descriptor.pb.h"
 #include "utils/base64.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/util/variant_utils.hh>
 
 #include <absl/container/flat_hash_set.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/escaping.h>
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/range/combine.hpp>
+#include <confluent/meta.pb.h>
+#include <confluent/types/decimal.pb.h>
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/api.pb.h>
 #include <google/protobuf/compiler/parser.h>
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/descriptor_database.h>
 #include <google/protobuf/duration.pb.h>
 #include <google/protobuf/empty.pb.h>
 #include <google/protobuf/field_mask.pb.h>
@@ -62,9 +51,38 @@
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/type.pb.h>
 #include <google/protobuf/wrappers.pb.h>
+#include <google/type/calendar_period.pb.h>
+#include <google/type/color.pb.h>
+#include <google/type/date.pb.h>
+#include <google/type/datetime.pb.h>
+#include <google/type/dayofweek.pb.h>
+#include <google/type/decimal.pb.h>
+#include <google/type/expr.pb.h>
+#include <google/type/fraction.pb.h>
+#include <google/type/interval.pb.h>
+#include <google/type/latlng.pb.h>
+#include <google/type/localized_text.pb.h>
+#include <google/type/money.pb.h>
+#include <google/type/month.pb.h>
+#include <google/type/phone_number.pb.h>
+#include <google/type/postal_address.pb.h>
+#include <google/type/quaternion.pb.h>
+#include <google/type/timeofday.pb.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <ranges>
 #include <string_view>
 #include <unordered_set>
+
+namespace {
+
+constexpr auto not_map = std::views::filter(
+  [](const auto& m) { return !m.options().has_map_entry(); });
+
+} // namespace
 
 namespace pandaproxy::schema_registry {
 
@@ -143,14 +161,6 @@ class io_error_collector final : public pb::io::ErrorCollector {
     };
 
 public:
-#if PROTOBUF_VERSION < 5027000
-    void AddError(int line, int column, const std::string& message) final {
-        _errors.emplace_back(err{level::error, line, column, message});
-    }
-    void AddWarning(int line, int column, const std::string& message) final {
-        _errors.emplace_back(err{level::warn, line, column, message});
-    }
-#else
     void RecordError(int line, int column, std::string_view message) final {
         _errors.emplace_back(
           err{level::error, line, column, ss::sstring{message}});
@@ -159,7 +169,6 @@ public:
         _errors.emplace_back(
           err{level::warn, line, column, ss::sstring{message}});
     }
-#endif
 
     error_info error() const;
 
@@ -171,41 +180,6 @@ private:
 
 class dp_error_collector final : public pb::DescriptorPool::ErrorCollector {
 public:
-#if PROTOBUF_VERSION < 5027000
-    void AddError(
-      const std::string& filename,
-      const std::string& element_name,
-      const pb::Message* descriptor,
-      ErrorLocation location,
-      const std::string& message) final {
-        _errors.emplace_back(err{
-          level::error,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring {
-              message
-          }});
-    }
-
-    void AddWarning(
-      const std::string& filename,
-      const std::string& element_name,
-      const pb::Message* descriptor,
-      ErrorLocation location,
-      const std::string& message) final {
-        _errors.emplace_back(err{
-          level::warn,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring {
-              message
-          }});
-    }
-#else
     void RecordError(
       std::string_view filename,
       std::string_view element_name,
@@ -235,9 +209,8 @@ public:
           location,
           ss::sstring{message}});
     }
-#endif
 
-    error_info error() const;
+    error_info error(std::string_view sub) const;
 
 private:
     enum class level {
@@ -302,11 +275,7 @@ public:
             }
         }
         const auto& sub = schema.sub()();
-#if PROTOBUF_VERSION < 5027000
-        _fdp.set_name(sub.data(), sub.size());
-#else
         _fdp.set_name(std::string_view(sub));
-#endif
         return _fdp;
     }
 
@@ -314,6 +283,125 @@ private:
     pb::compiler::Parser _parser;
     pb::FileDescriptorProto _fdp;
 };
+
+template<typename T, typename Proj = std::identity>
+void sort(pb::RepeatedPtrField<T>* range, Proj proj = Proj{}) {
+    if (range) {
+        std::ranges::sort(*range, std::ranges::less{}, proj);
+    }
+}
+
+void normalize_proto(
+  pb::RepeatedPtrField<pb::FieldDescriptorProto>* raw_extensions) {
+    sort(raw_extensions, [](const auto& extension) {
+        return std::make_pair(extension.extendee(), extension.number());
+    });
+}
+
+// Normalize an enum
+void normalize_proto(pb::EnumDescriptorProto& enum_proto) {
+    sort(
+      enum_proto.mutable_reserved_range(),
+      &pb::EnumDescriptorProto_EnumReservedRange::start);
+
+    sort(enum_proto.mutable_reserved_name());
+
+    sort(enum_proto.mutable_value(), [](const auto& v) {
+        // In proto3, enums are open and open enums need to
+        // have the first field being equal to zero. By casting
+        // to an unsigned integer for sorting, all the negative
+        // fields will be at the end, after all the positives.
+        return std::pair<uint32_t, std::string_view>{
+          static_cast<uint32_t>(v.number()), v.name()};
+    });
+}
+
+// Normalize a message, including nested messages
+void normalize_proto(pb::DescriptorProto& message) {
+    sort(
+      message.mutable_reserved_range(),
+      &pb::DescriptorProto_ReservedRange::start);
+
+    sort(message.mutable_reserved_name());
+
+    // Oneof fields should stay next to each other in the field array.
+    // To ensure this, we sort all the one_of together at the end of the range
+    // grouped by their oneof index.
+    const auto tag_oneofs = [](const pb::FieldDescriptorProto& dp) {
+        const auto is_oneof = [&dp]() {
+            return dp.has_oneof_index() && !dp.proto3_optional();
+        };
+        return std::make_pair(is_oneof() ? dp.oneof_index() : -1, dp.number());
+    };
+    sort(message.mutable_field(), tag_oneofs);
+
+    normalize_proto(message.mutable_extension());
+
+    sort(
+      message.mutable_extension_range(),
+      &pb::DescriptorProto_ExtensionRange::start);
+
+    // Normalize nested types
+    for (auto& nested : *message.mutable_nested_type() | not_map) {
+        normalize_proto(nested);
+    }
+
+    // Normalize nested enums
+    for (auto& nested : *message.mutable_enum_type()) {
+        normalize_proto(nested);
+    }
+}
+
+void normalize_imports(pb::FileDescriptorProto& fdp, normalize norm) {
+    struct dependency {
+        enum { private_, weak, public_ } type;
+        std::string name;
+        auto operator<=>(const dependency&) const = default;
+    };
+
+    auto deps_view = std::views::transform(
+      fdp.dependency(),
+      [](const auto& dep) { return dependency{dependency::private_, dep}; });
+    std::vector<dependency> deps{deps_view.begin(), deps_view.end()};
+    for (auto i : fdp.public_dependency()) {
+        deps[i].type = dependency::public_;
+    }
+    for (auto i : fdp.weak_dependency()) {
+        deps[i].type = dependency::weak;
+    }
+
+    if (norm) {
+        std::ranges::sort(deps);
+    } else {
+        std::ranges::stable_sort(deps, std::less{}, &dependency::type);
+    }
+    fdp.clear_dependency();
+    fdp.clear_public_dependency();
+    fdp.clear_weak_dependency();
+
+    for (auto dep : deps) {
+        fdp.add_dependency(std::move(dep.name));
+        if (dep.type == dependency::public_) {
+            fdp.add_public_dependency(fdp.dependency_size() - 1);
+        } else if (dep.type == dependency::weak) {
+            fdp.add_weak_dependency(fdp.dependency_size() - 1);
+        }
+    }
+}
+
+void normalize_proto_file(pb::FileDescriptorProto& fdp) {
+    // Normalize messages
+    for (auto& message : *fdp.mutable_message_type() | not_map) {
+        normalize_proto(message);
+    }
+
+    // Normalize enums
+    for (auto& enum_proto : *fdp.mutable_enum_type()) {
+        normalize_proto(enum_proto);
+    }
+
+    normalize_proto(fdp.mutable_extension());
+}
 
 ///\brief Build a FileDescriptor using the DescriptorPool.
 ///
@@ -333,15 +421,18 @@ build_file(pb::DescriptorPool& dp, const pb::FileDescriptorProto& fdp) {
     if (auto fd = dp.BuildFileCollectingErrors(fdp, &dp_ec); fd) {
         return fd;
     }
-    throw as_exception(dp_ec.error());
+    throw as_exception(dp_ec.error(fdp.name()));
 }
 
 ///\brief Build a FileDescriptor and import references from the store.
 ///
 /// Recursively import references into the DescriptorPool, building the
 /// files on stack unwind.
-ss::future<const pb::FileDescriptor*> build_file_with_refs(
-  pb::DescriptorPool& dp, schema_getter& store, canonical_schema schema) {
+ss::future<pb::FileDescriptorProto> build_file_with_refs(
+  pb::DescriptorPool& dp,
+  schema_getter& store,
+  canonical_schema schema,
+  normalize norm) {
     for (const auto& ref : schema.def().refs()) {
         if (dp.FindFileByName(ref.name)) {
             continue;
@@ -351,21 +442,33 @@ ss::future<const pb::FileDescriptor*> build_file_with_refs(
         co_await build_file_with_refs(
           dp,
           store,
-          canonical_schema{subject{ref.name}, std::move(dep.schema).def()});
+          canonical_schema{subject{ref.name}, std::move(dep.schema).def()},
+          normalize::no);
     }
 
     parser p;
-    co_return build_file(dp, p.parse(schema));
+    auto new_fdp = p.parse(schema);
+    normalize_imports(new_fdp, norm);
+    if (norm) {
+        normalize_proto_file(new_fdp);
+    }
+    build_file(dp, new_fdp);
+    co_return new_fdp;
 }
 
 ///\brief Import a schema in the DescriptorPool and return the
 /// FileDescriptor.
-ss::future<const pb::FileDescriptor*> import_schema(
-  pb::DescriptorPool& dp, schema_getter& store, canonical_schema schema) {
+ss::future<pb::FileDescriptorProto> import_schema(
+  pb::DescriptorPool& dp,
+  schema_getter& store,
+  canonical_schema schema,
+  normalize norm) {
     try {
-        co_return co_await build_file_with_refs(dp, store, schema.share());
+        co_return co_await build_file_with_refs(
+          dp, store, schema.share(), norm);
     } catch (const exception& e) {
-        vlog(plog.warn, "Failed to decode schema: {}", e.what());
+        vlog(
+          plog.warn, "Failed to decode schema {}: {}", schema.sub(), e.what());
         throw as_exception(invalid_schema(schema));
     }
 }
@@ -373,6 +476,7 @@ ss::future<const pb::FileDescriptor*> import_schema(
 struct protobuf_schema_definition::impl {
     pb::DescriptorPool _dp;
     const pb::FileDescriptor* fd{};
+    pb::FileDescriptorProto fdp{};
 
     /**
      * debug_string swaps the order of the import and package lines that
@@ -424,11 +528,15 @@ struct protobuf_schema_definition::impl {
         return ssx::sformat(
           "{}\n{}\n\n{}\n\n{}\n", header, package, imports, footer);
     }
+
+    canonical_schema_definition::raw_string raw() const {
+        return canonical_schema_definition::raw_string{debug_string()};
+    }
 };
 
 canonical_schema_definition::raw_string
 protobuf_schema_definition::raw() const {
-    return canonical_schema_definition::raw_string{_impl->debug_string()};
+    return _impl->raw();
 }
 
 ::result<ss::sstring, kafka::error_code>
@@ -465,6 +573,21 @@ descriptor(
     return *d;
 }
 
+::result<
+  std::reference_wrapper<const google::protobuf::Descriptor>,
+  kafka::error_code>
+descriptor(const protobuf_schema_definition& def, std::string_view full_name) {
+    if (full_name.empty()) {
+        return kafka::error_code::invalid_record;
+    }
+    const google::protobuf::Descriptor* d = def()._dp.FindMessageTypeByName(
+      full_name);
+    if (!d) {
+        return kafka::error_code::invalid_record;
+    }
+    return *d;
+}
+
 bool operator==(
   const protobuf_schema_definition& lhs,
   const protobuf_schema_definition& rhs) {
@@ -478,23 +601,31 @@ operator<<(std::ostream& os, const protobuf_schema_definition& def) {
     return os;
 }
 
-ss::future<protobuf_schema_definition>
-make_protobuf_schema_definition(schema_getter& store, canonical_schema schema) {
-    auto impl = ss::make_shared<protobuf_schema_definition::impl>();
+ss::future<protobuf_schema_definition> make_protobuf_schema_definition(
+  schema_getter& store, canonical_schema schema, normalize norm) {
     auto refs = schema.def().refs();
-    impl->fd = co_await import_schema(impl->_dp, store, std::move(schema));
+    auto impl = ss::make_shared<protobuf_schema_definition::impl>();
+    impl->fdp = co_await import_schema(
+      impl->_dp, store, std::move(schema), normalize(norm));
+
+    if (norm) {
+        std::sort(refs.begin(), refs.end());
+        auto uniq = std::ranges::unique(refs);
+        refs.erase(uniq.begin(), uniq.end());
+    }
+    impl->fd = impl->_dp.FindFileByName(impl->fdp.name());
     co_return protobuf_schema_definition{std::move(impl), std::move(refs)};
 }
 
-ss::future<canonical_schema_definition>
-validate_protobuf_schema(sharded_store& store, canonical_schema schema) {
+ss::future<canonical_schema_definition> validate_protobuf_schema(
+  sharded_store& store, canonical_schema schema, normalize norm) {
     auto res = co_await make_protobuf_schema_definition(
-      store, std::move(schema));
+      store, std::move(schema), norm);
     co_return canonical_schema_definition{std::move(res)};
 }
 
-ss::future<canonical_schema>
-make_canonical_protobuf_schema(sharded_store& store, unparsed_schema schema) {
+ss::future<canonical_schema> make_canonical_protobuf_schema(
+  sharded_store& store, unparsed_schema schema, normalize norm) {
     auto [sub, unparsed] = std::move(schema).destructure();
     auto [def, type, refs] = std::move(unparsed).destructure();
     canonical_schema temp{
@@ -505,7 +636,7 @@ make_canonical_protobuf_schema(sharded_store& store, unparsed_schema schema) {
 
     co_return canonical_schema{
       std::move(sub),
-      co_await validate_protobuf_schema(store, std::move(temp))};
+      co_await validate_protobuf_schema(store, std::move(temp), norm)};
 }
 
 namespace {
@@ -823,9 +954,10 @@ error_info io_error_collector::error() const {
       error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
 }
 
-error_info dp_error_collector::error() const {
+error_info dp_error_collector::error(std::string_view sub) const {
     return error_info{
-      error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
+      error_code::schema_invalid,
+      fmt::format("{}:{}", sub, fmt::join(_errors, "; "))};
 }
 
 } // namespace pandaproxy::schema_registry

@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/filesystem_catalog.h"
 
 #include "iceberg/manifest_entry.h"
@@ -77,6 +78,7 @@ filesystem_catalog::create_table(
       .partition_specs = std::move(specs),
       .default_spec_id = partition_spec::id_t{0},
       .last_partition_id = highest_pid,
+      .snapshots = chunked_vector<snapshot>{},
       .sort_orders = std::move(sort_orders),
       .default_sort_order_id = sort_order::id_t{0},
     };
@@ -130,6 +132,13 @@ filesystem_catalog::drop_table(const table_identifier& table_id, bool) {
 ss::future<checked<std::nullopt_t, catalog::errc>>
 filesystem_catalog::commit_txn(
   const table_identifier& table_ident, transaction txn) {
+    if (txn.updates().updates.empty()) {
+        vlog(
+          log.debug,
+          "Transaction has no updates to table {}, returning early",
+          table_ident.table);
+        co_return std::nullopt;
+    }
     auto current_tmeta = co_await read_table_meta(table_ident);
     if (current_tmeta.has_error()) {
         co_return current_tmeta.error();
@@ -138,7 +147,20 @@ filesystem_catalog::commit_txn(
 
     // Apply the updates to the latest version of the table, since it may have
     // been updated since the transaction was constructed.
-    // TODO: also check the table requirements all pass.
+
+    for (const auto& req : txn.updates().requirements) {
+        auto check_res = table_requirement::check(req, &new_tmeta);
+        if (check_res.has_error()) {
+            vlog(
+              log.warn,
+              "Current version of table {} metadata doesn't satisfy tx "
+              "requirement: {}",
+              table_ident.table,
+              check_res.error());
+            co_return errc::unexpected_state;
+        }
+    }
+
     for (const auto& update : txn.updates().updates) {
         auto res = table_update::apply(update, new_tmeta);
         if (res != table_update::outcome::success) {
@@ -207,6 +229,17 @@ filesystem_catalog::check_expected_version_hint(
         co_return errc::already_exists;
     }
     co_return std::nullopt;
+}
+
+ss::future<checked<std::nullopt_t, catalog::errc>>
+filesystem_catalog::rewrite_table_meta_for_tests(
+  const table_identifier& table_ident, const table_metadata& tmeta) {
+    auto read_res = co_await read_table_meta(table_ident);
+    if (read_res.has_error()) {
+        co_return read_res.error();
+    }
+    auto cur_version = read_res.value().version;
+    co_return co_await write_table_meta(table_ident, tmeta, cur_version);
 }
 
 ss::future<checked<std::nullopt_t, catalog::errc>>

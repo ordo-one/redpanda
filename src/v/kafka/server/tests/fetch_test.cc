@@ -434,11 +434,10 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
             {
                 auto batches
                   = model::test::make_random_batches(model::offset(0), 5).get();
-                auto rdr = model::make_memory_record_batch_reader(
-                  std::move(batches));
+
                 partition->raft()
                   ->replicate(
-                    std::move(rdr),
+                    chunked_vector<model::record_batch>(std::move(batches)),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack))
                   .discard_result()
@@ -447,13 +446,12 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
             partition->raft()->step_down("trigger epoch change").get();
             wait_for_leader(ntp, 10s).get();
             {
-                auto batches
-                  = model::test::make_random_batches(model::offset(0), 5).get();
-                auto rdr = model::make_memory_record_batch_reader(
-                  std::move(batches));
+                auto batches = chunked_vector<model::record_batch>(
+                  model::test::make_random_batches(model::offset(0), 5).get());
+
                 partition->raft()
                   ->replicate(
-                    std::move(rdr),
+                    std::move(batches),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack))
                   .discard_result()
@@ -531,10 +529,8 @@ FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
                 return model::test::make_random_batches(model::offset(0), 5)
                   .then([ntp, &mgr](auto batches) {
                       auto partition = mgr.get(ntp);
-                      auto rdr = model::make_memory_record_batch_reader(
-                        std::move(batches));
                       return partition->raft()->replicate(
-                        std::move(rdr),
+                        chunked_vector<model::record_batch>(std::move(batches)),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack));
                   });
@@ -600,10 +596,8 @@ FIXTURE_TEST(fetch_leader_ack, redpanda_thread_fixture) {
             return model::test::make_random_batches(model::offset(0), 5)
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
-                  auto rdr = model::make_memory_record_batch_reader(
-                    std::move(batches));
                   return partition->raft()->replicate(
-                    std::move(rdr),
+                    chunked_vector<model::record_batch>(std::move(batches)),
                     raft::replicate_options(
                       raft::consistency_level::leader_ack));
               });
@@ -659,10 +653,8 @@ FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
             return model::test::make_random_batches(model::offset(0), 5)
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
-                  auto rdr = model::make_memory_record_batch_reader(
-                    std::move(batches));
                   return partition->raft()->replicate(
-                    std::move(rdr),
+                    chunked_vector<model::record_batch>(std::move(batches)),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
               });
@@ -740,10 +732,8 @@ FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
                 return model::test::make_random_batches(model::offset(0), 5)
                   .then([ntp, &mgr](auto batches) {
                       auto partition = mgr.get(ntp);
-                      auto rdr = model::make_memory_record_batch_reader(
-                        std::move(batches));
                       return partition->raft()->replicate(
-                        std::move(rdr),
+                        chunked_vector<model::record_batch>(std::move(batches)),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack));
                   });
@@ -793,10 +783,8 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
             return model::test::make_random_batches(model::offset(0), 20)
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
-                  auto rdr = model::make_memory_record_batch_reader(
-                    std::move(batches));
                   return partition->raft()->replicate(
-                    std::move(rdr),
+                    chunked_vector<model::record_batch>(std::move(batches)),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
               });
@@ -840,4 +828,92 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
     BOOST_REQUIRE(fetch_one_byte.data.topics[0].partitions[0].records);
     BOOST_REQUIRE(
       fetch_one_byte.data.topics[0].partitions[0].records->size_bytes() > 0);
+}
+
+FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
+    model::topic topic("foo");
+    model::partition_id pid(0);
+    auto ntp = make_default_ntp(topic, pid);
+
+    wait_for_controller_leadership().get();
+
+    add_topic(model::topic_namespace_view(ntp)).get();
+    wait_for_partition_offset(ntp, model::offset(0)).get();
+    // append some data
+    auto shard = app.shard_table.local().shard_for(ntp);
+    app.partition_manager
+      .invoke_on(
+        *shard,
+        [ntp](cluster::partition_manager& mgr) {
+            return model::test::make_random_batches(model::offset(0), 20)
+              .then([ntp, &mgr](auto batches) {
+                  auto partition = mgr.get(ntp);
+                  return partition->raft()->replicate(
+                    chunked_vector<model::record_batch>(std::move(batches)),
+                    raft::replicate_options(
+                      raft::consistency_level::quorum_ack));
+              });
+        })
+      .get();
+
+    auto trunc_err = app.partition_manager
+                       .invoke_on(
+                         *shard,
+                         [ntp](cluster::partition_manager& mgr) {
+                             auto partition = mgr.get(ntp);
+                             auto k_trunc_offset = kafka::offset(5);
+                             auto rp_trunc_offset
+                               = partition->log()->to_log_offset(
+                                 model::offset(k_trunc_offset));
+                             return partition->prefix_truncate(
+                               rp_trunc_offset,
+                               k_trunc_offset,
+                               ss::lowres_clock::time_point::max());
+                         })
+                       .get();
+    BOOST_REQUIRE(!trunc_err);
+
+    auto hwm = app.partition_manager
+                 .invoke_on(
+                   *shard,
+                   [ntp](cluster::partition_manager& mgr) {
+                       auto partition = mgr.get(ntp);
+                       return partition->log()->from_log_offset(
+                         partition->high_watermark());
+                   })
+                 .get();
+
+    kafka::fetch_request req;
+    req.data.min_bytes = 1;
+    req.data.max_wait_ms = std::chrono::milliseconds(0);
+    req.data.session_id = kafka::invalid_fetch_session_id;
+    req.data.topics.emplace_back(kafka::fetch_topic{
+      .name = topic,
+      .fetch_partitions = {{
+        .partition_index = pid,
+        .fetch_offset = model::offset(0),
+      }},
+    });
+
+    auto client = make_kafka_client().get();
+    client.connect().get();
+    auto fresp = client.dispatch(std::move(req), kafka::api_version(5));
+
+    auto resp = fresp.get();
+    client.stop().then([&client] { client.shutdown(); }).get();
+
+    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions.size(), 1);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.topics[0].partitions[0].error_code,
+      kafka::error_code::offset_out_of_range);
+
+    // This is used by the clients to determine what should be done with the
+    // offset out of range error. See
+    // https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica
+    BOOST_REQUIRE_EQUAL(
+      resp.data.topics[0].partitions[0].log_start_offset, model::offset(5));
+    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions[0].high_watermark, hwm);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.topics[0].partitions[0].last_stable_offset, hwm);
 }

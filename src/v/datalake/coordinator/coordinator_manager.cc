@@ -16,10 +16,10 @@
 #include "datalake/coordinator/catalog_factory.h"
 #include "datalake/coordinator/coordinator.h"
 #include "datalake/coordinator/iceberg_file_committer.h"
+#include "datalake/coordinator/iceberg_snapshot_remover.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/logger.h"
 #include "datalake/record_schema_resolver.h"
-#include "datalake/table_creator.h"
 #include "iceberg/manifest_io.h"
 #include "model/fundamental.h"
 #include "schema/registry.h"
@@ -30,6 +30,7 @@ namespace datalake::coordinator {
 
 coordinator_manager::coordinator_manager(
   model::node_id self,
+  ss::sharded<storage::api>& storage,
   ss::sharded<raft::group_manager>& gm,
   ss::sharded<cluster::partition_manager>& pm,
   ss::sharded<cluster::topic_table>& topics,
@@ -39,6 +40,7 @@ coordinator_manager::coordinator_manager(
   ss::sharded<cloud_io::remote>& io,
   cloud_storage_clients::bucket_name bucket)
   : self_(self)
+  , storage_(storage.local())
   , gm_(gm.local())
   , pm_(pm.local())
   , topics_(topics.local())
@@ -54,9 +56,12 @@ coordinator_manager::~coordinator_manager() = default;
 ss::future<> coordinator_manager::start() {
     catalog_ = co_await catalog_factory_->create_catalog();
     schema_mgr_ = std::make_unique<catalog_schema_manager>(*catalog_);
-    table_creator_ = std::make_unique<direct_table_creator>(
-      *type_resolver_, *schema_mgr_);
     file_committer_ = std::make_unique<iceberg_file_committer>(
+      storage_,
+      *catalog_,
+      manifest_io_,
+      config::shard_local_cfg().iceberg_disable_snapshot_tagging.bind());
+    snapshot_remover_ = std::make_unique<iceberg_snapshot_remover>(
       *catalog_, manifest_io_);
 
     manage_notifications_ = pm_.register_manage_notification(
@@ -83,7 +88,7 @@ ss::future<> coordinator_manager::start() {
       });
 }
 
-ss::future<> coordinator_manager::stop() {
+ss::future<> coordinator_manager::shutdown() {
     if (manage_notifications_) {
         pm_.unregister_manage_notification(*manage_notifications_);
     }
@@ -94,9 +99,14 @@ ss::future<> coordinator_manager::stop() {
         gm_.unregister_leadership_notification(*leadership_notifications_);
     }
     auto gate_close = gate_.close();
+    ss::future catalog_stop = ss::now();
+    if (catalog_) {
+        catalog_stop = catalog_->stop();
+    }
     for (auto& [_, crd] : coordinators_) {
         co_await crd->stop_and_wait();
     }
+    co_await std::move(catalog_stop);
     co_await std::move(gate_close);
 }
 
@@ -120,12 +130,17 @@ void coordinator_manager::start_managing(cluster::partition& p) {
     auto crd = ss::make_lw_shared<coordinator>(
       std::move(stm),
       topics_,
-      *table_creator_,
+      *type_resolver_,
+      *schema_mgr_,
       [this](const model::topic& t, model::revision_id rev) {
           return remove_tombstone(t, rev);
       },
       *file_committer_,
-      config::shard_local_cfg().iceberg_catalog_commit_interval_ms.bind());
+      *snapshot_remover_,
+      config::shard_local_cfg().iceberg_catalog_commit_interval_ms.bind(),
+      config::shard_local_cfg().iceberg_default_partition_spec.bind(),
+      config::shard_local_cfg()
+        .iceberg_disable_automatic_snapshot_expiry.bind());
     if (p.is_leader()) {
         crd->notify_leadership(self_);
     }

@@ -14,6 +14,9 @@ seastar_cc_swagger_library(
 seastar_cc_swagger_library(
     name = "cluster_config",
     src = "api-doc/cluster_config.json",
+    definitions = [
+        "api-doc/cluster_config.def.json",
+    ],
 )
 
 seastar_cc_swagger_library(
@@ -247,8 +250,10 @@ redpanda_cc_library(
         "//src/v/strings:utf8",
         "//src/v/transform",
         "//src/v/transform:fwd",
+        "//src/v/utils:arch",
         "//src/v/utils:functional",
         "//src/v/utils:unresolved_address",
+        "//src/v/version",
         "//src/v/wasm:api",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",

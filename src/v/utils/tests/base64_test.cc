@@ -8,8 +8,8 @@
 // by the Apache License, Version 2.0
 
 #include "bytes/iobuf_parser.h"
-#include "bytes/random.h"
 #include "random/generators.h"
+#include "test_utils/random_bytes.h"
 #include "utils/base64.h"
 
 #include <boost/test/unit_test.hpp>
@@ -42,13 +42,23 @@ BOOST_AUTO_TEST_CASE(iobuf_type) {
     // test with multiple iobuf fragments
     iobuf buf;
     while (std::distance(buf.begin(), buf.end()) < 3) {
-        auto data = random_generators::get_bytes(128);
+        auto data = tests::random_bytes(128);
         buf.append(data.data(), data.size());
     }
 
     auto encoded = iobuf_to_base64(buf);
     auto decoded = base64_to_bytes(encoded);
     BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(buf));
+
+    auto encdec_limit = [](iobuf input, const auto expected, size_t sz_bytes) {
+        auto encoded = iobuf_to_base64(input, sz_bytes);
+        BOOST_REQUIRE_EQUAL(encoded, expected);
+        auto decoded = base64_to_bytes(encoded);
+        BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(input.share(0, sz_bytes)));
+    };
+
+    encdec_limit(iobuf::from("this is a string"), "dGhpcyBpcyA=", 8);
+    encdec_limit(iobuf::from("this"), "dGhpcw==", 8);
 }
 
 BOOST_AUTO_TEST_CASE(test_base64_to_iobuf) {

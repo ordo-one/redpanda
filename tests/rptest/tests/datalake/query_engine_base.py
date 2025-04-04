@@ -32,6 +32,7 @@ class QueryEngineBase(ABC):
     def run_query(self, query):
         client = self.make_client()
         assert client
+        self.logger.debug(f"running query: {query}")
         try:
             try:
                 cursor = client.cursor()
@@ -48,7 +49,13 @@ class QueryEngineBase(ABC):
 
     def run_query_fetch_all(self, query):
         with self.run_query(query) as cursor:
-            return cursor.fetchall()
+            result = cursor.fetchall()
+            self.logger.debug(f"query result: {result}")
+            return result
+
+    def run_query_fetch_one(self, query):
+        with self.run_query(query) as cursor:
+            return cursor.fetchone()
 
     def count_table(self, namespace, table) -> int:
         query = f"select count(*) from {namespace}.{self.escape_identifier(table)}"
@@ -59,3 +66,11 @@ class QueryEngineBase(ABC):
         query = f"select max(redpanda.offset) from {namespace}.{self.escape_identifier(table)} where redpanda.partition={partition}"
         with self.run_query(query) as cursor:
             return cursor.fetchone()[0]
+
+    @abstractmethod
+    def count_parquet_files(self, namespace, table) -> int:
+        ...
+
+    @abstractmethod
+    def optimize_parquet_files(self, namespace, table) -> None:
+        ...

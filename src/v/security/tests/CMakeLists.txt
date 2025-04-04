@@ -13,8 +13,21 @@ rp_test(
     oidc_principal_mapping_test.cc
     role_store_test.cc
   DEFINITIONS BOOST_TEST_DYN_LINK
-  LIBRARIES Boost::unit_test_framework v::kafka_protocol v::storage v::security
+  LIBRARIES Boost::unit_test_framework v::kafka_protocol v::storage v::security v::test_random_bytes
   LABELS kafka
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME test_authenticators
+  SOURCES
+    plain_authenticator_test.cc
+  LIBRARIES
+    v::security
+    v::gtest_main
+  LABELS kafka
+  ARGS "-- -c 1"
 )
 
 rp_test(
@@ -26,6 +39,7 @@ rp_test(
   LIBRARIES
     v::seastar_testing_main
     v::security
+    v::test_random_bytes
   ARGS "-- -c 1"
   LABELS
     kafka

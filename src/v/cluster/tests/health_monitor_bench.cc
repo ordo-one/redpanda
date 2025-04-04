@@ -23,6 +23,18 @@ cluster::topic_status make_topic_status(size_t id, size_t num_partitions) {
         part_status.reclaimable_size_bytes = 100;
         part_status.revision_id = model::revision_id(1);
         part_status.term = model::term_id(1);
+        if (i % 3 == 0) { // leaders
+            if (i % 30) { // 10% of leaders to have faulty partitions
+                part_status.under_replicated_replicas.emplace(2);
+                part_status.followers_stats.emplace(cluster::followers_stats{
+                  .in_sync = 2,
+                  .out_of_sync = {model::node_id(1), model::node_id(2)},
+                  .down = {model::node_id(3), model::node_id(4)}});
+            } else {
+                part_status.under_replicated_replicas.emplace(0);
+                part_status.followers_stats.emplace();
+            }
+        }
 
         ts.partitions.push_back(part_status);
     }
@@ -85,9 +97,8 @@ template<typename T>
 [[gnu::noinline]] T do_bench_deserialize_node_health_report(iobuf buf) {
     return serde::from_iobuf<T>(std::move(buf));
 }
-template<typename GenFunc>
 void bench_deserialize_node_health_report(
-  size_t num_topics, size_t partitions_per_topic, GenFunc& f) {
+  size_t num_topics, size_t partitions_per_topic) {
     auto hr = make_node_health_report(num_topics, partitions_per_topic);
     auto buf = iobuf();
     serde::write(buf, std::move(hr));
@@ -100,13 +111,13 @@ void bench_deserialize_node_health_report(
 }
 
 PERF_TEST(node_health_report, deserialize_many_partitions) {
-    bench_deserialize_node_health_report(10, 5000, make_node_health_report);
+    bench_deserialize_node_health_report(10, 5000);
 }
 
 PERF_TEST(node_health_report, deserialize_many_topics) {
-    bench_deserialize_node_health_report(50000, 1, make_node_health_report);
+    bench_deserialize_node_health_report(50000, 1);
 }
 
 PERF_TEST(node_health_report, deserialize_many_topics_replicated_partitions) {
-    bench_deserialize_node_health_report(50000, 3, make_node_health_report);
+    bench_deserialize_node_health_report(50000, 3);
 }

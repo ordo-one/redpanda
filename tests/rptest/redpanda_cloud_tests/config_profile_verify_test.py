@@ -60,30 +60,37 @@ class ConfigProfileVerifyTest(RedpandaCloudTest):
 
     def _check_rp_config(self):
         confRes = self.redpanda.kubectl.exec(
-            "rpk redpanda admin config print --host 0")
+            'rpk redpanda admin config print --host 0')
         clusterConfig = json.loads(confRes)
-        self.logger.debug(
-            "asserting we got the config for the right cluster: expected rp-{}, actual: {}"
-            .format(self._clusterId, clusterConfig["cluster_id"]))
-        assert clusterConfig['cluster_id'] in (self._clusterId,
-                                               f'rp-{self._clusterId}')
+        assert clusterConfig['cluster_id'] in (
+            self._clusterId, f'rp-{self._clusterId}'
+        ), f'asserting we got the config for the right cluster: expected {self._clusterId} to contain {clusterConfig["cluster_id"]}'
 
-        for k, v in self._configProfile["cluster_config"].items():
+        for k, expected_v in self._configProfile["cluster_config"].items():
+            actual_v = clusterConfig[k]
             self.logger.debug(
                 "asserting cluster config key {} has expected value: {}  actual: {}"
-                .format(k, v, clusterConfig[k]))
-            if clusterConfig[k] != v and "{}".format(clusterConfig[k]) != v:
-                assert False
+                .format(k, expected_v, actual_v))
+            if expected_v == "null":
+                expected_v = None
+            if actual_v != expected_v and "{}".format(actual_v) != expected_v:
+                assert False, f"incorrect config value for key '{k}': {actual_v} != {expected_v}"
 
     def _check_aws_nodes(self):
         cmd = self.redpanda.kubectl._ssh_prefix() + [
             'aws', 'ec2', 'describe-instances',
-            '--filters="Name=tag:Name, Values=redpanda-{}-rp"'.format(
+            '--filters="Name=tag:Name, Values=redpanda-{}-rp-*"'.format(
                 self._clusterId),
             '--query="Reservations[0].Instances[*].InstanceType"'
         ]
         res = subprocess.check_output(cmd)
-        resd = json.loads(res)
+        try:
+            resd = json.loads(res)
+        except json.JSONDecodeError as e:
+            self.logger.error(
+                f"Failed to parse AWS describe-instances response: {res}")
+            raise ValueError(
+                f"Failed to parse AWS describe-instances response: {e}")
 
         self.logger.debug(
             "asserting nodes_count: expected: {}, actual: {}".format(
@@ -96,27 +103,37 @@ class ConfigProfileVerifyTest(RedpandaCloudTest):
         assert resd[0] == self._configProfile['machine_type']
 
     def _check_azure_nodes(self):
-        # currently, we have to override the PATH for azure because
-        # az-cli is installed via snap and /snap/bin only appears in
-        # $PATH on *interactive* shells
+        jsonpath = '{..labels.node\\.kubernetes\\.io/instance-type}'
         cmd = self.redpanda.kubectl._ssh_prefix() + [
-            'env', 'PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin',
-            'az', 'aks', 'nodepool', 'list',
-            '--cluster-name', f'aks-rpcloud-{self._clusterId}',
-            '--resource-group', f'rg-rpcloud-{self._clusterId}',
-            '--query', "'[?starts_with(name,`redpanda`)].vmSize'",
-            '--output', 'json'
+            'kubectl', 'get', 'nodes',
+            '--selector', 'redpanda-node=true',
+            '--output', f'jsonpath-as-json="{jsonpath}"'
         ] # yapf: disable
 
-        res = subprocess.check_output(cmd)
-        resd = json.loads(res)
+        output = subprocess.check_output(cmd).decode("utf-8").strip()
 
-        nc = self._configProfile['nodes_count']
-        assert len(
-            resd) == nc, f"expected nodes_count: {nc}, actual: {len(resd)}"
+        self.logger.debug(f'Azure nodes raw output: {output}')
 
-        mt = self._configProfile['machine_type']
-        assert resd[1] == mt, f"expected machineType: {mt}, actual: {resd[1]}"
+        # Convert space separated output into a Python list
+        # Example: ["Standard_D2d_v5", "Standard_D2d_v5", "Standard_D2d_v5"]
+        nodes = output.split()
+
+        # Ensure we have nodes to validate
+        if not nodes:
+            self.logger.error(
+                "No nodes found with selector 'redpanda-node=true'")
+            raise ValueError(
+                "No nodes found with selector 'redpanda-node=true'")
+
+        # Validate the number of nodes
+        config_nodes_count = self._configProfile['nodes_count']
+        actual_nodes_count = len(nodes)
+        assert actual_nodes_count == config_nodes_count, f"expected nodes_count: {config_nodes_count}, actual: {actual_nodes_count}"
+
+        # Validate machine type
+        config_machine_type = self._configProfile['machine_type']
+        actual_machine_type = nodes[0]
+        assert actual_machine_type == config_machine_type, f"expected machineType: {config_machine_type}, actual: {actual_machine_type}"
 
     def _check_gcp_nodes(self):
         cmd = self.redpanda.kubectl._ssh_prefix() + [
@@ -125,7 +142,13 @@ class ConfigProfileVerifyTest(RedpandaCloudTest):
                 self._clusterId), '--format="json(name,machineType,disks)"'
         ]
         res = subprocess.check_output(cmd)
-        resd = json.loads(res)
+        try:
+            resd = json.loads(res)
+        except json.JSONDecodeError as e:
+            self.logger.error(
+                f"Failed to parse gcloud compute instances response: {res}")
+            raise ValueError(
+                f"Failed to parse gcloud compute instances response: {e}")
 
         self.logger.debug(
             "asserting machineType: expected: {}, actual: {}".format(

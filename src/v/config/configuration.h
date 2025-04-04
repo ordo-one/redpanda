@@ -13,7 +13,6 @@
 
 #include "config/bounded_property.h"
 #include "config/broker_endpoint.h"
-#include "config/client_group_byte_rate_quota.h"
 #include "config/config_store.h"
 #include "config/convert.h"
 #include "config/data_directory_path.h"
@@ -108,8 +107,6 @@ private:
 
 struct configuration final : public config_store {
     using meta = base_property::metadata;
-    constexpr static auto target_produce_quota_byte_rate_default
-      = 0; // disabled
 
     // WAL
     bounded_property<uint64_t> log_segment_size;
@@ -156,6 +153,7 @@ struct configuration final : public config_store {
     bounded_property<std::optional<int32_t>> topic_fds_per_partition;
     bounded_property<uint32_t> topic_partitions_per_shard;
     bounded_property<uint32_t> topic_partitions_reserve_shard0;
+    bounded_property<uint32_t> topic_partitions_memory_allocation_percent;
     property<std::chrono::milliseconds>
       partition_manager_shutdown_watchdog_timeout;
 
@@ -191,13 +189,15 @@ struct configuration final : public config_store {
     bounded_property<int16_t> default_num_windows;
     bounded_property<std::chrono::milliseconds> default_window_sec;
     property<std::chrono::milliseconds> quota_manager_gc_sec;
-    bounded_property<uint32_t> target_quota_byte_rate;
-    property<std::optional<uint32_t>> target_fetch_quota_byte_rate;
-    bounded_property<std::optional<uint32_t>> kafka_admin_topic_api_rate;
+    deprecated_property target_quota_byte_rate;
+    deprecated_property target_fetch_quota_byte_rate;
+    deprecated_property kafka_admin_topic_api_rate;
     property<std::optional<ss::sstring>> cluster_id;
     property<bool> disable_metrics;
     property<bool> disable_public_metrics;
     property<bool> aggregate_metrics;
+    property<std::vector<ss::sstring>> enable_consumer_group_metrics;
+    property<std::chrono::seconds> consumer_group_lag_collection_interval;
     property<std::chrono::milliseconds> group_min_session_timeout_ms;
     property<std::chrono::milliseconds> group_max_session_timeout_ms;
     property<std::chrono::milliseconds> group_initial_rebalance_delay;
@@ -234,6 +234,8 @@ struct configuration final : public config_store {
     enum_property<model::compression> log_compression_type;
     property<size_t> fetch_max_bytes;
     property<bool> use_fetch_scheduler_group;
+    property<bool> use_produce_scheduler_group;
+    property<bool> use_kafka_handler_scheduler_group;
     property<std::chrono::milliseconds> metadata_status_wait_timeout_ms;
     property<std::chrono::seconds> kafka_tcp_keepalive_idle_timeout_seconds;
     property<std::chrono::seconds> kafka_tcp_keepalive_probe_interval_seconds;
@@ -252,8 +254,12 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> log_compaction_interval_ms;
     // same as delete.retention.ms in kafka
     property<std::optional<std::chrono::milliseconds>> tombstone_retention_ms;
+    bounded_property<std::optional<double>, numeric_bounds>
+      min_cleanable_dirty_ratio;
     property<bool> log_disable_housekeeping_for_tests;
     property<bool> log_compaction_use_sliding_window;
+    property<std::optional<size_t>>
+      log_compaction_adjacent_merge_self_compaction_count;
     // same as retention.size in kafka - TODO: size not implemented
     property<std::optional<size_t>> retention_bytes;
     property<int32_t> group_topic_partitions;
@@ -335,6 +341,7 @@ struct configuration final : public config_store {
     bounded_property<std::optional<std::chrono::milliseconds>>
       kafka_sasl_max_reauth_ms;
     property<std::optional<bool>> kafka_enable_authorization;
+    enum_property<tls_name_format> tls_certificate_name_format;
     property<std::optional<std::vector<ss::sstring>>>
       kafka_mtls_principal_mapping_rules;
     property<bool> kafka_enable_partition_reassignment;
@@ -358,10 +365,8 @@ struct configuration final : public config_store {
     property<std::optional<uint32_t>> kafka_connections_max;
     property<std::optional<uint32_t>> kafka_connections_max_per_ip;
     property<std::vector<ss::sstring>> kafka_connections_max_overrides;
-    one_or_many_map_property<client_group_quota>
-      kafka_client_group_byte_rate_quota;
-    one_or_many_map_property<client_group_quota>
-      kafka_client_group_fetch_byte_rate_quota;
+    deprecated_property kafka_client_group_byte_rate_quota;
+    deprecated_property kafka_client_group_fetch_byte_rate_quota;
     bounded_property<std::optional<int>> kafka_rpc_server_tcp_recv_buf;
     bounded_property<std::optional<int>> kafka_rpc_server_tcp_send_buf;
     bounded_property<std::optional<size_t>> kafka_rpc_server_stream_recv_buf;
@@ -468,9 +473,14 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds>
       cloud_storage_topic_purge_grace_period_ms;
     property<bool> cloud_storage_disable_upload_consistency_checks;
-    property<bool> cloud_storage_disable_metadata_consistency_checks;
+    deprecated_property cloud_storage_disable_metadata_consistency_checks;
+    property<bool> cloud_storage_disable_archival_stm_rw_fence;
     property<std::chrono::milliseconds> cloud_storage_hydration_timeout_ms;
     property<bool> cloud_storage_disable_remote_labels_for_tests;
+
+    // Safe pause/resume functionality
+    property<bool> cloud_storage_enable_segment_uploads;
+    property<bool> cloud_storage_enable_remote_allow_gaps;
 
     // Azure Blob Storage
     property<std::optional<ss::sstring>> cloud_storage_azure_storage_account;
@@ -666,7 +676,8 @@ struct configuration final : public config_store {
       enable_schema_id_validation;
     config::property<size_t> kafka_schema_id_validation_cache_capacity;
 
-    property<bool> schema_registry_normalize_on_startup;
+    property<bool> schema_registry_always_normalize;
+    deprecated_property schema_registry_protobuf_renderer_v2;
     property<std::optional<uint32_t>> pp_sr_smp_max_non_local_requests;
     bounded_property<size_t> max_in_flight_schema_registry_requests_per_shard;
     bounded_property<size_t> max_in_flight_pandaproxy_requests_per_shard;
@@ -699,11 +710,14 @@ struct configuration final : public config_store {
     property<bool> unsafe_enable_consumer_offsets_delete_retention;
 
     enum_property<tls_version> tls_min_version;
+    property<bool> tls_enable_renegotiation;
 
     // datalake configurations
     enterprise<property<bool>> iceberg_enabled;
     bounded_property<std::chrono::milliseconds>
       iceberg_catalog_commit_interval_ms;
+    bounded_property<std::chrono::milliseconds>
+      iceberg_latest_schema_cache_ttl_ms;
     property<ss::sstring> iceberg_catalog_base_location;
     bounded_property<std::chrono::seconds>
       datalake_coordinator_snapshot_max_delay_secs;
@@ -716,10 +730,40 @@ struct configuration final : public config_store {
     property<std::optional<ss::sstring>> iceberg_rest_catalog_token;
     property<std::chrono::milliseconds> iceberg_rest_catalog_request_timeout_ms;
     property<std::optional<ss::sstring>> iceberg_rest_catalog_trust_file;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_trust;
     property<std::optional<ss::sstring>> iceberg_rest_catalog_crl_file;
-    property<std::optional<ss::sstring>> iceberg_rest_catalog_prefix;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_crl;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_warehouse;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_oauth2_server_uri;
+    property<ss::sstring> iceberg_rest_catalog_oauth2_scope;
+    enum_property<datalake_catalog_auth_mode>
+      iceberg_rest_catalog_authentication_mode;
+    property<double> iceberg_backlog_controller_p_coeff;
+    property<double> iceberg_backlog_controller_i_coeff;
+    bounded_property<uint32_t> iceberg_target_backlog_size;
+    property<double> iceberg_throttle_backlog_size_ratio;
 
     property<bool> iceberg_delete;
+    property<ss::sstring> iceberg_default_partition_spec;
+    enum_property<model::iceberg_invalid_record_action>
+      iceberg_invalid_record_action;
+    bounded_property<std::chrono::milliseconds> iceberg_target_lag_ms;
+    property<bool> iceberg_disable_snapshot_tagging;
+    property<bool> iceberg_disable_automatic_snapshot_expiry;
+
+    property<bool> enable_host_metrics;
+
+    // datalake scheduler configs
+    bounded_property<size_t> datalake_scheduler_block_size_bytes;
+    bounded_property<size_t> datalake_scheduler_max_concurrent_translations;
+    bounded_property<std::chrono::milliseconds>
+      datalake_scheduler_time_slice_ms;
+    bounded_property<size_t> datalake_translator_flush_bytes;
+    property<bool> datalake_disk_space_monitor_enable;
+    bounded_property<std::chrono::milliseconds>
+      datalake_disk_space_monitor_interval;
+    property<size_t> datalake_scratch_space_size_bytes;
+    property<double> datalake_disk_usage_overage_coeff;
 
     configuration();
 

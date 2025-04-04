@@ -950,7 +950,25 @@ class StreamVerifier():
             hwms = {}
             for p in partitions:
                 # Get the partitions low and high watermark offsets.
-                (lo, hi) = c.get_watermark_offsets(p, timeout=10, cached=False)
+                # This can fail with cimpl.KafkaException: KafkaError{code=NOT_LEADER_FOR_PARTITION}.
+                # Retry the command with some backoff to allow partition leadership to settle if this
+                # is encountered.
+                num_retries = 10
+                err = None
+                while num_retries > 0:
+                    num_retries -= 1
+                    try:
+                        (lo, hi) = c.get_watermark_offsets(p,
+                                                           timeout=10,
+                                                           cached=False)
+                        break
+                    except ck.KafkaException as e:
+                        err = e
+                        # Backoff
+                        sleep(1)
+                else:
+                    raise err
+
                 hwms[p.partition] = hi
             return hwms
         else:

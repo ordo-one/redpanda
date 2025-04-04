@@ -29,9 +29,30 @@ filegroup(
 alias(
     name = "redpanda",
     actual = "//src/v/redpanda:redpanda",
+    visibility = ["//visibility:public"],
 )
 
 alias(
     name = "rpk",
     actual = "//src/go/rpk/cmd/rpk:rpk",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "cc_gen",
+    actual = "//bazel/compilation_database_generator",
+)
+
+filegroup(
+    name = "lsan_suppressions",
+    testonly = True,
+    srcs = ["lsan_suppressions.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "ubsan_suppressions",
+    testonly = True,
+    srcs = ["ubsan_suppressions.txt"],
+    visibility = ["//visibility:public"],
 )

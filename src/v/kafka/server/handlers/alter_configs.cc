@@ -16,6 +16,7 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/alter_configs_request.h"
 #include "kafka/protocol/schemata/alter_configs_response.h"
+#include "kafka/protocol/types.h"
 #include "kafka/server/handlers/configs/config_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
@@ -83,7 +84,7 @@ create_topic_properties_update(
     std::apply(apply_op(op_t::none), update.custom_properties.serde_fields());
 
     static_assert(
-      std::tuple_size_v<decltype(update.properties.serde_fields())> == 32,
+      std::tuple_size_v<decltype(update.properties.serde_fields())> == 37,
       "If you added a property, please decide on it's default alter config "
       "policy, and handle the update in the loop below");
     static_assert(
@@ -366,6 +367,56 @@ create_topic_properties_update(
             if (cfg.name == topic_property_iceberg_delete) {
                 parse_and_set_optional_bool_alpha(
                   update.properties.iceberg_delete,
+                  cfg.value,
+                  kafka::config_resource_operation::set);
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_partition_spec) {
+                // Use std::identity as the "parser function" (i.e. pass through
+                // the raw string) because boost::lexical_cast<ss::sstring> (the
+                // default) doesn't allow spaces in the config value.
+                parse_and_set_optional(
+                  update.properties.iceberg_partition_spec,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  iceberg_partition_spec_validator{},
+                  std::identity{});
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_invalid_record_action) {
+                parse_and_set_optional(
+                  update.properties.iceberg_invalid_record_action,
+                  cfg.value,
+                  kafka::config_resource_operation::set);
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_target_lag_ms) {
+                parse_and_set_optional(
+                  update.properties.iceberg_target_lag_ms,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  iceberg_target_lag_ms_validator{},
+                  [](const ss::sstring& v) {
+                      auto parsed
+                        = boost::lexical_cast<std::chrono::milliseconds::rep>(
+                          v);
+                      return std::chrono::milliseconds{parsed};
+                  });
+                continue;
+            }
+
+            if (cfg.name == topic_property_min_cleanable_dirty_ratio) {
+                parse_and_set_tristate(
+                  update.properties.min_cleanable_dirty_ratio,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  min_cleanable_dirty_ratio_validator{});
+                continue;
+            }
+
+            if (cfg.name == topic_property_remote_allow_gaps) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.remote_allow_gaps,
                   cfg.value,
                   kafka::config_resource_operation::set);
                 continue;

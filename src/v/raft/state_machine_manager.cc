@@ -207,9 +207,10 @@ ss::future<> state_machine_manager::stop() {
     _apply_mutex.broken();
     _as.request_abort();
 
-    co_await _gate.close();
+    auto gate_f = _gate.close();
     co_await ss::coroutine::parallel_for_each(
       _machines, [](auto p) { return p.second->stm->stop(); });
+    co_await std::move(gate_f);
 }
 
 ss::future<> state_machine_manager::apply_raft_snapshot() {
@@ -454,6 +455,11 @@ ss::future<> state_machine_manager::background_apply_fiber(
           entry->stm->next(),
           _next,
           entry->name);
+        /**
+         * As the STM is catching up and not reading the tip of the log it is
+         * pointless to populate the batch cache with the read batches.
+         */
+        config.skip_batch_cache = true;
         bool error = false;
         try {
             model::record_batch_reader reader = co_await _raft->make_reader(

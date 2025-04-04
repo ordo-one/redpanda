@@ -81,10 +81,10 @@ coordinator_stm::sync(model::timeout_clock::duration timeout) {
 ss::future<checked<std::nullopt_t, coordinator_stm::errc>>
 coordinator_stm::replicate_and_wait(
   model::term_id term, model::record_batch batch, ss::abort_source& as) {
-    auto opts = raft::replicate_options{raft::consistency_level::quorum_ack};
+    auto opts = raft::replicate_options(
+      raft::consistency_level::quorum_ack, std::ref(as));
     opts.set_force_flush();
-    auto res = co_await _raft->replicate(
-      term, model::make_memory_record_batch_reader(std::move(batch)), opts);
+    auto res = co_await _raft->replicate(term, std::move(batch), opts);
     if (res.has_error()) {
         co_return errc::raft_error;
     }
@@ -110,8 +110,7 @@ ss::future<> coordinator_stm::do_apply(const model::record_batch& b) {
         // TODO: make updates a variant so we can share code more easily?
         case update_key::add_files: {
             auto update = co_await serde::read_async<add_files_update>(val_p);
-            vlog(
-              _log.debug, "Applying {} from offset {}: {}", key, o, update.tp);
+            vlog(_log.debug, "Applying {} from offset {}: {}", key, o, update);
             auto res = update.apply(state_, o);
             maybe_log_update_error(_log, key, o, res);
             continue;
@@ -119,8 +118,7 @@ ss::future<> coordinator_stm::do_apply(const model::record_batch& b) {
         case update_key::mark_files_committed: {
             auto update
               = co_await serde::read_async<mark_files_committed_update>(val_p);
-            vlog(
-              _log.debug, "Applying {} from offset {}: {}", key, o, update.tp);
+            vlog(_log.debug, "Applying {} from offset {}: {}", key, o, update);
             auto res = update.apply(state_);
             maybe_log_update_error(_log, key, o, res);
             continue;
@@ -144,11 +142,12 @@ ss::future<> coordinator_stm::do_apply(const model::record_batch& b) {
 
 model::offset coordinator_stm::max_collectible_offset() { return {}; }
 
-ss::future<> coordinator_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied> coordinator_stm::apply_local_snapshot(
   raft::stm_snapshot_header, iobuf&& snapshot_buf) {
     auto parser = iobuf_parser(std::move(snapshot_buf));
     auto snapshot = co_await serde::read_async<stm_snapshot>(parser);
     state_ = std::move(snapshot.topics);
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot>

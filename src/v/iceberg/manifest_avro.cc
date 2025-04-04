@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #include "iceberg/manifest_avro.h"
 
 #include "base/units.h"
@@ -104,8 +105,7 @@ metadata_to_map(const manifest_metadata& meta) {
       {"format-version", std::string{format_to_str(meta.format_version)}}};
 }
 // TODO: make DataFileReader::getMetadata const!
-manifest_metadata
-metadata_from_reader(avro::DataFileReader<avro::GenericDatum>& rdr) {
+manifest_metadata metadata_from_reader(avro::DataFileReaderBase& rdr) {
     const auto find_required_str = [&rdr](const std::string& key) {
         auto val = rdr.getMetadata(key);
         if (!val) {
@@ -154,7 +154,6 @@ iobuf serialize_avro(const manifest& m) {
               entry_struct, entry_schema.root());
             writer.write(entry_datum);
         }
-        writer.flush();
         writer.close();
 
         // NOTE: ~DataFileWriter does a final sync which may write to the
@@ -168,14 +167,20 @@ iobuf serialize_avro(const manifest& m) {
     return buf;
 }
 
-manifest parse_manifest(const partition_key_type& pk_type, iobuf buf) {
-    auto entry_type = field_type{manifest_entry_type(pk_type.copy())};
+manifest parse_manifest(iobuf buf) {
+    auto in = std::make_unique<avro_iobuf_istream>(std::move(buf));
+    auto reader_base = std::make_unique<avro::DataFileReaderBase>(
+      std::move(in));
+
+    auto meta = metadata_from_reader(*reader_base);
+    auto entry_type = field_type{manifest_entry_type(
+      partition_key_type::create(meta.partition_spec, meta.schema))};
     auto entry_schema = avro::ValidSchema(
       struct_type_to_avro(std::get<struct_type>(entry_type), "manifest_entry"));
-    auto in = std::make_unique<avro_iobuf_istream>(std::move(buf));
+
     avro::DataFileReader<avro::GenericDatum> reader(
-      std::move(in), entry_schema);
-    auto meta = metadata_from_reader(reader);
+      std::move(reader_base), entry_schema);
+
     chunked_vector<manifest_entry> entries;
     while (true) {
         avro::GenericDatum d(entry_schema);

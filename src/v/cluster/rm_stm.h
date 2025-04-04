@@ -197,12 +197,12 @@ public:
 
     kafka_stages replicate_in_stages(
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch batch,
       raft::replicate_options);
 
     ss::future<result<kafka_result>> replicate(
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch batch,
       raft::replicate_options);
 
     ss::future<ss::basic_rwlock<>::holder> prepare_transfer_leadership();
@@ -240,9 +240,10 @@ private:
     // for the first time from the incoming request.
     using producer_previously_known
       = ss::bool_class<struct new_producer_created_tag>;
-    std::pair<tx::producer_ptr, producer_previously_known>
+    checked<std::pair<tx::producer_ptr, producer_previously_known>, tx::errc>
       maybe_create_producer(model::producer_identity);
-    void cleanup_producer_state(model::producer_identity);
+    void cleanup_producer_state(model::producer_identity) noexcept;
+    ss::future<> cleanup_evicted_producers();
     ss::future<> reset_producers();
     ss::future<checked<model::term_id, tx::errc>> do_begin_tx(
       model::term_id,
@@ -261,7 +262,7 @@ private:
       tx::producer_ptr,
       std::optional<model::tx_seq>,
       model::timeout_clock::duration);
-    ss::future<>
+    ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&&) override;
     ss::future<raft::stm_snapshot>
     take_local_snapshot(ssx::semaphore_units apply_units) override;
@@ -273,28 +274,28 @@ private:
 
     ss::future<result<kafka_result>> do_replicate(
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>);
 
-    ss::future<result<kafka_result>> transactional_replicate(
-      model::batch_identity, model::record_batch_reader);
+    ss::future<result<kafka_result>>
+      transactional_replicate(model::batch_identity, model::record_batch);
 
     ss::future<result<kafka_result>> transactional_replicate(
       model::term_id,
       tx::producer_ptr,
       model::batch_identity,
-      model::record_batch_reader);
+      model::record_batch);
 
     ss::future<result<kafka_result>> do_transactional_replicate(
       model::term_id,
       tx::producer_ptr,
       model::batch_identity,
-      model::record_batch_reader);
+      model::record_batch);
 
     ss::future<result<kafka_result>> idempotent_replicate(
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>);
 
@@ -302,7 +303,7 @@ private:
       model::term_id,
       tx::producer_ptr,
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>,
       ssx::semaphore_units&,
@@ -312,14 +313,14 @@ private:
       model::term_id,
       tx::producer_ptr,
       model::batch_identity,
-      model::record_batch_reader,
+      model::record_batch,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>,
       ssx::semaphore_units,
       producer_previously_known);
 
     ss::future<result<kafka_result>> replicate_msg(
-      model::record_batch_reader,
+      model::record_batch,
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>);
 
@@ -413,6 +414,8 @@ private:
     // a given producer_id remains active. This also works for idempotent
     // producers because epoch is unused.
     producers_t _producers;
+
+    ss::queue<model::producer_identity> _producers_pending_cleanup;
 
     // All the producers with open transactions in this partition.
     // The list is sorted by the open transaction begin offset, so

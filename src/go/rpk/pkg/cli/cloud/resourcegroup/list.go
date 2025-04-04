@@ -15,8 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	controlplanev1beta2 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1beta2"
-
+	controlplanev1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1"
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/oauth"
@@ -45,14 +44,12 @@ func listCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			cfg, err := p.Load(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			priorProfile := cfg.ActualProfile()
-			_, authVir, clearedProfile, _, err := oauth.LoadFlow(cmd.Context(), fs, cfg, auth0.NewClient(cfg.DevOverrides()), false, false, cfg.DevOverrides().CloudAPIURL)
+			_, authVir, clearedProfile, _, err := oauth.LoadFlow(cmd.Context(), fs, cfg, auth0.NewClient(cfg.DevOverrides()), false, false)
 			out.MaybeDie(err, "unable to authenticate with Redpanda Cloud: %v", err)
 
 			oauth.MaybePrintSwapMessage(clearedProfile, priorProfile, authVir)
 			authToken := authVir.AuthToken
-			cl, err := publicapi.NewControlPlaneClientSet(cfg.DevOverrides().PublicAPIURL, authToken)
-
-			out.MaybeDie(err, "unable to create the public api client: %v", err)
+			cl := publicapi.NewCloudClientSet(cfg.DevOverrides().PublicAPIURL, authToken)
 
 			resourceGroups, err := listAllResourceGroups(cmd.Context(), cl)
 			out.MaybeDie(err, "unable to list resource groups: %v", err)
@@ -73,13 +70,13 @@ func listCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 // listAllResourceGroups uses the pagination feature to traverse all pages of the
 // list request and return all resource groups.
-func listAllResourceGroups(ctx context.Context, cl *publicapi.ControlPlaneClientSet) ([]listResponse, error) {
+func listAllResourceGroups(ctx context.Context, cl *publicapi.CloudClientSet) ([]listResponse, error) {
 	var (
 		pageToken string
-		listed    []*controlplanev1beta2.ResourceGroup
+		listed    []*controlplanev1.ResourceGroup
 	)
 	for {
-		l, err := cl.ResourceGroup.ListResourceGroups(ctx, connect.NewRequest(&controlplanev1beta2.ListResourceGroupsRequest{PageToken: pageToken}))
+		l, err := cl.ResourceGroup.ListResourceGroups(ctx, connect.NewRequest(&controlplanev1.ListResourceGroupsRequest{PageToken: pageToken}))
 		if err != nil {
 			return nil, err
 		}

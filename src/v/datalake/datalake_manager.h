@@ -15,12 +15,19 @@
 #include "cluster/fwd.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
+#include "datalake/backlog_controller.h"
 #include "datalake/fwd.h"
+#include "datalake/location.h"
+#include "datalake/record_schema_resolver.h"
 #include "datalake/translation/partition_translator.h"
+#include "datalake/translation/scheduling.h"
+#include "datalake/translation/translation_probe.h"
 #include "features/fwd.h"
+#include "model/metadata.h"
 #include "pandaproxy/schema_registry/fwd.h"
 #include "raft/fwd.h"
 #include "ssx/semaphore.h"
+#include "ssx/work_queue.h"
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/scheduling.hh>
@@ -64,19 +71,74 @@ public:
       size_t memory_limit);
     ~datalake_manager();
 
+    /*
+     * Call prepare_staging_directory before starting. Preparation involves
+     * clearing out the directory, and since start() will be invoked on all
+     * cores we expect the caller to prepare the directory to avoid potential
+     * affects of concurrent file creates and deletes.
+     */
     ss::future<> start();
-    ss::future<> stop();
+
+    ss::future<> shutdown();
+
+    /*
+     * Return the amount of disk space currently in use by the datalake
+     * subsystem (e.g. staged translated data on disk, etc...).
+     *
+     * This interface computes a global value, rather than shard local.
+     */
+    static ss::future<uint64_t> disk_usage();
+
+    /**
+     * Returns the number of partitions that the translator is not able to keep
+     * up with.
+     */
+    size_t overdue_translation_partition_count() const;
+    /**
+     * Returns count of partitions that translation is blocked. This value
+     * should be 0 in normal conditions.
+     */
+    size_t partitions_with_translation_blocked() const;
+    /**
+     * Returns true if datalake translation runs with maximum allowed priority.
+     */
+    bool max_shares_assigned() const;
+
+    /*
+     * Ensure that the datalake scratch directory exists and is empty. The
+     * directory isn't required to be empty when starting up, but there is no
+     * way for translators to resume processing files so clearing the directory
+     * is a convenient way to deal with orphaned files.
+     */
+    static ss::future<> prepare_staging_directory(std::filesystem::path);
+
+    /**
+     * Returns total number of bytes that are ready to be translated for all
+     * datalake enabled partitions on a current shard.
+     */
+    size_t total_translation_backlog() const;
 
 private:
     using translator = std::unique_ptr<translation::partition_translator>;
-    using translator_map = chunked_hash_map<model::ntp, translator>;
 
-    std::chrono::milliseconds translation_interval_ms() const;
-    void on_group_notification(const model::ntp&);
-    void start_translator(
-      ss::lw_shared_ptr<cluster::partition>, model::iceberg_mode);
-    ss::future<> stop_translator(const model::ntp&);
+    ss::future<> handle_translator_state_change(const model::ntp&);
 
+    /// \note The probe is created on the first use.
+    ss::lw_shared_ptr<translation_probe> get_or_create_probe(const model::ntp&);
+
+    /*
+     * Background loop that periodically invokes `check_disk_space`.
+     */
+    ss::future<> disk_space_monitor();
+
+    /*
+     * Checks disk space usage across all translators, and if the total usage
+     * exceeds the configured limits for datalake, request schedulers to finish
+     * translations and free disk space.
+     */
+    ss::future<> check_and_manage_disk_space();
+
+private:
     model::node_id _self;
     ss::sharded<raft::group_manager>* _group_mgr;
     ss::sharded<cluster::partition_manager>* _partition_mgr;
@@ -87,26 +149,28 @@ private:
     ss::sharded<features::feature_table>* _features;
     ss::sharded<coordinator::frontend>* _coordinator_frontend;
     std::unique_ptr<datalake::cloud_data_io> _cloud_data_io;
+    location_provider _location_provider;
     std::unique_ptr<schema::registry> _schema_registry;
     std::unique_ptr<coordinator::catalog_factory> _catalog_factory;
     std::unique_ptr<iceberg::catalog> _catalog;
     std::unique_ptr<datalake::schema_manager> _schema_mgr;
-    std::unique_ptr<datalake::type_resolver> _type_resolver;
+    std::unique_ptr<datalake::schema_cache> _schema_cache;
+    std::unique_ptr<backlog_controller> _backlog_controller;
+    chunked_hash_map<model::ntp, ss::lw_shared_ptr<class translation_probe>>
+      _translation_probe_by_ntp;
     ss::sharded<ss::abort_source>* _as;
     ss::scheduling_group _sg;
     ss::gate _gate;
 
-    size_t _effective_max_translator_buffered_data;
-    std::unique_ptr<ssx::semaphore> _parallel_translations;
-    translator_map _translators;
     using deferred_action = ss::deferred_action<std::function<void()>>;
     std::vector<deferred_action> _deregistrations;
-    config::binding<std::chrono::milliseconds> _iceberg_commit_interval;
-
-    // Translation requires buffering data batches in memory for efficient
-    // output representation, this controls the maximum bytes buffered in memory
-    // before the output is flushed.
-    static constexpr size_t max_translator_buffered_data = 64_MiB;
+    config::binding<model::iceberg_invalid_record_action>
+      _iceberg_invalid_record_action;
+    std::filesystem::path _writer_scratch_space;
+    translation::scheduling::scheduler _scheduler;
+    ssx::work_queue _queue;
+    ssx::semaphore _disk_space_monitor_sem{0, "datalake::disk_space_monitor"};
+    config::binding<std::chrono::milliseconds> _disk_usage_interval;
 };
 
 } // namespace datalake

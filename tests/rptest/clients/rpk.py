@@ -14,6 +14,7 @@ import typing
 import time
 import itertools
 import os
+import tempfile
 from collections import namedtuple
 from typing import Any, Iterator, Optional
 from ducktape.cluster.cluster import ClusterNode
@@ -183,6 +184,14 @@ class RpkTrimOffsetResponse(typing.NamedTuple):
     partition: int
     new_start_offset: int
     error_msg: str
+
+
+class RpkAnalyzedTopic(typing.NamedTuple):
+    topic: str
+    partitions: int
+    bytes_per_second: float
+    batches_per_second: float
+    average_bytes_per_batch: float
 
 
 @dataclass
@@ -642,6 +651,43 @@ class RpkTool:
         assert m, f"Reported offset not found in: {out}"
         return int(m.group(1))
 
+    def analyze_topic(self, topic: str,
+                      time_range: str) -> Iterator[RpkAnalyzedTopic]:
+        cmd = ['analyze', topic, '-t', time_range, '--print-topics']
+        output = self._run_topic(cmd)
+        table = parse_rpk_table(output)
+
+        expected_columns = set([
+            "TOPIC", "PARTITIONS", "BYTES-PER-SECOND", "BATCHES-PER-SECOND",
+            "AVERAGE-BYTES-PER-BATCH"
+        ])
+        received_columns = set()
+
+        for column in table.columns:
+            if column.name not in expected_columns:
+                self._redpanda.logger.error(
+                    f"Unexpected column: {column.name}")
+                raise RpkException(f"Unexpected column: {column.name}")
+            received_columns.add(column.name)
+
+        missing_columns = expected_columns - received_columns
+        if len(missing_columns) != 0:
+            missing_columns = ",".join(missing_columns)
+            self._redpanda.logger.error(f"Missing columns: {missing_columns}")
+            raise RpkException(f"Missing columns: {missing_columns}")
+
+        for row in table.rows:
+            obj = dict()
+            for i in range(0, len(table.columns)):
+                obj[table.columns[i].name] = row[i]
+
+            yield RpkAnalyzedTopic(
+                topic=obj["TOPIC"],
+                partitions=int(obj["PARTITIONS"]),
+                bytes_per_second=float(obj["BYTES-PER-SECOND"]),
+                batches_per_second=float(obj["BATCHES-PER-SECOND"]),
+                average_bytes_per_batch=float(obj["AVERAGE-BYTES-PER-BATCH"]))
+
     def describe_topic(self,
                        topic: str,
                        tolerant: bool = False) -> Iterator[RpkPartition]:
@@ -748,7 +794,10 @@ class RpkTool:
         return res
 
     def alter_topic_config(self, topic, set_key, set_value):
-        cmd = ['alter-config', topic, "--set", f"{set_key}={set_value}"]
+        cmd = [
+            'alter-config', topic, "--set", f"{set_key}={set_value}",
+            "--no-confirm"
+        ]
         out = self._run_topic(cmd)
         lines = out.splitlines()
         lines = list(map(lambda x: x.strip(), lines))
@@ -956,7 +1005,7 @@ class RpkTool:
 
     def group_delete(self, group):
         cmd = ["delete", group]
-        self._run_group(cmd)
+        return self._run_group(cmd)
 
     def group_list(self, states: list[str] = []) -> list[RpkListGroup]:
         cmd = ['list']
@@ -1138,10 +1187,21 @@ class RpkTool:
         return self._execute(cmd).strip()
 
     def cluster_config_set(self, key: str, value):
+        """
+        Note: This method returns without waiting for the configuration to be
+        applied to all shards/nodes. If you get the configuration immediately
+        after setting it, you may not see the new value yet. Similarly, if
+        interact with the cluster in a way which expects the new config to be
+        set (e.g. creating a topic with a new config), you may need to wait
+        for the configuration to be applied before proceeding.
+
+        Consider using `Redpanda.set_cluster_config` instead if you need to
+        wait for the configuration to be applied.
+        """
         cmd = [
             self._rpk_binary(), "--api-urls",
             self._admin_host(), "cluster", "config", "set", key,
-            str(value)
+            str(value), "--no-confirm"
         ]
         return self._execute(cmd)
 
@@ -1149,6 +1209,7 @@ class RpkTool:
         if timeout is None:
             timeout = DEFAULT_TIMEOUT
 
+        cmd += ['-X', f'globals.request_timeout_overhead={timeout}s']
         # Unconditionally enable verbose logging
         cmd += ['-v']
 
@@ -1301,7 +1362,7 @@ class RpkTool:
         flags += self._tls_settings()
         return flags
 
-    def acl_list(self, flags: list[str] = [], request_timeout_overhead=None):
+    def acl_list(self, flags: list[str] = []):
         """
         Run `rpk acl list` and return the results.
 
@@ -1317,13 +1378,6 @@ class RpkTool:
             "acl",
             "list",
         ] + flags + self._kafka_conn_settings()
-
-        # How long rpk will wait for a response from the broker, default is 5s
-        if request_timeout_overhead is not None:
-            cmd += [
-                "-X", "globals.request_timeout_overhead=" +
-                f'{str(request_timeout_overhead)}s'
-            ]
 
         output = self._execute(cmd)
 
@@ -1344,7 +1398,7 @@ class RpkTool:
             "acl",
             "create",
             "--allow-principal",
-            f"{principal_type}:{username}",
+            f"\"{principal_type}:{username}\"",
             "--operation",
             op,
             "--cluster",
@@ -1624,11 +1678,7 @@ class RpkTool:
             ]
         return flags
 
-    def _run_registry(self,
-                      cmd,
-                      stdin=None,
-                      timeout=None,
-                      output_format="json"):
+    def _run_registry(self, cmd, stdin=None, timeout=60, output_format="json"):
         cmd = [self._rpk_binary(), "registry", "--format", output_format
                ] + self._schema_registry_conn_settings() + cmd
         out = self._execute(cmd, stdin=stdin, timeout=timeout)
@@ -1663,6 +1713,15 @@ class RpkTool:
             cmd += ["--references", references]
 
         return self._run_registry(cmd)
+
+    def create_schema_from_str(self,
+                               subject: str,
+                               schema: str,
+                               schema_suffix="avro"):
+        with tempfile.NamedTemporaryFile(suffix=f".{schema_suffix}") as tf:
+            tf.write(bytes(schema, 'UTF-8'))
+            tf.flush()
+            return self.create_schema(subject, tf.name)
 
     def get_schema(self,
                    subject=None,
@@ -1930,7 +1989,8 @@ class RpkTool:
                                 default=[],
                                 name=[],
                                 strict=False,
-                                output_format="json"):
+                                output_format="json",
+                                node: Optional[ClusterNode] = None):
         cmd = ["describe"]
 
         if strict:
@@ -1942,7 +2002,9 @@ class RpkTool:
         if len(name) > 0:
             cmd += ["--name", ",".join(name)]
 
-        return self._run_cluster_quotas(cmd, output_format=output_format)
+        return self._run_cluster_quotas(cmd,
+                                        output_format=output_format,
+                                        node=node)
 
     def alter_cluster_quotas(self,
                              add=[],

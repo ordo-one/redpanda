@@ -1,5 +1,3 @@
-find_package(Arrow REQUIRED)
-find_package(Parquet REQUIRED)
 find_package(Protobuf REQUIRED)
 
 add_subdirectory(coordinator)
@@ -17,8 +15,10 @@ v_cc_library(
   NAME datalake_manager
   SRCS
     datalake_manager.cc
+    backlog_controller.cc
   DEPS
     v::datalake_translation
+    v::datalake_translation_probe
     v::datalake_coordinator
     v::cluster
     v::raft
@@ -28,13 +28,19 @@ v_cc_library(
 )
 
 v_cc_library(
+  NAME datalake_partition_spec_parser
+  SRCS
+    partition_spec_parser.cc
+  DEPS
+    v::iceberg_unresolved_partition_spec
+    Seastar::seastar
+)
+
+v_cc_library(
   NAME datalake_writer
   SRCS
-    arrow_translator.cc
-    batching_parquet_writer.cc
     catalog_schema_manager.cc
     data_writer_interface.cc
-    arrow_writer.cc
     record_multiplexer.cc
     record_schema_resolver.cc
     record_translator.cc
@@ -53,16 +59,16 @@ v_cc_library(
     values_parquet.cc
     local_parquet_file_writer.cc
     serde_parquet_writer.cc
+    partition_key_path.cc
   DEPS
     v::cloud_io
     v::datalake_common
+    v::datalake_translation_probe
     v::pandaproxy_schema_registry
     v::schema
     v::storage
     v::schema
     Seastar::seastar
-    Arrow::arrow_shared
-    Parquet::parquet_shared
     protobuf::libprotobuf
     v::iceberg
     v::serde_protobuf

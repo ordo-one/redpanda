@@ -538,19 +538,19 @@ public:
     /**
      * Lists all NTPs that replicas are being move to a node
      */
-    std::vector<model::ntp> ntps_moving_to_node(model::node_id) const;
+    chunked_vector<model::ntp> ntps_moving_to_node(model::node_id) const;
 
     /**
      * Lists all NTPs that replicas are being move from a node
      */
-    std::vector<model::ntp> ntps_moving_from_node(model::node_id) const;
+    chunked_vector<model::ntp> ntps_moving_from_node(model::node_id) const;
 
     /**
      * Lists all ntps moving either from or to a node
      */
-    std::vector<model::ntp> all_ntps_moving_per_node(model::node_id) const;
+    chunked_vector<model::ntp> all_ntps_moving_per_node(model::node_id) const;
 
-    std::vector<model::ntp> all_updates_in_progress() const;
+    chunked_vector<model::ntp> all_updates_in_progress() const;
 
     model::revision_id last_applied_revision() const {
         return _last_applied_revision_id;
@@ -672,7 +672,7 @@ private:
         uint64_t id;
     };
 
-    void notify_waiters();
+    ss::future<> notify_waiters();
 
     void change_partition_replicas(
       model::ntp ntp,
@@ -684,7 +684,7 @@ private:
 
     class snapshot_applier;
 
-    std::error_code do_local_delete(
+    ss::future<std::error_code> do_local_delete(
       model::topic_namespace nt, model::offset offset, bool ignore_migration);
     ss::future<std::error_code>
       do_apply(update_partition_replicas_cmd_data, model::offset);

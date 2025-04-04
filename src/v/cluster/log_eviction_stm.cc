@@ -330,10 +330,7 @@ ss::future<log_eviction_stm::offset_result> log_eviction_stm::replicate_command(
   std::optional<std::reference_wrapper<ss::abort_source>> as) {
     auto opts = raft::replicate_options(raft::consistency_level::quorum_ack);
     opts.set_force_flush();
-    auto fut = _raft->replicate(
-      _raft->term(),
-      model::make_memory_record_batch_reader(std::move(batch)),
-      opts);
+    auto fut = _raft->replicate(_raft->term(), std::move(batch), opts);
 
     /// Execute the replicate command bound by timeout and cancellable via
     /// abort_source mechanism
@@ -441,14 +438,14 @@ ss::future<> log_eviction_stm::apply_raft_snapshot(const iobuf&) {
     co_return;
 }
 
-ss::future<> log_eviction_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied> log_eviction_stm::apply_local_snapshot(
   raft::stm_snapshot_header header, iobuf&& data) {
     auto snapshot = serde::from_iobuf<snapshot_data>(std::move(data));
     vlog(
       _log.info, "Applying snapshot {} at offset: {}", snapshot, header.offset);
 
     _delete_records_eviction_offset = snapshot.effective_start_offset;
-    return ss::now();
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot>

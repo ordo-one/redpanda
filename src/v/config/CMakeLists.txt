@@ -3,7 +3,6 @@ v_cc_library(
   SRCS
     rest_authn_endpoint.cc
     broker_authn_endpoint.cc
-    client_group_byte_rate_quota.cc
     configuration.cc
     node_config.cc
     base_property.cc
@@ -14,6 +13,7 @@ v_cc_library(
     node_overrides.cc
     leaders_preference.cc
   DEPS
+    v::datalake_partition_spec_parser
     v::json
     v::model
     v::security_config

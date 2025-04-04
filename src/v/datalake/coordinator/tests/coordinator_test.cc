@@ -10,12 +10,15 @@
 #include "cluster/data_migrated_resources.h"
 #include "cluster/topic_table.h"
 #include "config/mock_property.h"
+#include "datalake/catalog_schema_manager.h"
 #include "datalake/coordinator/coordinator.h"
 #include "datalake/coordinator/file_committer.h"
+#include "datalake/coordinator/snapshot_remover.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/coordinator/state_update.h"
 #include "datalake/coordinator/tests/state_test_utils.h"
 #include "datalake/logger.h"
+#include "datalake/record_schema_resolver.h"
 #include "raft/tests/raft_fixture.h"
 #include "random/generators.h"
 #include "test_utils/async.h"
@@ -40,7 +43,7 @@ public:
     }
 
     ss::future<checked<std::nullopt_t, errc>>
-    drop_table(const model::topic&) const final {
+    drop_table(const iceberg::table_identifier&) const final {
         co_return std::nullopt;
     }
 
@@ -57,20 +60,26 @@ struct coordinator_node {
     coordinator_node(
       ss::shared_ptr<coordinator_stm> stm,
       std::unique_ptr<file_committer> committer,
+      std::unique_ptr<snapshot_remover> remover,
       std::chrono::milliseconds commit_interval)
       : stm(*stm)
       , commit_interval_ms(commit_interval)
       , topic_table(mr)
       , file_committer(std::move(committer))
+      , snapshot_remover(std::move(remover))
       , crd(
           stm,
           topic_table,
-          table_creator,
+          type_resolver,
+          schema_mgr,
           [this](const model::topic& t, model::revision_id r) {
               return remove_tombstone(t, r);
           },
           *file_committer,
-          commit_interval_ms.bind()) {}
+          *snapshot_remover,
+          commit_interval_ms.bind(),
+          default_partition_spec.bind(),
+          disable_snapshot_expiry.bind()) {}
 
     ss::future<checked<std::nullopt_t, coordinator::errc>>
     remove_tombstone(const model::topic&, model::revision_id) {
@@ -87,10 +96,15 @@ struct coordinator_node {
 
     coordinator_stm& stm;
     config::mock_property<std::chrono::milliseconds> commit_interval_ms;
+    config::mock_property<ss::sstring> default_partition_spec{
+      "(hour(redpanda.timestamp))"};
+    config::mock_property<bool> disable_snapshot_expiry{false};
     cluster::data_migrations::migrated_resources mr;
     cluster::topic_table topic_table;
-    noop_table_creator table_creator;
+    datalake::binary_type_resolver type_resolver;
+    datalake::simple_schema_manager schema_mgr;
     std::unique_ptr<file_committer> file_committer;
+    std::unique_ptr<snapshot_remover> snapshot_remover;
     coordinator crd;
 };
 
@@ -211,11 +225,13 @@ public:
                 crds.at(id()) = std::make_unique<coordinator_node>(
                   std::move(stm),
                   std::make_unique<noop_file_committer>(),
+                  std::make_unique<noop_snapshot_remover>(),
                   args.file_commit_interval);
             } else {
                 crds.at(id()) = std::make_unique<coordinator_node>(
                   std::move(stm),
                   std::make_unique<simple_file_committer>(),
+                  std::make_unique<noop_snapshot_remover>(),
                   args.file_commit_interval);
             }
         }
@@ -232,6 +248,23 @@ public:
             return crd->crd.stop_and_wait();
         }).get();
         raft::raft_fixture::TearDownAsync().get();
+    }
+
+    void register_in_topic_tables(
+      const model::topic& topic, model::revision_id rev) {
+        auto topic_cfg = cluster::topic_configuration(
+          model::kafka_namespace, topic, 1, 1);
+        for (auto& crd : crds) {
+            auto tt_res = crd->topic_table
+                            .apply(
+                              cluster::create_topic_cmd{
+                                model::topic_namespace{
+                                  model::kafka_namespace, topic},
+                                {topic_cfg, {}}},
+                              model::offset{rev()})
+                            .get();
+            ASSERT_EQ(tt_res, cluster::errc::success);
+        }
     }
 
     // Returns the coordinator on the current leader.
@@ -325,8 +358,10 @@ TEST_F(CoordinatorTest, TestAddFilesHappyPath) {
     const auto tp00 = tp(0, 0);
     const auto tp01 = tp(0, 1);
     const model::revision_id rev0{1};
+    register_in_topic_tables(tp00.topic, rev0);
     const auto tp10 = tp(1, 0);
     const model::revision_id rev1{2};
+    register_in_topic_tables(tp10.topic, rev1);
 
     leader.ensure_table(tp00.topic, rev0);
     pairs_t total_expected_00;
@@ -393,6 +428,7 @@ TEST_F(CoordinatorTest, TestLastAddedHappyPath) {
     const auto tp00 = tp(0, 0);
     const auto tp01 = tp(0, 1);
     const model::revision_id rev{1};
+    register_in_topic_tables(tp00.topic, rev);
     leader.ensure_table(tp00.topic, rev);
     pairs_t total_expected_00;
     for (const auto& v :
@@ -426,6 +462,7 @@ TEST_F(CoordinatorTest, TestNotLeader) {
     auto& non_leader = non_leader_opt->get();
     const auto tp00 = tp(0, 0);
     const model::revision_id rev{1};
+    register_in_topic_tables(tp00.topic, rev);
     leader_opt.value().get().ensure_table(tp00.topic, rev);
     pairs_t total_expected_00;
 
@@ -454,6 +491,7 @@ TEST_P(CoordinatorTestWithParams, TestConcurrentAddFiles) {
     }
     const auto tp00 = tp(0, 0);
     const model::revision_id rev0{1};
+    register_in_topic_tables(tp00.topic, rev0);
     bool done = false;
     std::vector<ss::future<>> adders;
     int fiber_id = 0;
@@ -562,6 +600,7 @@ TEST_F(CoordinatorLoopTest, TestCommitFilesHappyPath) {
     auto& leader = leader_opt->get();
     const auto tp00 = tp(0, 0);
     const model::revision_id rev0{1};
+    register_in_topic_tables(tp00.topic, rev0);
     leader.ensure_table(tp00.topic, rev0);
     auto add_res = leader.crd
                      .sync_add_files(tp00, rev0, make_pending_files({{0, 100}}))
@@ -592,6 +631,7 @@ TEST_F(CoordinatorLoopTest, TestCommitFilesNotLeader) {
     auto& leader = leader_opt->get();
     const auto tp00 = tp(0, 0);
     const model::revision_id rev0{1};
+    register_in_topic_tables(tp00.topic, rev0);
     leader.ensure_table(tp00.topic, rev0);
     auto add_res = leader.crd
                      .sync_add_files(tp00, rev0, make_pending_files({{0, 100}}))
@@ -673,6 +713,7 @@ TEST_F(CoordinatorSleepingLoopTest, TestQuickShutdownOnLeadershipChange) {
     for (int i = 0; i < 100; i++) {
         auto t = tp(i, 0);
         auto rev = model::revision_id{i};
+        register_in_topic_tables(t.topic, rev);
         leader.ensure_table(t.topic, rev);
         auto add_res = leader.crd
                          .sync_add_files(t, rev, make_pending_files({{0, 100}}))

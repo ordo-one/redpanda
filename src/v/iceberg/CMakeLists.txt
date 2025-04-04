@@ -25,11 +25,26 @@ foreach (schema ${schemas})
 endforeach()
 
 v_cc_library(
+  NAME iceberg_unresolved_partition_spec
+  SRCS
+    transform.cc
+    unresolved_partition_spec.cc
+  DEPS
+    Seastar::seastar
+    v::base
+    v::container
+)
+
+v_cc_library(
   NAME iceberg
   SRCS
     ${avro_hdrs}
     action.cc
+    bucket_transform_hashing_visitor.cc
     catalog.cc
+    compatibility.cc
+    compatibility_types.cc
+    compatibility_utils.cc
     datatypes.cc
     datatypes_json.cc
     filesystem_catalog.cc
@@ -45,9 +60,11 @@ v_cc_library(
     manifest_list_avro.cc
     merge_append_action.cc
     metadata_query.cc
+    partition.cc
     partition_key.cc
     partition_key_type.cc
     partition_json.cc
+    remove_snapshots_action.cc
     rest_catalog.cc
     schema.cc
     schema_avro.cc
@@ -55,32 +72,38 @@ v_cc_library(
     snapshot_json.cc
     struct_accessor.cc
     table_io.cc
+    table_metadata.cc
     table_metadata_json.cc
     table_requests_json.cc
     table_update_applier.cc
+    table_requirement.cc
     table_requirement_json.cc
     table_update_json.cc
     time_transform_visitor.cc
     table_identifier.cc
     transaction.cc
-    transform.cc
     transform_json.cc
     transform_utils.cc
+    update_partition_spec_action.cc
+    truncate_transform_visitor.cc
     update_schema_action.cc
     uri.cc
     values.cc
     values_avro.cc
     values_bytes.cc
+    values_json.cc
     rest_client/json.cc
     rest_client/retry_policy.cc
     rest_client/catalog_client.cc
     rest_client/entities.cc
     rest_client/error.cc
+    rest_client/client_probe.cc
   DEPS
     Avro::avro
     v::bytes
     v::cloud_io
     v::container
+    v::iceberg_unresolved_partition_spec
     v::json
     v::strings
     v::utils

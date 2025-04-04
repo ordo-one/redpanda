@@ -13,7 +13,6 @@ import time
 from enum import Enum
 from typing import Callable, Literal, List, TypedDict, get_type_hints
 import typing
-from requests.exceptions import ConnectionError
 from contextlib import contextmanager, nullcontext
 
 from rptest.services.admin import Admin, MigrationAction
@@ -21,23 +20,23 @@ from rptest.services.admin import OutboundDataMigration, InboundDataMigration, N
 
 import confluent_kafka as ck
 
+from ducktape.mark import matrix
+from ducktape.tests.test import TestContext
+from ducktape.utils.util import wait_until
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import RedpandaService, RedpandaServiceBase, SISettings
-from ducktape.utils.util import wait_until
 from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer
 from rptest.services.redpanda import SISettings
 from rptest.tests.redpanda_test import RedpandaTest
-from ducktape.tests.test import TestContext
 from rptest.clients.types import TopicSpec
 from rptest.tests.e2e_finjector import Finjector
 from rptest.clients.rpk import RpkTool, RpkException
-from ducktape.mark import matrix
+from rptest.utils.data_migrations import DataMigrationTestMixin
 import requests
 import re
 
 MIGRATION_LOG_ALLOW_LIST = [
     'Error during log recovery: cloud_storage::missing_partition_exception',
-    re.compile("cloud_storage.*Failed to fetch manifest during finalize().*"),
 ] + Finjector.LOG_ALLOW_LIST
 
 
@@ -46,7 +45,7 @@ def make_namespaced_topic(topic: str) -> NamespacedTopic:
 
 
 def now():
-    return round(time.time() * 1000)
+    return int(time.time() * 1000)
 
 
 class TransferLeadersBackgroundThread:
@@ -114,7 +113,7 @@ def generate_tmptpdi_params() -> List[TmtpdiParams]:
     ]
 
 
-class DataMigrationsApiTest(RedpandaTest):
+class DataMigrationsApiTest(RedpandaTest, DataMigrationTestMixin):
     log_segment_size = 10 * 1024
 
     def __init__(self, test_context: TestContext, *args, **kwargs):
@@ -125,11 +124,17 @@ class DataMigrationsApiTest(RedpandaTest):
             cloud_storage_enable_remote_read=True,
             cloud_storage_enable_remote_write=True,
         )
-        super().__init__(test_context=test_context, *args, **kwargs)
+        RedpandaTest.__init__(self, test_context=test_context, *args, **kwargs)
         self.flaky_admin = Admin(self.redpanda, retry_codes=[503, 504])
         self.admin = Admin(self.redpanda)
         self.last_producer_id = 0
         self.last_consumer_id = 0
+
+    def validate_timing(self, time_before, happened_at):
+        time_now = now()
+        self.logger.debug(f"{time_before=}, {happened_at=}, {time_now=}")
+        err_ms = 5  # allow for ntp error across nodes
+        assert time_before - err_ms <= happened_at <= time_now + err_ms
 
     def get_topic_initial_revision(self, topic_name):
         anomalies = self.admin.get_cloud_storage_anomalies(namespace="kafka",
@@ -163,13 +168,15 @@ class DataMigrationsApiTest(RedpandaTest):
 
     @contextmanager
     def flaky_admin_cm(self, other_cm):
-        with other_cm:
-            old_admin = self.admin
-            try:
-                self.admin = self.flaky_admin
+        self.logger.info("switching to flaky admin")
+        old_admin = self.admin
+        try:
+            self.admin = self.flaky_admin
+            with other_cm:
                 yield
-            finally:
-                self.admin = old_admin
+        finally:
+            self.logger.info("switching to non-flaky admin")
+            self.admin = old_admin
 
     def finj_thread(self):
         return self.flaky_admin_cm(
@@ -182,95 +189,6 @@ class DataMigrationsApiTest(RedpandaTest):
         return self.flaky_admin_cm(
             TransferLeadersBackgroundThread(self.redpanda, topic_name))
 
-    def get_migrations_map(self, node=None):
-        migrations = self.admin.list_data_migrations(node).json()
-        return {migration["id"]: migration for migration in migrations}
-
-    def get_migration(self, id, node=None):
-        try:
-            return self.admin.get_data_migration(id, node).json()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                return None
-            else:
-                raise
-
-    def assure_not_deletable(self, id, node=None):
-        try:
-            self.admin.delete_data_migration(id, node)
-            assert False
-        except:
-            pass
-
-    def on_all_live_nodes(self, migration_id, predicate):
-        success_cnt = 0
-        exception_cnt = 0
-        for n in self.redpanda.nodes:
-            try:
-                map = self.get_migrations_map(n)
-                self.logger.debug(f"migrations on node {n.name}: {map}")
-                list_item = map[migration_id] if migration_id in map else None
-                individual = self.get_migration(migration_id, n)
-
-                if predicate(list_item) and predicate(individual):
-                    success_cnt += 1
-                else:
-                    return False
-            except ConnectionError:
-                exception_cnt += 1
-        return success_cnt > exception_cnt
-
-    def wait_for_migration_states(self,
-                                  id: int,
-                                  states: list[str],
-                                  assure_completed_after: int = 0):
-        def migration_in_one_of_states_on_node(m):
-            if m is None:
-                return False
-            completed_at = m.get("completed_timestamp")
-            self.logger.debug(
-                f"{assure_completed_after=}, {completed_at=}, {now()=}")
-            if m["state"] in ("finished", "cancelled"):
-                assert assure_completed_after <= completed_at <= now()
-            else:
-                assert "completed_timestamp" not in m
-            return m["state"] in states
-
-        def migration_in_one_of_states():
-            return self.on_all_live_nodes(id,
-                                          migration_in_one_of_states_on_node)
-
-        self.logger.info(f'waiting for {" or ".join(states)}')
-        wait_until(
-            migration_in_one_of_states,
-            timeout_sec=90,
-            backoff_sec=1,
-            err_msg=
-            f"Failed waiting for migration {id} to reach one of {states} states"
-        )
-        if all(state not in ('planned', 'finished', 'cancelled')
-               for state in states):
-            self.assure_not_deletable(id)
-
-    def wait_migration_appear(self, migration_id, assure_created_after):
-        def migration_present_on_node(m):
-            if m is None:
-                return False
-            self.logger.debug(
-                f"{assure_created_after=}, {m['created_timestamp']=}, {now()=}"
-            )
-            assert assure_created_after <= m['created_timestamp'] <= now()
-            return True
-
-        def migration_is_present(id: int):
-            return self.on_all_live_nodes(id, migration_present_on_node)
-
-        wait_until(
-            lambda: migration_is_present(migration_id),
-            timeout_sec=30,
-            backoff_sec=2,
-            err_msg=f"Expected migration with id {migration_id} is present")
-
     def wait_migration_disappear(self, migration_id):
         def migration_is_absent(id: int):
             return self.on_all_live_nodes(id, lambda m: m is None)
@@ -280,62 +198,6 @@ class DataMigrationsApiTest(RedpandaTest):
             timeout_sec=90,
             backoff_sec=2,
             err_msg=f"Expected migration with id {migration_id} is absent")
-
-    def wait_partitions_appear(self, topics: list[TopicSpec]):
-        # we may be unlucky to query a slow node
-        def topic_has_all_partitions(t: TopicSpec):
-            part_cnt = len(self.client().describe_topic(t.name).partitions)
-            self.logger.debug(
-                f"topic {t.name} has {part_cnt} partitions out of {t.partition_count} expected"
-            )
-            return t.partition_count == part_cnt
-
-        def err_msg():
-            msg = "Failed waiting for partitions to appear:\n"
-            for t in topics:
-                msg += f"   {t.name} expected {t.partition_count} partitions, "
-                msg += f"got {len(self.client().describe_topic(t.name).partitions)} partitions\n"
-            return msg
-
-        wait_until(lambda: all(topic_has_all_partitions(t) for t in topics),
-                   timeout_sec=90,
-                   backoff_sec=1,
-                   err_msg=err_msg)
-
-    def wait_partitions_disappear(self, topics: list[TopicSpec]):
-        # we may be unlucky to query a slow node
-        wait_until(
-            lambda: all(self.client().describe_topic(t.name).partitions == []
-                        for t in topics),
-            timeout_sec=90,
-            backoff_sec=1,
-            err_msg=f"Failed waiting for partitions to disappear")
-
-    def create_and_wait(self, migration: InboundDataMigration
-                        | OutboundDataMigration):
-        def migration_id_if_exists():
-            for n in self.redpanda.nodes:
-                for m in self.admin.list_data_migrations(n).json():
-                    if m == migration:
-                        return m[id]
-            return None
-
-        time_before_creation = now()
-        try:
-            reply = self.admin.create_data_migration(migration).json()
-            self.logger.info(f"create migration reply: {reply}")
-            migration_id = reply["id"]
-        except requests.exceptions.HTTPError as e:
-            maybe_id = migration_id_if_exists()
-            if maybe_id is None:
-                raise
-            migration_id = maybe_id
-            self.logger.info(f"create migration failed "
-                             f"but migration {migration_id} present: {e}")
-
-        self.wait_migration_appear(migration_id, time_before_creation)
-
-        return migration_id
 
     def assure_not_migratable(self, topic: TopicSpec, expected_response=None):
         out_migration = OutboundDataMigration(
@@ -349,12 +211,7 @@ class DataMigrationsApiTest(RedpandaTest):
 
     @cluster(num_nodes=3, log_allow_list=MIGRATION_LOG_ALLOW_LIST)
     def test_listing_inexistent_migration(self):
-        try:
-            self.get_migration(42)
-        except Exception as e:
-            # check 404
-            self.logger.info("f{e}")
-            raise
+        assert self.get_migration(42) is None
 
     @cluster(num_nodes=3, log_allow_list=MIGRATION_LOG_ALLOW_LIST)
     def test_outbound_missing_topic(self):
@@ -565,7 +422,7 @@ class DataMigrationsApiTest(RedpandaTest):
             # still preparing, i.e. stuck
             self.wait_for_migration_states(in_migration_id, ['preparing'])
             # and the topic is not there
-            self.wait_partitions_disappear([topic])
+            self.wait_partitions_disappear([topic.name])
 
             time_before_final_action = now()
             self.execute_data_migration_action_flaky(in_migration_id,
@@ -576,13 +433,34 @@ class DataMigrationsApiTest(RedpandaTest):
             self.wait_for_migration_states(in_migration_id, ['cancelled'],
                                            time_before_final_action)
             # still not there
-            self.wait_partitions_disappear([topic])
+            self.wait_partitions_disappear([topic.name])
 
             self.admin.delete_data_migration(in_migration_id)
             self.wait_migration_disappear(in_migration_id)
 
+    def toggle_license(self, on: bool):
+        ENV_KEY = '__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE'
+        if on:
+            self.redpanda.unset_environment([ENV_KEY])
+        else:
+            self.redpanda.set_environment({ENV_KEY: '1'})
+        self.redpanda.rolling_restart_nodes(self.redpanda.nodes,
+                                            use_maintenance_mode=False)
+
     @cluster(num_nodes=3, log_allow_list=MIGRATION_LOG_ALLOW_LIST)
     def test_creating_and_listing_migrations(self):
+        self.do_test_creating_and_listing_migrations(False)
+
+    @cluster(
+        num_nodes=3,
+        log_allow_list=MIGRATION_LOG_ALLOW_LIST + [
+            # license violation
+            r'/v1/migrations.*Requested feature is disabled',
+        ])
+    def test_creating_and_listing_migrations_wo_license(self):
+        self.do_test_creating_and_listing_migrations(True)
+
+    def do_test_creating_and_listing_migrations(self, try_wo_license: bool):
         topics = [TopicSpec(partition_count=3) for i in range(5)]
 
         for t in topics:
@@ -591,13 +469,27 @@ class DataMigrationsApiTest(RedpandaTest):
         migrations_map = self.get_migrations_map()
         assert len(migrations_map) == 0, "There should be no data migrations"
 
-        with self.finj_thread():
+        if try_wo_license:
+            time.sleep(2)  # make sure test harness can see Redpanda is live
+            self.toggle_license(on=False)
+            self.assure_not_migratable(
+                topics[0], {
+                    "message":
+                    "Unexpected cluster error: Requested feature is disabled",
+                    "code": 500
+                })
+            self.toggle_license(on=True)
+
+        with nullcontext() if try_wo_license else self.finj_thread():
             # out
             outbound_topics = [make_namespaced_topic(t.name) for t in topics]
             out_migration = OutboundDataMigration(outbound_topics,
                                                   consumer_groups=[])
-
             out_migration_id = self.create_and_wait(out_migration)
+
+            if try_wo_license:
+                self.toggle_license(on=False)
+
             self.check_migrations(out_migration_id, len(topics), 1)
 
             self.execute_data_migration_action_flaky(out_migration_id,
@@ -605,6 +497,7 @@ class DataMigrationsApiTest(RedpandaTest):
             self.wait_for_migration_states(out_migration_id,
                                            ['preparing', 'prepared'])
             self.wait_for_migration_states(out_migration_id, ['prepared'])
+
             self.execute_data_migration_action_flaky(out_migration_id,
                                                      MigrationAction.execute)
             self.wait_for_migration_states(out_migration_id,
@@ -619,7 +512,7 @@ class DataMigrationsApiTest(RedpandaTest):
             self.wait_for_migration_states(out_migration_id, ['finished'],
                                            time_before_final_action)
 
-            self.wait_partitions_disappear(topics)
+            self.wait_partitions_disappear([t.name for t in topics])
 
             # in
             inbound_topics = [
@@ -631,7 +524,12 @@ class DataMigrationsApiTest(RedpandaTest):
             ]
             in_migration = InboundDataMigration(topics=inbound_topics,
                                                 consumer_groups=["g-1", "g-2"])
+            self.logger.info(f'{try_wo_license=}')
+            if try_wo_license:
+                self.toggle_license(on=True)
             in_migration_id = self.create_and_wait(in_migration)
+            if try_wo_license:
+                self.toggle_license(on=False)
             self.check_migrations(in_migration_id, len(inbound_topics), 2)
 
             self.log_topics(t.source_topic_reference.topic
@@ -639,9 +537,19 @@ class DataMigrationsApiTest(RedpandaTest):
 
             self.execute_data_migration_action_flaky(in_migration_id,
                                                      MigrationAction.prepare)
-            self.wait_for_migration_states(in_migration_id,
-                                           ['preparing', 'prepared'])
-            self.wait_for_migration_states(in_migration_id, ['prepared'])
+            if try_wo_license:
+                self.wait_for_migration_states(in_migration_id, ['preparing'])
+                time.sleep(5)
+                # stuck as a topic cannot be created without license
+                self.wait_for_migration_states(in_migration_id, ['preparing'])
+                self.toggle_license(on=True)
+                self.wait_for_migration_states(in_migration_id, ['prepared'])
+                self.toggle_license(on=False)
+            else:
+                self.wait_for_migration_states(in_migration_id,
+                                               ['preparing', 'prepared'])
+                self.wait_for_migration_states(in_migration_id, ['prepared'])
+
             self.execute_data_migration_action_flaky(in_migration_id,
                                                      MigrationAction.execute)
             self.wait_for_migration_states(in_migration_id,
@@ -686,7 +594,7 @@ class DataMigrationsApiTest(RedpandaTest):
             producer.flush()
             revisions[i] = self.get_topic_initial_revision(topic.name)
             out_migr_id = self.admin.unmount_topics([ns_topic]).json()["id"]
-            self.wait_partitions_disappear([topic])
+            self.wait_partitions_disappear([topic.name])
             self.wait_migration_disappear(out_migr_id)
 
         # mount and consume from them in random order
@@ -728,7 +636,7 @@ class DataMigrationsApiTest(RedpandaTest):
         out_migration_id = reply["id"]
         with self.finj_thread():
             self.logger.info('waiting for partitions be deleted')
-            self.wait_partitions_disappear(topics)
+            self.wait_partitions_disappear([t.name for t in topics])
             self.logger.info('waiting for migration to be deleted')
             self.wait_migration_disappear(out_migration_id)
 
@@ -1178,7 +1086,7 @@ class DataMigrationsApiTest(RedpandaTest):
         self.logger.info(f"create migration reply: {reply}")
 
         self.logger.info('waiting for partitions be deleted')
-        self.wait_partitions_disappear(topics)
+        self.wait_partitions_disappear([t.name for t in topics])
 
         list_mountable_res = admin.list_mountable_topics().json()
         assert len(list_mountable_res["topics"]) == len(

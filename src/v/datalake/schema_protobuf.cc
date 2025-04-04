@@ -1,11 +1,12 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 
 #include "datalake/schema_protobuf.h"
 
@@ -14,6 +15,7 @@
 #include "iceberg/datatypes.h"
 
 #include <seastar/core/sstring.hh>
+#include <seastar/util/defer.hh>
 
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
@@ -58,7 +60,9 @@ struct_outcome struct_from_protobuf(
           msg.DebugString(),
           max_recursion_depth));
     }
+
     stack.push_back(&msg);
+    auto pop_stack = ss::defer([&stack] { stack.pop_back(); });
     iceberg::struct_type struct_t;
     struct_t.fields.reserve(msg.field_count());
     for (int i = 0; i < msg.field_count(); ++i) {
@@ -145,15 +149,12 @@ field_outcome from_protobuf(
           fd.type_name()));
     case pb::FieldDescriptor::TYPE_MESSAGE: {
         auto msg_t = fd.message_type();
-
         // special case for handling google.protobuf.Timestamp
         if (
           msg_t->well_known_type() == pb::Descriptor::WELLKNOWNTYPE_TIMESTAMP) {
             return success(fd, iceberg::timestamp_type{});
         }
-
         auto st_result = struct_from_protobuf(*msg_t, stack);
-        stack.pop_back();
         if (st_result.has_error()) {
             return st_result.error();
         }

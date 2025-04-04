@@ -17,6 +17,7 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "container/fragmented_vector.h"
+#include "datalake/partition_spec_parser.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/server/handlers/topics/types.h"
@@ -27,6 +28,7 @@
 #include "pandaproxy/schema_registry/schema_id_validation.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
 #include "security/acl.h"
+#include "serde/rw/chrono.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sstring.hh>
@@ -36,6 +38,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <type_traits>
 
 namespace kafka {
 template<typename T>
@@ -504,6 +507,58 @@ struct delete_retention_ms_validator {
     }
 };
 
+struct iceberg_partition_spec_validator {
+    std::optional<ss::sstring>
+    operator()(const ss::sstring& /*raw*/, const ss::sstring& value) {
+        auto parsed = datalake::parse_partition_spec(value);
+        if (parsed.has_error()) {
+            return fmt::format(
+              "couldn't parse iceberg partition spec `{}': {}",
+              value,
+              parsed.error());
+        }
+        return std::nullopt;
+    }
+};
+
+struct iceberg_target_lag_ms_validator {
+    std::optional<ss::sstring> operator()(
+      const ss::sstring& /*raw*/,
+      const std::optional<std::chrono::milliseconds>& maybe_value) {
+        if (maybe_value.has_value()) {
+            const auto& value = maybe_value.value();
+            constexpr auto min_lag = std::chrono::milliseconds(10s);
+            if (value < min_lag || value > serde::max_serializable_ms) {
+                return fmt::format(
+                  "target.lag.ms value invalid, expected to be in range "
+                  "[{},{}]",
+                  min_lag,
+                  serde::max_serializable_ms);
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+struct min_cleanable_dirty_ratio_validator {
+    std::optional<ss::sstring>
+    operator()(const ss::sstring&, const tristate<double>& value) {
+        double min = 0.0;
+        double max = 1.0;
+        if (value.has_optional_value()) {
+            if (value.value() < min || value.value() > max) {
+                return fmt::format(
+                  "min.cleanable.dirty.ratio {} is outside of allowed range "
+                  "[{}, {}]",
+                  value.value(),
+                  min,
+                  max);
+            }
+        }
+        return std::nullopt;
+    }
+};
+
 template<typename T, typename... ValidatorTypes>
 requires requires(
   model::topic_namespace_view tns,
@@ -760,7 +815,9 @@ void parse_and_set_tristate(
     }
     // set property value
     if (op == config_resource_operation::set) {
-        auto parsed = boost::lexical_cast<int64_t>(*value);
+        using config_t
+          = std::conditional_t<std::is_floating_point_v<T>, T, int64_t>;
+        auto parsed = boost::lexical_cast<config_t>(*value);
         if (parsed <= 0) {
             property.value = tristate<T>{};
         } else {

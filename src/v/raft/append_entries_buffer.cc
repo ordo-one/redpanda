@@ -60,11 +60,14 @@ ss::future<> append_entries_buffer::stop() {
 
 void append_entries_buffer::start() {
     ssx::spawn_with_gate(_gate, [this] {
-        return ss::do_until(
-          [this] { return _gate.is_closed(); },
-          [this] {
-              return _enqueued.wait([this] { return !_requests.empty(); })
-                .then([this] { return flush(); });
+        return ss::with_scheduling_group(
+          _consensus._scheduling.recv_sg, [this] {
+              return ss::do_until(
+                [this] { return _gate.is_closed(); },
+                [this] {
+                    return _enqueued.wait([this] { return !_requests.empty(); })
+                      .then([this] { return flush(); });
+                });
           });
     });
 }
@@ -92,6 +95,7 @@ ss::future<> append_entries_buffer::do_flush(
     bool needs_flush = false;
     reply_list_t replies;
     auto f = ss::now();
+    _consensus._probe->append_entries_buffer_flush();
     {
         ssx::semaphore_units op_lock_units = std::move(u);
         replies.reserve(requests.size());

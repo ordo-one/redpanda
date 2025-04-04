@@ -1,16 +1,20 @@
-// Copyright 2024 Redpanda Data, Inc.
-//
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.md
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
 #pragma once
+
 #include "base/seastarx.h"
 #include "container/fragmented_vector.h"
 
 #include <seastar/core/sstring.hh>
+
+#include <boost/container_hash/hash.hpp>
 
 namespace iceberg {
 struct table_identifier {
@@ -23,6 +27,24 @@ struct table_identifier {
           .table = table,
         };
     }
+
+    bool operator==(const table_identifier& other) const = default;
 };
 std::ostream& operator<<(std::ostream& o, const table_identifier& id);
 } // namespace iceberg
+
+namespace std {
+
+template<>
+struct hash<iceberg::table_identifier> {
+    size_t operator()(const iceberg::table_identifier& table_id) const {
+        size_t h = 0;
+        for (const auto& ns : table_id.ns) {
+            boost::hash_combine(h, std::hash<ss::sstring>()(ns));
+        }
+        boost::hash_combine(h, std::hash<ss::sstring>()(table_id.table));
+        return h;
+    };
+};
+
+} // namespace std

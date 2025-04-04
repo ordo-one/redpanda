@@ -22,11 +22,13 @@
 #include "cluster/partition_probe.h"
 #include "config/configuration.h"
 #include "config/property.h"
+#include "container/chunked_hash_map.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/fwd.h"
 #include "rpc/connection_cache.h"
+#include "ssx/async_algorithm.h"
 #include "storage/types.h"
 
 #include <seastar/core/chunked_fifo.hh>
@@ -47,6 +49,11 @@
 
 #include <algorithm>
 #include <iterator>
+#include <optional>
+#include <ranges>
+#include <utility>
+
+using namespace cluster::health_monitor_backend_details;
 
 namespace cluster {
 
@@ -72,6 +79,7 @@ health_monitor_backend::health_monitor_backend(
   , _feature_table(feature_table)
   , _partition_leaders_table(partition_leaders_table)
   , _topic_table(topic_table)
+  , _reports{ss::make_lw_shared<report_cache_t>()}
   , _local_monitor(local_monitor)
   , _self(_raft0->self().id()) {}
 
@@ -81,7 +89,7 @@ health_monitor_backend::register_node_callback(health_node_cb_t cb) {
 
     auto id = _next_callback_id++;
     // call notification for all the groups
-    for (const auto& report : _reports) {
+    for (const auto& report : reports()) {
         cb(*report.second, {});
     }
     _node_callbacks.emplace_back(id, std::move(cb));
@@ -183,8 +191,8 @@ node_health_report::topics_t filter_topic_status(
 
 std::optional<node_health_report_ptr> health_monitor_backend::build_node_report(
   model::node_id id, const node_report_filter& f) {
-    auto it = _reports.find(id);
-    if (it == _reports.end()) {
+    auto it = reports().find(id);
+    if (it == reports().cend()) {
         return std::nullopt;
     }
     if (f.include_partitions && f.ntp_filters.namespaces.empty()) {
@@ -271,9 +279,363 @@ void health_monitor_backend::abort_current_refresh() {
     }
 }
 
+namespace {
+struct partition_risk {
+    using underlying = uint32_t;
+
+private:
+    underlying _value;
+
+public:
+    struct c;
+    constexpr explicit partition_risk()
+      : _value(0) {};
+    constexpr explicit partition_risk(uint32_t v)
+      : _value(v) {}
+
+    constexpr underlying operator()() const { return _value; };
+
+    friend constexpr bool
+    operator==(const partition_risk&, const partition_risk&)
+      = default;
+
+    friend constexpr partition_risk
+    operator&(const partition_risk x, const partition_risk y) {
+        return partition_risk{x() & y()};
+    }
+
+    friend constexpr partition_risk
+    operator|(const partition_risk x, const partition_risk y) {
+        return partition_risk{x() | y()};
+    }
+
+    friend partition_risk&
+    operator|=(partition_risk& x, const partition_risk y) {
+        x = x | y;
+        return x;
+    }
+    constexpr explicit operator bool() const;
+    friend std::ostream& operator<<(std::ostream&, const partition_risk&);
+};
+
+struct partition_risk::c {
+    static constexpr partition_risk no_risk{0}, rf1_offline{1},
+      full_acks_produce_unavailable{2}, unavailable{4}, acks1_data_loss{8};
+};
+
+constexpr partition_risk::operator bool() const {
+    return *this != partition_risk::c::no_risk;
+}
+
+std::ostream& operator<<(std::ostream& o, const partition_risk& r) {
+    std::vector<std::string_view> parts;
+    if (r & cluster::partition_risk::c::rf1_offline) {
+        parts.emplace_back("rf1_offline");
+    }
+    if (r & cluster::partition_risk::c::full_acks_produce_unavailable) {
+        parts.emplace_back("full_acks_produce_unavailable");
+    }
+    if (r & cluster::partition_risk::c::unavailable) {
+        parts.emplace_back("unavailable");
+    }
+    if (r & cluster::partition_risk::c::acks1_data_loss) {
+        parts.emplace_back("acks1_data_loss");
+    }
+
+    fmt::print(o, "{{{}}}", fmt::join(parts, ", "));
+    return o;
+}
+
+void record_risks_in_report(
+  restart_risk_report& report,
+  model::node_id self,
+  const followers_stats& fs,
+  const model::topic_namespace& nt,
+  model::partition_id pid) {
+    // 0 or 1 each
+    uint16_t self_out_of_sync = std::ranges::count(fs.out_of_sync, self);
+    uint16_t self_down = std::ranges::count(fs.down, self);
+    uint16_t self_in_sync = 1 - self_out_of_sync - self_down;
+    if (self_in_sync != 0 && self_in_sync != 1) {
+        vlog(clusterlog.error, "unexpected follower stats: {}", fs);
+    }
+
+    uint16_t n_in_sync = fs.in_sync;
+    uint16_t n_out_of_sync = fs.out_of_sync.size();
+    uint16_t n_down = fs.down.size();
+    uint16_t n_voters = n_in_sync + n_out_of_sync + n_down;
+
+    partition_risk restart_risk{partition_risk::c::no_risk};
+    if (n_voters == 1) {
+        restart_risk |= partition_risk::c::rf1_offline;
+    } else {
+        uint16_t majority = n_voters / 2 + 1;
+
+        // imagine current nodes goes down
+        n_in_sync -= self_in_sync;
+        n_out_of_sync -= self_out_of_sync;
+        n_down -= self_down;
+
+        if (n_in_sync + n_out_of_sync < majority) {
+            restart_risk |= partition_risk::c::unavailable;
+        }
+        if (n_in_sync < majority) {
+            restart_risk |= partition_risk::c::full_acks_produce_unavailable;
+        }
+        if (n_in_sync == 0) {
+            restart_risk |= partition_risk::c::acks1_data_loss;
+        }
+    }
+
+    vlog(
+      clusterlog.trace,
+      "record_risk_in_report ntp={}/{}/{}, risks={}",
+      nt.ns,
+      nt.tp,
+      pid,
+      restart_risk);
+
+    switch (restart_risk()) {
+    case partition_risk::c::no_risk():
+        return;
+    case partition_risk::c::rf1_offline():
+        report.push(&restart_risk_report::rf1_offline, nt, pid);
+        return;
+    case partition_risk::c::full_acks_produce_unavailable():
+        report.push(
+          &restart_risk_report::full_acks_produce_unavailable, nt, pid);
+        return;
+    case (
+      partition_risk::c::unavailable
+      | partition_risk::c::full_acks_produce_unavailable)():
+        report.push(&restart_risk_report::unavailable, nt, pid);
+        return;
+    case (
+      partition_risk::c::acks1_data_loss
+      | partition_risk::c::full_acks_produce_unavailable)():
+        report.push(&restart_risk_report::acks1_data_loss, nt, pid);
+        return;
+    case (
+      partition_risk::c::acks1_data_loss
+      | partition_risk::c::full_acks_produce_unavailable
+      | partition_risk::c::unavailable)():
+        report.push(&restart_risk_report::acks1_data_loss, nt, pid);
+        report.push(&restart_risk_report::unavailable, nt, pid);
+        return;
+    default:
+        vassert(
+          false,
+          "Unexpected partition restart risk combination {} for ntp {}",
+          restart_risk,
+          model::ntp{nt.ns, nt.tp, pid});
+    }
+}
+} // namespace
+
+ss::future<errc> health_monitor_backend::walk_local_and_remote_reports(
+  partition_leader_status_handler auto local_leader_handler,
+  partition_leader_status_handler auto remote_leader_handler,
+  partition_handler auto unclaimed_partition_handler) {
+    ssx::async_counter counter;
+    chunked_hash_map<
+      model::topic_namespace,
+      chunked_hash_set<model::partition_id>>
+      unclaimed_partitions;
+    // allow `collect_cluster_health` replace it concurrently
+    auto reports = hold_reports();
+
+    // local report
+    auto local_report_it = reports->find(_self);
+    if (local_report_it == reports->end()) {
+        vlog(clusterlog.debug, "current node is not part of the cluster");
+        co_return errc::node_does_not_exists;
+    };
+    for (const auto& [nt, partitions] : local_report_it->second->topics) {
+        co_await ssx::async_for_each_counter(
+          counter,
+          partitions,
+          [&unclaimed_partitions, nt, &local_leader_handler](
+            const auto& partition_status) {
+              if (const auto& fs = partition_status.followers_stats) {
+                  vlog(
+                    clusterlog.trace,
+                    "leader found locally ntp={}/{}/{} follower_stats={}",
+                    nt.ns,
+                    nt.tp,
+                    partition_status.id,
+                    *fs);
+                  local_leader_handler(*fs, nt, partition_status.id);
+              } else {
+                  unclaimed_partitions[nt].insert(partition_status.id);
+              }
+          });
+    }
+
+    // remote reports
+    auto other_nodes = *reports | std::views::keys
+                       | std::ranges::to<std::vector>();
+    // Iterate over saved keys, as new entries may be added into `*reports`
+    // concurrently by `get_current_node_health`, which potentially invalidates
+    // iterators.
+    for (const auto node_id : other_nodes) {
+        if (node_id == _self) {
+            continue;
+        }
+        const auto& node_report = *reports->at(node_id);
+        for (const auto& [nt, partitions] : node_report.topics) {
+            co_await ssx::async_for_each_counter(
+              counter,
+              partitions,
+              [&unclaimed_partitions, nt, node_id, &remote_leader_handler](
+                const auto& partition_status) {
+                  auto nt_it = unclaimed_partitions.find(nt);
+                  if (nt_it == unclaimed_partitions.end()) {
+                      return;
+                  }
+                  auto p_it = nt_it->second.find(partition_status.id);
+                  if (p_it == nt_it->second.end()) {
+                      return;
+                  }
+                  // replica exists locally, followers_stats not processed yet
+                  if (const auto& fs = partition_status.followers_stats) {
+                      vlog(
+                        clusterlog.trace,
+                        "leader found on node_id={} ntp={}/{}/{} fs={}",
+                        node_id,
+                        nt.ns,
+                        nt.tp,
+                        partition_status.id,
+                        *fs);
+                      remote_leader_handler(*fs, nt, partition_status.id);
+
+                      // to ignore other leaders, should there be more than one
+                      nt_it->second.erase(p_it);
+                      if (nt_it->second.empty()) {
+                          unclaimed_partitions.erase(nt_it);
+                      }
+                  }
+              });
+        }
+    }
+
+    // Partitions eventually unclaimed, no node says it hosts their leaders.
+    for (const auto& [nt, partitions] : unclaimed_partitions) {
+        co_await ssx::async_for_each_counter(
+          counter,
+          partitions,
+          [&nt, &unclaimed_partition_handler](const model::partition_id pid) {
+              unclaimed_partition_handler(nt, pid);
+          });
+    }
+    co_return errc::success;
+}
+
+const health_monitor_backend::report_cache_t&
+health_monitor_backend::reports() const {
+    return std::as_const(*_reports);
+}
+
+const ss::lw_shared_ptr<const health_monitor_backend::report_cache_t>
+health_monitor_backend::hold_reports() const {
+    return _reports;
+}
+
+ss::future<result<restart_risk_report>>
+health_monitor_backend::get_current_node_restart_risks(
+  size_t limit, model::timeout_clock::time_point deadline) {
+    auto holder = _gate.hold();
+    if (
+      auto ec = co_await maybe_refresh_cluster_health(
+        force_refresh::no, deadline)) {
+        co_return ec;
+    }
+    if (!_restart_risks_collected) {
+        // technically it may be already enabled at the moment,
+        // but was disabled on last collection
+        co_return make_error_code(errc::feature_disabled);
+    }
+
+    restart_risk_report report{.limit = limit};
+    auto report_handler = [&report, this](
+                            const followers_stats& fs,
+                            const model::topic_namespace& nt,
+                            model::partition_id pid) {
+        record_risks_in_report(report, _self, fs, nt, pid);
+    };
+    auto ec = co_await walk_local_and_remote_reports(
+      report_handler,
+      report_handler,
+      [&report,
+       this](const model::topic_namespace& nt, model::partition_id pid) {
+          auto rf = _topic_table.local().get_topic_replication_factor(nt);
+          if (rf == replication_factor{1}) {
+              report.push(&restart_risk_report::rf1_offline, nt, pid);
+          } else {
+              report.push(&restart_risk_report::acks1_data_loss, nt, pid);
+              report.push(&restart_risk_report::unavailable, nt, pid);
+          }
+      });
+    if (ec == errc::success) {
+        co_return report;
+    } else {
+        co_return ec;
+    }
+}
+
+ss::future<result<double>>
+health_monitor_backend::get_current_node_in_sync_replicas_share(
+  model::timeout_clock::time_point deadline) {
+    auto holder = _gate.hold();
+    if (
+      auto ec = co_await maybe_refresh_cluster_health(
+        force_refresh::no, deadline)) {
+        co_return ec;
+    }
+
+    int in_sync_replicas = 0;
+    int out_of_sync_replicas = 0;
+    auto ec = co_await walk_local_and_remote_reports(
+      [&in_sync_replicas](
+        const followers_stats&,
+        const model::topic_namespace&,
+        model::partition_id) {
+          // leader replica is always in sync
+          ++in_sync_replicas;
+      },
+      [this, &out_of_sync_replicas, &in_sync_replicas](
+        const followers_stats& fs,
+        const model::topic_namespace&,
+        model::partition_id) {
+          if (std::ranges::count(fs.out_of_sync, _self)) {
+              ++out_of_sync_replicas;
+          } else {
+              ++in_sync_replicas;
+          }
+      },
+      [&out_of_sync_replicas](
+        const model::topic_namespace&, model::partition_id) {
+          // unclaimed partition is deemed leaderless and thus out of sync
+          ++out_of_sync_replicas;
+      });
+
+    if (ec == errc::success) {
+        double res;
+        if (in_sync_replicas + out_of_sync_replicas == 0) {
+            res = 1.;
+        } else {
+            res = double(in_sync_replicas)
+                  / (in_sync_replicas + out_of_sync_replicas);
+        }
+        vlog(clusterlog.debug, "in_sync_replicas_share={}", res);
+        co_return res;
+    } else {
+        co_return ec;
+    }
+}
+
 bool health_monitor_backend::contains_node_health_report(
   model::node_id id) const {
-    return _reports.contains(id);
+    return reports().contains(id);
 }
 
 ss::future<result<cluster_health_report>>
@@ -295,7 +657,7 @@ health_monitor_backend::get_cluster_health(
 }
 
 ss::future<storage::disk_space_alert>
-health_monitor_backend::get_cluster_disk_health(
+health_monitor_backend::get_cluster_data_disk_health(
   force_refresh refresh, model::timeout_clock::time_point deadline) {
     auto ec = co_await maybe_refresh_cluster_health(refresh, deadline);
     if (ec) {
@@ -308,7 +670,7 @@ health_monitor_backend::get_cluster_disk_health(
         // operate, I guess.
         co_return storage::disk_space_alert::ok;
     }
-    co_return _reports_disk_health;
+    co_return _reports_data_disk_health;
 }
 
 ss::future<std::error_code>
@@ -427,13 +789,13 @@ result<node_health_report> health_monitor_backend::process_node_reply(
 }
 
 ss::future<std::error_code> health_monitor_backend::collect_cluster_health() {
-    /**
-     * We are collecting cluster health on raft 0 leader only
-     */
+    bool node_restart_risks_available = _feature_table.local().is_active(
+      features::feature::node_restart_risk_assessment);
+
     vlog(clusterlog.debug, "collecting cluster health statistics");
     // collect all reports
     auto ids = _members.local().node_ids();
-    auto reports = co_await ssx::async_transform(
+    auto collected_reports = co_await ssx::async_transform(
       ids.begin(), ids.end(), [this](model::node_id id) {
           if (id == _self) {
               return _report_collection_mutex.with(
@@ -441,28 +803,22 @@ ss::future<std::error_code> health_monitor_backend::collect_cluster_health() {
           }
           return collect_remote_node_health(id);
       });
+    auto new_reports = ss::make_lw_shared<report_cache_t>();
 
-    auto old_reports = std::exchange(_reports, {});
-
-    // update nodes reports and cache cluster-level disk health
-    storage::disk_space_alert cluster_disk_health
+    // update nodes reports and cache cluster-level data disk health
+    storage::disk_space_alert cluster_data_disk_health
       = storage::disk_space_alert::ok;
-    for (auto& r : reports) {
+    for (auto& r : collected_reports) {
         if (r) {
             const auto id = r.value().id;
-            vlog(
-              clusterlog.debug,
-              "collected node {} health report: {}",
-              id,
-              r.value());
+            vlog(clusterlog.debug, "collected node {} health report", id);
 
             std::optional<nhr_ptr> old_report;
-            if (auto old_i = old_reports.find(id); old_i != old_reports.end()) {
+            if (auto old_i = reports().find(id); old_i != reports().end()) {
                 vlog(
                   clusterlog.debug,
-                  "(previous node report from {}: {})",
-                  id,
-                  old_i->second);
+                  "(cache contains previous node report from {})",
+                  id);
                 old_report = old_i->second;
             } else {
                 vlog(clusterlog.debug, "(initial node report from {})", id);
@@ -471,14 +827,16 @@ ss::future<std::error_code> health_monitor_backend::collect_cluster_health() {
             for (auto& cb : _node_callbacks) {
                 cb.second(r.value(), old_report);
             }
-            cluster_disk_health = storage::max_severity(
-              r.value().local_state.get_disk_alert(), cluster_disk_health);
+            cluster_data_disk_health = storage::max_severity(
+              r.value().local_state.data_disk.alert, cluster_data_disk_health);
 
-            _reports.emplace(
-              id, ss::make_lw_shared<node_health_report>(std::move(r.value())));
+            new_reports->emplace(
+              id,
+              ss::make_lw_shared<const node_health_report>(
+                std::move(r.value())));
         }
     }
-    _reports_disk_health = cluster_disk_health;
+    _reports_data_disk_health = cluster_data_disk_health;
 
     if (config::shard_local_cfg().enable_usage()) {
         vlog(clusterlog.info, "collecting cloud health statistics");
@@ -508,9 +866,11 @@ ss::future<std::error_code> health_monitor_backend::collect_cluster_health() {
     /**
      * Remove reports from nodes that were removed
      */
-    absl::erase_if(_reports, not_in_members_table);
+    absl::erase_if(*new_reports, not_in_members_table);
     absl::erase_if(_status, not_in_members_table);
 
+    _reports = std::move(new_reports);
+    _restart_risks_collected = node_restart_risks_available;
     _last_refresh = ss::lowres_clock::now();
     co_return errc::success;
 }
@@ -538,8 +898,8 @@ ss::future<result<node_health_report_ptr>>
 health_monitor_backend::get_current_node_health() {
     vlog(clusterlog.debug, "getting current node health");
 
-    auto it = _reports.find(_self);
-    if (it != _reports.end()) {
+    auto it = reports().find(_self);
+    if (it != reports().end()) {
         co_return it->second;
     }
 
@@ -553,8 +913,8 @@ health_monitor_backend::get_current_node_health() {
           clusterlog.debug,
           "report collection in progress, waiting for report to be available");
         u.emplace(co_await _report_collection_mutex.get_units());
-        auto it = _reports.find(_self);
-        if (it != _reports.end()) {
+        auto it = reports().find(_self);
+        if (it != reports().end()) {
             co_return it->second;
         }
     }
@@ -567,7 +927,7 @@ health_monitor_backend::get_current_node_health() {
     }
 
     it = _reports
-           .emplace(
+           ->emplace(
              _self,
              ss::make_lw_shared<node_health_report>(std::move(r.value())))
            .first;
@@ -579,35 +939,52 @@ namespace {
 struct ntp_report {
     model::topic_namespace tp_ns;
     partition_status status;
+
+    explicit ntp_report(const partition& p)
+      : tp_ns(model::topic_namespace(p.ntp().ns, p.ntp().tp.topic)) {
+        status.id = p.ntp().tp.partition;
+        status.term = p.term();
+        status.leader_id = p.get_leader_id();
+        status.revision_id = p.get_revision_id();
+        status.size_bytes = p.size_bytes() + p.non_log_disk_size_bytes();
+        status.reclaimable_size_bytes = p.reclaimable_size_bytes();
+        status.shard = ss::this_shard_id();
+
+        if (p.raft()->is_elected_leader()) {
+            const auto fms = p.raft()->get_follower_metrics();
+
+            status.followers_stats.emplace();
+            status.under_replicated_replicas = 0;
+            for (const auto& fm : fms) {
+                if (fm.is_learner) {
+                    continue;
+                }
+                if (fm.is_live) {
+                    if (fm.under_replicated) {
+                        status.followers_stats->out_of_sync.push_back(fm.id);
+                        ++*status.under_replicated_replicas;
+                    } else {
+                        ++status.followers_stats->in_sync;
+                    }
+                } else {
+                    status.followers_stats->down.push_back(fm.id);
+                    if (fm.under_replicated) {
+                        ++*status.under_replicated_replicas;
+                    }
+                }
+            }
+        }
+    }
 };
 
 chunked_vector<ntp_report> collect_shard_local_reports(partition_manager& pm) {
+    auto partitions = pm.partitions() | std::views::values;
+
     chunked_vector<ntp_report> reports;
-
-    reports.reserve(pm.partitions().size());
-    std::transform(
-      pm.partitions().begin(),
-      pm.partitions().end(),
-      std::back_inserter(reports),
-      [](auto& p) {
-          return ntp_report {
-                  .tp_ns = model::topic_namespace(p.first.ns, p.first.tp.topic),
-                  .status = partition_status{
-                    .id = p.first.tp.partition,
-                    .term = p.second->term(),
-                    .leader_id = p.second->get_leader_id(),
-                    .revision_id = p.second->get_revision_id(),
-                    .size_bytes = p.second->size_bytes()
-                                  + p.second->non_log_disk_size_bytes(),
-                    .under_replicated_replicas
-                    = p.second->get_under_replicated(),
-                    .reclaimable_size_bytes
-                    = p.second->reclaimable_size_bytes(),
-                    .shard = ss::this_shard_id(),
-                  },
-              };
-      });
-
+    reports.reserve(partitions.size());
+    for (const auto& p : partitions) {
+        reports.emplace_back(*p);
+    }
     return reports;
 }
 
@@ -615,7 +992,7 @@ using reports_acc_t
   = absl::node_hash_map<model::topic_namespace, partition_statuses_t>;
 
 reports_acc_t reduce_reports_map(
-  reports_acc_t acc, chunked_vector<ntp_report> current_reports) {
+  reports_acc_t acc, chunked_vector<cluster::ntp_report> current_reports) {
     for (auto& ntpr : current_reports) {
         acc[ntpr.tp_ns].push_back(ntpr.status);
     }
@@ -658,8 +1035,8 @@ health_monitor_backend::get_node_drain_status(
         co_return ec;
     }
 
-    auto it = _reports.find(node_id);
-    if (it == _reports.end()) {
+    auto it = reports().find(node_id);
+    if (it == reports().end()) {
         co_return errc::node_does_not_exists;
     }
 
@@ -667,7 +1044,7 @@ health_monitor_backend::get_node_drain_status(
 }
 
 health_monitor_backend::aggregated_report
-health_monitor_backend::aggregate_reports(report_cache_t& reports) {
+health_monitor_backend::aggregate_reports(const report_cache_t& reports) {
     struct collector {
         absl::node_hash_set<model::ntp> to_ntp_set() const {
             absl::node_hash_set<model::ntp> ret;
@@ -740,9 +1117,9 @@ health_monitor_backend::get_cluster_health_overview(
                 ret.nodes_down.push_back(id);
             }
         }
-        auto report_it = _reports.find(id);
+        auto report_it = reports().find(id);
         if (
-          report_it != _reports.end()
+          report_it != reports().end()
           && report_it->second->local_state.recovery_mode_enabled) {
             ret.nodes_in_recovery_mode.push_back(id);
         }
@@ -753,7 +1130,7 @@ health_monitor_backend::get_cluster_health_overview(
     std::sort(
       ret.nodes_in_recovery_mode.begin(), ret.nodes_in_recovery_mode.end());
 
-    auto aggr_report = aggregate_reports(_reports);
+    auto aggr_report = aggregate_reports(reports());
 
     auto move_into = [](auto& dest, auto& src) {
         dest.reserve(src.size());

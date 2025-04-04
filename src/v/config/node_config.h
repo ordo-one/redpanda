@@ -70,6 +70,7 @@ public:
     deprecated_property enable_central_config;
 
     property<std::optional<uint32_t>> crash_loop_limit;
+    property<std::optional<std::chrono::seconds>> crash_loop_sleep_sec;
 
     // If true, permit any version of redpanda to start, even
     // if potentially incompatible with existing system state.
@@ -121,6 +122,10 @@ public:
         return data_directory().path / "startup_log";
     }
 
+    std::filesystem::path crash_report_dir_path() const {
+        return data_directory().path / "crash_reports";
+    }
+
     /**
      * Return the configured cache path if set, otherwise a default
      * path within the data directory.
@@ -139,6 +144,10 @@ public:
               cloud_storage_inventory_hash_store().value()};
         }
         return data_directory().path / "cloud_storage_inventory";
+    }
+
+    std::filesystem::path datalake_staging_path() const {
+        return data_directory().path / "datalake_staging";
     }
 
     std::vector<model::broker_endpoint> advertised_kafka_api() const {
