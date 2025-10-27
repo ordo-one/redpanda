@@ -10,6 +10,7 @@
 #include "storage/probe.h"
 
 #include "config/configuration.h"
+#include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
 #include "storage/logger.h"
 #include "storage/readers_cache_probe.h"
@@ -98,13 +99,10 @@ void probe::setup_metrics(const model::ntp& ntp) {
     }
 
     namespace sm = ss::metrics;
-    auto ns_label = sm::label("namespace");
-    auto topic_label = sm::label("topic");
-    auto partition_label = sm::label("partition");
     const std::vector<sm::label_instance> labels = {
-      ns_label(ntp.ns()),
-      topic_label(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 
     auto group_name = prometheus_sanitize::metrics_name("storage:log");
@@ -172,8 +170,9 @@ void probe::setup_metrics(const model::ntp& ntp) {
         sm::make_counter(
           "corrupted_compaction_indices",
           [this] { return _corrupted_compaction_index; },
-          sm::description("Number of times we had to re-construct the "
-                          ".compaction index on a segment"),
+          sm::description(
+            "Number of times we had to re-construct the "
+            ".compaction index on a segment"),
           labels),
         sm::make_counter(
           "compacted_segment",
@@ -198,8 +197,16 @@ void probe::setup_metrics(const model::ntp& ntp) {
         sm::make_counter(
           "tombstones_removed",
           [this] { return _tombstones_removed; },
-          sm::description("Number of tombstone records removed by compaction "
-                          "due to the delete.retention.ms setting."),
+          sm::description(
+            "Number of tombstone records removed by compaction "
+            "due to the delete.retention.ms setting."),
+          labels),
+        sm::make_counter(
+          "control_batches_removed",
+          [this] { return _control_batches_removed; },
+          sm::description(
+            "Number of transactional control batches removed by "
+            "compaction due to the delete.retention.ms setting."),
           labels),
         sm::make_counter(
           "cleanly_compacted_segment",
@@ -212,14 +219,16 @@ void probe::setup_metrics(const model::ntp& ntp) {
         sm::make_counter(
           "segments_marked_tombstone_free",
           [this] { return _segments_marked_tombstone_free; },
-          sm::description("Number of segments that have been verified through "
-                          "the compaction process to be tombstone free."),
+          sm::description(
+            "Number of segments that have been verified through "
+            "the compaction process to be tombstone free."),
           labels),
         sm::make_counter(
           "complete_sliding_window_rounds",
           [this] { return _num_rounds_window_compaction; },
-          sm::description("Number of rounds of sliding window compaction that "
-                          "have been driven to completion."),
+          sm::description(
+            "Number of rounds of sliding window compaction that "
+            "have been driven to completion."),
           labels),
         sm::make_counter(
           "chunked_compaction_runs",
@@ -239,9 +248,16 @@ void probe::setup_metrics(const model::ntp& ntp) {
           [this] { return _closed_segment_bytes; },
           sm::description("Number of bytes within closed segments of the log"),
           labels),
+        sm::make_counter(
+          "adjacent_segments_compacted",
+          [this] { return _num_adjacent_segments_compacted; },
+          sm::description(
+            "Number of segments that have been compacted away "
+            "during adjacent merge compaction."),
+          labels),
       },
       {},
-      {sm::shard_label, partition_label});
+      {sm::shard_label, metrics::partition_label});
 
     _metrics.add_group(
       group_name,
@@ -274,14 +290,11 @@ void readers_cache_probe::setup_metrics(const model::ntp& ntp) {
         return;
     }
     namespace sm = ss::metrics;
-    auto ns_label = sm::label("namespace");
-    auto topic_label = sm::label("topic");
-    auto partition_label = sm::label("partition");
 
     const std::vector<sm::label_instance> labels = {
-      ns_label(ntp.ns()),
-      topic_label(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 
     _metrics.add_group(
@@ -309,6 +322,6 @@ void readers_cache_probe::setup_metrics(const model::ntp& ntp) {
           labels),
       },
       {},
-      {sm::shard_label, partition_label});
+      {sm::shard_label, metrics::partition_label});
 }
 } // namespace storage

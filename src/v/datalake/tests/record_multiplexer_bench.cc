@@ -9,7 +9,7 @@
  * by the Apache License, Version 2.0
  */
 #include "cloud_io/provider.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/catalog_schema_manager.h"
 #include "datalake/location.h"
 #include "datalake/record_multiplexer.h"
@@ -19,12 +19,13 @@
 #include "datalake/tests/record_generator.h"
 #include "datalake/tests/test_data_writer.h"
 #include "datalake/tests/test_utils.h"
+#include "features/feature_table.h"
+#include "model/batch_compression.h"
 #include "model/compression.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "serde/avro/tests/data_generator.h"
 #include "serde/protobuf/tests/data_generator.h"
-#include "storage/parser_utils.h"
 
 #include <seastar/testing/perf_tests.hh>
 
@@ -36,8 +37,8 @@ namespace {
 std::string generate_nested_proto_internal(size_t total_depth) {
     constexpr auto proto_template = R"(
     message Foo{} {{
-        {} 
-        string a{} = {}; 
+        {}
+        string a{} = {};
         {}
     }})";
 
@@ -257,7 +258,8 @@ struct counting_consumer {
         return mux.do_multiplex(std::move(batch), kafka::offset{}, as);
     }
     ss::future<counting_consumer> end_of_stream() {
-        auto res = co_await std::move(mux).finish();
+        datalake::record_multiplexer::finished_files files;
+        auto res = co_await std::move(mux).finish(files);
         if (res.has_error()) [[unlikely]] {
             throw std::runtime_error(
               fmt::format("failed to end stream: {}", res.error()));
@@ -273,10 +275,12 @@ class record_multiplexer_bench_fixture
 public:
     record_multiplexer_bench_fixture()
       : _schema_cache({10, 5})
-      , _schema_mgr(catalog)
+      , _schema_mgr(catalog, &_features)
       , _type_resolver(registry, _schema_cache)
       , _record_gen(&registry)
-      , _table_creator(_type_resolver, _schema_mgr) {}
+      , _table_creator(_type_resolver, _schema_mgr) {
+        _features.testing_activate_all();
+    }
 
     template<typename T>
     requires std::same_as<T, ::testing::protobuf_generator_config>
@@ -308,7 +312,7 @@ public:
     }
 
     ss::future<size_t> run_bench() {
-        auto reader = model::make_fragmented_memory_record_batch_reader(
+        auto reader = model::make_chunked_memory_record_batch_reader(
           share_batches(_batch_data));
         auto consumer = counting_consumer{.mux = create_mux(), .as = _as};
 
@@ -326,6 +330,7 @@ private:
     const model::revision_id topic_rev{123};
 
     std::unordered_set<std::string> _added_names;
+    features::feature_table _features;
     datalake::chunked_schema_cache _schema_cache;
     datalake::catalog_schema_manager _schema_mgr;
     datalake::record_schema_resolver _type_resolver;
@@ -348,7 +353,8 @@ private:
           model::iceberg_invalid_record_action::dlq_table,
           datalake::location_provider(
             scoped_remote->remote.local().provider(), bucket_name),
-          _translation_probe);
+          _translation_probe,
+          &_features);
     }
 
     ss::future<>
@@ -360,8 +366,9 @@ private:
 
         auto reg_res = co_await _record_gen.register_avro_schema(name, schema);
         if (reg_res.has_error()) [[unlikely]] {
-            throw std::runtime_error(fmt::format(
-              "failed to register avro schema: {}", reg_res.error()));
+            throw std::runtime_error(
+              fmt::format(
+                "failed to register avro schema: {}", reg_res.error()));
         }
     }
 
@@ -375,8 +382,9 @@ private:
         auto reg_res = co_await _record_gen.register_protobuf_schema(
           name, schema);
         if (reg_res.has_error()) [[unlikely]] {
-            throw std::runtime_error(fmt::format(
-              "failed to register protobuf schema: {}", reg_res.error()));
+            throw std::runtime_error(
+              fmt::format(
+                "failed to register protobuf schema: {}", reg_res.error()));
         }
     }
 
@@ -408,7 +416,7 @@ private:
 
             auto batch = std::move(batch_builder).build();
             if (compression_type != model::compression::none) {
-                batch = co_await storage::internal::compress_batch(
+                batch = co_await model::compress_batch(
                   compression_type, std::move(batch));
             }
             ret.emplace_back(std::move(batch));

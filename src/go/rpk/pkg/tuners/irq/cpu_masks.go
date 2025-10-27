@@ -13,9 +13,11 @@ package irq
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors/commands"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/hwloc"
@@ -25,8 +27,8 @@ import (
 
 type CPUMasks interface {
 	BaseCPUMask(cpuMask string) (string, error)
-	CPUMaskForComputations(mode Mode, cpuMask string) (string, error)
-	CPUMaskForIRQs(mode Mode, cpuMask string) (string, error)
+	CPUMaskForComputations(mode Mode, cpuMask string, t config.RpkNodeConfig) (string, error)
+	CPUMaskForIRQs(mode Mode, cpuMask string, t config.RpkNodeConfig) (string, error)
 	SetMask(path string, mask string) error
 	ReadMask(path string) (string, error)
 	ReadIRQMask(IRQ int) (string, error)
@@ -38,6 +40,7 @@ type CPUMasks interface {
 	GetAllCpusMask() (string, error)
 	GetLogicalCoreIDsFromPhysCore(core uint) ([]uint, error)
 	IsSupported() bool
+	MaskToListFormat(mask string) (string, error)
 }
 
 func NewCPUMasks(
@@ -69,7 +72,7 @@ func (masks *cpuMasks) IsSupported() bool {
 }
 
 func (masks *cpuMasks) CPUMaskForComputations(
-	mode Mode, cpuMask string,
+	mode Mode, cpuMask string, rnc config.RpkNodeConfig,
 ) (string, error) {
 	zap.L().Sugar().Debugf("Computing CPU mask for '%s' mode and input CPU mask '%s'", mode, cpuMask)
 	computationsMask := ""
@@ -83,8 +86,23 @@ func (masks *cpuMasks) CPUMaskForComputations(
 	} else if mode == Mq {
 		// all available cores
 		computationsMask = cpuMask
+	} else if mode == Dedicated {
+		numOfPUs, err := masks.GetNumberOfPUs(cpuMask)
+		if err != nil {
+			return "", err
+		}
+		rpPUs := numOfPUs - uint(math.Ceil(float64(numOfPUs)/float64(rnc.Tuners.GetCoresPerDedicatedInterruptCore())))
+		separateMasks, err := masks.hwloc.DistributeRestrict(rpPUs, cpuMask)
+		if err != nil {
+			return "", err
+		}
+		// merge the separate masks into one
+		computationsMask, err = masks.hwloc.RunCalcRaw(separateMasks...)
+		if err != nil {
+			return "", err
+		}
 	} else {
-		err = fmt.Errorf("Unsupported mode: '%s'", mode)
+		err = fmt.Errorf("unsupported mode: '%s'", mode)
 	}
 
 	if masks.hwloc.CheckIfMaskIsEmpty(computationsMask) {
@@ -96,14 +114,14 @@ func (masks *cpuMasks) CPUMaskForComputations(
 }
 
 func (masks *cpuMasks) CPUMaskForIRQs(
-	mode Mode, cpuMask string,
+	mode Mode, cpuMask string, rnc config.RpkNodeConfig,
 ) (string, error) {
 	zap.L().Sugar().Debugf("Computing IRQ CPU mask for '%s' mode and input CPU mask '%s'",
 		mode, cpuMask)
 	var err error
 	var maskForIRQs string
 	if mode != Mq {
-		maskForComputations, err := masks.CPUMaskForComputations(mode, cpuMask)
+		maskForComputations, err := masks.CPUMaskForComputations(mode, cpuMask, rnc)
 		if err != nil {
 			return "", err
 		}
@@ -222,6 +240,10 @@ func (masks *cpuMasks) GetLogicalCoreIDsFromPhysCore(
 
 func (masks *cpuMasks) GetAllCpusMask() (string, error) {
 	return masks.hwloc.All()
+}
+
+func (masks *cpuMasks) MaskToListFormat(mask string) (string, error) {
+	return masks.hwloc.MaskToListFormat(mask)
 }
 
 func MasksEqual(a, b string) (bool, error) {

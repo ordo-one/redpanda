@@ -11,23 +11,24 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
+#include "cluster/cluster_link/errc.h"
 #include "cluster/errc.h"
 #include "cluster/feature_update_action.h"
 #include "cluster/fwd.h"
 #include "cluster/nt_revision.h"
-#include "cluster/remote_topic_properties.h"
-#include "cluster/snapshot.h"
+#include "cluster/partition_balancer_types.h"
 #include "cluster/topic_configuration.h"
-#include "cluster/topic_properties.h"
 #include "cluster/tx_errc.h"
-#include "cluster/tx_hash_ranges.h"
 #include "cluster/version.h"
+#include "cluster_link/model/types.h"
+#include "container/chunked_vector.h"
 #include "container/contiguous_range_map.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "model/namespace.h"
 #include "model/timeout_clock.h"
 #include "model/transform.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
@@ -56,9 +57,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-#include <absl/hash/hash.h>
 #include <fmt/format.h>
 
 #include <chrono>
@@ -178,6 +176,7 @@ struct reset_id_allocator_reply
 
 struct kafka_result {
     kafka::offset last_offset;
+    model::term_id last_term;
 };
 struct kafka_stages {
     kafka_stages(ss::future<>, ss::future<result<kafka_result>>);
@@ -207,7 +206,6 @@ enum class partition_removal_mode : uint8_t {
 struct join_node_request
   : serde::
       envelope<join_node_request, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     join_node_request() noexcept = default;
 
     explicit join_node_request(
@@ -265,8 +263,6 @@ struct join_node_request
 struct join_node_reply
   : serde::
       envelope<join_node_reply, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     enum class status_code : uint8_t {
         success = 0,
         // Non-specific error
@@ -409,7 +405,6 @@ struct configuration_update_request
       configuration_update_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     configuration_update_request() noexcept = default;
     explicit configuration_update_request(model::broker b, model::node_id tid)
       : node(std::move(b))
@@ -433,7 +428,6 @@ struct configuration_update_reply
       configuration_update_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     configuration_update_reply() noexcept = default;
     explicit configuration_update_reply(bool success)
       : success(success) {}
@@ -494,7 +488,7 @@ incremental_update_operation_as_string(incremental_update_operation op) {
     case incremental_update_operation::remove:
         return "remove";
     default:
-        vassert(false, "Unknown operation type passed: {}", int8_t(op));
+        vunreachable("Unknown operation type passed: {}", int8_t(op));
     }
 }
 
@@ -568,7 +562,7 @@ struct property_update<tristate<T>>
 struct incremental_topic_updates
   : serde::envelope<
       incremental_topic_updates,
-      serde::version<8>,
+      serde::version<9>,
       serde::compat_version<0>> {
     static constexpr int8_t version_with_data_policy = -1;
     static constexpr int8_t version_with_shadow_indexing = -3;
@@ -645,10 +639,23 @@ struct incremental_topic_updates
     property_update<std::optional<model::iceberg_invalid_record_action>>
       iceberg_invalid_record_action;
     property_update<tristate<double>> min_cleanable_dirty_ratio;
+    property_update<std::optional<std::chrono::milliseconds>>
+      min_compaction_lag_ms;
+    property_update<std::optional<std::chrono::milliseconds>>
+      max_compaction_lag_ms;
     property_update<std::optional<bool>> remote_allow_gaps;
 
     property_update<std::optional<std::chrono::milliseconds>>
       iceberg_target_lag_ms;
+
+    property_update<std::optional<std::chrono::milliseconds>>
+      message_timestamp_before_max_ms;
+    property_update<std::optional<std::chrono::milliseconds>>
+      message_timestamp_after_max_ms;
+
+    // Not a regular topic property. Used to assign topic UUIDs to pre-25-2
+    // topics that were created without one.
+    property_update<std::optional<model::topic_id>> topic_id;
 
     // To allow us to better control use of the deprecated shadow_indexing
     // field, use getters and setters instead.
@@ -693,7 +700,12 @@ struct incremental_topic_updates
           iceberg_invalid_record_action,
           iceberg_target_lag_ms,
           min_cleanable_dirty_ratio,
-          remote_allow_gaps);
+          remote_allow_gaps,
+          topic_id,
+          min_compaction_lag_ms,
+          max_compaction_lag_ms,
+          message_timestamp_before_max_ms,
+          message_timestamp_after_max_ms);
     }
 
     friend std::ostream&
@@ -912,6 +924,7 @@ using create_partitions_configuration_assignment
 enum class topic_purge_domain {
     cloud_storage = 0,
     iceberg = 1,
+    cloud_topic = 2,
 };
 
 std::ostream& operator<<(std::ostream&, const topic_purge_domain&);
@@ -975,6 +988,17 @@ struct nt_iceberg_tombstone
     auto serde_fields() { return std::tie(last_deleted_revision); }
 };
 
+struct nt_cloud_topic_tombstone
+  : serde::envelope<
+      nt_cloud_topic_tombstone,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // The topic ID used by cloud topic whose data requires removal.
+    model::topic_id topic_id;
+
+    auto serde_fields() { return std::tie(topic_id); }
+};
+
 struct topic_lifecycle_transition
   : serde::envelope<
       topic_lifecycle_transition,
@@ -1022,8 +1046,6 @@ struct create_topics_request
       create_topics_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     topic_configuration_vector topics;
     model::timeout_clock::duration timeout;
 
@@ -1046,8 +1068,6 @@ struct create_topics_reply
       create_topics_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     std::vector<topic_result> results;
     std::vector<model::topic_metadata> metadata;
     topic_configuration_vector configs;
@@ -1079,8 +1099,6 @@ struct purged_topic_request
       purged_topic_request,
       serde::version<1>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     nt_revision topic;
     model::timeout_clock::duration timeout;
     topic_purge_domain domain = topic_purge_domain::cloud_storage;
@@ -1099,8 +1117,6 @@ struct purged_topic_reply
       purged_topic_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     topic_result result;
 
     purged_topic_reply() noexcept = default;
@@ -1120,7 +1136,6 @@ struct finish_partition_update_request
       finish_partition_update_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::ntp ntp;
     replicas_t new_replica_set;
 
@@ -1140,7 +1155,6 @@ struct finish_partition_update_reply
       finish_partition_update_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     cluster::errc result;
 
     friend bool operator==(
@@ -1159,7 +1173,6 @@ struct update_topic_properties_request
       update_topic_properties_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     topic_properties_update_vector updates;
 
     friend std::ostream&
@@ -1182,8 +1195,7 @@ struct update_topic_properties_reply
       update_topic_properties_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    std::vector<topic_result> results;
+    chunked_vector<topic_result> results;
 
     friend std::ostream&
     operator<<(std::ostream&, const update_topic_properties_reply&);
@@ -1195,6 +1207,10 @@ struct update_topic_properties_reply
       = default;
 
     auto serde_fields() { return std::tie(results); }
+
+    update_topic_properties_reply copy() const {
+        return {.results = results.copy()};
+    }
 };
 
 struct configuration_invariants {
@@ -1218,10 +1234,11 @@ public:
     explicit configuration_invariants_changed(
       const configuration_invariants& expected,
       const configuration_invariants& current)
-      : _msg(ssx::sformat(
-          "Configuration invariants changed. Expected: {}, current: {}",
-          expected,
-          current)) {}
+      : _msg(
+          ssx::sformat(
+            "Configuration invariants changed. Expected: {}, current: {}",
+            expected,
+            current)) {}
 
     const char* what() const noexcept final { return _msg.c_str(); }
 
@@ -1241,7 +1258,7 @@ enum class reconfiguration_policy {
      * With target initial retention partition move policy controller backend
      * will calculate the learner start offset based on the configured learner
      * initial retention configuration (either a global cluster property or
-     * topic override ) and partition max collectible offset. Max collectible
+     * topic override ) and partition max removable offset. Max removable
      * offset is advanced after all the previous offsets were successfully
      * uploaded to the cloud.
      */
@@ -1396,7 +1413,6 @@ struct create_acls_request
       create_acls_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     create_acls_cmd_data data;
     model::timeout_clock::duration timeout;
 
@@ -1422,8 +1438,6 @@ struct create_acls_request
 struct create_acls_reply
   : serde::
       envelope<create_acls_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     std::vector<errc> results;
 
     friend bool operator==(const create_acls_reply&, const create_acls_reply&)
@@ -1465,7 +1479,6 @@ struct delete_acls_result
       delete_acls_result,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc error;
     std::vector<security::acl_binding> bindings;
 
@@ -1486,7 +1499,6 @@ struct delete_acls_request
       delete_acls_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     delete_acls_cmd_data data;
     model::timeout_clock::duration timeout;
 
@@ -1512,7 +1524,6 @@ struct delete_acls_request
 struct delete_acls_reply
   : serde::
       envelope<delete_acls_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     std::vector<delete_acls_result> results;
 
     friend bool operator==(const delete_acls_reply&, const delete_acls_reply&)
@@ -1565,7 +1576,6 @@ struct recovery_state
 struct backend_operation
   : serde::
       envelope<backend_operation, serde::version<2>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     ss::shard_id source_shard;
     partition_assignment p_as;
     partition_operation_type type;
@@ -1776,8 +1786,6 @@ struct feature_update_license_update_cmd_data
       feature_update_license_update_cmd_data,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     // Struct encoding version
     static constexpr int8_t current_version = 1;
 
@@ -1794,7 +1802,6 @@ struct user_and_credential
       user_and_credential,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     static constexpr int8_t current_version = 0;
 
     user_and_credential() = default;
@@ -1817,7 +1824,6 @@ struct cluster_recovery_init_state
       cluster_recovery_init_state,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     friend bool operator==(
       const cluster_recovery_init_state&, const cluster_recovery_init_state&)
       = default;
@@ -1837,8 +1843,6 @@ struct bootstrap_cluster_cmd_data
       bootstrap_cluster_cmd_data,
       serde::version<3>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     friend bool operator==(
       const bootstrap_cluster_cmd_data&, const bootstrap_cluster_cmd_data&)
       = default;
@@ -1872,8 +1876,6 @@ struct cluster_recovery_init_cmd_data
       cluster_recovery_init_cmd_data,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     friend bool operator==(
       const cluster_recovery_init_cmd_data&,
       const cluster_recovery_init_cmd_data&)
@@ -1924,7 +1926,6 @@ struct cluster_recovery_update_cmd_data
       cluster_recovery_update_cmd_data,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     friend bool operator==(
       const cluster_recovery_update_cmd_data&,
       const cluster_recovery_update_cmd_data&)
@@ -1952,7 +1953,6 @@ class ntp_reconciliation_state
       serde::version<0>,
       serde::compat_version<0>> {
 public:
-    using rpc_adl_exempt = std::true_type;
     ntp_reconciliation_state() noexcept = default;
 
     // success case
@@ -2059,8 +2059,6 @@ struct reconciliation_state_request
       reconciliation_state_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     chunked_vector<model::ntp> ntps;
 
     friend bool operator==(
@@ -2119,8 +2117,6 @@ struct bulk_force_reconfiguration_cmd_data
       bulk_force_reconfiguration_cmd_data,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     bulk_force_reconfiguration_cmd_data() = default;
     ~bulk_force_reconfiguration_cmd_data() noexcept = default;
     bulk_force_reconfiguration_cmd_data(bulk_force_reconfiguration_cmd_data&&)
@@ -2138,7 +2134,7 @@ struct bulk_force_reconfiguration_cmd_data
       = default;
 
     std::vector<model::node_id> from_nodes;
-    fragmented_vector<ntp_with_majority_loss>
+    chunked_vector<ntp_with_majority_loss>
       user_approved_force_recovery_partitions;
 
     auto serde_fields() {
@@ -2154,7 +2150,6 @@ struct reconciliation_state_reply
       reconciliation_state_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     chunked_vector<ntp_reconciliation_state> results;
 
     friend bool operator==(
@@ -2185,8 +2180,6 @@ struct decommission_node_request
       decommission_node_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::node_id id;
 
     friend bool operator==(
@@ -2207,8 +2200,6 @@ struct decommission_node_reply
       decommission_node_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc error;
 
     friend bool
@@ -2229,8 +2220,6 @@ struct recommission_node_request
       recommission_node_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::node_id id;
 
     friend bool operator==(
@@ -2251,8 +2240,6 @@ struct recommission_node_reply
       recommission_node_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc error;
 
     friend bool
@@ -2273,7 +2260,6 @@ struct finish_reallocation_request
       finish_reallocation_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::node_id id;
 
     friend bool operator==(
@@ -2294,8 +2280,6 @@ struct finish_reallocation_reply
       finish_reallocation_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc error;
 
     friend bool operator==(
@@ -2316,8 +2300,6 @@ struct set_maintenance_mode_request
       set_maintenance_mode_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     static constexpr int8_t current_version = 1;
     model::node_id id;
     bool enabled;
@@ -2340,8 +2322,6 @@ struct set_maintenance_mode_reply
       set_maintenance_mode_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     static constexpr int8_t current_version = 1;
     errc error;
 
@@ -2363,7 +2343,6 @@ struct config_status_request
       config_status_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     config_status status;
 
     friend std::ostream&
@@ -2381,7 +2360,6 @@ struct config_status_reply
       config_status_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc error;
 
     friend std::ostream& operator<<(std::ostream&, const config_status_reply&);
@@ -2398,7 +2376,6 @@ struct feature_action_request
       feature_action_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     feature_update_action action;
 
     friend bool
@@ -2416,7 +2393,6 @@ struct feature_action_response
       feature_action_response,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc error;
 
     friend bool
@@ -2437,7 +2413,6 @@ struct feature_barrier_request
       feature_barrier_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     static constexpr int8_t current_version = 1;
     feature_barrier_tag tag; // Each cooperative barrier must use a unique tag
     model::node_id peer;
@@ -2458,7 +2433,6 @@ struct feature_barrier_response
       feature_barrier_response,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     static constexpr int8_t current_version = 1;
     bool entered;  // Has the respondent entered?
     bool complete; // Has the respondent exited?
@@ -2478,7 +2452,6 @@ struct config_update_request final
       config_update_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     std::vector<cluster_property_kv> upsert;
     std::vector<ss::sstring> remove;
 
@@ -2497,7 +2470,6 @@ struct config_update_reply
       config_update_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc error;
     cluster::config_version latest_version{config_version_unset};
 
@@ -2513,8 +2485,6 @@ struct config_update_reply
 struct hello_request final
   : serde::
       envelope<hello_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::node_id peer;
 
     // milliseconds since epoch
@@ -2530,8 +2500,6 @@ struct hello_request final
 
 struct hello_reply
   : serde::envelope<hello_reply, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc error;
 
     friend bool operator==(const hello_reply&, const hello_reply&) = default;
@@ -2546,8 +2514,11 @@ struct leader_term {
       : leader(leader)
       , term(term) {}
 
+    explicit leader_term(std::optional<model::node_id> leader)
+      : leader(leader) {}
     std::optional<model::node_id> leader;
-    model::term_id term;
+    std::optional<model::term_id> term;
+    friend auto operator<=>(const leader_term&, const leader_term&) = default;
     friend std::ostream& operator<<(std::ostream&, const leader_term&);
 };
 
@@ -2600,6 +2571,11 @@ public:
 
     model::revision_id get_revision() const;
     std::optional<model::initial_revision_id> get_remote_revision() const;
+    // Returns location hint that can be passed to topic_manifest_downloader to
+    // disambiguate topic instances in cloud storage. Has the following form:
+    // "<remote label>/<remote revision id>".
+    // Nullopt will be returned for legacy topics without a remote label.
+    std::optional<ss::sstring> get_remote_location_hint() const;
 
     const topic_metadata_fields& get_fields() const { return _fields; }
     topic_metadata_fields& get_fields() { return _fields; }
@@ -2651,8 +2627,6 @@ struct cancel_all_partition_movements_request
       cancel_all_partition_movements_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     cancel_all_partition_movements_request() = default;
 
     auto serde_fields() { return std::tie(); }
@@ -2673,8 +2647,6 @@ struct cancel_node_partition_movements_request
       cancel_node_partition_movements_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::node_id node_id;
     partition_move_direction direction;
 
@@ -2694,8 +2666,6 @@ struct cancel_partition_movements_reply
       cancel_partition_movements_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     friend bool operator==(
       const cancel_partition_movements_reply&,
       const cancel_partition_movements_reply&)
@@ -2715,8 +2685,6 @@ struct cloud_storage_usage_request
       cloud_storage_usage_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     std::vector<model::ntp> partitions;
 
     friend bool operator==(
@@ -2731,8 +2699,6 @@ struct cloud_storage_usage_reply
       cloud_storage_usage_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     uint64_t total_size_bytes{0};
 
     // When replies are handled in 'cloud_storage_size_reducer'
@@ -2755,8 +2721,6 @@ struct producer_id_lookup_request
       producer_id_lookup_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     producer_id_lookup_request() noexcept = default;
     auto serde_fields() { return std::tie(); }
 };
@@ -2766,8 +2730,6 @@ struct producer_id_lookup_reply
       producer_id_lookup_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     cluster::errc ec{};
     model::producer_id highest_producer_id{};
 
@@ -2785,8 +2747,6 @@ struct partition_state_request
       partition_state_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::ntp ntp;
     friend bool
     operator==(const partition_state_request&, const partition_state_request&)
@@ -2800,14 +2760,13 @@ struct partition_stm_state
       partition_stm_state,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     ss::sstring name;
     model::offset last_applied_offset;
-    model::offset max_collectible_offset;
+    model::offset max_removable_local_log_offset;
 
     auto serde_fields() {
-        return std::tie(name, last_applied_offset, max_collectible_offset);
+        return std::tie(
+          name, last_applied_offset, max_removable_local_log_offset);
     }
 };
 
@@ -2816,8 +2775,6 @@ struct partition_raft_state
       partition_raft_state,
       serde::version<5>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::node_id node;
     model::term_id term;
     ss::sstring offset_translator_state;
@@ -2847,8 +2804,6 @@ struct partition_raft_state
           follower_state,
           serde::version<0>,
           serde::compat_version<0>> {
-        using rpc_adl_exempt = std::true_type;
-
         model::node_id node;
         model::offset last_flushed_log_index;
         model::offset last_dirty_log_index;
@@ -2945,8 +2900,6 @@ struct partition_raft_state
 struct partition_state
   : serde::
       envelope<partition_state, serde::version<1>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::offset start_offset;
     model::offset committed_offset;
     model::offset last_stable_offset;
@@ -2995,8 +2948,6 @@ struct partition_state_reply
       partition_state_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::ntp ntp;
     std::optional<partition_state> state;
     errc error_code;
@@ -3028,7 +2979,6 @@ struct revert_cancel_partition_move_request
       revert_cancel_partition_move_request,
       serde::version<0>,
       serde::version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::ntp ntp;
 
     auto serde_fields() { return std::tie(ntp); }
@@ -3044,7 +2994,6 @@ struct revert_cancel_partition_move_reply
       revert_cancel_partition_move_reply,
       serde::version<0>,
       serde::version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc result;
 
     auto serde_fields() { return std::tie(result); }
@@ -3058,7 +3007,6 @@ struct revert_cancel_partition_move_reply
 struct upsert_role_cmd_data
   : serde::
       envelope<upsert_role_cmd_data, serde::version<0>, serde::version<0>> {
-    using rpc_adl_exempt = std::true_type;
     security::role_name name;
     security::role role;
 
@@ -3072,7 +3020,6 @@ struct upsert_role_cmd_data
 struct delete_role_cmd_data
   : serde::
       envelope<delete_role_cmd_data, serde::version<0>, serde::version<0>> {
-    using rpc_adl_exempt = std::true_type;
     security::role_name name;
 
     auto serde_fields() { return std::tie(name); }
@@ -3216,7 +3163,8 @@ struct node_decommission_progress {
     // number of replicas left on decommissioned node
     size_t replicas_left{0};
     // Replicas on the node with failures during reallocation.
-    ss::chunked_fifo<model::ntp> allocation_failures;
+    chunked_hash_map<model::ntp, reallocation_failure_details>
+      allocation_failures;
     // list of currently ongoing partition reconfigurations
     chunked_vector<partition_reconfiguration_state> current_reconfigurations;
 };
@@ -3291,8 +3239,6 @@ struct controller_committed_offset_request
       controller_committed_offset_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     auto serde_fields() { return std::tie(); }
 };
 
@@ -3301,7 +3247,6 @@ struct controller_committed_offset_reply
       controller_committed_offset_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::offset last_committed;
     errc result;
 
@@ -3327,8 +3272,6 @@ struct upsert_plugin_request
       upsert_plugin_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::transform_metadata transform;
     model::timeout_clock::duration timeout{};
 
@@ -3343,7 +3286,6 @@ struct upsert_plugin_response
       upsert_plugin_response,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     errc ec;
 
     friend bool
@@ -3361,7 +3303,6 @@ struct remove_plugin_request
       remove_plugin_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::transform_name name;
     model::timeout_clock::duration timeout{};
 
@@ -3376,7 +3317,6 @@ struct remove_plugin_response
       remove_plugin_response,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     uuid_t uuid;
     errc ec;
 
@@ -3394,8 +3334,6 @@ struct update_partition_replicas_cmd_data
       update_partition_replicas_cmd_data,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::ntp ntp;
     replicas_t replicas;
     reconfiguration_policy policy;
@@ -3451,7 +3389,6 @@ struct delete_topics_request
       delete_topics_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     std::vector<model::topic_namespace> topics_to_delete;
     std::chrono::milliseconds timeout;
 
@@ -3467,7 +3404,6 @@ struct delete_topics_reply
       delete_topics_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     std::vector<topic_result> results;
 
     friend bool
@@ -3482,8 +3418,6 @@ struct set_partition_shard_request
       set_partition_shard_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     model::ntp ntp;
     uint32_t shard = -1;
 
@@ -3499,8 +3433,6 @@ struct set_partition_shard_reply
       set_partition_shard_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc ec;
 
     friend bool operator==(
@@ -3508,6 +3440,258 @@ struct set_partition_shard_reply
       = default;
 
     auto serde_fields() { return std::tie(ec); }
+};
+
+struct upsert_cluster_link_request
+  : serde::envelope<
+      upsert_cluster_link_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::metadata metadata;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const upsert_cluster_link_request&, const upsert_cluster_link_request&)
+      = default;
+    auto serde_fields() { return std::tie(metadata, timeout); }
+};
+
+struct upsert_cluster_link_response
+  : serde::envelope<
+      upsert_cluster_link_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster::cluster_link::errc ec;
+
+    friend bool operator==(
+      const upsert_cluster_link_response&, const upsert_cluster_link_response&)
+      = default;
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct remove_cluster_link_request
+  : serde::envelope<
+      remove_cluster_link_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::delete_shadow_link_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const remove_cluster_link_request&, const remove_cluster_link_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(cmd, timeout); }
+};
+
+struct remove_cluster_link_response
+  : serde::envelope<
+      remove_cluster_link_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster::cluster_link::errc ec;
+
+    friend bool operator==(
+      const remove_cluster_link_response&, const remove_cluster_link_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct add_mirror_topic_request
+  : serde::envelope<
+      add_mirror_topic_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::id_t link_id;
+    ::cluster_link::model::add_mirror_topic_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool
+    operator==(const add_mirror_topic_request&, const add_mirror_topic_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(link_id, cmd, timeout); }
+};
+
+struct add_mirror_topic_response
+  : serde::envelope<
+      add_mirror_topic_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster_link::errc ec{cluster_link::errc::success};
+
+    friend bool operator==(
+      const add_mirror_topic_response&, const add_mirror_topic_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct update_mirror_topic_status_request
+  : serde::envelope<
+      update_mirror_topic_status_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::id_t link_id;
+    ::cluster_link::model::update_mirror_topic_status_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const update_mirror_topic_status_request&,
+      const update_mirror_topic_status_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(link_id, cmd, timeout); }
+};
+
+struct update_mirror_topic_status_response
+  : serde::envelope<
+      update_mirror_topic_status_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster_link::errc ec{cluster_link::errc::success};
+
+    friend bool operator==(
+      const update_mirror_topic_status_response&,
+      const update_mirror_topic_status_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct update_mirror_topic_properties_request
+  : serde::envelope<
+      update_mirror_topic_properties_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::id_t link_id;
+    ::cluster_link::model::update_mirror_topic_properties_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const update_mirror_topic_properties_request&,
+      const update_mirror_topic_properties_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(link_id, cmd, timeout); }
+};
+
+struct update_mirror_topic_properties_response
+  : serde::envelope<
+      update_mirror_topic_properties_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster_link::errc ec{cluster_link::errc::success};
+
+    friend bool operator==(
+      const update_mirror_topic_properties_response&,
+      const update_mirror_topic_properties_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct update_cluster_link_configuration_request
+  : serde::envelope<
+      update_cluster_link_configuration_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::id_t link_id;
+    ::cluster_link::model::update_cluster_link_configuration_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const update_cluster_link_configuration_request&,
+      const update_cluster_link_configuration_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(link_id, cmd, timeout); }
+};
+
+struct update_cluster_link_configuration_response
+  : serde::envelope<
+      update_cluster_link_configuration_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster_link::errc ec{cluster_link::errc::success};
+
+    friend bool operator==(
+      const update_cluster_link_configuration_response&,
+      const update_cluster_link_configuration_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+struct delete_mirror_topic_request
+  : serde::envelope<
+      delete_mirror_topic_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    ::cluster_link::model::id_t link_id;
+    ::cluster_link::model::delete_mirror_topic_cmd cmd;
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const delete_mirror_topic_request&, const delete_mirror_topic_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(link_id, cmd, timeout); }
+};
+
+struct delete_mirror_topic_response
+  : serde::envelope<
+      delete_mirror_topic_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    cluster_link::errc ec{cluster_link::errc::success};
+
+    friend bool operator==(
+      const delete_mirror_topic_response&, const delete_mirror_topic_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec); }
+};
+
+// Request to get the current cluster epoch.
+struct get_current_cluster_epoch_request
+  : serde::envelope<
+      get_current_cluster_epoch_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    model::timeout_clock::duration timeout{};
+
+    friend bool operator==(
+      const get_current_cluster_epoch_request&,
+      const get_current_cluster_epoch_request&)
+      = default;
+
+    auto serde_fields() { return std::tie(timeout); }
+};
+
+// The reply to the get_current_cluster_epoch_request.
+struct get_current_cluster_epoch_response
+  : serde::envelope<
+      get_current_cluster_epoch_response,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    errc ec{errc::success};
+    int64_t epoch{-1};
+
+    friend bool operator==(
+      const get_current_cluster_epoch_response&,
+      const get_current_cluster_epoch_response&)
+      = default;
+
+    auto serde_fields() { return std::tie(ec, epoch); }
+};
+
+struct error_info {
+    std::error_code err;
+    ss::sstring message;
+
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 } // namespace cluster

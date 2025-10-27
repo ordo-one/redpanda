@@ -14,6 +14,8 @@
 #include "metrics/prometheus_sanitize.h"
 #include "ssx/future-util.h"
 #include "utils/human.h"
+
+#include <boost/range/irange.hpp>
 namespace kafka {
 using namespace std::chrono_literals;
 namespace {
@@ -54,9 +56,13 @@ bool datalake_throttle_manager::needs_throttling() const {
     if (!_disk_space_info) [[unlikely]] {
         return false;
     }
+    auto ratio = _backlog_size_throttling_ratio();
+    if (!ratio.has_value()) {
+        return false;
+    }
     return _translation_status.max_shares_assigned
            && _translation_status.total_translation_backlog
-                > _backlog_size_throttling_ratio() * _disk_space_info->total;
+                > ratio.value() * _disk_space_info->total;
 }
 
 std::ostream&
@@ -74,7 +80,7 @@ datalake_throttle_manager::datalake_throttle_manager(
   ss::sharded<storage::node>& storage_node,
   config::binding<std::chrono::milliseconds> producer_gc_threshold,
   config::binding<std::chrono::milliseconds> max_kafka_throttle,
-  config::binding<double> backlog_size_throttling_ratio)
+  config::binding<std::optional<double>> backlog_size_throttling_ratio)
   : _shard_status_provider(std::move(status_provider))
   , _storage_node(storage_node)
   , _producer_gc_threshold(std::move(producer_gc_threshold))
@@ -196,7 +202,7 @@ datalake_throttle_manager::maybe_throttle_producer(
                 shard_0_manager._translation_status,
                 human::bytes(shard_0_manager._disk_space_info->total),
                 human::bytes(
-                  shard_0_manager._backlog_size_throttling_ratio()
+                  shard_0_manager._backlog_size_throttling_ratio().value_or(0)
                   * shard_0_manager._disk_space_info->total));
           }
           return throttle_ms;

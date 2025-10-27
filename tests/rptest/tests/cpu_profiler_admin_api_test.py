@@ -9,26 +9,28 @@
 
 import re
 from typing import Any
-from rptest.services.cluster import cluster
-from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.admin import Admin
-from rptest.services.redpanda import LoggingConfig, ResourceSettings
-from rptest.clients.types import TopicSpec
-from rptest.services.kgo_repeater_service import repeater_traffic
 
 import requests
+
+from rptest.clients.types import TopicSpec
+from rptest.services.admin import Admin
+from rptest.services.cluster import cluster
+from rptest.services.kgo_repeater_service import repeater_traffic
+from rptest.services.redpanda import LoggingConfig
+from rptest.tests.redpanda_test import RedpandaTest
 
 VERSION_REGEX = re.compile(r".+ - .+")
 
 
-def assert_profile_good_v2(profile: dict[str, Any],
-                           wait_ms: int | None = None):
+def assert_profile_good_v2(profile: dict[str, Any], wait_ms: int | None = None):
     """Check that a profile looks normal."""
 
     assert profile
 
     def get(key: str):
-        assert key in profile, f"profile did not contain expected top-level attribute '{key}'"
+        assert key in profile, (
+            f"profile did not contain expected top-level attribute '{key}'"
+        )
         return profile[key]
 
     assert get("arch") in ("amd64", "arm64"), f"bad arch: {profile['arch']}"
@@ -40,34 +42,35 @@ def assert_profile_good_v2(profile: dict[str, Any],
     profile_attr = get("profile")
     assert len(profile_attr) > 0, "At least one shard should exist"
     samples = profile_attr[0]["samples"]
-    assert len(
-        samples) > 0, "At least one cpu profile should've been collected."
+    assert len(samples) > 0, "At least one cpu profile should've been collected."
 
 
 class CPUProfilerAdminAPITest(RedpandaTest):
-    topics = (TopicSpec(partition_count=30, replication_factor=1), )
+    topics = (TopicSpec(partition_count=30, replication_factor=1),)
 
     def __init__(self, test_context):
         super(CPUProfilerAdminAPITest, self).__init__(
             test_context=test_context,
             num_brokers=1,
-            log_config=LoggingConfig('info',
-                                     logger_levels={'resources': 'trace'}),
+            log_config=LoggingConfig("info", logger_levels={"resources": "trace"}),
             extra_rp_conf={
                 "cpu_profiler_enabled": False,
                 "cpu_profiler_sample_period_ms": 50,
-            })
+            },
+        )
 
         self.admin = Admin(self.redpanda)
 
     @cluster(num_nodes=2)
     def test_get_cpu_profile_with_override(self):
         # Provide traffic so there is something to sample.
-        with repeater_traffic(context=self.test_context,
-                              redpanda=self.redpanda,
-                              topics=[self.topic],
-                              msg_size=4096,
-                              workers=1) as repeater:
+        with repeater_traffic(
+            context=self.test_context,
+            redpanda=self.redpanda,
+            topics=[self.topic],
+            msg_size=4096,
+            workers=1,
+        ) as repeater:
             repeater.await_group_ready()
             profile = self.admin.get_cpu_profile(wait_ms=30 * 1_000)
             assert_profile_good_v2(profile)
@@ -90,18 +93,22 @@ class CPUProfilerAdminAPITest(RedpandaTest):
 
     @cluster(num_nodes=1)
     def test_cpu_profile_stress(self):
-        self.redpanda.set_cluster_config({
-            "cpu_profiler_enabled": True,
-            "cpu_profiler_sample_period_ms": 1,
-        })
+        self.redpanda.set_cluster_config(
+            {
+                "cpu_profiler_enabled": True,
+                "cpu_profiler_sample_period_ms": 1,
+            }
+        )
 
         node0 = self.redpanda.nodes[0]
 
-        self.admin.stress_fiber_start(num_fibers=1,
-                                      node=node0,
-                                      min_spins_per_scheduling_point=1000,
-                                      max_spins_per_scheduling_point=1000,
-                                      stack_depth=64)
+        self.admin.stress_fiber_start(
+            num_fibers=1,
+            node=node0,
+            min_spins_per_scheduling_point=1000,
+            max_spins_per_scheduling_point=1000,
+            stack_depth=64,
+        )
 
         # There is currently effectively a max sample count of ~1280 samples
         # due to a limit of 10 sample buffers * 128 samples per buffer, so

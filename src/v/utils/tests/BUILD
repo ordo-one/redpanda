@@ -5,7 +5,6 @@ redpanda_test_cc_library(
     hdrs = [
         "randoms.h",
     ],
-    include_prefix = "utils/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/random:generators",
@@ -154,12 +153,14 @@ redpanda_cc_btest(
         "base64_test.cc",
     ],
     deps = [
+        "//src/v/base",
         "//src/v/bytes:iobuf_parser",
         "//src/v/random:generators",
         "//src/v/test_utils:random_bytes",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:base64",
         "@boost//:test",
+        "@seastar",
     ],
 )
 
@@ -172,6 +173,7 @@ redpanda_cc_btest(
     deps = [
         "//src/v/random:generators",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:directory_walker",
         "@fmt",
         "@seastar",
@@ -311,22 +313,6 @@ redpanda_cc_btest(
         "//src/v/utils:moving_average",
         "@boost//:test",
         "@seastar",
-    ],
-)
-
-redpanda_cc_btest(
-    name = "rwlock_test",
-    timeout = "short",
-    srcs = [
-        "rwlock_test.cc",
-    ],
-    deps = [
-        "//src/v/base",
-        "//src/v/ssx:semaphore",
-        "//src/v/test_utils:seastar_boost",
-        "//src/v/utils:rwlock",
-        "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -555,5 +541,64 @@ redpanda_cc_gtest(
         "//src/v/test_utils:random_bytes",
         "//src/v/utils:file_io",
         "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "exponential_backoff",
+    timeout = "short",
+    srcs = [
+        "exponential_backoff.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:backoff_policy",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "execution_monitor_test",
+    timeout = "short",
+    srcs = [
+        "execution_monitor_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:execution_monitor",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "unresolved_address_test",
+    timeout = "short",
+    srcs = [
+        "unresolved_address_test.cc",
+    ],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:unresolved_address",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "windowed_sum_tracker_test",
+    timeout = "short",
+    srcs = ["windowed_sum_tracker_test.cc"],
+    deps = [
+        "//src/v/base",
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:windowed_sum_tracker",
+        "@googletest//:gtest",
+        "@seastar",
     ],
 )

@@ -15,8 +15,9 @@
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/tmp_dir.h"
 
-#include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
+
+#include <gtest/gtest.h>
 
 constexpr size_t segment_size{32_MiB};
 
@@ -40,17 +41,15 @@ size_t copy_stream(concat_segment_reader_view& cv) {
     return sz;
 }
 
-SEASTAR_THREAD_TEST_CASE(
+TEST(
+  ConcatSegmentReaderTest,
   test_multiple_segments_read_with_content_verification) {
     temporary_dir tmp_dir("concat_segment_read");
     auto data_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      data_path.string(),
-      segment_size,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      data_path.string(), segment_size, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"test_ns", "test_tpc", 0}, {data_path}});
     auto defer = ss::defer([&b] { b.stop().get(); });
@@ -115,38 +114,33 @@ SEASTAR_THREAD_TEST_CASE(
 
     // All the batches in the view should have user_management_cmd as type. The
     // boundaries should exclude acl_management_cmd.
-    concat_segment_reader_view cv{
-      segments, start_pos, end_pos, ss::default_priority_class()};
+    concat_segment_reader_view cv{segments, start_pos, end_pos};
 
     iobuf buf;
-    auto result = transform_stream(
-                    cv.take_stream(),
-                    make_iobuf_ref_output_stream(buf),
-                    [](model::record_batch_header h) {
-                        BOOST_REQUIRE_EQUAL(
-                          h.type,
-                          model::record_batch_type::user_management_cmd);
-                        return batch_consumer::consume_result::accept_batch;
-                    })
-                    .get();
-    BOOST_REQUIRE(!result.has_error());
-    BOOST_REQUIRE_EQUAL(
+    auto result
+      = transform_stream(
+          cv.take_stream(),
+          make_iobuf_ref_output_stream(buf),
+          [](model::record_batch_header h) {
+              EXPECT_EQ(h.type, model::record_batch_type::user_management_cmd);
+              return batch_consumer::consume_result::accept_batch;
+          })
+          .get();
+    EXPECT_FALSE(result.has_error());
+    EXPECT_EQ(
       result.value(),
       b.get_disk_log_impl().size_bytes()
         - (start_pos + final_segment->file_size() - end_pos));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_single_segment_read_with_bounds) {
+TEST(ConcatSegmentReaderTest, test_single_segment_read_with_bounds) {
     temporary_dir tmp_dir("concat_segment_read");
     auto data_path = tmp_dir.get_path();
 
     using namespace storage;
 
     disk_log_builder b{log_config{
-      data_path.string(),
-      segment_size,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      data_path.string(), segment_size, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"test_ns", "test_tpc", 0}, {data_path}})
       | add_segment(0) | add_random_batch(0, 10);
@@ -159,22 +153,17 @@ SEASTAR_THREAD_TEST_CASE(test_single_segment_read_with_bounds) {
     size_t start_pos = 20;
     size_t end_pos = log_segments.back()->file_size() - 20;
 
-    concat_segment_reader_view cv{
-      segments, start_pos, end_pos, ss::default_priority_class()};
-    BOOST_REQUIRE_EQUAL(
-      b.get_disk_log_impl().size_bytes() - 40, copy_stream(cv));
+    concat_segment_reader_view cv{segments, start_pos, end_pos};
+    EXPECT_EQ(b.get_disk_log_impl().size_bytes() - 40, copy_stream(cv));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_single_segment_read_full) {
+TEST(ConcatSegmentReaderTest, test_single_segment_read_full) {
     temporary_dir tmp_dir("concat_segment_read");
     auto data_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      data_path.string(),
-      segment_size,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      data_path.string(), segment_size, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"test_ns", "test_tpc", 0}, {data_path}})
       | add_segment(0) | add_random_batch(0, 10);
@@ -186,21 +175,17 @@ SEASTAR_THREAD_TEST_CASE(test_single_segment_read_full) {
 
     size_t start_pos = 0;
     size_t end_pos = log_segments.back()->file_size();
-    concat_segment_reader_view cv{
-      segments, start_pos, end_pos, ss::default_priority_class()};
-    BOOST_REQUIRE_EQUAL(b.get_disk_log_impl().size_bytes(), copy_stream(cv));
+    concat_segment_reader_view cv{segments, start_pos, end_pos};
+    EXPECT_EQ(b.get_disk_log_impl().size_bytes(), copy_stream(cv));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_multiple_segments_read_full) {
+TEST(ConcatSegmentReaderTest, test_multiple_segments_read_full) {
     temporary_dir tmp_dir("concat_segment_read");
     auto data_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      data_path.string(),
-      segment_size,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      data_path.string(), segment_size, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"test_ns", "test_tpc", 0}, {data_path}});
     auto defer = ss::defer([&b] { b.stop().get(); });
@@ -218,7 +203,6 @@ SEASTAR_THREAD_TEST_CASE(test_multiple_segments_read_full) {
 
     size_t start_pos = 0;
     size_t end_pos = log_segments.back()->file_size();
-    concat_segment_reader_view cv{
-      segments, start_pos, end_pos, ss::default_priority_class()};
-    BOOST_REQUIRE_EQUAL(b.get_disk_log_impl().size_bytes(), copy_stream(cv));
+    concat_segment_reader_view cv{segments, start_pos, end_pos};
+    EXPECT_EQ(b.get_disk_log_impl().size_bytes(), copy_stream(cv));
 }

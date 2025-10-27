@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "random/generators.h"
+#include "test_utils/test_env.h"
 #include "utils/directory_walker.h"
 
 #include <seastar/core/file.hh>
@@ -16,8 +16,10 @@
 
 #include <fmt/format.h>
 
+auto test_directory() { return test_env::random_dir_path(); }
+
 SEASTAR_THREAD_TEST_CASE(empty_dir) {
-    auto dir = "test.dir_" + random_generators::gen_alphanum_string(4);
+    auto dir = test_directory();
     ss::recursive_touch_directory(dir).get();
 
     int count = 0;
@@ -30,7 +32,7 @@ SEASTAR_THREAD_TEST_CASE(empty_dir) {
 }
 
 SEASTAR_THREAD_TEST_CASE(non_empty_dir) {
-    auto dir = "test.dir_" + random_generators::gen_alphanum_string(4);
+    auto dir = test_directory();
     ss::recursive_touch_directory(dir).get();
 
     // sees directories
@@ -65,7 +67,7 @@ SEASTAR_THREAD_TEST_CASE(non_empty_dir) {
 }
 
 SEASTAR_THREAD_TEST_CASE(exceptional_future) {
-    auto dir = "test.dir_" + random_generators::gen_alphanum_string(4);
+    auto dir = test_directory();
     ss::recursive_touch_directory(dir).get();
 
     // make sure we have some files in the directory
@@ -104,8 +106,7 @@ SEASTAR_THREAD_TEST_CASE(exceptional_future) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_empty_dir) {
-    auto dir = std::filesystem::path(
-      "test.dir_" + random_generators::gen_alphanum_string(4));
+    auto dir = std::filesystem::path(test_directory());
     ss::recursive_touch_directory(dir.string()).get();
     BOOST_REQUIRE(directory_walker::empty(dir).get());
     ss::recursive_touch_directory((dir / "xxx").string()).get();

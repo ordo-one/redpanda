@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "absl/container/flat_hash_map.h"
 #include "config/property.h"
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
@@ -23,7 +24,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <rpc/types.h>
 
 namespace raft {
@@ -53,8 +53,8 @@ public:
         return _current_max_inflight_requests
                - _inflight_requests_sem.available_units();
     };
+
     bool is_idle() const;
-    void log_status() const;
 
 private:
     ss::future<> dispatch_loop();
@@ -125,7 +125,8 @@ public:
       ss::scheduling_group sg,
       consensus_client_protocol base,
       config::binding<size_t> max_inflight_requests,
-      config::binding<size_t> max_buffered_bytes);
+      config::binding<size_t> max_buffered_bytes,
+      std::chrono::milliseconds gc_interval = 10s);
 
     ss::future<result<vote_reply>>
       vote(model::node_id, vote_request, rpc::client_opts) final;
@@ -150,6 +151,18 @@ public:
       model::node_id, transfer_leadership_request, rpc::client_opts) final;
 
     ss::future<> reset_backoff(model::node_id n) final;
+
+    ss::future<result<remake_learner_state_reply>> remake_learner_state(
+      model::node_id, remake_learner_state_request, rpc::client_opts) final;
+
+    ss::future<result<get_compaction_mcco_reply>> get_compaction_mcco(
+      model::node_id, get_compaction_mcco_request, rpc::client_opts) final;
+
+    ss::future<result<distribute_compaction_mtro_reply>>
+      distribute_compaction_mtro(
+        model::node_id,
+        distribute_compaction_mtro_request,
+        rpc::client_opts) final;
 
     ss::future<> stop();
 

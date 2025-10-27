@@ -30,7 +30,7 @@ using namespace std::chrono_literals;
 
 namespace {
 std::string generate_example_avro_record(
-  const pandaproxy::schema_registry::canonical_schema_definition& def) {
+  const pandaproxy::schema_registry::schema_definition& def) {
     // Generate a simple avro record that looks like this (as json):
     // {"a":5,"b":"foo"}
     iobuf_istream bis{def.shared_raw()};
@@ -52,7 +52,7 @@ std::string generate_example_avro_record(
 
 TEST_F(WasmTestFixture, SchemaRegistry) {
     // Test an example schema registry encoded avro value -> JSON transform
-    load_wasm("schema-registry");
+    load_wasm("schema-registry.wasm");
     const auto& schemas = registered_schemas();
     ASSERT_EQ(schemas.size(), 1);
     ASSERT_EQ(schemas[0].id, 1);

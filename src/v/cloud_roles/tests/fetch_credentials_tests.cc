@@ -14,9 +14,10 @@
 #include "http/tests/http_imposter.h"
 #include "test_definitions.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 #include "test_utils/tee_log.h"
+#include "utils/file_io.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -83,6 +84,7 @@ FIXTURE_TEST(test_get_oauth_token, fixture) {
       model::cloud_credentials_source::gcp_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -116,6 +118,7 @@ FIXTURE_TEST(test_token_refresh_on_expiry, fixture) {
       model::cloud_credentials_source::gcp_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -154,6 +157,7 @@ FIXTURE_TEST(test_aws_credentials, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -208,11 +212,12 @@ FIXTURE_TEST(test_short_lived_aws_credentials, fixture) {
 
     when()
       .request(cloud_role_tests::aws_creds_url)
-      .then_reply_with(fmt::format(
-        fmt::runtime(response),
+      .then_reply_with(
         fmt::format(
-          "{:%Y-%m-%dT%H:%M:%SZ}",
-          fmt::gmtime(std::chrono::system_clock::now() + 5s))));
+          fmt::runtime(response),
+          fmt::format(
+            "{:%Y-%m-%dT%H:%M:%SZ}",
+            fmt::gmtime(std::chrono::system_clock::now() + 5s))));
 
     listen();
 
@@ -226,6 +231,7 @@ FIXTURE_TEST(test_short_lived_aws_credentials, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -269,17 +275,13 @@ FIXTURE_TEST(test_sts_credentials, fixture) {
 
     one_shot_fetch s(c);
 
-    auto token_f = ss::open_file_dma(
-                     "test_sts_creds_f",
-                     ss::open_flags::create | ss::open_flags::rw)
-                     .get();
-    ss::sstring token{"token"};
-    token_f.dma_write(0, token.data(), token.size()).get();
+    write_fully("test_sts_creds_f", iobuf::from("token")).get();
 
     auto refresh = cloud_roles::make_refresh_credentials(
       model::cloud_credentials_source::sts,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -290,7 +292,6 @@ FIXTURE_TEST(test_sts_credentials, fixture) {
         return c.has_value();
     }).get();
 
-    token_f.close().get();
     ss::remove_file("test_sts_creds_f").get();
 
     auto aws_creds = std::get<cloud_roles::aws_credentials>(c.value());
@@ -321,11 +322,12 @@ FIXTURE_TEST(test_short_lived_sts_credentials, fixture) {
     when()
       .request("/")
       .with_method(ss::httpd::POST)
-      .then_reply_with(fmt::format(
-        fmt::runtime(sts_creds),
+      .then_reply_with(
         fmt::format(
-          "{:%Y-%m-%dT%H:%M:%SZ}",
-          fmt::gmtime(std::chrono::system_clock::now() + 5s))));
+          fmt::runtime(sts_creds),
+          fmt::format(
+            "{:%Y-%m-%dT%H:%M:%SZ}",
+            fmt::gmtime(std::chrono::system_clock::now() + 5s))));
 
     listen();
 
@@ -335,17 +337,13 @@ FIXTURE_TEST(test_short_lived_sts_credentials, fixture) {
     two_fetches s(c);
     auto count = s.get_counter();
 
-    auto token_f = ss::open_file_dma(
-                     "test_short_sts_f",
-                     ss::open_flags::create | ss::open_flags::rw)
-                     .get();
-    ss::sstring token{"token"};
-    token_f.dma_write(0, token.data(), token.size()).get();
+    write_fully("test_short_sts_f", iobuf::from("token")).get();
 
     auto refresh = cloud_roles::make_refresh_credentials(
       model::cloud_credentials_source::sts,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -356,7 +354,6 @@ FIXTURE_TEST(test_short_lived_sts_credentials, fixture) {
         return *count >= 2;
     }).get();
 
-    token_f.close().get();
     ss::remove_file("test_short_sts_f").get();
     auto aws_creds = std::get<cloud_roles::aws_credentials>(c.value());
     BOOST_REQUIRE_EQUAL("sts-key", aws_creds.access_key_id());
@@ -386,6 +383,7 @@ FIXTURE_TEST(test_client_closed_on_error, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -415,6 +413,7 @@ FIXTURE_TEST(test_handle_temporary_timeout, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -452,6 +451,7 @@ FIXTURE_TEST(test_handle_bad_response, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       net::unresolved_address{httpd_host_name.data(), httpd_port_number()});
 
@@ -503,6 +503,7 @@ FIXTURE_TEST(test_intermittent_error, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       net::unresolved_address{httpd_host_name.data(), httpd_port_number()});
 
@@ -555,6 +556,7 @@ FIXTURE_TEST(test_imdsv2_fallback, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -608,6 +610,7 @@ FIXTURE_TEST(test_imdsv2_fallback_not_triggered_unless_error_matches, fixture) {
       model::cloud_credentials_source::aws_instance_metadata,
       as,
       s,
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -663,15 +666,16 @@ FIXTURE_TEST(test_abs_aks_credentials, fixture) {
     when()
       .request(endpoint)
       .with_method(ss::httpd::POST)
-      .then_reply_with(ssx::sformat(
-        R"json(
+      .then_reply_with(
+        ssx::sformat(
+          R"json(
 {{
   "token_type": "Bearer",
   "expires_in": 5,
   "access_token": "{}"
 }}
       )json",
-        token_value));
+          token_value));
     listen();
 
     // save resulting credentials here
@@ -688,6 +692,7 @@ FIXTURE_TEST(test_abs_aks_credentials, fixture) {
           ++cred_requests;
           return ss::now();
       },
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
     refresh.start();
@@ -754,14 +759,15 @@ FIXTURE_TEST(test_abs_aks_credentials_missing_fields, fixture) {
     when()
       .request(endpoint)
       .with_method(ss::httpd::POST)
-      .then_reply_with(ssx::sformat(
-        R"json(
+      .then_reply_with(
+        ssx::sformat(
+          R"json(
 {{
   "token_type": "Bearer",
   "access_token": "{}"
 }}
       )json",
-        token_value));
+          token_value));
     listen();
 
     // save credentials here (expected to remain empty)
@@ -775,6 +781,7 @@ FIXTURE_TEST(test_abs_aks_credentials_missing_fields, fixture) {
           maybe_credentials = in;
           return ss::now();
       },
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
 
@@ -814,8 +821,9 @@ FIXTURE_TEST(test_abs_vm_credentials, fixture) {
     when()
       .request(endpoint)
       .with_method(ss::httpd::GET)
-      .then_reply_with(ssx::sformat(
-        R"json(
+      .then_reply_with(
+        ssx::sformat(
+          R"json(
 {{
   "token_type": "Bearer",
   "expires_in": "5",
@@ -826,7 +834,7 @@ FIXTURE_TEST(test_abs_vm_credentials, fixture) {
   "resource": "https://storage.azure.com/"
 }}
       )json",
-        token_value));
+          token_value));
     listen();
 
     // save resulting credentials here
@@ -843,6 +851,7 @@ FIXTURE_TEST(test_abs_vm_credentials, fixture) {
           ++cred_requests;
           return ss::now();
       },
+      cloud_roles::aws_service_name{"s3"},
       cloud_roles::aws_region_name{""},
       address());
     refresh.start();

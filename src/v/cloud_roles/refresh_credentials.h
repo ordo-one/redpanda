@@ -128,7 +128,8 @@ public:
       std::unique_ptr<impl> impl,
       ss::abort_source& as,
       credentials_update_cb_t creds_update,
-      aws_region_name region);
+      aws_region_name region,
+      ss::sstring metrics_tag = "");
 
     void start();
 
@@ -174,9 +175,11 @@ template<typename CredentialsProvider>
 refresh_credentials make_refresh_credentials(
   ss::abort_source& as,
   credentials_update_cb_t creds_update_cb,
+  aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint = std::nullopt,
-  retry_params retry_params = default_retry_params) {
+  retry_params retry_params = default_retry_params,
+  ss::sstring metrics_tag = "") {
     ss::sstring host = {
       CredentialsProvider::default_host.data(),
       CredentialsProvider::default_host.size()};
@@ -197,11 +200,16 @@ refresh_credentials make_refresh_credentials(
     auto port = endpoint ? endpoint->port() : CredentialsProvider::default_port;
     auto impl = std::make_unique<CredentialsProvider>(
       net::unresolved_address{{host.data(), host.size()}, port},
+      service,
       region,
       as,
       retry_params);
     return refresh_credentials{
-      std::move(impl), as, std::move(creds_update_cb), std::move(region)};
+      std::move(impl),
+      as,
+      std::move(creds_update_cb),
+      std::move(region),
+      std::move(metrics_tag)};
 }
 
 /// Builds a refresh_credentials object based on the credentials source set
@@ -210,8 +218,10 @@ refresh_credentials make_refresh_credentials(
   model::cloud_credentials_source cloud_credentials_source,
   ss::abort_source& as,
   credentials_update_cb_t creds_update_cb,
+  aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint = std::nullopt,
-  retry_params retry_params = default_retry_params);
+  retry_params retry_params = default_retry_params,
+  ss::sstring metrics_tag = "");
 
 } // namespace cloud_roles

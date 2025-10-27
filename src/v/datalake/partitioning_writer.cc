@@ -37,7 +37,8 @@ ss::future<> partitioning_writer::flush() {
             if (err == writer_error::ok) {
                 return ss::make_ready_future();
             }
-            return ss::make_exception_future<>(err);
+            return ss::make_exception_future<>(std::runtime_error(
+              fmt::format("Error flushing parquet file writer: {}", err)));
         });
     });
 }
@@ -73,7 +74,14 @@ ss::future<writer_error> partitioning_writer::add_data(
     auto write_res = co_await writer->add_data_struct(
       std::move(val), approx_size, as);
     if (write_res != writer_error::ok) {
-        vlog(datalake_log.error, "Failed to add data: {}", write_res);
+        auto is_shutdown_error = write_res == writer_error::shutting_down;
+        vlogl(
+          datalake_log,
+          is_recoverable_error(write_res) || is_shutdown_error
+            ? ss::log_level::debug
+            : ss::log_level::error,
+          "Failed to add data: {}",
+          write_res);
         co_return write_res;
     }
     co_return write_res;
@@ -104,8 +112,11 @@ partitioning_writer::finish() && {
     for (auto& [pk, writer] : writers_) {
         auto file_res = co_await writer->finish();
         if (file_res.has_error()) {
-            vlog(
-              datalake_log.error,
+            auto is_shutdown_error = file_res.error()
+                                     == writer_error::shutting_down;
+            vlogl(
+              datalake_log,
+              is_shutdown_error ? ss::log_level::debug : ss::log_level::error,
               "Failed to finish writer: {}",
               file_res.error());
             if (first_error == writer_error::ok) {
@@ -123,14 +134,28 @@ partitioning_writer::finish() && {
             continue;
         }
 
-        files.push_back(partitioned_file{
-          .local_file = std::move(file_res.value()),
-          .table_location = remote_prefix_,
-          .schema_id = schema_id_,
-          .partition_spec_id = spec_.spec_id,
-          .partition_key = std::move(pk),
-          .partition_key_path = std::move(partition_key_path_res.value())});
+        vlog(
+          datalake_log.trace,
+          "writer finished: file_bytes={}, file_path={}",
+          file_res.value().size_bytes,
+          file_res.value().path());
+
+        files.push_back(
+          partitioned_file{
+            .local_file = std::move(file_res.value()),
+            .data_location = remote_prefix_,
+            .schema_id = schema_id_,
+            .partition_spec_id = spec_.spec_id,
+            .partition_key = std::move(pk),
+            .partition_key_path = std::move(partition_key_path_res.value())});
     }
+
+    vlog(
+      datalake_log.trace,
+      "partitioning writer finish complete: schema_id={}, files_created={}",
+      schema_id_,
+      files.size());
+
     if (first_error != writer_error::ok) {
         co_return first_error;
     }

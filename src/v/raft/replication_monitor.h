@@ -11,13 +11,14 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "base/seastarx.h"
 #include "model/fundamental.h"
 #include "storage/types.h"
 
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/future.hh>
-
-#include <absl/container/btree_map.h>
+#include <seastar/core/gate.hh>
 
 namespace raft {
 

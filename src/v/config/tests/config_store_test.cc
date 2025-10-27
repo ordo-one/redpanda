@@ -119,27 +119,29 @@ struct test_config : public config::config_store {
 struct noop_config : public config::config_store {};
 
 YAML::Node minimal_valid_configuration() {
-    return YAML::Load("required_string: test_value_1\n"
-                      "strings:\n"
-                      " - first\n"
-                      " - second\n"
-                      " - third\n");
+    return YAML::Load(
+      "required_string: test_value_1\n"
+      "strings:\n"
+      " - first\n"
+      " - second\n"
+      " - third\n");
 }
 
 YAML::Node valid_configuration() {
-    return YAML::Load("optional_int: 3\n"
-                      "required_string: test_value_2\n"
-                      "an_int64_t: 55\n"
-                      "an_aggregate:\n"
-                      "  string_value: some_value\n"
-                      "  int_value: 88\n"
-                      "strings:\n"
-                      " - one\n"
-                      " - two\n"
-                      " - three\n"
-                      "nullable_int: 111\n"
-                      "secret_string: actual_secret\n"
-                      "aliased_bool_legacy: false\n");
+    return YAML::Load(
+      "optional_int: 3\n"
+      "required_string: test_value_2\n"
+      "an_int64_t: 55\n"
+      "an_aggregate:\n"
+      "  string_value: some_value\n"
+      "  int_value: 88\n"
+      "strings:\n"
+      " - one\n"
+      " - two\n"
+      " - three\n"
+      "nullable_int: 111\n"
+      "secret_string: actual_secret\n"
+      "aliased_bool_legacy: false\n");
 }
 
 } // namespace
@@ -229,6 +231,24 @@ SEASTAR_THREAD_TEST_CASE(update_property_value) {
     BOOST_TEST(cfg.required_string() == "test_value_1");
     cfg.get("required_string").set_value(ss::sstring("new_string_value"));
     BOOST_TEST(cfg.required_string() == "new_string_value");
+};
+
+SEASTAR_THREAD_TEST_CASE(track_set_state) {
+    auto cfg = test_config();
+
+    BOOST_TEST(cfg.optional_int() == 100);
+    BOOST_TEST(cfg.optional_int.is_default() == true);
+    BOOST_TEST(cfg.optional_int.is_set() == false);
+
+    // set to default value
+    cfg.get("required_string").set_value(ss::sstring{});
+    BOOST_TEST(cfg.required_string.is_default() == true);
+    BOOST_TEST(cfg.required_string.is_set() == true);
+
+    // set to non-default value
+    cfg.get("an_int64_t").set_value(int64_t{100});
+    BOOST_TEST(cfg.an_int64_t.is_default() == false);
+    BOOST_TEST(cfg.an_int64_t.is_set() == true);
 };
 
 SEASTAR_THREAD_TEST_CASE(validate_valid_configuration) {
@@ -335,12 +355,13 @@ SEASTAR_THREAD_TEST_CASE(config_json_serialization) {
 /// Test that unset std::optional options are decoded correctly
 /// when given as 'null', not just when absent.
 SEASTAR_THREAD_TEST_CASE(deserialize_explicit_null) {
-    auto with_null = YAML::Load("required_string: test_value_1\n"
-                                "strings:\n"
-                                " - first\n"
-                                " - second\n"
-                                " - third\n"
-                                "nullable_int: ~\n");
+    auto with_null = YAML::Load(
+      "required_string: test_value_1\n"
+      "strings:\n"
+      " - first\n"
+      " - second\n"
+      " - third\n"
+      "nullable_int: ~\n");
 
     auto cfg = test_config();
     auto errors = cfg.read_yaml(with_null);
@@ -599,25 +620,17 @@ aliased_bool_legacy: false
         BOOST_CHECK_EQUAL(cfg.secret_string.value(), "terces");
         BOOST_CHECK_EQUAL(cfg.aliased_bool.value(), false);
     }
-    BOOST_TEST_CONTEXT("if a key is managed by the config, it will be set and "
-                       "the ignored_missing list does not matter") {
+    BOOST_TEST_CONTEXT(
+      "if a key is managed by the config, it will be set and "
+      "the ignored_missing list does not matter") {
         auto cfg = test_config{};
-        BOOST_REQUIRE_NO_THROW(cfg.read_yaml(
-          yaml_with_unknown_properties,
-          {"secret_string", "aliased_bool_legacy"}));
+        BOOST_REQUIRE_NO_THROW(cfg.read_yaml(yaml_with_unknown_properties));
         BOOST_CHECK_EQUAL(cfg.secret_string.value(), "terces");
         BOOST_CHECK_EQUAL(cfg.aliased_bool.value(), false);
     }
-    BOOST_TEST_CONTEXT("an unknow key will generate an exception") {
+    BOOST_TEST_CONTEXT("an unknown key will not generate an exception") {
         auto noop_cfg = noop_config{};
-        BOOST_REQUIRE_THROW(
-          noop_cfg.read_yaml(yaml_with_unknown_properties),
-          std::invalid_argument);
-    }
-    BOOST_TEST_CONTEXT("unknown keys that are accounted for are fine") {
-        auto noop_cfg = noop_config{};
-        BOOST_REQUIRE_NO_THROW(noop_cfg.read_yaml(
-          yaml_with_unknown_properties,
-          test_config{}.property_names_and_aliases()));
+        BOOST_REQUIRE_NO_THROW(
+          noop_cfg.read_yaml(yaml_with_unknown_properties));
     }
 }

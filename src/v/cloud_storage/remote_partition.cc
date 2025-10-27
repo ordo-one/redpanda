@@ -100,7 +100,7 @@ remote_partition::iterator remote_partition::get_or_materialize_segment(
 
 remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
   const partition_manifest& manifest,
-  storage::log_reader_config config,
+  cloud_storage::cloud_log_reader_config config,
   segment_units segment_unit,
   segment_reader_units segment_reader_unit,
   model::offset hint) {
@@ -116,13 +116,14 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
     // - The config.start_offset matches the base_offset - delta_offset of
     //   the next segment.
 
-    auto ko = model::offset_cast(config.start_offset);
+    auto ko = config.start_offset;
     // Two level lookup:
     // - find segment meta based on kafka offset
     //   this allow us to avoid any ambiguity in case if the segment
     //   doesn't have any data. The 'segment_containing' method of the
     //   manifest takes this into account.
     // - find materialized segment or materialize the new one
+    const auto manifest_end = manifest.end();
     auto mit = manifest.end();
     if (hint == model::offset{}) {
         // This code path is only used for the first lookup. It
@@ -139,23 +140,21 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
             // skip segments without data batches (the logic is implemented
             // inside the partition_manifest).
             mit = manifest.segment_containing(ko);
-            if (mit == manifest.end()) {
+            if (mit == manifest_end) {
                 // Segment that matches exactly can't be found in the manifest.
                 // In this case we want to start scanning from the beginning of
                 // the partition if the start of the manifest is contained by
                 // the scan range.
                 auto so = manifest.get_start_kafka_offset().value_or(
                   kafka::offset::min());
-                if (
-                  model::offset_cast(config.start_offset) < so
-                  && model::offset_cast(config.max_offset) > so) {
+                if (config.start_offset < so && config.max_offset > so) {
                     mit = manifest.begin();
                 }
             }
         }
     } else {
         mit = manifest.segment_containing(hint);
-        while (mit != manifest.end()) {
+        while (mit != manifest_end) {
             // The segment 'mit' points to might not have any
             // data batches. In this case we need to move iterator forward.
             // The check can only be done if we have 'delta_offset_end'.
@@ -175,7 +174,7 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
     }
     const auto partition_start_offset
       = _manifest_view->stm_manifest().full_log_start_offset();
-    while (mit != manifest.end()
+    while (mit != manifest_end
            && mit->committed_offset < partition_start_offset) {
         // Make sure to skip segments that have been removed via archival GC,
         // which wouldn't be reflected in a spillover manifest's segment list.
@@ -184,7 +183,7 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
         // before getting here, but that isn't the case for timequeries.
         ++mit;
     }
-    if (mit == manifest.end()) {
+    if (mit == manifest_end) {
         // No such segment
         return borrow_result_t{};
     }
@@ -208,7 +207,7 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
     }
     auto mit_committed_offset = mit->committed_offset;
     auto next_it = std::next(std::move(mit));
-    while (next_it != manifest.end()) {
+    while (next_it != manifest_end) {
         // Normally, the segments in the manifest do not overlap.
         // But in some cases we may see them overlapping, for instance
         // if they were produced by older version of redpanda.
@@ -219,9 +218,8 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
         }
         ++next_it;
     }
-    model::offset next_offset = next_it == manifest.end()
-                                  ? model::offset{}
-                                  : next_it->base_offset;
+    model::offset next_offset = next_it == manifest_end ? model::offset{}
+                                                        : next_it->base_offset;
     return borrow_result_t{
       .reader = iter->second->borrow_reader(
         config, _ctxlog, _probe, _ts_probe, std::move(segment_reader_unit)),
@@ -233,19 +231,20 @@ class partition_record_batch_reader_impl final
 public:
     explicit partition_record_batch_reader_impl(
       ss::shared_ptr<remote_partition> part,
+      ss::gate::holder holder,
       ss::lw_shared_ptr<storage::offset_translator_state> ot_state,
       ssx::semaphore_units units) noexcept
       : _rtc(part->_as)
       , _ctxlog(cst_log, _rtc, part->get_ntp().path())
       , _partition(std::move(part))
       , _ot_state(std::move(ot_state))
-      , _gate_guard(_partition->_gate)
+      , _gate_guard(std::move(holder))
       , _units(std::move(units)) {
         auto ntp = _partition->get_ntp();
         vlog(_ctxlog.trace, "Constructing reader {}", ntp);
     }
 
-    ss::future<> start(storage::log_reader_config config) {
+    ss::future<> start(cloud_storage::cloud_log_reader_config config) {
         if (config.abort_source) {
             vlog(_ctxlog.debug, "abort_source is set");
             _partition_reader_as = config.abort_source;
@@ -470,13 +469,13 @@ public:
                 if (_first_produced_offset == model::offset{} && !d.empty()) {
                     _first_produced_offset = d.front().base_offset();
                 } else {
-                    auto current_ko = _ot_state->from_log_offset(
-                      _seg_reader->current_rp_offset());
+                    auto current_ko = model::offset_cast(
+                      _ot_state->from_log_offset(
+                        _seg_reader->current_rp_offset()));
                     vlog(
                       _ctxlog.debug,
                       "No results, current rp offset: {}, current kafka "
-                      "offset: {}, max rp offset: "
-                      "{}",
+                      "offset: {}, max rp offset: {}",
                       _seg_reader->current_rp_offset(),
                       current_ko,
                       _seg_reader->config().max_offset);
@@ -549,7 +548,7 @@ private:
         }
     }
 
-    ss::future<> init_cursor(storage::log_reader_config config) {
+    ss::future<> init_cursor(cloud_storage::cloud_log_reader_config config) {
         auto segment_unit = co_await _partition->materialized()
                               .get_segment_units(config.abort_source);
         auto segment_reader_unit
@@ -559,13 +558,11 @@ private:
         async_view_search_query_t query;
         if (config.first_timestamp.has_value()) {
             query = async_view_timestamp_query(
-              model::offset_cast(config.start_offset),
+              config.start_offset,
               config.first_timestamp.value(),
-              model::offset_cast(config.max_offset));
+              config.max_offset);
         } else {
-            // NOTE: config.start_offset actually contains kafka offset
-            // stored using model::offset type.
-            query = model::offset_cast(config.start_offset);
+            query = config.start_offset;
         }
         // Find manifest that contains requested offset or timestamp
         auto cur = co_await _partition->_manifest_view->get_cursor(query);
@@ -636,10 +633,11 @@ private:
                   });
             }
 
-            throw std::runtime_error(fmt::format(
-              "Failed to query spillover manifests: {}, query: {}",
-              cur.error(),
-              query));
+            throw std::runtime_error(
+              fmt::format(
+                "Failed to query spillover manifests: {}, query: {}",
+                cur.error(),
+                query));
         }
         _view_cursor = std::move(cur.value());
         co_await _view_cursor->with_manifest(
@@ -660,7 +658,7 @@ private:
     // Initialize object using remote_partition as a source
     void initialize_reader_state(
       const partition_manifest& manifest,
-      const storage::log_reader_config& config,
+      const cloud_storage::cloud_log_reader_config& config,
       segment_units segment_unit,
       segment_reader_units segment_reader_unit) {
         vlog(
@@ -690,7 +688,7 @@ private:
 
     remote_partition::borrow_result_t find_cached_reader(
       const partition_manifest& manifest,
-      const storage::log_reader_config& config,
+      const cloud_storage::cloud_log_reader_config& config,
       segment_units segment_unit,
       segment_reader_units segment_reader_unit) {
         if (!_partition || _partition->_manifest_view->stm_manifest().empty()) {
@@ -908,7 +906,7 @@ private:
     /// Cancellation subscription
     ss::abort_source::subscription _as_sub;
     /// Reference to the abort source of the partition reader
-    storage::opt_abort_source_t _partition_reader_as;
+    model::opt_abort_source_t _partition_reader_as;
     /// Guard for the partition gate
     ss::gate::holder _gate_guard;
     model::offset _next_segment_base_offset{};
@@ -924,7 +922,7 @@ private:
 remote_partition::remote_partition(
   ss::shared_ptr<async_manifest_view> m,
   remote& api,
-  cache& c,
+  cloud_io::cache& c,
   cloud_storage_clients::bucket_name bucket,
   partition_probe& probe)
   : _ntp(m->get_ntp())
@@ -1058,8 +1056,9 @@ remote_partition::aborted_transactions(offset_range offsets) {
         // redpanda offsets to extract aborted transactions metadata because
         // tx-manifests contains redpanda offsets.
         std::deque<ss::lw_shared_ptr<remote_segment>> remote_segs;
-        for (auto it = stm_manifest.segment_containing(offsets.begin);
-             it != stm_manifest.end();
+        for (auto it = stm_manifest.segment_containing(offsets.begin),
+                  end_it = stm_manifest.end();
+             it != end_it;
              ++it) {
             if (it->base_offset > offsets.end_rp) {
                 break;
@@ -1107,8 +1106,9 @@ remote_partition::aborted_transactions(offset_range offsets) {
           std::move(cursor),
           [&offsets, &meta_to_materialize, this](
             ssx::task_local_ptr<const partition_manifest> manifest) {
-              for (auto it = manifest->segment_containing(offsets.begin);
-                   it != manifest->end();
+              for (auto it = manifest->segment_containing(offsets.begin),
+                        end_it = manifest->end();
+                   it != end_it;
                    ++it) {
                   if (it->base_offset > offsets.end_rp) {
                       return ss::stop_iteration::yes;
@@ -1222,7 +1222,7 @@ size_t remote_partition::reader_mem_use_estimate() noexcept {
 }
 
 ss::future<storage::translating_reader> remote_partition::make_reader(
-  storage::log_reader_config config,
+  cloud_storage::cloud_log_reader_config config,
   std::optional<model::timeout_clock::time_point> deadline) {
     std::ignore = deadline;
     vlog(
@@ -1245,7 +1245,7 @@ ss::future<storage::translating_reader> remote_partition::make_reader(
       _segments.size());
 
     auto impl = std::make_unique<partition_record_batch_reader_impl>(
-      shared_from_this(), ot_state, std::move(units));
+      shared_from_this(), _gate.hold(), ot_state, std::move(units));
     co_await impl->start(config);
     co_return storage::translating_reader{
       model::record_batch_reader(std::move(impl)), std::move(ot_state)};
@@ -1260,16 +1260,16 @@ remote_partition::timequery(storage::timequery_config cfg) {
     }
 
     auto start_offset = std::max(
-      cfg.min_offset,
-      kafka::offset_cast(stm_manifest.full_log_start_kafka_offset().value()));
+      model::offset_cast(cfg.min_offset),
+      stm_manifest.full_log_start_kafka_offset().value());
+    auto max_offset = model::offset_cast(cfg.max_offset);
 
     // Synthesize a log_reader_config from our timequery_config
-    storage::log_reader_config config(
+    cloud_log_reader_config config(
       start_offset,
-      cfg.max_offset,
+      max_offset,
       0,
       2048, // We just need one record batch
-      cfg.prio,
       cfg.type_filter,
       cfg.time,
       cfg.abort_source,
@@ -1280,16 +1280,17 @@ remote_partition::timequery(storage::timequery_config cfg) {
     auto translating_reader = co_await make_reader(config);
 
     // Read one batch from the reader to learn the offset
-    model::record_batch_reader::storage_t data
-      = co_await model::consume_reader_to_memory(
-        std::move(translating_reader.reader), model::no_timeout);
+    auto batches = co_await model::consume_reader_to_memory(
+      std::move(translating_reader.reader), model::no_timeout);
 
-    auto& batches = std::get<model::record_batch_reader::data_t>(data);
     vlog(_ctxlog.debug, "timequery: {} batches", batches.size());
 
     if (batches.size()) {
-        co_return storage::batch_timequery(
-          *(batches.begin()), cfg.min_offset, cfg.time, cfg.max_offset);
+        co_return co_await storage::batch_timequery(
+          std::move(*(batches.begin())),
+          cfg.min_offset,
+          cfg.time,
+          cfg.max_offset);
     } else {
         co_return std::nullopt;
     }
@@ -1304,7 +1305,6 @@ bool remote_partition::bounds_timestamp(model::timestamp t) const {
     }
 }
 
-static constexpr ss::lowres_clock::duration finalize_timeout = 20s;
 static constexpr ss::lowres_clock::duration finalize_backoff = 1s;
 
 /// When a remote_partition is being destroyed for the last time, we save this
@@ -1329,7 +1329,10 @@ ss::future<> finalize_in_background(
   remote& api, finalize_data data, remote_path_provider path_provider) {
     ss::abort_source& as = api.as();
 
-    retry_chain_node local_rtc(as, finalize_timeout, finalize_backoff);
+    retry_chain_node local_rtc(
+      as,
+      config::shard_local_cfg().cloud_storage_manifest_upload_timeout_ms(),
+      finalize_backoff);
 
     // Start with an empty manifest.
     partition_manifest remote_manifest(data.ntp, data.revision);

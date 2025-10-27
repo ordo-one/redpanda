@@ -211,54 +211,109 @@ ss::future<begin_tx_reply> rm_partition_frontend::do_begin_tx(
   std::chrono::milliseconds transaction_timeout_ms,
   model::partition_id tm) {
     if (!is_leader_of(ntp)) {
-        return ss::make_ready_future<begin_tx_reply>(
-          begin_tx_reply{ntp, tx::errc::leader_not_found});
+        return ssx::now(
+          begin_tx_reply{std::move(ntp), tx::errc::leader_not_found});
     }
 
     auto shard = _shard_table.local().shard_for(ntp);
-
     if (!shard) {
-        return ss::make_ready_future<begin_tx_reply>(
-          begin_tx_reply{ntp, tx::errc::shard_not_found});
+        return ssx::now(
+          begin_tx_reply{std::move(ntp), tx::errc::shard_not_found});
     }
 
     return _partition_manager.invoke_on(
       *shard,
       _ssg,
-      [ntp, pid, tx_seq, transaction_timeout_ms, tm, this](
+      [ntp = std::move(ntp), pid, tx_seq, transaction_timeout_ms, tm, this](
         cluster::partition_manager& mgr) mutable {
-          auto partition = mgr.get(ntp);
-          if (!partition) {
-              return ss::make_ready_future<begin_tx_reply>(
-                begin_tx_reply{ntp, tx::errc::partition_not_found});
-          }
-
-          auto stm = partition->rm_stm();
-
-          if (!stm) {
-              vlog(txlog.warn, "partition {} doesn't have rm_stm", ntp);
-              return ss::make_ready_future<begin_tx_reply>(
-                begin_tx_reply{ntp, tx::errc::stm_not_found});
-          }
-
-          auto topic_md = _metadata_cache.local().get_topic_metadata(
-            model::topic_namespace_view(ntp));
-          if (!topic_md) {
-              return ss::make_ready_future<begin_tx_reply>(
-                begin_tx_reply{ntp, tx::errc::partition_not_exists});
-          }
-          auto topic_revision = topic_md->get_revision();
-
-          return stm->begin_tx(pid, tx_seq, transaction_timeout_ms, tm)
-            .then(
-              [ntp, topic_revision](checked<model::term_id, tx::errc> etag) {
-                  if (!etag.has_value()) {
-                      return begin_tx_reply{ntp, etag.error()};
-                  }
-                  return begin_tx_reply{
-                    ntp, etag.value(), tx::errc::none, topic_revision};
-              });
+          return do_begin_tx_on_partition_shard(
+            std::move(ntp), pid, tx_seq, transaction_timeout_ms, tm, mgr);
       });
+}
+namespace {
+ss::future<result<ss::rwlock::holder, tx::errc>>
+hold_writes_enabled(ss::lw_shared_ptr<partition> partition) {
+    auto units_result = co_await partition->hold_writes_enabled();
+    if (units_result.has_value()) {
+        co_return result<ss::rwlock::holder, tx::errc>{
+          std::move(units_result.value())};
+    }
+
+    auto err = units_result.error();
+    if (err.category() == cluster::error_category()) {
+        /**
+         * Handle different types of errors that can occur when trying to
+         * grab a write enable lock.
+         */
+        switch (cluster::errc(err.value())) {
+        case cluster::errc::not_leader:
+            co_return tx::errc::leader_not_found;
+        case cluster::errc::resource_is_being_migrated:
+            vlog(
+              txlog.warn,
+              "partition {} is not writable, errc: {}",
+              partition->ntp(),
+              units_result.error());
+            co_return tx::errc::partition_writes_locked;
+        case cluster::errc::timeout:
+            co_return tx::errc::timeout;
+        case cluster::errc::partition_disabled:
+            co_return tx::errc::partition_disabled;
+        default:
+            break;
+        }
+    } else if (err == raft::errc::not_leader) {
+        co_return tx::errc::leader_not_found;
+    } else if (err == raft::errc::timeout) {
+        co_return tx::errc::timeout;
+    }
+    vlog(
+      txlog.error,
+      "error holding a write enable lock for {}, errc: {}",
+      partition->ntp(),
+      err);
+    co_return tx::errc::unknown_server_error;
+}
+} // namespace
+
+ss::future<begin_tx_reply>
+rm_partition_frontend::do_begin_tx_on_partition_shard(
+  model::ntp ntp,
+  model::producer_identity pid,
+  model::tx_seq tx_seq,
+  std::chrono::milliseconds transaction_timeout_ms,
+  model::partition_id tm,
+  cluster::partition_manager& mgr) {
+    auto partition = mgr.get(ntp);
+    if (!partition) {
+        co_return begin_tx_reply{std::move(ntp), tx::errc::partition_not_found};
+    }
+
+    auto maybe_partition_units = co_await hold_writes_enabled(partition);
+    if (!maybe_partition_units.has_value()) {
+        co_return begin_tx_reply{std::move(ntp), maybe_partition_units.error()};
+    }
+
+    auto stm = partition->rm_stm();
+    if (!stm) {
+        vlog(txlog.warn, "partition {} doesn't have rm_stm", ntp);
+        co_return begin_tx_reply{std::move(ntp), tx::errc::stm_not_found};
+    }
+
+    auto topic_md = _metadata_cache.local().get_topic_metadata(
+      model::topic_namespace_view(ntp));
+    if (!topic_md) {
+        co_return begin_tx_reply{
+          std::move(ntp), tx::errc::partition_not_exists};
+    }
+    auto topic_revision = topic_md->get_revision();
+
+    auto etag = co_await stm->begin_tx(pid, tx_seq, transaction_timeout_ms, tm);
+    if (!etag.has_value()) {
+        co_return begin_tx_reply{std::move(ntp), etag.error()};
+    }
+    co_return begin_tx_reply{
+      std::move(ntp), etag.value(), tx::errc::none, topic_revision};
 }
 
 ss::future<commit_tx_reply> rm_partition_frontend::commit_tx(

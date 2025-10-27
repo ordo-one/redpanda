@@ -11,7 +11,7 @@
 
 #include "cluster/errc.h"
 #include "cluster/tx_gateway_frontend.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/describe_transactions_request.h"
 #include "kafka/protocol/types.h"
@@ -20,7 +20,6 @@
 #include "kafka/server/response.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
-#include "resource_mgmt/io_priority.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
@@ -145,10 +144,11 @@ ss::future<response_ptr> describe_transactions_handler::handle(
       tx_frontend, response, std::move(request.data.transactional_ids));
 
     for (auto& tx_id : unauthorized) {
-        response.data.transaction_states.push_back(describe_transaction_state{
-          .error_code = error_code::transactional_id_authorization_failed,
-          .transactional_id = tx_id,
-        });
+        response.data.transaction_states.push_back(
+          describe_transaction_state{
+            .error_code = error_code::transactional_id_authorization_failed,
+            .transactional_id = tx_id,
+          });
     }
 
     co_return co_await ctx.respond(std::move(response));

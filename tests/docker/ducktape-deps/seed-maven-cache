@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This script is used to download the maven cache seed for the ducktape docker image.
+# Further documentation at ../docker/README.md.
+
+source "$(dirname "${BASH_SOURCE[0]}")/download-utils" # import download-utils
+
+seed_file="m2-cache-2025-04-25-59e96a8aeb.tgz"
+
+seed_url="https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/$seed_file"
+# Use this URL instead for local testing:
+# seed_url="https://perf-team-public.s3.us-west-2.amazonaws.com/deps-staging/$seed_file"
+
+if [[ ${USE_MAVEN_SEED:=unset} != 1 ]]; then
+  echo "Skipping maven cache seeding (USE_MAVEN_SEED=$USE_MAVEN_SEED)"
+  exit 0
+fi
+
+download_extract "$seed_url" /root

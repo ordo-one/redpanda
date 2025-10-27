@@ -47,11 +47,12 @@ void index_schema(schema_element& root) {
         auto [path, rep_level, def_level, element] = std::move(to_visit.back());
         to_visit.pop_back();
         if (element->path.size() != 1) {
-            throw std::invalid_argument(fmt::format(
-              "unindexed schemas should only have a single path "
-              "element, which is that node's name. Indexing will "
-              "populate the full path, got element with path: {}",
-              fmt::join(element->path, "/")));
+            throw std::invalid_argument(
+              fmt::format(
+                "unindexed schemas should only have a single path "
+                "element, which is that node's name. Indexing will "
+                "populate the full path, got element with path: {}",
+                fmt::join(element->path, "/")));
         }
         std::ranges::move(element->path, std::back_inserter(path));
         element->path = std::move(path);
@@ -78,8 +79,8 @@ void index_schema(schema_element& root) {
 } // namespace serde::parquet
 
 auto fmt::formatter<serde::parquet::schema_element>::format(
-  const serde::parquet::schema_element& e,
-  fmt::format_context& ctx) const -> decltype(ctx.out()) {
+  const serde::parquet::schema_element& e, fmt::format_context& ctx) const
+  -> decltype(ctx.out()) {
     return fmt::format_to(
       ctx.out(),
       "{{ position: {}, type: {}, repetition_type: {}, max_def_level: {}, "

@@ -25,12 +25,13 @@ struct sax_deserializer {};
 
 ss::future<> test_body(size_t n) {
     // Test data.
-    fragmented_vector<model::tx_range> tx_ranges{};
+    chunked_vector<model::tx_range> tx_ranges{};
     for (size_t i = 0; i < n; ++i) {
-        tx_ranges.push_back(model::tx_range{
-          model::producer_identity(i, i + 1),
-          model::offset(i + 2),
-          model::offset(i + 3)});
+        tx_ranges.push_back(
+          model::tx_range{
+            model::producer_identity(i, i + 1),
+            model::offset(i + 2),
+            model::offset(i + 3)});
     }
 
     tx_range_manifest m(segment_path, std::move(tx_ranges));

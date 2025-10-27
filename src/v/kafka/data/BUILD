@@ -4,7 +4,7 @@ redpanda_cc_library(
     name = "logger",
     srcs = ["logger.cc"],
     hdrs = ["logger.h"],
-    visibility = ["//visibility:private"],
+    visibility = ["//visibility:__subpackages__"],
     deps = [
         "//src/v/base",
         "@seastar",
@@ -14,10 +14,12 @@ redpanda_cc_library(
 redpanda_cc_library(
     name = "partition_proxy",
     srcs = [
+        "cloud_topic_partition.cc",
         "partition_proxy.cc",
         "replicated_partition.cc",
     ],
     hdrs = [
+        "cloud_topic_partition.h",
         "partition_proxy.h",
         "replicated_partition.h",
     ],
@@ -26,16 +28,23 @@ redpanda_cc_library(
         "//src/v/cluster",
         "@boost//:numeric_conversion",
     ],
-    include_prefix = "kafka/data",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
-        "//src/v/cloud_storage",
+        "//src/v/cloud_storage:types",
+        "//src/v/cloud_topics:data_plane_api",
+        "//src/v/cloud_topics:log_reader_config",
+        "//src/v/cloud_topics:state_accessors",
+        "//src/v/cloud_topics/frontend",
+        "//src/v/cloud_topics/frontend:errc",
+        "//src/v/cloud_topics/level_zero/frontend_reader",
+        "//src/v/kafka/data:log_reader_config",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server:errors",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/storage",
+        "//src/v/storage:record_batch_builder",
         "//src/v/utils:truncating_logger",
         "@boost//:outcome",
         "@seastar",
@@ -57,12 +66,29 @@ redpanda_cc_library(
         "//src/v/utils:truncating_logger",
         "@abseil-cpp//absl/algorithm:container",
     ],
-    include_prefix = "kafka/data",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/model",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "log_reader_config",
+    srcs = [
+        "log_reader_config.cc",
+    ],
+    hdrs = [
+        "log_reader_config.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/model",
+        "//src/v/utils:named_type",
+        "//src/v/utils:to_string",
         "@seastar",
     ],
 )

@@ -9,16 +9,15 @@
  */
 #pragma once
 
+#include "absl/hash/hash.h"
 #include "cluster/fwd.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/file_committer.h"
 #include "datalake/coordinator/snapshot_remover.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/fwd.h"
 #include "model/fundamental.h"
-
-#include <absl/hash/hash.h>
 
 namespace datalake::coordinator {
 
@@ -85,6 +84,11 @@ public:
     ss::future<checked<last_offsets, errc>> sync_get_last_added_offsets(
       model::topic_partition tp, model::revision_id topic_rev);
 
+    ss::future<checked<datalake_usage_stats, errc>> sync_get_usage_stats();
+
+    ss::future<checked<chunked_hash_map<model::topic, topic_state>, errc>>
+    sync_get_topic_state(chunked_vector<model::topic> topics);
+
     void notify_leadership(std::optional<model::node_id>);
 
     bool leader_loop_running() const { return term_as_.has_value(); }
@@ -141,6 +145,16 @@ private:
       record_schema_components,
       std::string_view method_name,
       const table_schema_provider&);
+
+    // Get the effective default partition spec.
+    // This is an AWS Glue compatibility kludge.
+    ss::sstring get_effective_default_partition_spec(
+      const std::optional<ss::sstring>& partition_spec) const;
+
+    // Return whether the underlying catalog is the Glue REST catalog.
+    // TODO: if the kludges start piling up, we should abstract some "catalog
+    // capabilities" out.
+    bool using_glue_catalog() const;
 
     ss::shared_ptr<coordinator_stm> stm_;
     cluster::topic_table& topic_table_;

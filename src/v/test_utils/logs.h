@@ -11,7 +11,9 @@
 
 #pragma once
 #include "base/seastarx.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/fundamental.h"
+#include "model/limits.h"
 #include "model/record_batch_reader.h"
 #include "storage/api.h"
 
@@ -26,7 +28,7 @@ namespace tests {
 static inline ss::future<> persist_log_file(
   ss::sstring base_dir,
   model::ntp file_ntp,
-  ss::circular_buffer<model::record_batch> batches) {
+  chunked_circular_buffer<model::record_batch> batches) {
     return ss::async([base_dir = std::move(base_dir),
                       file_ntp = std::move(file_ntp),
                       batches = std::move(batches)]() mutable {
@@ -51,10 +53,7 @@ static inline ss::future<> persist_log_file(
             },
             [base_dir]() {
                 return storage::log_config(
-                  base_dir,
-                  1_GiB,
-                  ss::default_priority_class(),
-                  storage::make_sanitized_file_config());
+                  base_dir, 1_GiB, storage::make_sanitized_file_config());
             },
             std::ref(feature_table))
           .get();
@@ -66,9 +65,7 @@ static inline ss::future<> persist_log_file(
               .then([b = std::move(batches)](
                       ss::shared_ptr<storage::log> log) mutable {
                   storage::log_append_config cfg{
-                    storage::log_append_config::fsync::yes,
-                    ss::default_priority_class(),
-                    model::no_timeout};
+                    storage::log_append_config::fsync::yes, model::no_timeout};
                   auto reader = model::make_memory_record_batch_reader(
                     std::move(b));
                   return std::move(reader)
@@ -129,10 +126,7 @@ read_log_file(ss::sstring base_dir, model::ntp file_ntp) {
             },
             [base_dir]() {
                 return storage::log_config(
-                  base_dir,
-                  1_GiB,
-                  ss::default_priority_class(),
-                  storage::make_sanitized_file_config());
+                  base_dir, 1_GiB, storage::make_sanitized_file_config());
             },
             std::ref(feature_table))
           .get();
@@ -143,10 +137,10 @@ read_log_file(ss::sstring base_dir, model::ntp file_ntp) {
               = mgr.manage(storage::ntp_config(file_ntp, mgr.config().base_dir))
                   .then([](ss::shared_ptr<storage::log> log) mutable {
                       return log
-                        ->make_reader(storage::log_reader_config(
-                          model::offset(0),
-                          model::model_limits<model::offset>::max(),
-                          ss::default_priority_class()))
+                        ->make_reader(
+                          storage::local_log_reader_config(
+                            model::offset(0),
+                            model::model_limits<model::offset>::max()))
                         .then([](model::record_batch_reader reader) {
                             return std::move(reader).consume(
                               to_vector_consumer(), model::no_timeout);

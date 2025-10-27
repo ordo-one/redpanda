@@ -11,7 +11,7 @@
 
 #include "base/vassert.h"
 #include "bytes/iobuf_parser.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "hashing/crc32c.h"
 #include "hashing/xx.h"
 #include "reflection/adl.h"
@@ -208,8 +208,10 @@ offset_time_index::offset_time_index(
 
 uint32_t offset_time_index::raw_value() const { return _val; }
 
-index_state index_state::make_empty_index(offset_delta_time with_offset) {
+index_state index_state::make_empty_index(
+  model::offset base_offset, offset_delta_time with_offset) {
     index_state idx{};
+    idx.base_offset = base_offset;
     idx.with_offset = with_offset;
 
     return idx;
@@ -239,8 +241,6 @@ bool index_state::maybe_index(
       base_offset,
       *this);
 
-    bool retval = false;
-
     // The first non-config batch in the segment, use its timestamp
     // to override the timestamps of any config batch that was indexed
     // by virtue of being the first in the segment.
@@ -255,8 +255,9 @@ bool index_state::maybe_index(
           time_col_reset,
           "Relative time index can not be reset, unexpected index size {} "
           "(expected 1). This can only happen if more than one non-data "
-          "timestamp was added to the index.",
-          index.size());
+          "timestamp was added to the index: {}.",
+          index.size(),
+          *this);
 
         base_timestamp = first_timestamp;
         max_timestamp = first_timestamp;
@@ -264,6 +265,8 @@ bool index_state::maybe_index(
     }
 
     // index_state
+    bool is_empty = false;
+    bool should_set_non_data_timestamp = false;
     if (empty()) {
         // Ordinarily, we do not allow configuration batches to contribute to
         // the segment's timestamp bounds (because config batches use walltime
@@ -271,11 +274,11 @@ bool index_state::maybe_index(
         // batch we set the timestamps, and then set a `non_data_timestamps`
         // flag so that the next time we see user data we will overwrite
         // the walltime timestamps with the user data timestamps.
-        non_data_timestamps = !user_data;
+        should_set_non_data_timestamp = !user_data;
 
         base_timestamp = first_timestamp;
         max_timestamp = first_timestamp;
-        retval = true;
+        is_empty = true;
     }
 
     // NOTE: we don't need the 'max()' trick below because we controll the
@@ -299,16 +302,34 @@ bool index_state::maybe_index(
           = num_compactible_records_appended.value_or(0) + compactible_records;
     }
     // always saving the first batch simplifies a lot of book keeping
-    if ((accumulator >= step && user_data) || retval) {
-        add_entry(
-          // We know that a segment cannot be > 4GB
-          batch_base_offset() - base_offset(),
-          offset_time_index{last_timestamp - base_timestamp, with_offset},
-          starting_position_in_file);
-
-        retval = true;
+    if ((accumulator >= step && user_data) || is_empty) {
+        auto offset_delta = batch_base_offset() - base_offset();
+        // on sparse compacted topic indexes, there could be a case where the
+        // offset range between valid keys is greater than can be represented
+        // with 4 bytes. i.e.: first valid key is at offset 0, next valid key is
+        // uint32::max + 1 instead of increasing the index memory footprint size
+        // to int64_t which meaningfully increases the size of the index memory
+        // pressure, we explicitly trade off 1 additional disk seek. This would
+        // be the case anyway because it is very likely that offset 0 and
+        // uint32_t::max+1 would be in the same page on disk ok to return that
+        // the prev (offset 0) would be the default start of the disk read
+        if (offset_delta <= std::numeric_limits<uint32_t>::max()) {
+            add_entry(
+              // We know that a segment cannot be > 4GB
+              batch_base_offset() - base_offset(),
+              offset_time_index{last_timestamp - base_timestamp, with_offset},
+              starting_position_in_file);
+            if (should_set_non_data_timestamp) {
+                non_data_timestamps = true;
+            }
+            return true;
+        } else {
+            // We can't index anything beyond uint32 space. Presumably no
+            // further entries will be added because of this same condition.
+            return false;
+        }
     }
-    return retval;
+    return false;
 }
 
 std::ostream& operator<<(std::ostream& o, const index_state& s) {
@@ -326,7 +347,9 @@ std::ostream& operator<<(std::ostream& o, const index_state& s) {
              << s.num_compactible_records_appended
              << ", clean_compact_timestamp:" << s.clean_compact_timestamp
              << ", may_have_tombstone_records:" << s.may_have_tombstone_records
-             << ", " << s.index << "}";
+             << ", self_compact_timestamp:" << s.self_compact_timestamp
+             << ", may_have_transaction_batches:"
+             << s.may_have_transaction_batches << ", " << s.index << "}";
 }
 
 void index_state::serde_write(iobuf& out) const {
@@ -348,6 +371,8 @@ void index_state::serde_write(iobuf& out) const {
     write(tmp, num_compactible_records_appended);
     write(tmp, clean_compact_timestamp);
     write(tmp, may_have_tombstone_records);
+    write(tmp, self_compact_timestamp);
+    write(tmp, may_have_transaction_batches);
 
     crc::crc32c crc;
     crc_extend_iobuf(crc, tmp);
@@ -460,6 +485,16 @@ void read_nested(
     } else {
         st.may_have_tombstone_records = true;
     }
+    if (hdr._version >= index_state::self_compact_timestamp_version) {
+        read_nested(p, st.self_compact_timestamp, 0U);
+    } else {
+        st.self_compact_timestamp = std::nullopt;
+    }
+    if (hdr._version >= index_state::may_have_transaction_batches_version) {
+        read_nested(p, st.may_have_transaction_batches, 0U);
+    } else {
+        st.may_have_transaction_batches = true;
+    }
 }
 
 index_state index_state::copy() const { return *this; }
@@ -525,7 +560,9 @@ index_state::index_state(const index_state& o) noexcept
   , broker_timestamp(o.broker_timestamp)
   , num_compactible_records_appended(o.num_compactible_records_appended)
   , clean_compact_timestamp(o.clean_compact_timestamp)
-  , may_have_tombstone_records(o.may_have_tombstone_records) {}
+  , may_have_tombstone_records(o.may_have_tombstone_records)
+  , self_compact_timestamp(o.self_compact_timestamp)
+  , may_have_transaction_batches(o.may_have_transaction_batches) {}
 
 namespace serde_compat {
 uint64_t index_state_serde::checksum(const index_state& r) {
@@ -674,7 +711,15 @@ std::optional<index_state::entry> index_state::find_nearest(model::offset o) {
     if (o < base_offset || empty()) {
         return std::nullopt;
     }
-    const uint32_t needle = o() - base_offset();
+    int64_t query_offset_delta = o() - base_offset();
+    int64_t seg_offset_delta = max_offset - base_offset;
+    static constexpr int64_t uint32_max = std::numeric_limits<uint32_t>::max();
+    if (query_offset_delta > uint32_max || seg_offset_delta > uint32_max) {
+        // TODO: this is a major hack! Older versions of Redpanda may index
+        // this segment incorrectly. Conservatively return the first entry.
+        return translate_index_entry(get_entry(0));
+    }
+    const auto needle = static_cast<uint32_t>(query_offset_delta);
 
     auto ix = index.offset_lower_bound(needle).value_or(index.size() - 1);
 
@@ -743,12 +788,21 @@ bool index_state::truncate(
     if (new_max_offset < base_offset) {
         return needs_persistence;
     }
-    const uint32_t i = new_max_offset() - base_offset();
-    auto res = index.offset_lower_bound(i);
-    size_t remove_back_elems = index.size() - res.value_or(index.size());
-    if (remove_back_elems > 0) {
-        needs_persistence = true;
-        pop_back(remove_back_elems);
+    static constexpr int64_t u32_max = std::numeric_limits<uint32_t>::max();
+    int64_t delta = new_max_offset() - base_offset();
+    // NOTE: we expect that deltas above u32_max would have not been
+    // added to the index, unless by an older buggy version of Redpanda.
+    // With this in mind, either there are no entries above u32_max, or
+    // offset_lower_bound() isn't going to work correctly anyway, so we just
+    // skip removal and rely on queries to detect the overflow.
+    if (delta <= u32_max) {
+        auto i = static_cast<uint32_t>(delta);
+        auto res = index.offset_lower_bound(i);
+        size_t remove_back_elems = index.size() - res.value_or(index.size());
+        if (remove_back_elems > 0) {
+            needs_persistence = true;
+            pop_back(remove_back_elems);
+        }
     }
     if (new_max_offset < max_offset) {
         needs_persistence = true;

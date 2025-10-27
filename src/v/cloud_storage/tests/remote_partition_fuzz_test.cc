@@ -1,3 +1,4 @@
+
 /*
  * Copyright 2023 Redpanda Data, Inc.
  *
@@ -9,18 +10,18 @@
  * by the Apache License, Version 2.0
  */
 
-#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/async_manifest_view.h"
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/tests/cloud_storage_fixture.h"
 #include "cloud_storage/tests/util.h"
+#include "cloud_storage/types.h"
 #include "model/record_batch_types.h"
+#include "random/generators.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/lowres_clock.hh>
 
 #include <fmt/chrono.h>
-
-#include <random>
 
 using namespace cloud_storage;
 
@@ -67,8 +68,8 @@ scan_remote_partition_incrementally_with_reuploads(
 
     std::vector<model::record_batch_header> headers;
 
-    storage::log_reader_config reader_config(
-      base, max, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), model::offset_cast(max));
 
     // starting max_bytes
     constexpr size_t max_bytes_limit = 4_KiB;
@@ -174,7 +175,7 @@ scan_remote_partition_incrementally_with_reuploads(
 
     int num_fetches = 0;
     while (next < max) {
-        reader_config.start_offset = next;
+        reader_config.start_offset = model::offset_cast(next);
         reader_config.max_bytes = random_generators::get_int(
           max_bytes_limit - 1);
         drop_reupload_flag();
@@ -207,7 +208,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [batch_types, num_data_batches] = generate_segment_layout(
@@ -235,7 +236,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [batch_types, num_data_batches] = generate_segment_layout(
@@ -265,7 +266,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [batch_types, num_data_batches] = generate_segment_layout(
@@ -308,7 +309,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [segment_layout, num_data_batches] = generate_segment_layout(
@@ -349,7 +350,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [segment_layout, num_data_batches] = generate_segment_layout(
@@ -392,7 +393,7 @@ FIXTURE_TEST(
     vlog(
       test_log.info,
       "Seed used for read workload: {}",
-      random_generators::internal::seed);
+      random_generators::global().initial_seed());
 
     constexpr int num_segments = 1000;
     const auto [batch_types, num_data_batches] = generate_segment_layout(
@@ -425,7 +426,7 @@ namespace {
 
 ss::future<> scan_until_close(
   ss::shared_ptr<remote_partition> partition,
-  storage::log_reader_config reader_config,
+  cloud_log_reader_config reader_config,
   ss::gate& g) {
     test_log.info("starting scan_until_close");
     auto _ = ss::defer([] { test_log.info("exiting scan_until_close"); });
@@ -475,8 +476,7 @@ FIXTURE_TEST(test_scan_while_shutting_down, cloud_storage_fixture) {
     ss::gate g;
     auto scan_future = scan_until_close(
       partition,
-      storage::log_reader_config(
-        base, model::offset::max(), ss::default_priority_class()),
+      cloud_log_reader_config(model::offset_cast(base), kafka::offset::max()),
       g);
     auto close_fut
       = ss::maybe_yield()
@@ -495,8 +495,9 @@ FIXTURE_TEST(test_scan_while_shutting_down, cloud_storage_fixture) {
               });
           });
     // NOTE: see issues/11271
-    BOOST_TEST_CONTEXT("scan_unit_close should terminate in a finite amount of "
-                       "time at shutdown") {
+    BOOST_TEST_CONTEXT(
+      "scan_unit_close should terminate in a finite amount of "
+      "time at shutdown") {
         test_log.info("waiting on close future with timeout");
         BOOST_CHECK_LE(close_fut.get(), 60s);
         test_log.info(

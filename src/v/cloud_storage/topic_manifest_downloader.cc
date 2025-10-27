@@ -9,6 +9,7 @@
 
 #include "cloud_storage/topic_manifest_downloader.h"
 
+#include "absl/container/btree_set.h"
 #include "base/outcome.h"
 #include "base/vlog.h"
 #include "cloud_storage/logger.h"
@@ -16,14 +17,12 @@
 #include "cloud_storage/topic_path_utils.h"
 #include "cloud_storage/types.h"
 #include "cloud_storage_clients/client.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "hashing/xx.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
-
-#include <absl/container/btree_set.h>
 
 namespace cloud_storage {
 
@@ -189,7 +188,7 @@ topic_manifest_downloader::download_manifest(
 
 namespace {
 using list_outcome_t
-  = std::vector<cloud_storage_clients::client::list_bucket_item>;
+  = chunked_vector<cloud_storage_clients::client::list_bucket_item>;
 ss::future<result<list_outcome_t, error_outcome>> find_prefixed_manifest_paths(
   remote& remote,
   cloud_storage_clients::bucket_name bucket,
@@ -215,7 +214,7 @@ ss::future<result<list_outcome_t, error_outcome>> find_prefixed_manifest_paths(
           prefixed_list_res.error());
         co_return error_outcome::manifest_download_error;
     }
-    co_return prefixed_list_res.value().contents;
+    co_return std::move(prefixed_list_res.value().contents);
 }
 } // namespace
 

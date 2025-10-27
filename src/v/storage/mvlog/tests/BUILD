@@ -8,6 +8,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/base",
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model/tests:random",
         "//src/v/random:generators",
         "//src/v/storage",
@@ -81,7 +82,7 @@ redpanda_cc_gtest(
         "file_test.cc",
     ],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/storage/mvlog",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random_bytes",
@@ -116,6 +117,7 @@ redpanda_cc_gtest(
         "segment_io_test.cc",
     ],
     deps = [
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model/tests:random",
         "//src/v/storage/mvlog",
         "//src/v/test_utils:gtest",

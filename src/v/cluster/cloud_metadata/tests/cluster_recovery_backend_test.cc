@@ -15,24 +15,24 @@
 #include "cluster/cloud_metadata/tests/cluster_metadata_utils.h"
 #include "cluster/cloud_metadata/tests/manual_mixin.h"
 #include "cluster/cloud_metadata/uploader.h"
-#include "cluster/cluster_recovery_reconciler.h"
+#include "cluster/cluster_recovery_manager.h"
 #include "cluster/config_frontend.h"
-#include "cluster/controller_snapshot.h"
 #include "cluster/feature_manager.h"
 #include "cluster/id_allocator_frontend.h"
 #include "cluster/partition.h"
+#include "cluster/partition_manager.h"
 #include "cluster/security_frontend.h"
-#include "cluster/tests/topic_properties_generator.h"
 #include "cluster/tests/tx_compaction_utils.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
-#include "partition_manager.h"
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
+#include "security/credential_store.h"
 #include "security/scram_credential.h"
+#include "security/tests/license_utils.h"
 #include "security/types.h"
 #include "ssx/future-util.h"
 #include "test_utils/async.h"
@@ -44,6 +44,7 @@
 #include <seastar/util/defer.hh>
 
 using namespace cluster::cloud_metadata;
+
 namespace {
 ss::logger logger("backend_test");
 static ss::abort_source never_abort;
@@ -110,10 +111,14 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
     auto with_leadership_changes = GetParam();
 
     // Create a license.
-    auto license = get_test_license();
+    auto opt_license = security::testing::get_test_license();
+    if (!opt_license) {
+        GTEST_SKIP() << security::testing::skip_no_license_msg;
+        return;
+    }
     auto err = app.controller->get_feature_manager()
                  .local()
-                 .update_license(std::move(license))
+                 .update_license(std::move(*opt_license))
                  .get();
     ASSERT_TRUE(!err);
 
@@ -179,6 +184,7 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
             continue;
         }
         auto& archiver = p->archiver().value().get();
+        archiver.initialize_probe();
         archiver.sync_for_tests().get();
         auto res = archiver
                      .upload_next_candidates(
@@ -226,10 +232,9 @@ TEST_P(ClusterRecoveryBackendLeadershipParamTest, TestRecoveryControllerState) {
     // Perform recovery.
     auto recover_err = app.controller->get_cluster_recovery_manager()
                          .local()
-                         .initialize_recovery(bucket)
+                         .initialize_recovery(bucket, std::nullopt)
                          .get();
     ASSERT_TRUE(recover_err.has_value());
-    ASSERT_EQ(recover_err.value(), cluster::errc::success);
 
     // If configured, start leadership transfers.
     ss::gate gate;
@@ -406,10 +411,9 @@ TEST_F(ClusterRecoveryBackendTest, TestRecoverMissingTopicManifest) {
         // Attempt a recovery.
         auto recover_err = app.controller->get_cluster_recovery_manager()
                              .local()
-                             .initialize_recovery(bucket)
+                             .initialize_recovery(bucket, std::nullopt)
                              .get();
         ASSERT_TRUE(recover_err.has_value());
-        ASSERT_EQ(recover_err.value(), cluster::errc::success);
         RPTEST_REQUIRE_EVENTUALLY(10s, [&] {
             return !app.controller->get_cluster_recovery_table()
                       .local()
@@ -505,10 +509,9 @@ TEST_F(ClusterRecoveryBackendTest, TestRecoverFailedDownload) {
     // Attempt a recovery.
     auto recover_err = app.controller->get_cluster_recovery_manager()
                          .local()
-                         .initialize_recovery(bucket)
+                         .initialize_recovery(bucket, std::nullopt)
                          .get();
-    BOOST_REQUIRE(recover_err.has_value());
-    BOOST_REQUIRE_EQUAL(recover_err.value(), cluster::errc::success);
+    ASSERT_TRUE(recover_err.has_value());
     RPTEST_REQUIRE_EVENTUALLY(10s, [&] {
         return !app.controller->get_cluster_recovery_table()
                   .local()

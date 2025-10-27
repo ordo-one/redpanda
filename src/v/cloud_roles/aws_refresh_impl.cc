@@ -12,6 +12,7 @@
 
 #include "cloud_roles/logger.h"
 #include "request_response_helpers.h"
+#include "strings/utf8.h"
 
 namespace cloud_roles {
 
@@ -28,8 +29,9 @@ ss::sstring read_string_from_response(cloud_roles::api_response response) {
     vassert(
       std::holds_alternative<iobuf>(response),
       "response does not contain iobuf");
-    iobuf_const_parser parser(std::get<iobuf>(response));
-    return parser.read_string(parser.bytes_left());
+    auto str = std::get<iobuf>(response).linearize_to_string();
+    validate_utf8(str);
+    return str;
 }
 
 void add_metadata_token_to_request(
@@ -57,11 +59,13 @@ struct ec2_response_schema {
 
 aws_refresh_impl::aws_refresh_impl(
   net::unresolved_address address,
+  aws_service_name service,
   aws_region_name region,
   ss::abort_source& as,
   retry_params retry_params)
   : refresh_credentials::impl(
-      std::move(address), std::move(region), as, retry_params) {}
+      std::move(address), std::move(region), as, retry_params)
+  , _service(std::move(service)) {}
 
 bool aws_refresh_impl::is_fallback_required(const api_request_error& response) {
     return std::find(
@@ -173,9 +177,10 @@ api_response_parse_result aws_refresh_impl::parse_response(iobuf resp) {
       = private_key_str{doc[ec2_response_schema::secret_access_key.data()]
                           .GetString()},
       .session_token
-      = s3_session_token{doc[ec2_response_schema::session_token.data()]
-                           .GetString()},
+      = session_token{doc[ec2_response_schema::session_token.data()]
+                        .GetString()},
       .region = region(),
+      .service = _service,
     };
 }
 

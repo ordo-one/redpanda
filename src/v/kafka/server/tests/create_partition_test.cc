@@ -7,19 +7,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/flat_hash_map.h"
 #include "config/configuration.h"
 #include "features/enterprise_feature_messages.h"
 #include "kafka/protocol/errors.h"
+#include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/tests/topic_properties_helpers.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/loop.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/defer.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/test/tools/context.hpp>
 
 using namespace std::chrono_literals; // NOLINT

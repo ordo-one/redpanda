@@ -12,12 +12,14 @@
 #include "kafka/client/configuration.h"
 #include "kafka/client/test/fixture.h"
 #include "kafka/client/test/utils.h"
+#include "kafka/client/utils.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/metadata.h"
 #include "kafka/protocol/produce.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "pandaproxy/test/utils.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/util/defer.hh>
@@ -34,8 +36,8 @@ FIXTURE_TEST(reconnect, kafka_client_fixture) {
 
     auto tp = model::topic_partition(model::topic("t"), model::partition_id(0));
     auto client = make_connected_client();
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(0));
+    client.set_retry_base_backoff(10ms);
+    client.set_max_retries(size_t(0));
 
     {
         info("Checking no topics");
@@ -53,7 +55,11 @@ FIXTURE_TEST(reconnect, kafka_client_fixture) {
         info("Checking for known topic");
         auto res = client.dispatch(make_list_topics_req()).get();
         BOOST_REQUIRE_EQUAL(res.data.topics.size(), 1);
-        BOOST_REQUIRE_EQUAL(res.data.topics[0].name(), "t");
+        static_assert(
+          kc::api_version_for(kafka::metadata_request::api_type::key)
+            < kafka::api_version(12),
+          "topic::name is nullable in v12+");
+        BOOST_REQUIRE_EQUAL((*res.data.topics[0].name)(), "t");
     }
 
     {
@@ -62,17 +68,15 @@ FIXTURE_TEST(reconnect, kafka_client_fixture) {
     }
 
     {
-        info("Checking for known topic - expect controller not ready");
-        auto res = client.dispatch(make_list_topics_req());
-        BOOST_REQUIRE_THROW(res.get(), kc::broker_error);
-    }
-
-    {
-        client.config().retries.set_value(size_t(5));
+        client.set_max_retries(size_t(5));
         info("Checking for known topic - controller ready");
         auto res = client.dispatch(make_list_topics_req()).get();
         BOOST_REQUIRE_EQUAL(res.data.topics.size(), 1);
-        BOOST_REQUIRE_EQUAL(res.data.topics[0].name(), "t");
+        static_assert(
+          kc::api_version_for(kafka::metadata_request::api_type::key)
+            < kafka::api_version(12),
+          "topic::name is nullable in v12+");
+        BOOST_REQUIRE_EQUAL((*res.data.topics[0].name)(), "t");
     }
 
     info("Stopping client");
@@ -116,10 +120,13 @@ FIXTURE_TEST(password_change_live_client, kafka_client_fixture) {
 
     auto tp = model::topic_partition(model::topic("t"), model::partition_id(0));
     auto kafka_client = make_client();
-    kafka_client.config().sasl_mechanism.set_value(
-      ss::sstring{"SCRAM-SHA-256"});
-    kafka_client.config().scram_username.set_value(username);
-    kafka_client.config().scram_password.set_value(userpass);
+    kafka_client.set_credentials(
+      kc::sasl_configuration{
+        .mechanism = "SCRAM-SHA-256",
+        .username = username,
+        .password = userpass,
+      });
+
     kafka_client.connect().get();
 
     {
@@ -132,21 +139,34 @@ FIXTURE_TEST(password_change_live_client, kafka_client_fixture) {
         info("Checking for known topic");
         auto res = kafka_client.dispatch(make_list_topics_req()).get();
         BOOST_REQUIRE_EQUAL(res.data.topics.size(), 1);
-        BOOST_REQUIRE_EQUAL(res.data.topics[0].name(), "t");
+        static_assert(
+          kc::api_version_for(kafka::metadata_request::api_type::key)
+            < kafka::api_version(12),
+          "topic::name is nullable in v12+");
+        BOOST_REQUIRE_EQUAL((*res.data.topics[0].name)(), "t");
     }
 
     {
         // Setting the password has no effect until the client disconnects
         info("Changing password");
         userpass = "foobar";
-        kafka_client.config().scram_password.set_value(userpass);
+        kafka_client.set_credentials(
+          kc::sasl_configuration{
+            .mechanism = "SCRAM-SHA-256",
+            .username = username,
+            .password = userpass,
+          });
     }
 
     {
         info("Recheck for known topic");
         auto res = kafka_client.dispatch(make_list_topics_req()).get();
         BOOST_REQUIRE_EQUAL(res.data.topics.size(), 1);
-        BOOST_REQUIRE_EQUAL(res.data.topics[0].name(), "t");
+        static_assert(
+          kc::api_version_for(kafka::metadata_request::api_type::key)
+            < kafka::api_version(12),
+          "topic::name is nullable in v12+");
+        BOOST_REQUIRE_EQUAL((*res.data.topics[0].name)(), "t");
     }
 
     info("Stopping kafka client");

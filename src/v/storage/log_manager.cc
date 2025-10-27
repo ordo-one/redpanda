@@ -9,13 +9,14 @@
 
 #include "storage/log_manager.h"
 
+#include "absl/container/btree_map.h"
 #include "base/likely.h"
 #include "base/vlog.h"
+#include "compaction/key_offset_map.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
-#include "resource_mgmt/io_priority.h"
 #include "resource_mgmt/memory_groups.h"
 #include "ssx/async-clear.h"
 #include "ssx/future-util.h"
@@ -25,7 +26,6 @@
 #include "storage/disk_log_impl.h"
 #include "storage/file_sanitizer.h"
 #include "storage/fs_utils.h"
-#include "storage/key_offset_map.h"
 #include "storage/kvstore.h"
 #include "storage/log.h"
 #include "storage/log_manager_probe.h"
@@ -61,7 +61,6 @@
 #include <seastar/util/file.hh>
 #include <seastar/util/later.hh>
 
-#include <absl/container/btree_map.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <fmt/format.h>
 
@@ -79,14 +78,14 @@ using logs_type = absl::flat_hash_map<model::ntp, log_housekeeping_meta>;
 log_config::log_config(
   ss::sstring directory,
   size_t segment_size,
-  ss::io_priority_class compaction_priority,
+
   std::optional<file_sanitize_config> file_cfg) noexcept
   : base_dir(std::move(directory))
   , max_segment_size(config::mock_binding<size_t>(std::move(segment_size)))
   , segment_size_jitter(0) // For deterministic behavior in unit tests.
   , compacted_segment_size(config::mock_binding<size_t>(256_MiB))
   , max_compacted_segment_size(config::mock_binding<size_t>(5_GiB))
-  , compaction_priority(compaction_priority)
+
   , retention_bytes(config::mock_binding<std::optional<size_t>>(std::nullopt))
   , compaction_interval(
       config::mock_binding<std::chrono::milliseconds>(std::chrono::minutes(10)))
@@ -98,14 +97,10 @@ log_config::log_config(
 log_config::log_config(
   ss::sstring directory,
   size_t segment_size,
-  ss::io_priority_class compaction_priority,
+
   with_cache with,
   std::optional<file_sanitize_config> file_cfg) noexcept
-  : log_config(
-      std::move(directory),
-      segment_size,
-      compaction_priority,
-      std::move(file_cfg)) {
+  : log_config(std::move(directory), segment_size, std::move(file_cfg)) {
     cache = with;
 }
 
@@ -115,7 +110,7 @@ log_config::log_config(
   config::binding<size_t> compacted_segment_size,
   config::binding<size_t> max_compacted_segment_size,
   jitter_percents segment_size_jitter,
-  ss::io_priority_class compaction_priority,
+
   config::binding<std::optional<size_t>> ret_bytes,
   config::binding<std::chrono::milliseconds> compaction_ival,
   config::binding<std::optional<std::chrono::milliseconds>> log_ret,
@@ -129,7 +124,7 @@ log_config::log_config(
   , segment_size_jitter(segment_size_jitter)
   , compacted_segment_size(std::move(compacted_segment_size))
   , max_compacted_segment_size(std::move(max_compacted_segment_size))
-  , compaction_priority(compaction_priority)
+
   , retention_bytes(std::move(ret_bytes))
   , compaction_interval(std::move(compaction_ival))
   , log_retention(std::move(log_ret))
@@ -173,17 +168,19 @@ ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
         co_await _kvstore.put(
           kvstore::key_space::storage,
           internal::clean_segment_key(log->config().ntp()),
-          serde::to_iobuf(internal::clean_segment_value{
-            .segment_name = std::filesystem::path(clean_segment.value())
-                              .filename()
-                              .string()}));
+          serde::to_iobuf(
+            internal::clean_segment_value{
+              .segment_name = std::filesystem::path(clean_segment.value())
+                                .filename()
+                                .string()}));
     }
 }
 
 ss::future<> log_manager::start() {
     _probe->setup_metrics();
-    if (unlikely(config::shard_local_cfg()
-                   .log_disable_housekeeping_for_tests.value())) {
+    if (unlikely(
+          config::shard_local_cfg()
+            .log_disable_housekeeping_for_tests.value())) {
         co_return;
     }
 
@@ -293,7 +290,8 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
       && is_not_set(_logs_list.front().flags, bflags::compacted)) {
         auto compaction_mem_bytes
           = memory_groups().compaction_reserved_memory();
-        auto compaction_map = std::make_unique<hash_key_offset_map>();
+        auto compaction_map
+          = std::make_unique<compaction::hash_key_offset_map>();
         co_await compaction_map->initialize(compaction_mem_bytes);
         _compaction_hash_key_map = std::move(compaction_map);
     }
@@ -310,15 +308,19 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
         compaction_heuristic_to_log_metas;
     for (auto& log_meta : _logs_list) {
         auto should_compact_log = [](ss::shared_ptr<log> l) {
-            // Consider the dirty ratio.
-            const auto min_cleanable_dirty_ratio
-              = l->config().min_cleanable_dirty_ratio().value_or(0.0);
-            const auto dirty_ratio = l->dirty_ratio();
-            if (dirty_ratio >= min_cleanable_dirty_ratio) {
-                return true;
+            auto needs_compact = l->needs_compaction();
+            if (!needs_compact) {
+                vlog(
+                  gclog.trace,
+                  "{}: dirty ratio ({}) < min.cleanable.dirty.ratio ({}) and "
+                  "time since earliest dirty timestamp does not exceed "
+                  "max.compaction.lag.ms ({}), skipping compaction.",
+                  l->config().ntp(),
+                  l->dirty_ratio(),
+                  l->config().min_cleanable_dirty_ratio(),
+                  l->config().max_compaction_lag_ms());
             }
-
-            return false;
+            return needs_compact;
         };
 
         const auto compact_log = should_compact_log(log_meta.handle);
@@ -397,7 +399,8 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
 
         // Until we better implement bailing out of compaction, the best thing
         // we can do for observability is add a watchdog here.
-        ssx::watchdog wd5m(5min, [ntp = current_log.handle->config().ntp()] {
+        auto ntp = current_log.handle->config().ntp();
+        ssx::watchdog wd5m(5min, [ntp] {
             vlog(
               gclog.warn, "{}: Housekeeping process exceeding 5 minutes", ntp);
         });
@@ -405,12 +408,50 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
         // NOTE: housekeeping holds _compaction_housekeeping_gate, that prevents
         // the removal of the parent object. this makes awaiting housekeeping
         // safe against removal of segments from _logs_list
+        auto& log = current_log.handle;
+        auto pinned_kafka_offset
+          = current_log.handle->stm_manager()->lowest_pinned_data_offset();
+        std::optional<model::offset> max_unpinned_offset;
+        if (pinned_kafka_offset) {
+            auto local_log_start = log->offsets().start_offset;
+            auto kafka_local_start = model::offset_cast(
+              log->from_log_offset(local_log_start));
+            if (*pinned_kafka_offset >= kafka_local_start) {
+                // Translate the pinned Kafka offset.
+                max_unpinned_offset = model::prev_offset(
+                  log->to_log_offset(kafka::offset_cast(*pinned_kafka_offset)));
+            } else {
+                // The pin falls below the log start, in which case the entire
+                // local log is pinned.
+                max_unpinned_offset = model::prev_offset(
+                  log->offsets().start_offset);
+            }
+        }
+        model::offset max_compactible_offset
+          = current_log.handle->stm_manager()->max_removable_local_log_offset();
+        model::offset max_tombstone_remove_offset
+          = current_log.handle->stm_manager()->max_tombstone_remove_offset();
+        if (
+          max_unpinned_offset
+          && *max_unpinned_offset < max_compactible_offset) {
+            vlog(
+              gclog.debug,
+              "{}: Compaction is pinned by offset: pinned Kafka offset: {}, "
+              "log offsets max unpinned {} < max removable {}",
+              ntp,
+              *pinned_kafka_offset,
+              *max_unpinned_offset,
+              max_compactible_offset);
+            max_compactible_offset = *max_unpinned_offset;
+        }
         co_await current_log.handle->housekeeping(housekeeping_config(
           collection_threshold,
           _config.retention_bytes(),
-          current_log.handle->stm_manager()->max_collectible_offset(),
+          max_compactible_offset,
+          max_tombstone_remove_offset,
           current_log.handle->config().tombstone_retention_ms(),
-          _config.compaction_priority,
+          current_log.handle->config().tx_retention_ms(),
+          current_log.handle->config().min_compaction_lag_ms(),
           _abort_source,
           std::move(ntp_sanitizer_cfg),
           _compaction_hash_key_map.get()));
@@ -630,7 +671,6 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
   const ntp_config& ntp,
   model::offset base_offset,
   model::term_id term,
-  ss::io_priority_class pc,
   size_t read_buf_size,
   unsigned read_ahead,
   size_t segment_size_hint,
@@ -643,7 +683,6 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
       ntp,
       base_offset,
       term,
-      pc,
       version,
       read_buf_size,
       read_ahead,
@@ -684,23 +723,13 @@ ss::future<ss::shared_ptr<log>> log_manager::manage(
 }
 
 ss::future<> log_manager::maybe_clear_kvstore(const ntp_config& cfg) {
-    return ss::file_exists(cfg.work_directory())
-      .then([this,
-             offset_key = internal::start_offset_key(cfg.ntp()),
-             segment_key = internal::clean_segment_key(cfg.ntp())](
-              bool dir_exists) {
-          if (dir_exists) {
-              return ss::now();
-          }
-          // directory was deleted, make sure we do not have any state in KV
-          // store.
-          // NOTE: this only removes state in the storage key space.
-          return _kvstore.remove(kvstore::key_space::storage, offset_key)
-            .then([this, segment_key] {
-                return _kvstore.remove(
-                  kvstore::key_space::storage, segment_key);
-            });
-      });
+    if (co_await ss::file_exists(cfg.work_directory())) {
+        co_return;
+    }
+    // directory was deleted, make sure we do not have any state in KV
+    // store.
+    // NOTE: this only removes state in the storage key space.
+    co_await disk_log_impl::remove_kvstore_state(cfg.ntp(), _kvstore);
 }
 
 ss::future<ss::shared_ptr<log>> log_manager::do_manage(
@@ -731,7 +760,7 @@ ss::future<ss::shared_ptr<log>> log_manager::do_manage(
 
     auto segments = co_await recover_segments(
       partition_path(cfg),
-      cfg.is_compacted(),
+      cfg.is_locally_compacted(),
       [this, cache_enabled] { return create_cache(cache_enabled); },
       _abort_source,
       config::shard_local_cfg().storage_read_buffer_size(),
@@ -805,16 +834,19 @@ ss::future<> log_manager::remove(model::ntp ntp) {
           //
           // TODO: we should more consistently clean up the staging operations
           // to clean up after themselves on failure.
-          if (boost::algorithm::ends_with(de.name, ".staging")) {
+          static constexpr auto suffixes_to_remove = std::to_array(
+            {".staging", ".cannotrecover", ".ignore_have_newer"});
+          const auto should_remove = std::ranges::any_of(
+            suffixes_to_remove,
+            [&](const auto& v) { return de.name.ends_with(v); });
+
+          if (should_remove) {
               // It isn't necessarily problematic to get here since we can
               // proceed with removal, but it points to a missing cleanup which
               // can be problematic for users, as it needlessly consumes space.
               // Log verbosely to make it easier to catch.
               auto file_path = fmt::format("{}/{}", ntp_dir, de.name);
-              vlog(
-                stlog.error,
-                "Leftover staging file found, removing: {}",
-                file_path);
+              vlog(stlog.warn, "Leftover file found, removing: {}", file_path);
               return ss::remove_file(file_path);
           }
           return ss::make_ready_future<>();
@@ -1006,20 +1038,34 @@ ss::future<usage_report> log_manager::disk_usage() {
      */
     auto cfg = default_gc_config();
 
-    fragmented_vector<ss::shared_ptr<log>> logs;
+    chunked_vector<ss::shared_ptr<log>> logs;
     for (auto& it : _logs) {
         logs.push_back(it.second->handle);
     }
 
-    ss::semaphore limit(std::max<size_t>(
-      1, config::shard_local_cfg().space_management_max_log_concurrency()));
+    ss::semaphore limit(
+      std::max<size_t>(
+        1, config::shard_local_cfg().space_management_max_log_concurrency()));
 
     co_return co_await ss::map_reduce(
       logs.begin(),
       logs.end(),
       [&limit, cfg](ss::shared_ptr<log> log) {
           return ss::with_semaphore(
-            limit, 1, [cfg, log] { return log->disk_usage(cfg); });
+                   limit, 1, [cfg, log] { return log->disk_usage(cfg); })
+            .then_wrapped([log](ss::future<usage_report> f) {
+                if (f.failed()) {
+                    auto e = f.get_exception();
+                    vlog(
+                      gclog.warn,
+                      "Unable to collect disk usage from ntp {}: {}",
+                      log->config().ntp(),
+                      e);
+                    return ss::make_ready_future<usage_report>();
+                } else {
+                    return f;
+                }
+            });
       },
       usage_report{},
       [](usage_report acc, usage_report update) { return acc + update; });

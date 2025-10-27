@@ -8,6 +8,8 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "absl/container/flat_hash_set.h"
+#include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "cloud_storage/anomalies_detector.h"
 #include "cloud_storage/base_manifest.h"
@@ -21,12 +23,11 @@
 #include "config/node_config.h"
 #include "hashing/xx.h"
 #include "http/tests/http_imposter.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 
 #include <seastar/util/short_streams.hh>
 
-#include <absl/container/flat_hash_set.h>
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
 
@@ -223,11 +224,6 @@ ss::input_stream<char> make_manifest_stream(std::string_view json) {
     return make_iobuf_input_stream(std::move(i));
 }
 
-ss::sstring iobuf_to_string(iobuf buf) {
-    auto input_stream = make_iobuf_input_stream(std::move(buf));
-    return ss::util::read_entire_stream_contiguous(input_stream).get();
-}
-
 } // namespace
 
 class bucket_view_fixture : public http_imposter_fixture {
@@ -251,7 +247,9 @@ public:
             ss::sharded_parameter(
               [this] { return get_client_configuration(); }),
             ss::sharded_parameter(
-              [] { return model::cloud_credentials_source::config_file; }))
+              [] { return model::cloud_credentials_source::config_file; }),
+            ss::sharded_parameter(
+              [] { return ss::default_scheduling_group(); }))
           .get();
         _io.invoke_on_all([](cloud_io::remote& io) { return io.start(); })
           .get();
@@ -391,7 +389,7 @@ public:
           0);
     }
 
-    fragmented_vector<uint64_t> path_hashes(
+    chunked_vector<uint64_t> path_hashes(
       const absl::flat_hash_set<cloud_storage::segment_meta>& skip_metas) {
         std::vector<ss::sstring> paths;
         std::ranges::copy(
@@ -424,7 +422,10 @@ private:
           .request(full_path)
           .with_method(ss::httpd::operation_type::GET)
           .then_reply_with(
-            not_found_response, ss::http::reply::status_type::not_found);
+            not_found_response,
+            std::vector<std::pair<ss::sstring, ss::sstring>>{
+              {"Content-Type", "application/xml"}},
+            ss::http::reply::status_type::not_found);
     }
 
     void parse_manifests(
@@ -477,7 +478,7 @@ private:
     void set_expectations_for_manifest(
       const cloud_storage::partition_manifest& manifest) {
         const auto path = manifest.get_manifest_path(path_provider)().string();
-        const auto reply_body = iobuf_to_string(manifest.to_iobuf());
+        const auto reply_body = manifest.to_iobuf().linearize_to_string();
 
         when()
           .request(fmt::format("/{}", path))
@@ -524,8 +525,8 @@ private:
         return paths;
     }
 
-    fragmented_vector<uint64_t> path_hashes(std::vector<ss::sstring> paths) {
-        fragmented_vector<uint64_t> hashes;
+    chunked_vector<uint64_t> path_hashes(std::vector<ss::sstring> paths) {
+        chunked_vector<uint64_t> hashes;
         for (auto& path : paths) {
             hashes.push_back(xxhash_64(path.data(), path.size()));
         }
@@ -540,6 +541,7 @@ private:
         conf.access_key = cloud_roles::public_key_str("access-key");
         conf.secret_key = cloud_roles::private_key_str("secret-key");
         conf.region = cloud_roles::aws_region_name("us-east-1");
+        conf.service = cloud_roles::aws_service_name("s3");
         conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
         conf.server_addr = server_addr;
         conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
@@ -853,22 +855,25 @@ FIXTURE_TEST(test_metadata_anomalies, bucket_view_fixture) {
 
     cloud_storage::anomalies expected;
     // Bad deltas in STM manifest
-    expected.segment_metadata_anomalies.insert(cloud_storage::anomaly_meta{
-      .type = cloud_storage::anomaly_type::non_monotonical_delta,
-      .at = *get_stm_manifest().last_segment(),
-      .previous = *get_stm_manifest().begin()});
+    expected.segment_metadata_anomalies.insert(
+      cloud_storage::anomaly_meta{
+        .type = cloud_storage::anomaly_type::non_monotonical_delta,
+        .at = *get_stm_manifest().last_segment(),
+        .previous = *get_stm_manifest().begin()});
 
     // Overlap between spillover and STM manifest
-    expected.segment_metadata_anomalies.insert(cloud_storage::anomaly_meta{
-      .type = cloud_storage::anomaly_type::offset_overlap,
-      .at = *get_stm_manifest().begin(),
-      .previous = get_spillover_manifests().at(1).last_segment()});
+    expected.segment_metadata_anomalies.insert(
+      cloud_storage::anomaly_meta{
+        .type = cloud_storage::anomaly_type::offset_overlap,
+        .at = *get_stm_manifest().begin(),
+        .previous = get_spillover_manifests().at(1).last_segment()});
 
     // Gap between spillover manifests
-    expected.segment_metadata_anomalies.insert(cloud_storage::anomaly_meta{
-      .type = cloud_storage::anomaly_type::offset_gap,
-      .at = *get_spillover_manifests().at(1).begin(),
-      .previous = get_spillover_manifests().at(0).last_segment()});
+    expected.segment_metadata_anomalies.insert(
+      cloud_storage::anomaly_meta{
+        .type = cloud_storage::anomaly_type::offset_gap,
+        .at = *get_spillover_manifests().at(1).begin(),
+        .previous = get_spillover_manifests().at(0).last_segment()});
 
     BOOST_REQUIRE(result.detected == expected);
 
@@ -1198,9 +1203,10 @@ BOOST_AUTO_TEST_CASE(test_anomalies_size_limit) {
     {
         anomalies tmp;
         for (int i = 0; i < 80; i++) {
-            tmp.missing_segments.insert(segment_meta{
-              .base_offset = model::offset{i},
-            });
+            tmp.missing_segments.insert(
+              segment_meta{
+                .base_offset = model::offset{i},
+              });
         }
         result += std::move(tmp);
     }
@@ -1210,9 +1216,10 @@ BOOST_AUTO_TEST_CASE(test_anomalies_size_limit) {
     {
         anomalies tmp;
         for (int i = 100; i < 180; i++) {
-            tmp.missing_segments.insert(segment_meta{
-              .base_offset = model::offset{i},
-            });
+            tmp.missing_segments.insert(
+              segment_meta{
+                .base_offset = model::offset{i},
+              });
         }
         result += std::move(tmp);
     }
@@ -1222,9 +1229,10 @@ BOOST_AUTO_TEST_CASE(test_anomalies_size_limit) {
     {
         anomalies tmp;
         for (int i = 200; i < 400; i++) {
-            tmp.missing_segments.insert(segment_meta{
-              .base_offset = model::offset{i},
-            });
+            tmp.missing_segments.insert(
+              segment_meta{
+                .base_offset = model::offset{i},
+              });
         }
         result += std::move(tmp);
     }
@@ -1239,18 +1247,20 @@ BOOST_AUTO_TEST_CASE(test_anomalies_size_limit2) {
     anomalies result;
     {
         for (int i = 0; i < 200; i++) {
-            result.missing_segments.insert(segment_meta{
-              .base_offset = model::offset{i},
-            });
+            result.missing_segments.insert(
+              segment_meta{
+                .base_offset = model::offset{i},
+              });
         }
     }
 
     {
         anomalies tmp;
         for (int i = 200; i < 280; i++) {
-            tmp.missing_segments.insert(segment_meta{
-              .base_offset = model::offset{i},
-            });
+            tmp.missing_segments.insert(
+              segment_meta{
+                .base_offset = model::offset{i},
+              });
         }
         result += std::move(tmp);
     }

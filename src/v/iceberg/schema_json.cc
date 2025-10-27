@@ -10,13 +10,12 @@
 
 #include "iceberg/schema_json.h"
 
+#include "absl/container/btree_set.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/datatypes_json.h"
 #include "iceberg/json_utils.h"
 #include "iceberg/schema.h"
 #include "json/document.h"
-
-#include <absl/container/btree_set.h>
 
 namespace iceberg {
 
@@ -36,9 +35,10 @@ schema parse_schema(const json::Value& v) {
         }
         for (const auto& id_json : identifier_fids_json->get().GetArray()) {
             if (!id_json.IsInt()) {
-                throw std::invalid_argument(fmt::format(
-                  "Schema has non-int 'identifier-field-ids' type: {}",
-                  id_json.GetType()));
+                throw std::invalid_argument(
+                  fmt::format(
+                    "Schema has non-int 'identifier-field-ids' type: {}",
+                    id_json.GetType()));
             }
             identifier_fids.emplace(id_json.GetInt());
         }

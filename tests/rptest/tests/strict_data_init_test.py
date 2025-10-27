@@ -1,10 +1,10 @@
 import re
 
-from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.redpanda import RedpandaService, RESTART_LOG_ALLOW_LIST
 from rptest.clients.rpk import RpkTool
 from rptest.services.cluster import cluster
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, RedpandaService
 from rptest.services.utils import BadLogLines
+from rptest.tests.redpanda_test import RedpandaTest
 
 STRICT_DATA_ERR_MSG_SUFFIX = "not found, is the expected filesystem mounted?"
 
@@ -33,10 +33,12 @@ class StrictDataInitTest(RedpandaTest):
         try:
             self.redpanda.raise_on_bad_logs()
         except BadLogLines as b:
-            bad_lines = b.node_to_lines[target_node]
+            bad_lines = b.node_to_lines[target_node]["lines"]
             assert any(STRICT_DATA_ERR_MSG_SUFFIX in b for b in bad_lines)
         else:
-            assert False, "The reason why redpanda failed to start isn't due to a nonexistent magic file"
+            assert False, (
+                "The reason why redpanda failed to start isn't due to a nonexistent magic file"
+            )
 
         # Write the empty `.redpanda_data_dir` file then start
         # the node once more. It should start this time.

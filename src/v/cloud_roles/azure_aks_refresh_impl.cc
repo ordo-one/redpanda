@@ -13,7 +13,6 @@
 #include "http/utils.h"
 #include "json/schema.h"
 #include "request_response_helpers.h"
-#include "thirdparty/ada/ada.h"
 #include "utils/file_io.h"
 
 #include <seastar/coroutine/as_future.hh>
@@ -22,17 +21,20 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <rapidjson/error/en.h>
 
+#include <ada.h>
+
 namespace {
 
 // utility to wrap std::getenv for required environment variables
 ss::sstring load_from_env(const char* env_var) {
     auto env_value = std::getenv(env_var);
     if (!env_value) {
-        throw std::runtime_error(fmt::format(
-          "environment variable {} is not set, the Azure AKS client cannot "
-          "function "
-          "without this.",
-          env_var));
+        throw std::runtime_error(
+          fmt::format(
+            "environment variable {} is not set, the Azure AKS client cannot "
+            "function "
+            "without this.",
+            env_var));
     }
     return env_value;
 }
@@ -49,6 +51,7 @@ namespace cloud_roles {
 
 azure_aks_refresh_impl::azure_aks_refresh_impl(
   net::unresolved_address address,
+  aws_service_name, // Ignored for Azure AKS
   aws_region_name region,
   ss::abort_source& as,
   retry_params retry_params)

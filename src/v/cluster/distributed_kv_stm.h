@@ -171,7 +171,9 @@ public:
     }
 
     // TODO: implement delete retention with incremental raft snapshots.
-    ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
+    ss::future<iobuf> take_raft_snapshot(model::offset) final {
+        co_return iobuf{};
+    }
 
     /**
      * Discover the partition that is responsible for holding this key.
@@ -351,6 +353,11 @@ public:
         co_return _num_partitions.value();
     }
 
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
+
 private:
     static constexpr model::partition_id routing_partition{0};
     static constexpr std::chrono::seconds sync_timeout{5};
@@ -401,9 +408,9 @@ private:
 
     ss::future<errc> replicate_and_wait(simple_batch_builder builder) {
         auto r = co_await _raft->replicate(
-          _insync_term,
           std::move(builder).build(),
-          raft::replicate_options(raft::consistency_level::quorum_ack));
+          raft::replicate_options(
+            raft::consistency_level::quorum_ack, _insync_term));
 
         if (!r) {
             co_return errc::replication_error;

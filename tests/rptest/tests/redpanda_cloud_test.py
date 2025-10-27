@@ -7,8 +7,9 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from ducktape.utils.util import wait_until
 from ducktape.tests.test import TestContext
+from ducktape.utils.util import wait_until
+
 from rptest.clients.default import DefaultClient
 from rptest.services.redpanda import make_redpanda_cloud_service
 from rptest.tests.redpanda_test import RedpandaTestBase
@@ -18,8 +19,8 @@ class RedpandaCloudTest(RedpandaTestBase):
     """
     Base class for tests which run only against the Redpanda Cloud.
     """
-    def __init__(self, test_context: TestContext):
 
+    def __init__(self, test_context: TestContext):
         super().__init__(test_context=test_context)
 
         self.redpanda = make_redpanda_cloud_service(test_context)
@@ -30,10 +31,12 @@ class RedpandaCloudTest(RedpandaTestBase):
 
     def setup(self):
         super().setup()
-        wait_until(lambda: self.redpanda.cluster_healthy(),
-                   timeout_sec=20,
-                   backoff_sec=5,
-                   err_msg='cluster unhealthy before start of test')
+        wait_until(
+            lambda: self.redpanda.cluster_healthy(),
+            timeout_sec=20,
+            backoff_sec=5,
+            err_msg="cluster unhealthy before start of test",
+        )
 
     def client(self):
         return self._client

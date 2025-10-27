@@ -15,6 +15,7 @@
 #include "ssx/future-util.h"
 
 #include <seastar/core/loop.hh>
+#include <seastar/core/rwlock.hh>
 
 #include <chrono>
 
@@ -61,7 +62,7 @@ client_ptr kafka_client_cache::make_client(
       to_yaml(cfg, config::redact_secrets::no));
 }
 
-std::pair<client_ptr, client_mu_ptr> kafka_client_cache::fetch_or_insert(
+std::pair<client_ptr, client_lock_ptr> kafka_client_cache::fetch_or_insert(
   credential_t user, config::rest_authn_method authn_method) {
     // This method does not need a gate or lock becase the entire function is
     // synchronous until the point that client clean up is called. Then
@@ -74,7 +75,7 @@ std::pair<client_ptr, client_mu_ptr> kafka_client_cache::fetch_or_insert(
     auto it_hash = inner_hash.find(k);
 
     client_ptr client;
-    client_mu_ptr client_mu;
+    client_lock_ptr client_lock;
 
     // When no client is found ...
     if (it_hash == inner_hash.end()) {
@@ -90,20 +91,26 @@ std::pair<client_ptr, client_mu_ptr> kafka_client_cache::fetch_or_insert(
         vlog(plog.debug, "Make client for user {}", k);
 
         client = make_client(user, authn_method);
-        client_mu = ss::make_lw_shared<mutex>("client_mu");
-        inner_list.emplace_front(k, client, client_mu);
+        client_lock = ss::make_lw_shared<ss::rwlock>();
+        inner_list.emplace_front(k, client, client_lock);
     } else {
         // If the passwords don't match, update the password on the client, so
         // that it can reconnect.
-        if (it_hash->client->config().scram_password.value() != user.pass) {
+        auto& current_credentials = it_hash->client->get_credentials();
+        if (current_credentials && current_credentials->password != user.pass) {
             vlog(plog.debug, "Updating password for user {}", k);
-            it_hash->client->config().scram_password.set_value(user.pass);
+            it_hash->client->set_credentials(
+              kafka::client::sasl_configuration{
+                .mechanism = current_credentials->mechanism,
+                .username = current_credentials->username,
+                .password = user.pass,
+              });
         } else {
             vlog(plog.debug, "Reuse client for user {}", k);
         }
 
         client = it_hash->client;
-        client_mu = it_hash->client_mu;
+        client_lock = it_hash->client_lock;
 
         // Convert hash iterator to list iterator
         auto it_list = _cache.project<underlying_list>(it_hash);
@@ -116,7 +123,7 @@ std::pair<client_ptr, client_mu_ptr> kafka_client_cache::fetch_or_insert(
         inner_list.relocate(inner_list.begin(), it_list);
     }
 
-    return std::make_pair(client, client_mu);
+    return std::make_pair(client, client_lock);
 }
 
 template<typename List, typename Pred>
@@ -133,19 +140,16 @@ ss::future<> remove_client_if(List& list, Pred pred) {
         }
     }
     for (auto& item : remove) {
-        co_await item.client_mu
-          ->with([&item]() {
-              return item.client->stop().handle_exception(
-                [&item](std::exception_ptr ex) {
-                    // The stop failed
-                    vlog(
-                      plog.debug,
-                      "Stale client {} stop already happened {}",
-                      item.key,
-                      ex);
-                });
-          })
-          .finally([client{item.client}]() {});
+        auto holder = co_await item.client_lock->hold_write_lock();
+        co_await item.client->stop().handle_exception(
+          [&item](std::exception_ptr ex) {
+              // The stop failed
+              vlog(
+                plog.debug,
+                "Stale client {} stop already happened {}",
+                item.key,
+                ex);
+          });
     }
 }
 

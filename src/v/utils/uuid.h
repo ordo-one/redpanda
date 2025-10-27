@@ -8,13 +8,14 @@
 // by the Apache License, Version 2.0
 #pragma once
 
+#include "absl/hash/hash.h"
 #include "base/seastarx.h"
 
 #include <seastar/core/sstring.hh>
 
-#include <absl/hash/hash.h>
 #include <boost/uuid/uuid.hpp>
 
+#include <compare>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,8 +44,9 @@ public:
     friend std::ostream& operator<<(std::ostream& os, const uuid_t& u);
     friend std::istream& operator>>(std::istream& is, uuid_t& u);
     friend bool operator==(const uuid_t& u, const uuid_t& v) = default;
+    friend std::strong_ordering operator<=>(const uuid_t& u, const uuid_t& v);
 
-    operator ss::sstring() const;
+    operator ss::sstring() const; // NOLINT(*explicit*)
 
     template<typename H>
     friend H AbslHashValue(H h, const uuid_t& u) {
@@ -62,7 +64,7 @@ private:
     explicit uuid_t(const underlying_t& uuid)
       : _uuid(uuid) {}
 
-    underlying_t _uuid;
+    underlying_t _uuid{};
 };
 
 bool operator<(const uuid_t& l, const uuid_t& r);

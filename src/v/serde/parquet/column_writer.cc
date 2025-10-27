@@ -11,15 +11,15 @@
 
 #include "serde/parquet/column_writer.h"
 
+#include "absl/numeric/int128.h"
 #include "compression/compression.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "hashing/crc32.h"
 #include "serde/parquet/column_stats_collector.h"
 #include "serde/parquet/encoding.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/util/variant_utils.hh>
-
-#include <absl/numeric/int128.h>
 
 #include <limits>
 #include <stdexcept>
@@ -82,35 +82,27 @@ public:
 
         ss::visit(
           std::move(val),
-          [this, &value_memory_usage](value_type& v) {
+          [this, &value_memory_usage](value_type v) {
               if constexpr (!std::is_trivially_copyable_v<value_type>) {
                   value_memory_usage = v.val.size_bytes();
               } else {
                   value_memory_usage = sizeof(value_type);
               }
               _current_page_stats.record_value(v);
-              _value_buffer.push_back(std::move(v));
+              _value_buffer.add_value(std::move(v));
           },
-          [this](null_value&) {
+          [this](null_value) {
               // null values are valid, but are not encoded in the actual data,
               // they are encoded in the defintion levels.
               _current_page_stats.record_null();
           },
-          [](auto& v) {
-              throw std::runtime_error(fmt::format(
-                "invalid value for column: {:.32}", value(std::move(v))));
+          [](auto v) {
+              throw std::runtime_error(
+                fmt::format(
+                  "invalid value for column: {:.32}", value(std::move(v))));
           });
         _rep_levels.push_back(rl);
         _def_levels.push_back(dl);
-
-        // NOTE: This does not account for the underlying buffer memory
-        // but we don't want account for the capacity here, ideally we
-        // always use the full capacity in our value buffer, and eagerly
-        // accounting that usage might cause callers to overagressively
-        // flush pages/row groups.
-        _current_page_memory_usage += value_memory_usage
-                                      + static_cast<int64_t>(
-                                        sizeof(rep_level) + sizeof(def_level));
     }
 
     ss::future<> flush_page() {
@@ -126,19 +118,14 @@ public:
             encoded_rep_levels = encode_levels(_max_rep_level, _rep_levels);
         }
         _rep_levels.clear();
-        iobuf encoded_data;
-        if constexpr (std::is_trivially_copyable_v<value_type>) {
-            encoded_data = encode_plain(_value_buffer);
-            _value_buffer.clear();
-        } else {
-            encoded_data = encode_plain(std::exchange(_value_buffer, {}));
-        }
+        iobuf encoded_data = _value_buffer.get_encoded_buf();
         size_t uncompressed_page_size = encoded_def_levels.size_bytes()
                                         + encoded_rep_levels.size_bytes()
                                         + encoded_data.size_bytes();
         if (uncompressed_page_size > std::numeric_limits<int32_t>::max()) {
-            throw std::runtime_error(fmt::format(
-              "page size limit exceeded: {} bytes", uncompressed_page_size));
+            throw std::runtime_error(
+              fmt::format(
+                "page size limit exceeded: {} bytes", uncompressed_page_size));
         }
         if (_opts.compress) {
             encoded_data = co_await compression::stream_compressor::compress(
@@ -192,22 +179,29 @@ public:
         full_page_data.append(std::move(encoded_def_levels));
         full_page_data.append(std::move(encoded_data));
         _current_page_stats.reset();
-        _current_page_memory_usage = 0;
         _total_memory_usage += static_cast<int32_t>(
           full_page_data.size_bytes());
-        _flushed_pages.push_back(data_page{
-          .header = std::move(header),
-          .serialized_header_size = header_size,
-          .serialized = std::move(full_page_data),
-        });
+        _flushed_pages.push_back(
+          data_page{
+            .header = std::move(header),
+            .serialized_header_size = header_size,
+            .serialized = std::move(full_page_data),
+          });
     }
 
     int64_t memory_usage() const override {
-        return _total_memory_usage + _current_page_memory_usage;
+        return _total_memory_usage + current_page_memory_usage();
     }
 
     int64_t current_page_memory_usage() const override {
-        return _current_page_memory_usage;
+        // NOTE: This does account for the underlying buffer memory
+        // but we don't want to account for the capacity here, ideally we
+        // always use the full capacity in our value buffer, and eagerly
+        // accounting that usage might cause callers to overagressively
+        // flush pages/row groups.
+        return _value_buffer.size_bytes()
+               + (_rep_levels.size() * sizeof(_rep_levels[0]))
+               + (_def_levels.size() * sizeof(_def_levels[0]));
     }
 
     ss::future<> next_page() override { return flush_page(); }
@@ -244,9 +238,8 @@ public:
 private:
     column_stats_collector<value_type, comparator> _current_page_stats;
     column_stats_collector<value_type, comparator> _flushed_stats;
-    int64_t _current_page_memory_usage = 0;
     int64_t _total_memory_usage = 0;
-    chunked_vector<value_type> _value_buffer;
+    plain_encoder<value_type> _value_buffer;
     chunked_vector<def_level> _def_levels;
     chunked_vector<rep_level> _rep_levels;
     chunked_vector<data_page> _flushed_pages;
@@ -274,8 +267,9 @@ template class buffered_column_writer<
 
 std::unique_ptr<column_writer::impl>
 make_impl(const schema_element&, std::monostate, options) {
-    throw std::runtime_error("invariant error: cannot make a column writer "
-                             "from an intermediate value");
+    throw std::runtime_error(
+      "invariant error: cannot make a column writer "
+      "from an intermediate value");
 }
 std::unique_ptr<column_writer::impl>
 make_impl(const schema_element& e, bool_type, options opts) {
@@ -333,8 +327,9 @@ make_impl(const schema_element& e, byte_array_type t, options opts) {
 } // namespace
 
 column_writer::column_writer(const schema_element& col, options opts)
-  : _impl(std::visit(
-      [&col, opts](auto x) { return make_impl(col, x, opts); }, col.type)) {}
+  : _impl(
+      std::visit(
+        [&col, opts](auto x) { return make_impl(col, x, opts); }, col.type)) {}
 
 column_writer::column_writer(column_writer&&) noexcept = default;
 column_writer& column_writer::operator=(column_writer&&) noexcept = default;

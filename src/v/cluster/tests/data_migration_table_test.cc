@@ -8,20 +8,19 @@
 // by the Apache License, Version 2.0
 
 #include "cluster/commands.h"
+#include "cluster/data_migrated_resources.h"
 #include "cluster/data_migration_table.h"
 #include "cluster/data_migration_types.h"
-#include "commands.h"
+#include "cluster/errc.h"
+#include "cluster/topic_table.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
-#include "data_migrated_resources.h"
-#include "data_migration_types.h"
-#include "errc.h"
+#include "config/node_config.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "random/generators.h"
 #include "test_utils/test.h"
-#include "topic_table.h"
 
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
@@ -65,9 +64,10 @@ create_inbound_topics(std::vector<std::string_view> topics) {
     chunked_vector<cluster::data_migrations::inbound_topic> ret;
     ret.reserve(topics.size());
     for (auto& t : topics) {
-        ret.push_back(cluster::data_migrations::inbound_topic{
-          .source_topic_name = model::topic_namespace(
-            model::kafka_namespace, model::topic(t))});
+        ret.push_back(
+          cluster::data_migrations::inbound_topic{
+            .source_topic_name = model::topic_namespace(
+              model::kafka_namespace, model::topic(t))});
     }
     return ret;
 }
@@ -85,12 +85,16 @@ create_groups(std::vector<std::string_view> strings) {
 struct data_migration_table_fixture : public seastar_test {
     ss::future<> SetUpAsync() override {
         // for all new topics to be created with it
+        ss::smp::invoke_on_all([] {
+            config::node().node_id.set_value(model::node_id{1});
+        }).get();
         config::shard_local_cfg().cloud_storage_enable_remote_write.set_value(
           true);
 
         co_await resources.start();
-        co_await topics.start(ss::sharded_parameter(
-          [this] { return std::ref(resources.local()); }));
+        co_await topics.start(ss::sharded_parameter([this] {
+            return std::ref(resources.local());
+        }));
         table = std::make_unique<cluster::data_migrations::migrations_table>(
           resources, topics, true);
         table->register_notification([this](cluster::data_migrations::id id) {
@@ -210,8 +214,9 @@ struct data_migration_table_fixture : public seastar_test {
         expected_states) {
         for (auto& expected : expected_states) {
             EXPECT_EQ(
-              resources.local().get_topic_state(model::topic_namespace(
-                model::kafka_namespace, model::topic(expected.first))),
+              resources.local().get_topic_state(
+                model::topic_namespace(
+                  model::kafka_namespace, model::topic(expected.first))),
               expected.second);
         }
     }

@@ -9,10 +9,11 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
 #include "base/vlog.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "security/acl.h"
 #include "security/acl_entry_set.h"
 #include "security/fwd.h"
@@ -22,11 +23,12 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/util/bool_class.hh>
 
-#include <absl/container/flat_hash_set.h>
-
 #include <iosfwd>
 
 namespace security {
+
+// Flag to tell the authorizer that a superuser is required for the operation
+using superuser_required = ss::bool_class<struct superuser_required_tag>;
 
 /**
  * Holds authZ check metadata for audit processing
@@ -38,6 +40,8 @@ struct auth_result {
     bool authorization_disabled{false};
     // Indicates if the user is a superuser
     bool is_superuser{false};
+    // Indicates if the action required superuser level authorized
+    bool required_superuser{false};
     // Indicates if no ACL matches were found
     bool empty_matches{false};
 
@@ -92,6 +96,23 @@ struct auth_result {
         return {
           .authorized = true,
           .is_superuser = true,
+          .principal = principal,
+          .host = host,
+          .resource_type = get_resource_type<T>(),
+          .resource_name = resource(),
+          .operation = operation};
+    }
+
+    template<typename T>
+    static auth_result superuser_required_unauthorized(
+      const security::acl_principal& principal,
+      security::acl_host host,
+      security::acl_operation operation,
+      const T& resource) {
+        return {
+          .authorized = false,
+          .is_superuser = false,
+          .required_superuser = true,
           .principal = principal,
           .host = host,
           .resource_type = get_resource_type<T>(),
@@ -232,10 +253,11 @@ public:
       const T& resource_name,
       acl_operation operation,
       const acl_principal& principal,
-      const acl_host& host) const;
+      const acl_host& host,
+      superuser_required superuser_required) const;
 
-    ss::future<fragmented_vector<acl_binding>> all_bindings() const;
-    ss::future<> reset_bindings(const fragmented_vector<acl_binding>& bindings);
+    ss::future<chunked_vector<acl_binding>> all_bindings() const;
+    ss::future<> reset_bindings(const chunked_vector<acl_binding>& bindings);
 
     acl_store& store() &;
     const acl_store& store() const&;
@@ -246,7 +268,8 @@ private:
       const T& resource_name,
       acl_operation operation,
       const acl_principal& principal,
-      const acl_host& host) const;
+      const acl_host& host,
+      superuser_required superuser_required) const;
 
     /*
      * Compute whether the specified operation is allowed based on the implied

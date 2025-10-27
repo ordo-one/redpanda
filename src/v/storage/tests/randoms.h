@@ -13,8 +13,7 @@
 
 #include "model/tests/randoms.h"
 #include "random/generators.h"
-#include "storage/types.h"
-#include "test_utils/randoms.h"
+#include "storage/disk.h"
 
 namespace storage {
 
@@ -27,9 +26,10 @@ inline storage::disk random_disk() {
 }
 
 inline disk_space_alert random_disk_space_alert() {
-    return disk_space_alert(random_generators::get_int(
-      static_cast<int>(disk_space_alert::ok),
-      static_cast<int>(disk_space_alert::degraded)));
+    return disk_space_alert(
+      random_generators::get_int(
+        static_cast<int>(disk_space_alert::ok),
+        static_cast<int>(disk_space_alert::degraded)));
 }
 
 } // namespace storage

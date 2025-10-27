@@ -1,85 +1,70 @@
 /*
- * Copyright 2024 Redpanda Data, Inc.
+ * Copyright 2025 Redpanda Data, Inc.
  *
- * Use of this software is governed by the Business Source License
- * included in the file licenses/BSL.md
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
  *
- * As of the Change Date specified in that file, in accordance with
- * the Business Source License, use of this software will be governed
- * by the Apache License, Version 2.0
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
+
 #include "cloud_topics/reconciler/reconciler.h"
 
+#include "base/source_location.h"
 #include "base/vlog.h"
-#include "cloud_storage/configuration.h"
-#include "cloud_topics/dl_overlay.h"
-#include "cloud_topics/dl_stm/dl_stm_api.h"
-#include "cloud_topics/types.h"
+#include "cloud_topics/data_plane_api.h"
+#include "cloud_topics/frontend/frontend.h"
+#include "cloud_topics/level_one/common/abstract_io.h"
+#include "cloud_topics/level_one/common/object.h"
+#include "cloud_topics/level_one/common/object_id.h"
+#include "cloud_topics/level_one/metastore/metastore.h"
+#include "cloud_topics/level_one/metastore/retry.h"
+#include "cloud_topics/log_reader_config.h"
+#include "cloud_topics/reconciler/reconciliation_consumer.h"
+#include "cloud_topics/reconciler/reconciliation_source.h"
 #include "cluster/partition.h"
-#include "kafka/data/partition_proxy.h"
-#include "kafka/utils/txn_reader.h"
-#include "model/namespace.h"
-#include "random/generators.h"
+#include "model/fundamental.h"
+#include "ssx/future-util.h"
+#include "utils/retry_chain_node.h"
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/log.hh>
 
+#include <chrono>
+#include <exception>
+#include <expected>
+#include <iterator>
+
+using namespace std::chrono_literals;
+
+namespace cloud_topics::reconciler {
+
 namespace {
 ss::logger lg("reconciler");
 
-/*
- * Temporary hack for identifying cloud partitions (topic has "_ct" suffix).
- * This can be removed once we teach Redpanda about this new type of topic.
- */
-bool is_cloud_partition(
-  const ss::lw_shared_ptr<cluster::partition>& partition) {
-    return partition->get_ntp_config().cloud_topic_enabled();
+void log_error(
+  const reconcile_error& err,
+  vlog::file_line file_line = vlog::file_line::current()) {
+    lg.log(
+      err.benign ? ss::log_level::debug : ss::log_level::error,
+      "{} - {}",
+      file_line,
+      err.message);
 }
+
 } // namespace
 
-namespace experimental::cloud_topics::reconciler {
-
-reconciler::reconciler(
-  ss::sharded<cluster::partition_manager>* pm,
-  ss::sharded<cloud_io::remote>* cloud_io,
-  std::optional<cloud_storage_clients::bucket_name> bucket)
-  : _partition_manager(pm)
-  , _cloud_io(cloud_io) {
-    if (bucket.has_value()) {
-        _bucket = std::move(bucket.value());
-    } else {
-        _bucket = cloud_storage_clients::bucket_name(
-          cloud_storage::configuration::get_bucket_config().value().value());
-    }
-}
+reconciler::reconciler(l1::io* l1_io, l1::metastore* metastore)
+  : _l1_io(l1_io)
+  , _metastore(metastore) {}
 
 ss::future<> reconciler::start() {
-    _manage_notify_handle
-      = _partition_manager->local().register_manage_notification(
-        model::kafka_namespace,
-        [this](ss::lw_shared_ptr<cluster::partition> p) {
-            attach_partition(std::move(p));
-        });
-
-    _unmanage_notify_handle
-      = _partition_manager->local().register_unmanage_notification(
-        model::kafka_namespace, [this](model::topic_partition_view tp_p) {
-            detach_partition(
-              model::ntp(model::kafka_namespace, tp_p.topic, tp_p.partition));
-        });
-
+    _probe.setup_metrics();
     ssx::spawn_with_gate(_gate, [this] { return reconciliation_loop(); });
-
     co_return;
 }
 
 ss::future<> reconciler::stop() {
-    _partition_manager->local().unregister_manage_notification(
-      _manage_notify_handle);
-
-    _partition_manager->local().unregister_unmanage_notification(
-      _unmanage_notify_handle);
-
     _as.request_abort();
     _control_sem.broken();
 
@@ -87,56 +72,119 @@ ss::future<> reconciler::stop() {
 }
 
 void reconciler::attach_partition(
+  const model::ntp& ntp,
+  model::topic_id_partition tidp,
+  data_plane_api* data_plane,
   ss::lw_shared_ptr<cluster::partition> partition) {
-    if (!is_cloud_partition(partition)) {
+    attach_source(make_source(ntp, tidp, data_plane, std::move(partition)));
+}
+
+void reconciler::attach_source(ss::shared_ptr<source> src) {
+    if (_sources.contains(src->ntp())) {
         return;
     }
-    const auto& ntp = partition->ntp();
-    vlog(lg.info, "Reconciler is attaching cloud partition {}", ntp);
-    auto attached = ss::make_lw_shared<attached_partition_info>(partition);
-    auto res = _partitions.try_emplace(ntp, std::move(attached));
-    vassert(res.second, "Double registration of ntp {}", ntp);
+    vlog(
+      lg.debug,
+      "Attaching partition {} (tidp: {})",
+      src->ntp(),
+      src->topic_id_partition());
+    _sources.emplace(src->ntp(), src);
 }
 
-void reconciler::detach_partition(const model::ntp& ntp) {
-    if (auto it = _partitions.find(ntp); it != _partitions.end()) {
-        vlog(lg.info, "Reconciler is detaching partition {}", ntp);
+void reconciler::detach(const model::ntp& ntp) {
+    if (auto it = _sources.find(ntp); it != _sources.end()) {
+        vlog(lg.debug, "Detaching partition {}", ntp);
         /*
          * This upcall doesn't synchronize with the rest of the reconciler,
-         * which means that once a reference to an attached partition is held,
-         * it shouldn't be assumed that the attached partition remains in the
-         * _partitions collection.
+         * which means that once a reference to a source is held,
+         * it shouldn't be assumed that the source remains in the
+         * _sources collection.
          */
-        _partitions.erase(it);
+        _sources.erase(it);
     }
-}
-
-void reconciler::object::add(range range, const attached_partition& partition) {
-    vassert(!range.data.empty(), "cannot add an empty range to object");
-    const auto physical_offset_start = data.size_bytes();
-    data.append(std::move(range.data));
-    const auto physical_offset_end = data.size_bytes();
-
-    ranges.emplace_back(
-      partition, physical_offset_start, physical_offset_end, range.info);
 }
 
 ss::future<> reconciler::reconciliation_loop() {
     /*
-     * polling is not particularly efficient, and in practice, we'll probably
+     * Polling is not particularly efficient, and in practice, we'll probably
      * want to look into receiving upcalls from partitions announcing that new
      * data is available.
+     * TODO: Investigate performance of polling and alternatives to polling.
      */
     constexpr std::chrono::seconds poll_frequency(10);
 
+    ss::lowres_clock::duration next_wait = poll_frequency;
     while (!_gate.is_closed()) {
         try {
             co_await _control_sem.wait(
-              poll_frequency, std::max(_control_sem.current(), size_t(1)));
-        } catch (const ss::semaphore_timed_out&) {
-            // time to do some work
+              next_wait, std::max(_control_sem.current(), size_t(1)));
+        } catch (const ss::semaphore_timed_out& ex) {
+            // Time to do some work.
+            std::ignore = ex;
         }
 
+        vlog(
+          lg.debug,
+          "Reconciliation loop tick with {} attached partitions",
+          _sources.size());
+        if (config::shard_local_cfg()
+              .cloud_topics_disable_reconciliation_loop()) {
+            vlog(lg.debug, "Reconciliation loop disabled, skipping iteration");
+            next_wait = poll_frequency;
+            continue;
+        }
+
+        // clang-format off
+        /*
+         * Error Handling
+         * (Props to Claude for the tree diagram)
+         *
+         * The reconciler uses nested exception boundaries to ensure proper
+         * cleanup and partial failure recovery. One object's failure prevents
+         * reconciliation of its partitions for this round, but not other
+         * partitions'.
+         *
+         * reconciliation_loop()
+         * └─ try/catch → catches unhandled exceptions, logs, better luck next time
+         *    └─ reconcile()
+         *       └─ FOR EACH OBJECT:
+         *          └─ as_future(reconcile_partitions) → catches all exceptions
+         *             └─ reconcile_partitions(oid, partitions)
+         *                ├─ make_context() → returns error if staging fails
+         *                │  └─ as_future(output_stream()) → catches, cleans staging
+         *                │
+         *                ├─ as_future(build_and_put_object)
+         *                │  ├─ build_object() → can throw in builder->finish()
+         *                │  └─ put_object() → returns error on upload failure
+         *                │
+         *                └─ GUARANTEED CLEANUP (always executed):
+         *                   ├─ ctx.close_builder()   → closes object builder
+         *                   └─ ctx.cleanup_staging() → removes temp file
+         *
+         * Failure Scopes:
+         * - Single object failures:
+         *   • Staging file creation fails
+         *   • No data in partitions (empty object)
+         *   • Build or upload exceptions
+         *   • Individual partition read failures
+         *   • Object-level metadata failure
+         *
+         * - Reconciliation round failures:
+         *   • Final metastore batch commit failure
+         *   • Any unhandled exception in reconcile()
+         *
+         * - Reconciliation loop termination:
+         *   • Shutdown exceptions only
+         *
+         * Resource Guarantees:
+         * - Builder is ALWAYS closed if created
+         * - Staging file is ALWAYS removed if created
+         * - Failures in one object don't leak resources or affect others
+         * - Reconciliation will try again next schedule point after failure,
+         *   except for shutdown
+         */
+        // clang-format on
+        auto round_start = ss::lowres_clock::now();
         try {
             co_await reconcile();
         } catch (...) {
@@ -148,177 +196,527 @@ ss::future<> reconciler::reconciliation_loop() {
               "Recoverable error during reconciliation: {}",
               std::current_exception());
         }
+        auto round_duration = ss::lowres_clock::now() - round_start;
+        next_wait = std::max(
+          poll_frequency - round_duration, ss::lowres_clock::duration(0));
     }
 }
 
 ss::future<> reconciler::reconcile() {
-    auto object = co_await build_object();
-    if (!object.has_value()) {
+    _probe.increment_rounds();
+
+    chunked_vector<ss::shared_ptr<source>> sources;
+    // Make a copy of the sources to not worry about concurrent modification.
+    for (auto& [_, src] : _sources) {
+        sources.push_back(src);
+    }
+    if (sources.empty()) {
+        vlog(lg.trace, "No leader partitions to reconcile");
         co_return;
     }
 
-    auto result = co_await upload_object(std::move(object->data));
-    if (result != cloud_io::upload_result::success) {
-        vlog(lg.info, "Failed to upload L1 object: {}", result);
+    // Begin by creating the set of objects to be built.
+    retry_chain_node rtc = l1::make_default_metastore_rtc(_as);
+    auto metadata_builder_res = co_await l1::retry_metastore_op(
+      [this]() {
+          return _metastore->object_builder().then(
+            [this](
+              std::expected<
+                std::unique_ptr<l1::metastore::object_metadata_builder>,
+                l1::metastore::errc> result) {
+                if (
+                  !result.has_value()
+                  && result.error() == l1::metastore::errc::transport_error) {
+                    _probe.increment_metastore_retries();
+                }
+                return result;
+            });
+      },
+      rtc);
+    if (!metadata_builder_res.has_value()) {
+        vlog(
+          lg.warn,
+          "Could not create object metadata builder: {}",
+          metadata_builder_res.error());
+        _probe.increment_rounds_failed();
+        co_return;
+    }
+    auto& metadata_builder = metadata_builder_res.value();
+    chunked_hash_map<l1::object_id, chunked_vector<ss::shared_ptr<source>>>
+      oid_to_sources;
+    for (const auto& src : sources) {
+        auto oid = metadata_builder->get_or_create_object_for(
+          src->topic_id_partition());
+        if (!oid.has_value()) {
+            vlog(lg.warn, "Could not get object: {}", oid.error());
+            _probe.increment_rounds_failed();
+            co_return;
+        }
+        oid_to_sources[oid.value()].push_back(src);
+    }
+
+    // Process sources by their object. This should be easier to
+    // improve than processing source-by-source.
+    chunked_vector<built_object_metadata> successful_objects;
+    chunked_vector<l1::object_id> failed_objects;
+    for (const auto& [oid, sources] : oid_to_sources) {
+        if (_as.abort_requested()) {
+            co_return;
+        }
+        auto object_fut = co_await ss::coroutine::as_future(
+          reconcile_sources(oid, sources));
+        if (object_fut.failed()) {
+            auto ex = object_fut.get_exception();
+            const auto is_shutdown = ssx::is_shutdown_exception(ex);
+            vlogl(
+              lg,
+              is_shutdown ? ss::log_level::debug : ss::log_level::error,
+              "Exception reconciling {} partitions into object {}: {}",
+              sources.size(),
+              oid,
+              ex);
+            if (is_shutdown) {
+                co_return;
+            }
+            failed_objects.push_back(oid);
+            continue; // Skip this object and move to the next
+        }
+
+        auto result = object_fut.get();
+        if (!result.has_value()) {
+            failed_objects.push_back(oid);
+            log_error(result.error().with_context(
+              "Exception reconciling {} partitions into object {}",
+              sources.size(),
+              oid));
+            continue; // Skip this object and move to the next
+        }
+
+        auto obj_metadata = std::move(result).value();
+        auto add_result = add_object_metadata(
+          oid, obj_metadata, metadata_builder.get());
+        if (!add_result.has_value()) {
+            failed_objects.push_back(oid);
+            log_error(add_result.error().with_context(
+              "Exception reconciling {} partitions into object {}",
+              sources.size(),
+              oid));
+            continue; // Skip this object and move to the next
+        }
+
+        // Success - collect the metadata for final processing.
+        successful_objects.push_back(std::move(obj_metadata));
+    }
+
+    for (const auto& oid : failed_objects) {
+        auto rm_ret = metadata_builder->remove_pending_object(oid);
+        vassert(
+          rm_ret.has_value(), "Removing object {} in non-pending state", oid);
+    }
+
+    // Check if we have any successful objects to commit.
+    if (successful_objects.empty()) {
+        // NB: This doesn't count as failing the round because it may be that
+        // all sources are fully reconciled.
+        vlog(lg.debug, "No successful objects to commit to metastore");
         co_return;
     }
 
-    // commit for each partition represented in the uploaded object
-    for (const auto& range : object->ranges) {
-        co_await commit_object(range);
+    // Commit all successful objects to the metastore.
+    auto commit_result = co_await commit_objects(
+      successful_objects, std::move(metadata_builder));
+    if (!commit_result.has_value()) {
+        log_error(commit_result.error().with_context(
+          "Abandoning reconciliation run because the L1 metastore operation "
+          "failed"));
+        _probe.increment_rounds_failed();
+        co_return;
     }
 }
 
-ss::future<std::optional<reconciler::object>> reconciler::build_object() {
-    // light-weight copy for stable iteration
-    std::vector<attached_partition> partitions;
-    for (const auto& p : _partitions) {
-        if (p.second->partition->is_leader()) {
-            partitions.push_back(p.second);
-        }
+ss::future<std::expected<reconciler::built_object_metadata, reconcile_error>>
+reconciler::reconcile_sources(
+  const l1::object_id& oid,
+  const chunked_vector<ss::shared_ptr<source>>& sources) {
+    auto ctx_result = co_await make_context();
+    if (!ctx_result.has_value()) {
+        co_return std::unexpected(ctx_result.error());
+    }
+    auto ctx = std::move(ctx_result.value());
+
+    auto fut = co_await ss::coroutine::as_future(
+      build_and_put_object(oid, ctx, sources));
+
+    // Always cleanup.
+    auto close_fut = co_await ss::coroutine::as_future(ctx.close_builder());
+    if (close_fut.failed()) {
+        auto ex = close_fut.get_exception();
+        vlogl(
+          lg,
+          ssx::is_shutdown_exception(ex) ? ss::log_level::debug
+                                         : ss::log_level::warn,
+          "Exception while closing builder: {}",
+          ex);
     }
 
-    // avoid starving partitions
-    std::shuffle(
-      partitions.begin(), partitions.end(), random_generators::internal::gen);
-
-    object object;
-    auto size_budget = max_object_size;
-    for (const auto& partition : partitions) {
-        auto reader = co_await make_reader(partition, size_budget);
-        auto range = co_await std::move(reader).consume(
-          range_batch_consumer{}, model::no_timeout);
-        if (range.has_value()) {
-            object.add(std::move(*range), partition);
-            size_budget -= std::min(object.data.size_bytes(), size_budget);
-        }
+    auto cleanup_fut = co_await ss::coroutine::as_future(ctx.cleanup_staging());
+    if (cleanup_fut.failed()) {
+        auto ex = cleanup_fut.get_exception();
+        vlogl(
+          lg,
+          ssx::is_shutdown_exception(ex) ? ss::log_level::debug
+                                         : ss::log_level::warn,
+          "Exception while cleaning up staging: {}",
+          ex);
     }
 
-    if (object.data.empty()) {
+    if (fut.failed()) {
+        auto ex = fut.get_exception();
+        co_return std::unexpected(
+          reconcile_error(
+            "Exception building and putting object {}: {}", oid, ex)
+            .mark_benign(ssx::is_shutdown_exception(ex)));
+    }
+
+    co_return fut.get();
+}
+
+ss::future<std::expected<reconciler::built_object_metadata, reconcile_error>>
+reconciler::build_and_put_object(
+  const l1::object_id& oid,
+  builder_context& ctx,
+  const chunked_vector<ss::shared_ptr<source>>& sources) {
+    // Build the object.
+    auto build_result = co_await build_object(ctx, sources);
+    if (!build_result.has_value()) {
+        _probe.increment_object_build_failed();
+        co_return std::unexpected(build_result.error());
+    }
+
+    auto obj_meta = std::move(build_result.value());
+    if (obj_meta.commits.empty()) {
+        _probe.increment_empty_objects_skipped();
+        co_return std::unexpected(
+          reconcile_error("Skipping put for object {}: no data", oid));
+    }
+
+    // Upload the object.
+    auto put_result = co_await put_object(oid, ctx);
+    if (!put_result.has_value()) {
+        _probe.increment_object_upload_failed();
+        co_return std::unexpected(put_result.error());
+    }
+
+    _probe.increment_objects_uploaded();
+    _probe.add_bytes_reconciled(obj_meta.object_info.size_bytes);
+    _probe.record_object_size_bytes(obj_meta.object_info.size_bytes);
+    _probe.record_sources_per_object(obj_meta.commits.size());
+
+    co_return obj_meta;
+}
+
+ss::future<std::expected<reconciler::builder_context, reconcile_error>>
+reconciler::make_context() {
+    builder_context ctx;
+
+    // Create staging file.
+    auto staging_result = co_await _l1_io->create_tmp_file();
+    if (!staging_result.has_value()) {
+        co_return std::unexpected(
+          reconcile_error(
+            "Failed to create staging file: {}", staging_result.error())
+            .non_benign());
+    }
+    ctx.staging = std::move(staging_result).value();
+
+    // Create output stream and builder.
+    auto stream_fut = co_await ss::coroutine::as_future(
+      ctx.staging->output_stream());
+    if (stream_fut.failed()) {
+        auto ex = stream_fut.get_exception();
+        co_await ctx.cleanup_staging();
+        co_return std::unexpected(
+          reconcile_error("Failed to create output stream: {}", ex)
+            .mark_benign(ssx::is_shutdown_exception(ex)));
+    }
+
+    auto output_stream = stream_fut.get();
+    ctx.builder = l1::object_builder::create(
+      std::move(output_stream), l1::object_builder::options{});
+
+    co_return ctx;
+}
+
+ss::future<std::expected<reconciler::built_object_metadata, reconcile_error>>
+reconciler::build_object(
+  builder_context& ctx, const chunked_vector<ss::shared_ptr<source>>& sources) {
+    chunked_vector<commit_info> metas;
+    metas.reserve(sources.size());
+    for (const auto& src : sources) {
+        if (_as.abort_requested()) {
+            co_return std::unexpected(
+              reconcile_error("abort requested while building object"));
+        }
+        auto start_offset = kafka::next_offset(src->last_reconciled_offset());
+        auto read_result = co_await add_source_to_object(
+          ctx, src, start_offset);
+        if (!read_result.has_value()) {
+            // Log an error, we don't want a single stuck partition to
+            // prevent all partitions from being reconciled.
+            log_error(read_result.error().with_context(
+              "unable to reconcile partition {}", src->ntp()));
+            continue;
+        }
+        auto meta = read_result.value();
+        if (meta.has_value()) {
+            _probe.increment_partitions_reconciled();
+            _probe.add_batches_reconciled(meta->batch_count);
+            metas.emplace_back(src, std::move(meta).value(), start_offset);
+        }
+    }
+    metas.shrink_to_fit();
+
+    auto obj_info = co_await ctx.builder->finish().finally(
+      [&ctx] { return ctx.close_builder(); });
+    vlog(
+      lg.debug,
+      "Built L1 object from {} partitions ({} partitions were skipped)",
+      metas.size(),
+      sources.size() - metas.size());
+    co_return built_object_metadata{
+      .object_info = std::move(obj_info),
+      .commits = std::move(metas),
+    };
+}
+
+ss::future<std::expected<void, reconcile_error>>
+reconciler::put_object(const l1::object_id& oid, builder_context& ctx) {
+    auto metrics_duration = _probe.measure_object_upload_duration();
+    auto put_result = co_await _l1_io->put_object(oid, ctx.staging.get(), &_as);
+    if (!put_result.has_value()) {
+        co_return std::unexpected(reconcile_error(
+          "failed to put L1 object {}: {}", oid, put_result.error()));
+    }
+    vlog(lg.debug, "Successfully put L1 object {}", oid);
+    co_return std::expected<void, reconcile_error>{};
+}
+
+ss::future<std::expected<std::optional<consumer_metadata>, reconcile_error>>
+reconciler::add_source_to_object(
+  builder_context& ctx,
+  ss::shared_ptr<source> src,
+  kafka::offset start_offset) {
+    vlog(
+      lg.debug,
+      "Processing partition {} with LRO {}",
+      src->ntp(),
+      src->last_reconciled_offset());
+
+    std::optional<consumer_metadata> metadata;
+    try {
+        auto reader = co_await src->make_reader(
+          source::reader_config{
+            .start_offset = start_offset,
+            .max_bytes = ctx.size_budget,
+            .as = &_as,
+          });
+        metadata = co_await build_from_reader(
+          src->topic_id_partition(),
+          std::move(reader),
+          ctx.builder.get(),
+          &_probe);
+    } catch (...) {
+        co_return std::unexpected(reconcile_error(
+          "unable to consume from L0 partition: {}", std::current_exception()));
+    }
+
+    if (!metadata.has_value()) {
+        vlog(
+          lg.debug,
+          "No batches found for partition {}",
+          src->topic_id_partition());
         co_return std::nullopt;
     }
 
-    co_return object;
-}
-
-ss::future<cloud_io::upload_result> reconciler::upload_object(iobuf payload) {
-    const cloud_storage_clients::object_key key(
-      fmt::format("l1_{}", uuid_t::create()));
-
-    retry_chain_node rtc(
-      _as,
-      ss::lowres_clock::now() + std::chrono::seconds(20),
-      std::chrono::seconds(1));
-
-    co_return co_await _cloud_io->local().upload_object({
-      .transfer_details = {
-        .bucket = _bucket,
-        .key = key,
-        .parent_rtc = rtc,
-      },
-      .display_str = "l1_object",
-      .payload = std::move(payload),
-    });
-}
-
-ss::future<> reconciler::commit_object(const object_range_info& range) {
-    /*
-     * TODO: we aren't actually replicating an overlay batch here yet. This will
-     * come at the time of integration with the data layout STM.
-     */
-    const auto& part = range.partition->partition;
-    object_id id = object_id{uuid_t::create()};
-    dl_overlay_object overlay_obj(
-      id,
-      first_byte_offset_t{range.physical_offset_start},
-      byte_range_size_t{
-        range.physical_offset_end - range.physical_offset_start},
-      dl_stm_object_ownership::shared);
-
-    dl_overlay overlay{
-      range.info.base_offset,
-      range.info.last_offset,
-      range.info.base_timestamp,
-      range.info.last_timestamp,
-      range.info.terms,
-      overlay_obj};
-
-    auto push_result = co_await part->dl_stm_api()->push_overlay(overlay);
-    if (push_result.has_error()) {
-        vlog(
-          lg.error,
-          "Failed to replicate dl_overlay batch to {}, error: {}",
-          part->ntp(),
-          push_result.error());
-        co_return;
-    }
-
-    range.partition->lro = range.info.last_offset + kafka::offset(1);
-
     vlog(
-      lg.info,
-      "Committed overlay {} for {} phy {}~{} log {}~{}. New LRO {}",
-      id,
-      part->ntp(),
-      range.physical_offset_start,
-      range.physical_offset_end,
-      range.info.base_offset,
-      range.info.last_offset,
-      range.partition->lro);
+      lg.debug,
+      "Adding partition {} to L1 object with offsets {}~{} starting at offset "
+      "{}",
+      src->topic_id_partition(),
+      metadata->base_offset,
+      metadata->last_offset,
+      start_offset);
 
-    co_return;
+    co_return metadata.value();
 }
 
-ss::future<model::record_batch_reader>
-reconciler::make_reader(const attached_partition& partition, size_t max_bytes) {
-    auto proxy = kafka::make_partition_proxy(partition->partition);
-
-    auto effective_start = co_await proxy.sync_effective_start();
-    if (effective_start.has_error()) {
-        vlog(
-          lg.info,
-          "Error querying partition start offset ({}): {}",
-          proxy.ntp(),
-          effective_start.error());
-        co_return model::make_empty_record_batch_reader();
+std::expected<void, reconcile_error> reconciler::add_object_metadata(
+  const l1::object_id& oid,
+  const built_object_metadata& obj_meta,
+  l1::metastore::object_metadata_builder* meta_builder) {
+    // Add metadata for this object to the metadata builder.
+    // Remember that there are two kinds of partitions here: the
+    // partition of the cloud topic and the partition of the L1 object.
+    // There may be multiple partitions in the L1 object for a cloud
+    // topic partition, but right now we only add one per reconciler run.
+    for (const auto& commit : obj_meta.commits) {
+        auto [first, last] = obj_meta.object_info.index.partitions.equal_range(
+          commit.source->topic_id_partition());
+        vassert(
+          std::distance(first, last) == 1,
+          "expected a single partition in the object");
+        for (auto it = first; it != last; ++it) {
+            const auto& obj_partition = it->second;
+            auto add_result = meta_builder->add(
+              oid,
+              l1::metastore::object_metadata::ntp_metadata{
+                .tidp = commit.source->topic_id_partition(),
+                // Use the start offset, this may differ from the base offset in
+                // the metadata info in topics with transactions, as control
+                // batch offsets are skipped.
+                .base_offset = commit.start_offset,
+                .last_offset = obj_partition.last_offset,
+                .max_timestamp = obj_partition.max_timestamp,
+                .pos = obj_partition.file_position,
+                .size = obj_partition.length});
+            if (!add_result.has_value()) {
+                // TODO: The object has been uploaded. The reconciler could
+                //       attempt cleanup (or notify a cleanup subsystem).
+                return std::unexpected(reconcile_error(
+                  "Failed to finish metadata for partition {} of object {}: {}",
+                  commit.source->topic_id_partition(),
+                  oid,
+                  add_result.error()));
+            }
+        }
     }
 
-    kafka::offset start_offset = std::max(
-      model::offset_cast(effective_start.value()), partition->lro);
-
-    auto maybe_lso = proxy.last_stable_offset();
-    if (maybe_lso.has_error()) {
-        vlog(
-          lg.info,
-          "Error querying partition LSO ({}): {}",
-          proxy.ntp(),
-          maybe_lso.error());
-        co_return model::make_empty_record_batch_reader();
+    auto meta_result = meta_builder->finish(
+      oid, obj_meta.object_info.footer_offset, obj_meta.object_info.size_bytes);
+    if (!meta_result.has_value()) {
+        // TODO: The object has been uploaded. The reconciler could
+        //       attempt cleanup (or notify a cleanup subsystem).
+        return std::unexpected(reconcile_error(
+                                 "Failed to finish metadata for object {}: {}",
+                                 oid,
+                                 meta_result.error())
+                                 .non_benign());
     }
 
-    // It's possible for LSO to be 0, which in this case the previous offset
-    // is model::offset::min(), this is the same as the kafka fetch path.
-    auto max_offset = kafka::prev_offset(model::offset_cast(maybe_lso.value()));
-
-    if (max_offset < start_offset) {
-        co_return model::make_empty_record_batch_reader();
-    }
-
-    auto reader = co_await proxy.make_reader(storage::log_reader_config(
-      kafka::offset_cast(start_offset),
-      kafka::offset_cast(max_offset),
-      0,
-      max_bytes,
-      ss::default_priority_class(),
-      std::nullopt,
-      std::nullopt,
-      _as));
-
-    auto tracker = kafka::aborted_transaction_tracker::create_default(
-      &proxy, std::move(reader.ot_state));
-
-    co_return model::make_record_batch_reader<kafka::read_committed_reader>(
-      std::move(tracker), std::move(reader.reader));
+    return {};
 }
 
-} // namespace experimental::cloud_topics::reconciler
+ss::future<std::expected<void, reconcile_error>> reconciler::commit_objects(
+  const chunked_vector<built_object_metadata>& objects,
+  std::unique_ptr<l1::metastore::object_metadata_builder> meta_builder) {
+    // It's possible to build the terms map as we build the objects, but
+    // I think re-iterating over all the commits here is worth
+    // it in exchange for less context passing among functions.
+    l1::metastore::term_offset_map_t terms;
+    for (const auto& obj_meta : objects) {
+        for (const auto& commit : obj_meta.commits) {
+            auto tidp = commit.source->topic_id_partition();
+            chunked_vector<l1::metastore::term_offset> term_offsets;
+            auto it = commit.metadata.terms.begin();
+            auto end = commit.metadata.terms.end();
+            vassert(
+              it != end, "missing terms for ntp: {}", commit.source->ntp());
+            // We have to override the start term to be the start offset, this
+            // may differ from the first observed offset when transaction
+            // control batches are skipped but still need to be accounted for in
+            // the offset space.
+            term_offsets.emplace_back(it->first, commit.start_offset);
+            ++it;
+            for (const auto& [term, first_offset] :
+                 std::ranges::subrange(it, end)) {
+                term_offsets.emplace_back(term, first_offset);
+            }
+            terms[tidp] = std::move(term_offsets);
+        }
+    }
+
+    retry_chain_node rtc = l1::make_default_metastore_rtc(_as);
+    auto add_objects_result = co_await l1::retry_metastore_op(
+      [this, &meta_builder, &terms]() {
+          auto metrics_duration_add_objects
+            = _probe.measure_metastore_add_objects_duration();
+          return _metastore->add_objects(*meta_builder, terms)
+            .then(
+              [this,
+               metrics_duration_add_objects = std::move(
+                 metrics_duration_add_objects)](
+                std::expected<l1::metastore::add_response, l1::metastore::errc>
+                  result) mutable {
+                  metrics_duration_add_objects.reset();
+
+                  if (
+                    !result.has_value()
+                    && result.error() == l1::metastore::errc::transport_error) {
+                      _probe.increment_metastore_retries();
+                  }
+
+                  return result;
+              });
+      },
+      rtc);
+
+    if (!add_objects_result.has_value()) {
+        // TODO: The objects have been uploaded. The reconciler could
+        //       attempt cleanup (or notify a cleanup subsystem).
+        co_return std::unexpected(reconcile_error(
+          "Failed to add objects to the L1 metastore: {}",
+          add_objects_result.error()));
+    }
+
+    // Now update the LRO, taking into account any corrections from
+    // the metastore.
+    const auto& corrected_next_offsets
+      = add_objects_result.value().corrected_next_offsets;
+    std::optional<reconcile_error> error;
+    for (const auto& obj_meta : objects) {
+        for (const auto& commit : obj_meta.commits) {
+            auto tidp = commit.source->topic_id_partition();
+            kafka::offset lro = commit.metadata.last_offset;
+            auto it = corrected_next_offsets.find(tidp);
+            if (it != corrected_next_offsets.end()) {
+                _probe.increment_offset_corrections();
+                // We want the previous offset, because that is what was last
+                // reconciled. During next reconciliation we should get the
+                // offset *after* the LRO to start reading from.
+                lro = kafka::prev_offset(it->second);
+            }
+            auto result = co_await commit.source->set_last_reconciled_offset(
+              lro, _as);
+            if (result.has_value()) {
+                vlog(
+                  lg.debug,
+                  "successfully bumped LRO for {} (tidp: {}) to {}",
+                  commit.source->ntp(),
+                  tidp,
+                  lro);
+            } else {
+                // Don't fail early, just keep going until we're done.
+                if (error) {
+                    error = error->with_context(
+                      "failed to set LRO in L0: {}", result.error());
+                } else {
+                    error = reconcile_error(
+                      "failed to set LRO in L0: {}", result.error());
+                }
+                if (result.error() == source::errc::failure) {
+                    // Other errors can be expected in normal operating
+                    // conditions.
+                    error = error->non_benign();
+                }
+            }
+        }
+    }
+    co_return error
+      .transform(
+        [](reconcile_error& err) -> std::expected<void, reconcile_error> {
+            return std::unexpected(std::move(err));
+        })
+      .value_or(std::expected<void, reconcile_error>{});
+}
+
+} // namespace cloud_topics::reconciler

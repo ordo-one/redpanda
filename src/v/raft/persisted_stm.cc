@@ -12,6 +12,7 @@
 #include "bytes/iostream.h"
 #include "raft/consensus.h"
 #include "raft/state_machine_base.h"
+#include "ssx/future-util.h"
 #include "ssx/sformat.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
@@ -80,8 +81,10 @@ persisted_stm_base<BaseT, T>::load_local_snapshot() {
 }
 template<typename BaseT, supported_stm_snapshot T>
 ss::future<> persisted_stm_base<BaseT, T>::stop() {
+    vlog(_log.debug, "Stopping");
     co_await raft::state_machine_base::stop();
     co_await _gate.close();
+    vlog(_log.debug, "Stopped");
 }
 
 template<typename BaseT, supported_stm_snapshot T>
@@ -95,8 +98,7 @@ file_backed_stm_snapshot::file_backed_stm_snapshot(
   , _log(log)
   , _snapshot_mgr(
       std::filesystem::path(c->log_config().work_directory()),
-      std::move(snapshot_name),
-      ss::default_priority_class()) {}
+      std::move(snapshot_name)) {}
 
 ss::future<> file_backed_stm_snapshot::perform_initial_cleanup() {
     // Do nothing as the log directory name contains the partition revision,
@@ -272,15 +274,25 @@ kvstore_backed_stm_snapshot::load_snapshot() {
     if (!snapshot_blob) {
         co_return std::nullopt;
     }
-    auto thin_snapshot = serde::from_iobuf<stm_thin_snapshot>(
-      std::move(*snapshot_blob));
-    stm_snapshot snapshot;
-    snapshot.header = raft::stm_snapshot_header{
-      .version = stm_snapshot_version,
-      .snapshot_size = static_cast<int32_t>(thin_snapshot.data.size_bytes()),
-      .offset = thin_snapshot.offset};
-    snapshot.data = std::move(thin_snapshot.data);
-    co_return snapshot;
+    try {
+        auto thin_snapshot = serde::from_iobuf<stm_thin_snapshot>(
+          std::move(*snapshot_blob));
+        stm_snapshot snapshot;
+        snapshot.header = raft::stm_snapshot_header{
+          .version = stm_snapshot_version,
+          .snapshot_size = static_cast<int32_t>(
+            thin_snapshot.data.size_bytes()),
+          .offset = thin_snapshot.offset};
+        snapshot.data = std::move(thin_snapshot.data);
+        co_return snapshot;
+    } catch (...) {
+        vlog(
+          _log.warn,
+          "Failed to deserialize snapshot from kvstore for ntp {}: {}",
+          _ntp,
+          std::current_exception());
+        throw;
+    }
 }
 
 ss::future<>
@@ -367,40 +379,47 @@ ss::future<> persisted_stm_base<BaseT, T>::ensure_local_snapshot_exists(
 }
 
 template<typename BaseT, supported_stm_snapshot T>
-model::offset persisted_stm_base<BaseT, T>::max_collectible_offset() {
+model::offset persisted_stm_base<BaseT, T>::max_removable_local_log_offset() {
     return model::offset::max();
 }
 
 template<typename BaseT, supported_stm_snapshot T>
-ss::future<fragmented_vector<model::tx_range>>
+ss::future<chunked_vector<model::tx_range>>
 persisted_stm_base<BaseT, T>::aborted_tx_ranges(model::offset, model::offset) {
-    return ss::make_ready_future<fragmented_vector<model::tx_range>>();
+    return ss::make_ready_future<chunked_vector<model::tx_range>>();
 }
 
 template<typename BaseT, supported_stm_snapshot T>
 ss::future<> persisted_stm_base<BaseT, T>::wait_offset_committed(
   model::timeout_clock::duration timeout,
   model::offset offset,
-  model::term_id term) {
+  model::term_id term,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) {
     auto stop_cond = [this, offset, term] {
         return _raft->committed_offset() >= offset || _raft->term() > term;
     };
-
-    return _raft->commit_index_updated().wait(timeout, stop_cond);
+    auto deadline = model::timeout_clock::now() + timeout;
+    if (as) {
+        co_await _raft->commit_index_updated().wait(
+          deadline, as->get(), stop_cond);
+    } else {
+        co_await _raft->commit_index_updated().wait(deadline, stop_cond);
+    }
 }
 
 template<typename BaseT, supported_stm_snapshot T>
 ss::future<bool> persisted_stm_base<BaseT, T>::do_sync(
   model::timeout_clock::duration timeout,
   model::offset offset,
-  model::term_id term) {
+  model::term_id term,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) {
     const auto committed = _raft->committed_offset();
     const auto ntp = _raft->ntp();
     _raft->events().notify_commit_index();
 
     if (offset > committed) {
         try {
-            co_await wait_offset_committed(timeout, offset, term);
+            co_await wait_offset_committed(timeout, offset, term, as);
         } catch (const ss::broken_condition_variable&) {
             co_return false;
         } catch (const ss::gate_closed_exception&) {
@@ -425,7 +444,8 @@ ss::future<bool> persisted_stm_base<BaseT, T>::do_sync(
 
     if (_raft->term() == term) {
         try {
-            co_await BaseT::wait(offset, model::timeout_clock::now() + timeout);
+            co_await BaseT::wait(
+              offset, model::timeout_clock::now() + timeout, as);
         } catch (const ss::broken_condition_variable&) {
             co_return false;
         } catch (const ss::gate_closed_exception&) {
@@ -463,8 +483,9 @@ ss::future<bool> persisted_stm_base<BaseT, T>::do_sync(
 }
 
 template<typename BaseT, supported_stm_snapshot T>
-ss::future<bool>
-persisted_stm_base<BaseT, T>::sync(model::timeout_clock::duration timeout) {
+ss::future<bool> persisted_stm_base<BaseT, T>::sync(
+  model::timeout_clock::duration timeout,
+  std::optional<std::reference_wrapper<ss::abort_source>> as) {
     auto term = _raft->term();
     if (!_raft->is_leader()) {
         return ss::make_ready_future<bool>(false);
@@ -477,7 +498,7 @@ persisted_stm_base<BaseT, T>::sync(model::timeout_clock::duration timeout) {
         auto sync_waiter = ss::make_lw_shared<expiring_promise<bool>>();
         _sync_waiters.push_back(sync_waiter);
         return sync_waiter->get_future_with_timeout(
-          deadline, [] { return false; });
+          deadline, [] { return false; }, as);
     }
     _is_catching_up = true;
 
@@ -503,7 +524,7 @@ persisted_stm_base<BaseT, T>::sync(model::timeout_clock::duration timeout) {
         sync_offset = log_offsets.dirty_offset;
     }
 
-    return do_sync(timeout, sync_offset, term).then([this](bool is_synced) {
+    return do_sync(timeout, sync_offset, term, as).then([this](bool is_synced) {
         _is_catching_up = false;
         for (auto& sync_waiter : _sync_waiters) {
             sync_waiter->set_value(is_synced);

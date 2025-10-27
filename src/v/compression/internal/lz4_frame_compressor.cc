@@ -11,11 +11,12 @@
 
 #include "base/vassert.h"
 #include "compression/lz4_decompression_buffers.h"
-#include "thirdparty/lz4/lz4.h"
-#include "thirdparty/lz4/lz4frame.h"
 #include "utils/static_deleter_fn.h"
 
 #include <seastar/core/temporary_buffer.hh>
+
+#include <lz4.h>
+#include <lz4frame.h>
 
 namespace compression::internal {
 // from frameCompress.c
@@ -281,11 +282,12 @@ iobuf lz4_frame_compressor::uncompress(const iobuf& input) {
     }
 
     if (unlikely(read_total < src_size)) {
-        throw std::runtime_error(fmt::format(
-          "lz4 error. could not consume all input bytes in decompression. "
-          "Input:{}, consumed:{}",
-          src_size,
-          read_total));
+        throw std::runtime_error(
+          fmt::format(
+            "lz4 error. could not consume all input bytes in decompression. "
+            "Input:{}, consumed:{}",
+            src_size,
+            read_total));
     }
 
     if (write_this_chunk > 0) {

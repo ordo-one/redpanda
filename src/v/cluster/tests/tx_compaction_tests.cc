@@ -1,9 +1,18 @@
+// Copyright 2022 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
 #include "cluster/rm_stm.h"
 #include "cluster/tests/rm_stm_test_fixture.h"
-#include "config/config_store.h"
-#include "storage/tests/utils/disk_log_builder.h"
+#include "cluster/tests/tx_compaction_utils.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
-#include "tx_compaction_utils.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/util/defer.hh>
 
@@ -21,7 +30,7 @@ using cluster::tx_executor;
     auto stm = _stm;                                                           \
     stm->testing_only_disable_auto_abort();                                    \
     auto stop = ss::defer([&] {                                                \
-        _data_dir = "test_dir_" + random_generators::gen_alphanum_string(6);   \
+        _data_dir = test_env::random_dir_path();                               \
         stop_all();                                                            \
         producer_state_manager.stop().get();                                   \
         producer_expiration_ms.stop().get();                                   \

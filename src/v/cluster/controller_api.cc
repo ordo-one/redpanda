@@ -10,11 +10,11 @@
  */
 #include "cluster/controller_api.h"
 
+#include "absl/container/node_hash_map.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/controller_backend.h"
 #include "cluster/controller_service.h"
 #include "cluster/errc.h"
-#include "cluster/health_monitor_frontend.h"
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/partition_balancer_backend.h"
@@ -38,8 +38,6 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/node_hash_map.h>
-
 namespace cluster {
 
 controller_api::controller_api(
@@ -48,7 +46,6 @@ controller_api::controller_api(
   ss::sharded<topic_table>& topics,
   ss::sharded<shard_table>& shard_table,
   ss::sharded<rpc::connection_cache>& cache,
-  ss::sharded<health_monitor_frontend>& health_monitor,
   ss::sharded<members_table>& members,
   ss::sharded<partition_balancer_backend>& partition_balancer,
   ss::sharded<partition_manager>& partition_manager,
@@ -58,7 +55,6 @@ controller_api::controller_api(
   , _topics(topics)
   , _shard_table(shard_table)
   , _connections(cache)
-  , _health_monitor(health_monitor)
   , _members(members)
   , _partition_balancer(partition_balancer)
   , _partition_manager(partition_manager)
@@ -367,13 +363,14 @@ controller_api::get_partitions_reconfiguration_state(
                   = operation.recovery_state->local_size;
                 for (auto& [id, recovery_state] :
                      operation.recovery_state->replicas) {
-                    state.replicas.push_back(replica_bytes{
-                      .node = id,
-                      .bytes_left = recovery_state.bytes_left,
-                      .bytes_transferred = state.current_partition_size
-                                           - recovery_state.bytes_left,
-                      .offset = recovery_state.last_offset,
-                    });
+                    state.replicas.push_back(
+                      replica_bytes{
+                        .node = id,
+                        .bytes_left = recovery_state.bytes_left,
+                        .bytes_transferred = state.current_partition_size
+                                             - recovery_state.bytes_left,
+                        .offset = recovery_state.last_offset,
+                      });
                 }
             }
         }
@@ -389,7 +386,7 @@ controller_api::get_partitions_reconfiguration_state(
     co_return ret;
 }
 
-ss::future<result<ss::chunked_fifo<model::ntp>>>
+ss::future<result<chunked_hash_map<model::ntp, reallocation_failure_details>>>
 controller_api::get_decommission_allocation_failures(model::node_id node) {
     using result_t = std::variant<
       cluster::partition_balancer_overview_reply,
@@ -439,15 +436,38 @@ controller_api::get_decommission_allocation_failures(model::node_id node) {
     } else {
         co_return std::get<cluster::errc>(result);
     }
-
-    ss::chunked_fifo<model::ntp> ret;
-    auto it = overview.decommission_realloc_failures.find(node);
-    if (it == overview.decommission_realloc_failures.end()) {
+    /**
+     * If allocation failures are empty there are two possibilities, either a
+     * previous version of the reply was received or there are no failures,
+     * either way we are going to use decommission_realloc_failures map to
+     * determine the failures.
+     */
+    chunked_hash_map<model::ntp, reallocation_failure_details> ret;
+    if (overview.reallocation_failures.empty()) {
+        auto it = overview.decommission_realloc_failures.find(node);
+        if (it == overview.decommission_realloc_failures.end()) {
+            co_return ret;
+        }
+        ret.reserve(it->second.size());
+        for (const auto& ntp : it->second) {
+            ret.emplace(
+              ntp,
+              reallocation_failure_details{
+                .replica_to_move = node,
+                .reason = change_reason::node_decommissioning,
+                .error = reallocation_error::unknown_error,
+              });
+        }
         co_return ret;
     }
-    for (const auto& ntp : it->second) {
-        ret.push_back(ntp);
+    for (auto& [ntp, details] : overview.reallocation_failures) {
+        if (
+          details.replica_to_move == node
+          && details.reason == change_reason::node_decommissioning) {
+            ret.emplace(ntp, details);
+        }
     }
+
     co_return ret;
 }
 
@@ -558,6 +578,34 @@ controller_api::get_global_reconciliation_state(
         co_await ss::coroutine::maybe_yield();
     }
     co_return state;
+}
+
+ss::future<std::error_code> controller_api::remake_partition(raft::group_id g) {
+    auto shard_for_opt = shard_for(g);
+    if (!shard_for_opt.has_value()) {
+        co_return errc::partition_not_exists;
+    }
+
+    auto shard = shard_for_opt.value();
+    auto ntp_opt = co_await _partition_manager.invoke_on(
+      shard, [g](cluster::partition_manager& pm) -> std::optional<model::ntp> {
+          auto p = pm.partition_for(g);
+          if (!p) {
+              return std::nullopt;
+          }
+          return p->ntp();
+      });
+
+    if (!ntp_opt.has_value()) {
+        co_return errc::partition_not_exists;
+    }
+
+    auto ntp = std::move(ntp_opt).value();
+
+    co_return co_await _backend.invoke_on(
+      shard, [&ntp](cluster::controller_backend& b) {
+          return b.remake_partition(std::move(ntp));
+      });
 }
 
 } // namespace cluster

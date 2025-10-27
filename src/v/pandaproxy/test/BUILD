@@ -7,10 +7,9 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
     ],
-    include_prefix = "pandaproxy/test",
     visibility = ["//visibility:public"],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:core",
     ],
 )
 
@@ -21,11 +20,9 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
     ],
-    include_prefix = "pandaproxy/test",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/http",
-        "//src/v/pandaproxy",
         "//src/v/redpanda/tests:fixture",
     ],
 )
@@ -38,7 +35,9 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/kafka/protocol",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:error",
+        "//src/v/pandaproxy:json",
+        "//src/v/pandaproxy:parsing",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
     ],
@@ -51,7 +50,7 @@ redpanda_cc_btest(
         "one_shot.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:core",
         "//src/v/test_utils:seastar_boost",
         "@boost//:range",
         "@boost//:test",
@@ -69,7 +68,8 @@ redpanda_cc_btest(
     deps = [
         "//src/v/config",
         "//src/v/kafka/client",
-        "//src/v/pandaproxy",
+        "//src/v/kafka/client:configuration",
+        "//src/v/pandaproxy:core",
         "//src/v/security",
         "//src/v/ssx:future_util",
         "//src/v/test_utils:seastar_boost",

@@ -9,6 +9,8 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
+#include "absl/container/node_hash_set.h"
 #include "bytes/iobuf_parser.h"
 #include "cluster/drain_manager.h"
 #include "cluster/errc.h"
@@ -27,9 +29,6 @@
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/node_hash_map.h>
-#include <absl/container/node_hash_set.h>
 
 namespace cluster {
 
@@ -105,7 +104,7 @@ struct followers_stats
 };
 struct partition_status
   : serde::
-      envelope<partition_status, serde::version<4>, serde::compat_version<0>> {
+      envelope<partition_status, serde::version<6>, serde::compat_version<0>> {
     static constexpr size_t invalid_size_bytes = size_t(-1);
     static constexpr uint32_t invalid_shard_id = uint32_t(-1);
 
@@ -137,6 +136,22 @@ struct partition_status
     // present on leaders only
     std::optional<followers_stats> followers_stats;
 
+    /**
+     * Kafka high watermark of partition replica, this offset is only populated
+     * for Kafka partitions. For other partitions the offset stays not
+     * initialized.
+     */
+    kafka::offset high_watermark;
+
+    /*
+     * If the partition is a cloud topics partition, then this field records the
+     * maximum epoch (inclusive) that is eligible for garbage collection. When
+     * reducing (applying `min`) this value across node reports, ignore
+     * std::nullopt. If the reduced value is std::nullopt then the partition
+     * should be treated as if it contains no GC eligible data.
+     */
+    std::optional<int64_t> cloud_topic_max_gc_eligible_epoch;
+
     auto serde_fields() {
         return std::tie(
           id,
@@ -147,7 +162,9 @@ struct partition_status
           under_replicated_replicas,
           reclaimable_size_bytes,
           shard,
-          followers_stats);
+          followers_stats,
+          high_watermark,
+          cloud_topic_max_gc_eligible_epoch);
     }
 
     friend std::ostream& operator<<(std::ostream&, const partition_status&);
@@ -156,6 +173,8 @@ struct partition_status
 };
 
 using partition_statuses_t = chunked_vector<partition_status>;
+using partition_statuses_map_t
+  = chunked_hash_map<model::partition_id, partition_status>;
 
 struct topic_status
   : serde::envelope<topic_status, serde::version<0>, serde::compat_version<0>> {
@@ -184,7 +203,7 @@ struct topic_status
 struct node_health_report {
     using topics_t = chunked_hash_map<
       model::topic_namespace,
-      partition_statuses_t,
+      partition_statuses_map_t,
       model::topic_namespace_hash,
       model::topic_namespace_eq>;
 
@@ -312,8 +331,9 @@ struct cluster_health_report
         for (auto i = 0U; i < sz; ++i) {
             auto r = co_await read_async_nested<node_health_report_serde>(
               in, h._bytes_left_limit);
-            node_reports.emplace_back(ss::make_lw_shared<node_health_report>(
-              std::move(r).to_in_memory()));
+            node_reports.emplace_back(
+              ss::make_lw_shared<node_health_report>(
+                std::move(r).to_in_memory()));
         }
         bytes_in_cloud_storage = read_nested<std::optional<size_t>>(
           in, h._bytes_left_limit);
@@ -349,8 +369,9 @@ struct cluster_health_report
         for (auto i = 0U; i < sz; ++i) {
             auto r = read_nested<node_health_report_serde>(
               in, h._bytes_left_limit);
-            node_reports.emplace_back(ss::make_lw_shared<node_health_report>(
-              std::move(r).to_in_memory()));
+            node_reports.emplace_back(
+              ss::make_lw_shared<node_health_report>(
+                std::move(r).to_in_memory()));
         }
         bytes_in_cloud_storage = read_nested<std::optional<size_t>>(
           in, h._bytes_left_limit);
@@ -371,7 +392,7 @@ struct restart_risk_report {
     size_t limit;
 
     void push(
-      partitions_t restart_risk_report::*member,
+      partitions_t restart_risk_report::* member,
       const model::topic_namespace&,
       model::partition_id);
 };
@@ -491,7 +512,6 @@ class get_node_health_request
       serde::version<1>,
       serde::compat_version<0>> {
 public:
-    using rpc_adl_exempt = std::true_type;
     get_node_health_request() = default;
     explicit get_node_health_request(model::node_id target_node_id)
       : _target_node_id(target_node_id) {}
@@ -523,8 +543,6 @@ struct get_node_health_reply
       get_node_health_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     errc error = cluster::errc::success;
     std::optional<node_health_report_serde> report;
 
@@ -550,7 +568,6 @@ struct get_cluster_health_request
       get_cluster_health_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     static constexpr int8_t initial_version = 0;
     // version -1: included revision id in partition status
     static constexpr int8_t revision_id_version = -1;
@@ -595,7 +612,6 @@ struct get_cluster_health_reply
       get_cluster_health_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     static constexpr int8_t current_version = 0;
 
     errc error = cluster::errc::success;
@@ -612,5 +628,12 @@ struct get_cluster_health_reply
 
     auto serde_fields() { return std::tie(error, report); }
 };
+
+partition_statuses_map_t
+copy_partition_statuses(const partition_statuses_map_t& ps);
+partition_statuses_t copy_to_vector(const partition_statuses_map_t&);
+partition_statuses_t move_to_vector(partition_statuses_map_t&&);
+partition_statuses_map_t move_to_map(partition_statuses_t&&);
+partition_statuses_map_t copy_to_map(const partition_statuses_t&);
 
 } // namespace cluster

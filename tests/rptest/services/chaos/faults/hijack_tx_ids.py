@@ -9,8 +9,7 @@
 
 from time import sleep
 
-from confluent_kafka import Producer
-from confluent_kafka import KafkaException
+from confluent_kafka import KafkaException, Producer
 
 from .fault import OneoffFault
 
@@ -47,7 +46,7 @@ class HijackTxIDsFault(OneoffFault):
                 "request.required.acks": -1,
                 "retries": 5,
                 "enable.idempotence": True,
-                "transactional.id": tx_id
+                "transactional.id": tx_id,
             }
 
             attempt = 0

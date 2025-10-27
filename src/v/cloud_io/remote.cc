@@ -10,7 +10,6 @@
 
 #include "cloud_io/remote.h"
 
-#include "base/unreachable.h"
 #include "bytes/iostream.h"
 #include "cloud_io/logger.h"
 #include "cloud_io/provider.h"
@@ -22,6 +21,7 @@
 #include "model/metadata.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
+#include "ssx/watchdog.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
@@ -65,6 +65,9 @@ static constexpr auto s3_scheme = "s3";
 cloud_io::provider infer_provider(
   model::cloud_storage_backend backend,
   const cloud_storage_clients::client_configuration& conf) {
+    // The behavior of this function for existing backends MUST NOT change.
+    // They are likely already used by i.e. Iceberg tables and changing the
+    // behavior could break existing deployments.
     switch (backend) {
     case model::cloud_storage_backend::unknown:
         // NOTE: treat unknown cloud storage backend as a valid case
@@ -72,6 +75,7 @@ cloud_io::provider infer_provider(
     case model::cloud_storage_backend::aws:
     case model::cloud_storage_backend::minio:
     case model::cloud_storage_backend::oracle_s3_compat:
+    case model::cloud_storage_backend::linode_s3_compat:
         return cloud_io::s3_compat_provider{s3_scheme};
     case model::cloud_storage_backend::google_s3_compat:
         return cloud_io::s3_compat_provider{gcs_scheme};
@@ -84,6 +88,17 @@ cloud_io::provider infer_provider(
     }
 }
 
+template<typename ErrT>
+ErrT throw_if_not_timeout(const std::exception_ptr& e, ErrT on_timeout) {
+    try {
+        std::rethrow_exception(e);
+    } catch (const ss::timed_out_error&) {
+        return on_timeout;
+    } catch (...) {
+        throw;
+    }
+}
+
 } // namespace
 
 namespace cloud_io {
@@ -93,16 +108,19 @@ using namespace std::chrono_literals;
 remote::remote(
   ss::sharded<cloud_storage_clients::client_pool>& clients,
   const cloud_storage_clients::client_configuration& conf,
-  model::cloud_credentials_source cloud_credentials_source)
+  model::cloud_credentials_source cloud_credentials_source,
+  ss::scheduling_group sg)
   : _pool(clients)
   , _auth_refresh_bg_op{_gate, _as, conf, cloud_credentials_source}
-  , _resources(std::make_unique<io_resources>())
+  , _resources(std::make_unique<io_resources>(sg))
   , _azure_shared_key_binding(
       config::shard_local_cfg().cloud_storage_azure_shared_key.bind())
   , _cloud_storage_backend{cloud_storage_clients::
                              infer_backend_from_configuration(
                                conf, cloud_credentials_source)}
-  , _provider(infer_provider(_cloud_storage_backend, conf)) {
+  , _provider(infer_provider(_cloud_storage_backend, conf))
+  , _lease_timeout(
+      config::shard_local_cfg().cloud_storage_client_lease_timeout_ms.bind()) {
     vlog(
       log.info, "remote initialized with backend {}", _cloud_storage_backend);
     // If the credentials source is from config file, bypass the background
@@ -181,7 +199,7 @@ ss::future<> remote::stop() {
     co_await _resources->stop();
     co_await _gate.close();
     co_await _auth_refresh_bg_op.stop();
-    vlog(log.debug, "Stopeed remote...");
+    vlog(log.debug, "Stopped remote...");
 }
 
 size_t remote::concurrency() const { return _pool.local().max_size(); }
@@ -202,6 +220,9 @@ int remote::delete_objects_max_keys() const {
         [[fallthrough]];
     case model::cloud_storage_backend::oracle_s3_compat:
         // https://docs.oracle.com/en-us/iaas/api/#/en/s3objectstorage/20160918/Object/BulkDelete
+        [[fallthrough]];
+    case model::cloud_storage_backend::linode_s3_compat:
+        // Empirically verified, no public docs found.
         [[fallthrough]];
     case model::cloud_storage_backend::minio:
         // https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
@@ -237,11 +258,18 @@ ss::future<upload_result> remote::upload_stream(
       content_length);
     std::optional<upload_result> result;
     while (!_gate.is_closed() && permit.is_allowed && !result
-           && max_retries.value_or(1) > 0) {
+           && (!max_retries.has_value() || max_retries.value() > 0)) {
         if (max_retries.has_value()) {
             max_retries = max_retries.value() - 1;
         }
-        auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+        auto fut = co_await ss::coroutine::as_future(
+          _pool.local().acquire_with_timeout(
+            fib.root_abort_source(), _lease_timeout(), fib()));
+        if (fut.failed()) {
+            co_return throw_if_not_timeout(
+              fut.get_exception(), upload_result::timedout);
+        }
+        auto lease = std::move(fut).get();
         transfer_details.on_request(fib.retry_count());
 
         // Client acquisition can take some time. Do a check before starting
@@ -309,22 +337,23 @@ ss::future<upload_result> remote::upload_stream(
     if (!result) {
         vlog(
           log.warn,
-          "Uploading {} {} to {}, backoff quota exceded, {} not "
-          "uploaded",
+          "Uploading {} {} to {}, backoff quota exceded, {} not uploaded",
           stream_label,
           path,
           bucket,
           stream_label);
+        result = upload_result::timedout;
     } else {
         vlog(
           log.warn,
-          "Uploading {} {} to {}, {}, segment not uploaded",
+          "Uploading {} {} to {}, {}, {} not uploaded",
           stream_label,
           path,
           bucket,
-          *result);
+          *result,
+          stream_label);
     }
-    co_return upload_result::timedout;
+    co_return *result;
 }
 
 ss::future<download_result> remote::download_stream(
@@ -346,10 +375,16 @@ ss::future<download_result> remote::download_stream(
         hu = co_await _resources->get_hydration_units(1);
     }
 
-    auto lease = co_await [this, &fib, &transfer_details] {
+    auto fut = co_await [this, &fib, &transfer_details] {
         transfer_details.on_client_acquire();
-        return _pool.local().acquire(fib.root_abort_source());
+        return ss::coroutine::as_future(_pool.local().acquire_with_timeout(
+          fib.root_abort_source(), _lease_timeout(), fib()));
     }();
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), download_result::timedout);
+    }
+    auto lease = std::move(fut).get();
 
     auto permit = fib.retry();
     vlog(ctxlog.debug, "Download {} {}", stream_label, path);
@@ -393,16 +428,33 @@ ss::future<download_result> remote::download_stream(
 
         switch (resp.error()) {
         case cloud_storage_clients::error_outcome::retry:
-            vlog(
-              ctxlog.debug,
-              "Downloading {} from {}, {} backoff required",
-              stream_label,
-              bucket,
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                permit.delay));
-            transfer_details.on_backoff();
-            co_await ss::sleep_abortable(permit.delay, fib.root_abort_source());
-            permit = fib.retry();
+            if (_as.abort_requested()) {
+                // When the remote is stopped we may still get the 'timeout'
+                // error from the http client. This error is interpreted
+                // as a retriable error by the cloud_storage_client.
+                // In order to distinguish between the two cases (shutdown vs
+                // timeout) the state of the abort_source is checked.
+                vlog(
+                  ctxlog.debug,
+                  "Downloading {} from {}, skipping backoff because of the "
+                  "shutdown",
+                  stream_label,
+                  bucket);
+                result = download_result::timedout;
+                break;
+            } else {
+                vlog(
+                  ctxlog.debug,
+                  "Downloading {} from {}, {} backoff required",
+                  stream_label,
+                  bucket,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                    permit.delay));
+                transfer_details.on_backoff();
+                co_await ss::sleep_abortable(
+                  permit.delay, fib.root_abort_source());
+                permit = fib.retry();
+            }
             break;
         case cloud_storage_clients::error_outcome::operation_not_supported:
             [[fallthrough]];
@@ -447,7 +499,14 @@ remote::download_object(download_request download_request) {
     const auto bucket = transfer_details.bucket;
     const auto object_type = download_request.display_str;
 
-    auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+    auto fut = co_await ss::coroutine::as_future(
+      _pool.local().acquire_with_timeout(
+        fib.root_abort_source(), _lease_timeout(), fib()));
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), download_result::timedout);
+    }
+    auto lease = std::move(fut).get();
 
     auto permit = fib.retry();
     vlog(ctxlog.debug, "Downloading {} from {}", object_type, path);
@@ -531,7 +590,14 @@ ss::future<download_result> remote::object_exists(
     ss::gate::holder gh{_gate};
     retry_chain_node fib(&parent);
     retry_chain_logger ctxlog(log, fib);
-    auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+    auto fut = co_await ss::coroutine::as_future(
+      _pool.local().acquire_with_timeout(
+        fib.root_abort_source(), _lease_timeout(), fib()));
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), download_result::timedout);
+    }
+    auto lease = std::move(fut).get();
     auto permit = fib.retry();
     vlog(ctxlog.debug, "Check {} {}", object_type, path);
     std::optional<download_result> result;
@@ -601,7 +667,14 @@ remote::delete_object(transfer_details transfer_details) {
     ss::gate::holder gh{_gate};
     retry_chain_node fib(&parent);
     retry_chain_logger ctxlog(log, fib);
-    auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+    auto fut = co_await ss::coroutine::as_future(
+      _pool.local().acquire_with_timeout(
+        fib.root_abort_source(), _lease_timeout(), fib()));
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), upload_result::timedout);
+    }
+    auto lease = std::move(fut).get();
     auto permit = fib.retry();
     vlog(ctxlog.debug, "Delete object {}", path);
     std::optional<upload_result> result;
@@ -754,7 +827,14 @@ ss::future<upload_result> remote::delete_object_batch(
 
     retry_chain_node fib(&parent);
     retry_chain_logger ctxlog(log, fib);
-    auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+    auto fut = co_await ss::coroutine::as_future(
+      _pool.local().acquire_with_timeout(
+        fib.root_abort_source(), _lease_timeout(), fib()));
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), upload_result::timedout);
+    }
+    auto lease = std::move(fut).get();
     auto permit = fib.retry();
     vlog(ctxlog.debug, "Deleting a batch of size {}", keys.size());
     std::optional<upload_result> result;
@@ -882,19 +962,20 @@ ss::future<upload_result> remote::delete_objects_sequentially(
 
     std::vector<upload_result> results;
     results.reserve(key_nodes.size());
-    auto fut = co_await ss::coroutine::as_future(ss::max_concurrent_for_each(
-      key_nodes.begin(),
-      key_nodes.end(),
-      concurrency(),
-      [this, &bucket, &results, ctxlog, req_cb = std::move(req_cb)](
-        auto& kn) -> ss::future<> {
-          vlog(ctxlog.trace, "Deleting key {}", kn.key);
-          return delete_object({.bucket = bucket,
-                                .key = kn.key,
-                                .parent_rtc = *kn.node,
-                                .on_req_cb = req_cb})
-            .then([&results](auto result) { results.push_back(result); });
-      }));
+    auto fut = co_await ss::coroutine::as_future(
+      ss::max_concurrent_for_each(
+        key_nodes.begin(),
+        key_nodes.end(),
+        concurrency(),
+        [this, &bucket, &results, ctxlog, req_cb = std::move(req_cb)](
+          auto& kn) -> ss::future<> {
+            vlog(ctxlog.trace, "Deleting key {}", kn.key);
+            return delete_object({.bucket = bucket,
+                                  .key = kn.key,
+                                  .parent_rtc = *kn.node,
+                                  .on_req_cb = req_cb})
+              .then([&results](auto result) { results.push_back(result); });
+        }));
     if (fut.failed()) {
         std::exception_ptr eptr = fut.get_exception();
         if (ssx::is_shutdown_exception(eptr)) {
@@ -938,7 +1019,14 @@ ss::future<list_result> remote::list_objects(
     ss::gate::holder gh{_gate};
     retry_chain_node fib(&parent);
     retry_chain_logger ctxlog(log, fib);
-    auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+    auto fut = co_await ss::coroutine::as_future(
+      _pool.local().acquire_with_timeout(
+        fib.root_abort_source(), _lease_timeout(), fib()));
+    if (fut.failed()) {
+        co_return throw_if_not_timeout(
+          fut.get_exception(), cloud_storage_clients::error_outcome::retry);
+    }
+    auto lease = std::move(fut).get();
     auto permit = fib.retry();
     vlog(ctxlog.debug, "List objects {}", bucket);
     std::optional<list_result> result;
@@ -967,7 +1055,7 @@ ss::future<list_result> remote::list_objects(
           item_filter);
 
         if (res) {
-            auto list_result = res.value();
+            auto list_result = std::move(res.value());
             // Successful call, prepare for future calls by getting
             // continuation_token if result was truncated
             items_remaining = list_result.is_truncated;
@@ -1044,7 +1132,7 @@ ss::future<list_result> remote::list_objects(
           bucket,
           result->error());
     }
-    co_return *result;
+    co_return std::move(*result);
 }
 
 ss::future<upload_result> remote::upload_object(upload_request upload_request) {
@@ -1061,7 +1149,14 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
 
     std::optional<upload_result> result;
     while (!_gate.is_closed() && permit.is_allowed && !result) {
-        auto lease = co_await _pool.local().acquire(fib.root_abort_source());
+        auto fut = co_await ss::coroutine::as_future(
+          _pool.local().acquire_with_timeout(
+            fib.root_abort_source(), _lease_timeout(), fib()));
+        if (fut.failed()) {
+            co_return throw_if_not_timeout(
+              fut.get_exception(), upload_result::timedout);
+        }
+        auto lease = std::move(fut).get();
 
         vlog(
           ctxlog.debug,
@@ -1120,6 +1215,7 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
           path,
           transfer_details.bucket,
           upload_type);
+        result = upload_result::timedout;
     } else {
         vlog(
           ctxlog.warn,
@@ -1130,7 +1226,7 @@ ss::future<upload_result> remote::upload_object(upload_request upload_request) {
           *result,
           upload_type);
     }
-    co_return upload_result::timedout;
+    co_return *result;
 }
 
 ss::future<>

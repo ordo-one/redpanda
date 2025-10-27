@@ -12,16 +12,15 @@
 
 #pragma once
 
+#include "absl/container/node_hash_set.h"
 #include "base/outcome.h"
-#include "cluster/topics_frontend.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/partition_spec_parser.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/server/handlers/topics/types.h"
-#include "kafka/server/request_context.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -34,33 +33,14 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/node_hash_set.h>
-
 #include <algorithm>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 
-namespace kafka {
-template<typename T>
-struct groupped_resources {
-    chunked_vector<T> topic_changes;
-    chunked_vector<T> broker_changes;
-};
+using namespace std::chrono_literals;
 
-template<typename T>
-groupped_resources<T> group_alter_config_resources(chunked_vector<T> req) {
-    groupped_resources<T> ret;
-    for (auto& res : req) {
-        switch (config_resource_type(res.resource_type)) {
-        case config_resource_type::topic:
-            ret.topic_changes.push_back(std::move(res));
-            break;
-        default:
-            ret.broker_changes.push_back(std::move(res));
-        };
-    }
-    return ret;
-}
+namespace kafka {
 
 template<typename T, typename R>
 T assemble_alter_config_response(std::vector<chunked_vector<R>> responses) {
@@ -82,219 +62,6 @@ T make_error_alter_config_resource_response(
       .resource_name = resource.resource_name};
 }
 
-template<typename R, typename T>
-std::vector<chunked_vector<R>> make_audit_failure_response(
-  groupped_resources<T>&& resources, chunked_vector<R> unauthorized_responses) {
-    chunked_vector<R> responses;
-
-    auto gen_resp = [](const T& res) {
-        return make_error_alter_config_resource_response<R>(
-          res,
-          error_code::broker_not_available,
-          "Broker not available - audit system failure");
-    };
-
-    responses.reserve(
-      resources.broker_changes.size() + resources.topic_changes.size()
-      + unauthorized_responses.size());
-
-    std::transform(
-      resources.broker_changes.begin(),
-      resources.broker_changes.end(),
-      std::back_inserter(responses),
-      gen_resp);
-
-    std::transform(
-      resources.topic_changes.begin(),
-      resources.topic_changes.end(),
-      std::back_inserter(responses),
-      gen_resp);
-
-    std::for_each(
-      unauthorized_responses.begin(), unauthorized_responses.end(), [](R& r) {
-          r.error_code = error_code::broker_not_available;
-          r.error_message = "Broker not available - audit system failure";
-      });
-
-    std::move(
-      unauthorized_responses.begin(),
-      unauthorized_responses.end(),
-      std::back_inserter(responses));
-
-    std::vector<chunked_vector<R>> res;
-    res.push_back(std::move(responses));
-    return res;
-}
-
-/**
- * Authorizes groupped alter configuration resources, it returns not authorized
- * responsens and modifies passed in group_resources<T>
- */
-template<typename T, typename R>
-chunked_vector<R> authorize_alter_config_resources(
-  request_context& ctx, groupped_resources<T>& to_authorize) {
-    chunked_vector<R> not_authorized;
-    /**
-     * Check broker configuration authorization
-     */
-    if (
-      !to_authorize.broker_changes.empty()
-      && !ctx.authorized(
-        security::acl_operation::alter_configs,
-        security::default_cluster_name)) {
-        // not allowed
-        std::transform(
-          to_authorize.broker_changes.begin(),
-          to_authorize.broker_changes.end(),
-          std::back_inserter(not_authorized),
-          [](T& res) {
-              return make_error_alter_config_resource_response<R>(
-                res, error_code::cluster_authorization_failed);
-          });
-        // all broker changes have to be dropped
-        to_authorize.broker_changes.clear();
-    }
-
-    const auto& kafka_nodelete_topics
-      = config::shard_local_cfg().kafka_nodelete_topics();
-    const auto& kafka_noproduce_topics
-      = config::shard_local_cfg().kafka_noproduce_topics();
-
-    /**
-     * Check topic configuration authorization
-     */
-    auto unauthorized_it = std::partition(
-      to_authorize.topic_changes.begin(),
-      to_authorize.topic_changes.end(),
-      [&ctx, &kafka_nodelete_topics, &kafka_noproduce_topics](const T& res) {
-          auto topic = model::topic(res.resource_name);
-
-          auto is_nodelete_topic = std::find(
-                                     kafka_nodelete_topics.cbegin(),
-                                     kafka_nodelete_topics.cend(),
-                                     topic)
-                                   != kafka_nodelete_topics.cend();
-          if (is_nodelete_topic) {
-              return false;
-          }
-
-          auto is_noproduce_topic = std::find(
-                                      kafka_noproduce_topics.cbegin(),
-                                      kafka_noproduce_topics.cend(),
-                                      topic)
-                                    != kafka_noproduce_topics.cend();
-          if (is_noproduce_topic) {
-              return false;
-          }
-
-          return ctx.authorized(security::acl_operation::alter_configs, topic);
-      });
-
-    std::transform(
-      unauthorized_it,
-      to_authorize.topic_changes.end(),
-      std::back_inserter(not_authorized),
-      [](T& res) {
-          return make_error_alter_config_resource_response<R>(
-            res, error_code::topic_authorization_failed);
-      });
-
-    to_authorize.topic_changes.erase_to_end(unauthorized_it);
-
-    return not_authorized;
-}
-
-template<typename T, typename R, typename Func>
-ss::future<chunked_vector<R>> do_alter_topics_configuration(
-  request_context& ctx,
-  chunked_vector<T> resources,
-  bool validate_only,
-  Func f) {
-    chunked_vector<R> responses;
-    responses.reserve(resources.size());
-
-    absl::node_hash_set<ss::sstring> topic_names;
-    auto valid_end = std::stable_partition(
-      resources.begin(), resources.end(), [&topic_names](T& r) {
-          return !topic_names.contains(r.resource_name);
-      });
-
-    for (auto& r : boost::make_iterator_range(valid_end, resources.end())) {
-        responses.push_back(make_error_alter_config_resource_response<R>(
-          r,
-          error_code::invalid_config,
-          "duplicated topic {} alter config request"));
-    }
-    cluster::topic_properties_update_vector updates;
-    for (auto& r : boost::make_iterator_range(resources.begin(), valid_end)) {
-        auto res = f(r);
-        if (res.has_error()) {
-            responses.push_back(std::move(res.error()));
-        } else {
-            updates.push_back(std::move(res.value()));
-        }
-    }
-
-    if (validate_only) {
-        // all pending updates are valid, just generate responses
-        for (auto& u : updates) {
-            responses.push_back(R{
-              .error_code = error_code::none,
-              .resource_type = static_cast<int8_t>(config_resource_type::topic),
-              .resource_name = u.tp_ns.tp,
-            });
-        }
-
-        co_return responses;
-    }
-
-    auto update_results
-      = co_await ctx.topics_frontend().update_topic_properties(
-        std::move(updates),
-        model::timeout_clock::now()
-          + config::shard_local_cfg().alter_topic_cfg_timeout_ms());
-    for (auto& res : update_results) {
-        responses.push_back(R{
-          .error_code = map_topic_error_code(res.ec),
-          .error_message = res.error_message.value_or(
-            make_error_code(res.ec).message()),
-          .resource_type = static_cast<int8_t>(config_resource_type::topic),
-          .resource_name = res.tp_ns.tp(),
-        });
-    }
-
-    // Group-by error code, value is list of topic names as strings
-    absl::flat_hash_map<cluster::errc, std::vector<model::topic_namespace_view>>
-      err_map;
-    for (const auto& result : update_results) {
-        auto [itr, _] = err_map.try_emplace(
-          result.ec, std::vector<model::topic_namespace_view>());
-        itr->second.emplace_back(result.tp_ns);
-    }
-
-    // Log success case
-    auto found = err_map.find(cluster::errc::success);
-    if (found != err_map.end()) {
-        vlog(
-          klog.info,
-          "Altered topic properties of topic(s) {{{}}} successfully",
-          fmt::join(found->second, ", "));
-        err_map.erase(found);
-    }
-
-    // Log topics that had not successfully been created at warn level
-    for (const auto& err : err_map) {
-        vlog(
-          klog.warn,
-          "Failed to alter topic properties of topic(s) {{{}}} error_code "
-          "observed: {}",
-          fmt::join(err.second, ", "),
-          err.first);
-    }
-
-    co_return responses;
-}
-
 template<typename T, typename R>
 ss::future<chunked_vector<R>> unsupported_broker_configuration(
   chunked_vector<T> resources, const std::string_view msg) {
@@ -312,7 +79,7 @@ ss::future<chunked_vector<R>> unsupported_broker_configuration(
     return ss::make_ready_future<chunked_vector<R>>(std::move(responses));
 }
 
-class validation_error final : std::exception {
+class validation_error final : public std::exception {
 public:
     explicit validation_error(ss::sstring what)
       : _what(std::move(what)) {}
@@ -438,27 +205,46 @@ struct write_caching_config_validator {
     }
 };
 
-struct flush_ms_validator {
+struct duration_validator {
+    std::string_view name;
+    std::chrono::milliseconds min = std::chrono::milliseconds{0};
+    std::chrono::milliseconds max = serde::max_serializable_ms;
+
     std::optional<ss::sstring> operator()(
       const ss::sstring&,
       const std::optional<std::chrono::milliseconds>& maybe_value) {
-        if (!maybe_value) {
+        if (!maybe_value.has_value()) {
             return std::nullopt;
         }
         auto value = maybe_value.value();
-        if (value < 1ms || value > serde::max_serializable_ms) {
+        if (value < min || value > max) {
             return fmt::format(
-              "flush.ms value invalid, expected to be in range [1, {}]",
-              serde::max_serializable_ms);
+              "{} value invalid, expected to be in range [{}, {}]",
+              name,
+              min,
+              max);
         }
         return std::nullopt;
     }
 };
 
+const auto flush_ms_validator = duration_validator{
+  .name = "flush.ms", .min = 1ms};
+const auto iceberg_target_lag_ms_validator = duration_validator{
+  .name = "target.lag.ms", .min = 10s};
+const auto min_compaction_lag_ms_validator = duration_validator{
+  .name = "min.compaction.lag.ms"};
+const auto max_compaction_lag_ms_validator = duration_validator{
+  .name = "max.compaction.lag.ms", .min = 1ms};
+const auto message_timestamp_before_max_ms_validator = duration_validator{
+  .name = "message.timestamp.before.max.ms", .min = 0ms};
+const auto message_timestamp_after_max_ms_validator = duration_validator{
+  .name = "message.timestamp.after.max.ms", .min = 0ms};
+
 struct flush_bytes_validator {
     std::optional<ss::sstring>
     operator()(const ss::sstring&, const std::optional<size_t>& maybe_value) {
-        if (!maybe_value) {
+        if (!maybe_value.has_value()) {
             return std::nullopt;
         }
         auto value = maybe_value.value();
@@ -521,25 +307,6 @@ struct iceberg_partition_spec_validator {
     }
 };
 
-struct iceberg_target_lag_ms_validator {
-    std::optional<ss::sstring> operator()(
-      const ss::sstring& /*raw*/,
-      const std::optional<std::chrono::milliseconds>& maybe_value) {
-        if (maybe_value.has_value()) {
-            const auto& value = maybe_value.value();
-            constexpr auto min_lag = std::chrono::milliseconds(10s);
-            if (value < min_lag || value > serde::max_serializable_ms) {
-                return fmt::format(
-                  "target.lag.ms value invalid, expected to be in range "
-                  "[{},{}]",
-                  min_lag,
-                  serde::max_serializable_ms);
-            }
-        }
-        return std::nullopt;
-    }
-};
-
 struct min_cleanable_dirty_ratio_validator {
     std::optional<ss::sstring>
     operator()(const ss::sstring&, const tristate<double>& value) {
@@ -556,6 +323,29 @@ struct min_cleanable_dirty_ratio_validator {
             }
         }
         return std::nullopt;
+    }
+};
+
+struct batch_max_bytes_limits_validator {
+    std::optional<ss::sstring>
+    operator()(const ss::sstring&, const std::optional<uint32_t>& value) {
+        if (!value) {
+            return {};
+        }
+
+        const auto v = value.value();
+        const uint32_t upper_limit
+          = config::shard_local_cfg()
+              .kafka_max_message_size_upper_limit_bytes()
+              .value_or(std::numeric_limits<int32_t>::max());
+        if (v == 0 || v > upper_limit) {
+            return fmt::format(
+              "max.message.bytes {} is outside of the allowed range [1, {}]",
+              v,
+              upper_limit);
+        }
+
+        return {};
     }
 };
 
@@ -876,14 +666,15 @@ public:
     explicit schema_id_validation_config_parser(Props& props)
       : props(props) {}
 
-    ///\brief Parse a topic property from the supplied cfg.
-    template<typename C>
-    bool operator()(const C& cfg, kafka::config_resource_operation op) {
+    ///\brief Parse a topic property from the supplied name and value
+    template<typename T, typename S>
+    bool operator()(
+      const T& name, const S& value, kafka::config_resource_operation op) {
         using property_t = std::variant<
           decltype(&props.record_key_schema_id_validation),
           decltype(&props.record_key_subject_name_strategy)>;
 
-        auto matcher = string_switch<std::optional<property_t>>(cfg.name);
+        auto matcher = string_switch<std::optional<property_t>>(name);
         switch (config::shard_local_cfg().enable_schema_id_validation()) {
         case pandaproxy::schema_registry::schema_id_validation_mode::compat:
             matcher
@@ -921,9 +712,15 @@ public:
         auto prop = matcher.default_match(std::nullopt);
         if (prop.has_value()) {
             ss::visit(
-              prop.value(), [&cfg, op](auto& p) { apply(*p, cfg.value, op); });
+              prop.value(), [&value, op](auto& p) { apply(*p, value, op); });
         }
         return prop.has_value();
+    }
+
+    ///\brief Parse a topic property from the supplied cfg.
+    template<typename C>
+    bool operator()(const C& cfg, kafka::config_resource_operation op) {
+        return (*this)(cfg.name, cfg.value, op);
     }
 
 private:

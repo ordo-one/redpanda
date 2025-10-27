@@ -255,8 +255,7 @@ ss::future<> segment_appender::hydrate_last_half_page() {
     return _out
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-      .dma_read(
-        sz, buff, read_align /*must be full _write_ alignment*/, _opts.priority)
+      .dma_read(sz, buff, read_align /*must be full _write_ alignment*/)
 #pragma clang diagnostic pop
       .then([this, bytes_to_read](size_t actual) {
           vassert(
@@ -326,7 +325,12 @@ ss::future<> segment_appender::close() {
     _closed = true;
     return hard_flush()
       .then([this] { return do_truncation(_committed_offset); })
-      .then([this] { return _out.close(); });
+      .then([this] {
+          _fallocation_offset = _committed_offset;
+          _flushed_offset = _committed_offset;
+          _stable_offset = _committed_offset;
+          return _out.close();
+      });
 }
 
 ss::future<> segment_appender::do_next_adaptive_fallocation() {
@@ -571,8 +575,7 @@ void segment_appender::dispatch_background_head_write() {
                   .dma_write(
                     w->file_start_offset,
                     w->chunk->data() + w->chunk_begin,
-                    dma_size,
-                    _opts.priority)
+                    dma_size)
 #pragma clang diagnostic pop
                   .then([this, w](size_t got) {
                       /*
@@ -603,7 +606,7 @@ void segment_appender::dispatch_background_head_write() {
             .finally([head_sem] {});
       })
       .handle_exception([this](std::exception_ptr e) {
-          vassert(false, "Could not dma_write: {} - {}", e, *this);
+          vunreachable("Could not dma_write: {} - {}", e, *this);
       });
 }
 
@@ -638,7 +641,7 @@ ss::future<> segment_appender::flush() {
       *this);
 
     return _out.flush().handle_exception([this](std::exception_ptr e) {
-        vassert(false, "Could not flush: {} - {}", e, *this);
+        vunreachable("Could not flush: {} - {}", e, *this);
     });
 }
 
@@ -659,7 +662,7 @@ ss::future<> segment_appender::hard_flush() {
                  return _out.flush();
              })
       .handle_exception([this](std::exception_ptr e) {
-          vassert(false, "Could not flush: {} - {}", e, *this);
+          vunreachable("Could not flush: {} - {}", e, *this);
       });
 }
 

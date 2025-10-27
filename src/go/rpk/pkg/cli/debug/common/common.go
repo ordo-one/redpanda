@@ -1,9 +1,14 @@
 package common
 
 import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/httpapi"
 	"github.com/spf13/pflag"
 )
 
@@ -33,7 +38,7 @@ func (o *DebugBundleSharedOptions) InstallFlags(f *pflag.FlagSet) {
 	f.DurationVar(&o.MetricsInterval, "metrics-interval", 10*time.Second, "Interval between metrics snapshots. For example: 30s, 1.5m")
 	f.IntVar(&o.MetricsSampleCount, "metrics-samples", 2, "Number of metrics samples to take (at the interval of --metrics-interval). Must be >= 2")
 	f.StringArrayVarP(&o.PartitionFlag, "partition", "p", nil, "Comma-separated partition IDs. When provided, rpk saves extra Admin API requests for those partitions. See the help for extended usage")
-	f.StringVarP(&o.Namespace, "namespace", "n", "redpanda", "The namespace to use to collect the resources from (K8s only)")
+	f.StringVarP(&o.Namespace, "namespace", "n", "", "The namespace to use to collect the resources from (K8s only)")
 	f.StringArrayVarP(&o.LabelSelector, "label-selector", "l", []string{"app.kubernetes.io/name=redpanda"}, "Comma-separated label selectors to filter your resources. For example: <label>=<value>,<label>=<value> (K8s only)")
 }
 
@@ -47,4 +52,35 @@ func SanitizeName(name string) string {
 		r = strings.Replace(r, s, "-", -1)
 	}
 	return r
+}
+
+// S3EndpointError is the error that we get when calling an S3 url.
+type S3EndpointError struct {
+	XMLName xml.Name `xml:"Error"`
+	Code    string   `xml:"Code"`
+	Message string   `xml:"Message"`
+
+	HTTPCode int
+}
+
+func (e *S3EndpointError) Error() string {
+	return fmt.Sprintf("unexpected error code %v - %v : %v", e.HTTPCode, e.Code, e.Message)
+}
+
+// uploadBundle will send the file located in 'filepath' by issuing a PUT
+// request to the 'uploadURL'.
+func UploadBundle(ctx context.Context, filepath, uploadURL string) error {
+	uploadFile, err := os.Open(filepath)
+	if err != nil {
+		return fmt.Errorf("unable to open the file %q: %v", filepath, err)
+	}
+	defer uploadFile.Close()
+
+	cl := httpapi.NewClient(
+		httpapi.Err4xx(func(code int) error { return &S3EndpointError{HTTPCode: code} }),
+		httpapi.Headers(
+			"Content-Type", "application/zip",
+		))
+
+	return cl.Put(ctx, uploadURL, nil, uploadFile, nil)
 }

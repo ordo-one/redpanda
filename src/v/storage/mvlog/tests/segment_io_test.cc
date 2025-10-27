@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "container/chunked_circular_buffer.h"
 #include "model/tests/random_batch.h"
 #include "storage/mvlog/batch_collecting_stream_utils.h"
 #include "storage/mvlog/batch_collector.h"
@@ -42,7 +43,7 @@ public:
         }
     }
 
-    ss::future<ss::circular_buffer<model::record_batch>>
+    ss::future<chunked_circular_buffer<model::record_batch>>
     write_random_batches(int num_batches) {
         segment_appender appender(paging_file_.get());
         auto in_batches = co_await model::test::make_random_batches(
@@ -66,8 +67,8 @@ TEST_F(SegmentTest, TestBasicRoundTrip) {
     readable_segment readable_seg(paging_file_.get());
 
     ASSERT_GT(paging_file_->size(), 0);
-    storage::log_reader_config cfg{
-      model::offset{0}, model::offset::max(), ss::default_priority_class()};
+    storage::local_log_reader_config cfg{
+      model::offset{0}, model::offset::max()};
     batch_collector collector(cfg, model::term_id{0}, 128_MiB);
     auto reader = readable_seg.make_reader();
 
@@ -89,8 +90,8 @@ TEST_F(SegmentTest, TestFullCollector) {
     readable_segment readable_seg(paging_file_.get());
 
     ASSERT_GT(paging_file_->size(), 0);
-    storage::log_reader_config cfg{
-      model::offset{0}, model::offset::max(), ss::default_priority_class()};
+    storage::local_log_reader_config cfg{
+      model::offset{0}, model::offset::max()};
     batch_collector collector(
       cfg, model::term_id{0}, /*max_buffer_size*/ 0_MiB);
     auto reader = readable_seg.make_reader();
@@ -123,10 +124,8 @@ TEST_F(SegmentTest, TestBoundedOffsets) {
 
     for (int min = 0; min <= bounded_offset(); min++) {
         for (int max = min; max <= bounded_offset(); max++) {
-            storage::log_reader_config cfg{
-              model::offset{min},
-              model::offset{max},
-              ss::default_priority_class()};
+            storage::local_log_reader_config cfg{
+              model::offset{min}, model::offset{max}};
             batch_collector collector(cfg, model::term_id{0}, 128_MiB);
             entry_stream entries(reader->make_stream());
             auto res = collect_batches_from_stream(entries, collector).get();

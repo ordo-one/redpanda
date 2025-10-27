@@ -260,18 +260,37 @@ void url_encode_target(http::client::request_header& header) {
     auto query_pos = header.target().find_first_of("?");
     // encode full target as there are no query parameters
     if (query_pos == std::string::npos) {
-        header.target(std::string(
-          http::uri_encode(header.target(), http::uri_encode_slash::no)));
+        header.target(
+          std::string(
+            http::uri_encode(header.target(), http::uri_encode_slash::no)));
     } else {
         // encode only the path part of the target
         // TODO: add individual query parameters encoding here as well.
-        header.target(fmt::format(
-          "{}{}",
-          http::uri_encode(
-            std::string_view(header.target().begin(), query_pos),
-            http::uri_encode_slash::no),
-          header.target().substr(query_pos)));
+        header.target(
+          fmt::format(
+            "{}{}",
+            http::uri_encode(
+              std::string_view(header.target().begin(), query_pos),
+              http::uri_encode_slash::no),
+            header.target().substr(query_pos)));
     }
+}
+
+response_content_type
+get_response_content_type(const http::client::response_header& headers) {
+    static constexpr boost::beast::string_view content_type_name
+      = "Content-Type";
+    if (auto iter = headers.find(content_type_name); iter != headers.end()) {
+        if (iter->value().find("json") != std::string_view::npos) {
+            return response_content_type::json;
+        }
+
+        if (iter->value().find("xml") != std::string_view::npos) {
+            return response_content_type::xml;
+        }
+    }
+
+    return response_content_type::unknown;
 }
 
 } // namespace cloud_storage_clients::util

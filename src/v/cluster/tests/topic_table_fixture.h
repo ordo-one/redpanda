@@ -21,13 +21,22 @@
 #include "cluster/tests/utils.h"
 #include "cluster/topic_table.h"
 #include "config/configuration.h"
+#include "config/node_config.h"
 #include "config/property.h"
 #include "features/feature_table.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "random/generators.h"
-#include "test_utils/fixture.h"
 
 #include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+
+#include <boost/test/unit_test.hpp>
+
+#if defined(IS_GTEST)
+#error                                                                         \
+  "topic table fixture cannot be used in gtest because it uses boost assertions"
+#endif
 
 struct topic_table_fixture {
     static constexpr uint32_t partitions_per_shard = 7000;
@@ -36,8 +45,9 @@ struct topic_table_fixture {
     topic_table_fixture() {
         migrated_resources.start().get();
         table
-          .start(ss::sharded_parameter(
-            [this] { return std::ref(migrated_resources.local()); }))
+          .start(ss::sharded_parameter([this] {
+              return std::ref(migrated_resources.local());
+          }))
           .get();
         members.start_single().get();
         features.start().get();
@@ -94,7 +104,11 @@ struct topic_table_fixture {
     cluster::topic_configuration_assignment make_tp_configuration(
       const ss::sstring& topic, int partitions, int16_t replication_factor) {
         cluster::topic_configuration cfg(
-          test_ns, model::topic(topic), partitions, replication_factor);
+          test_ns,
+          model::topic(topic),
+          partitions,
+          replication_factor,
+          model::create_topic_id());
 
         cluster::allocation_request req(cfg.tp_ns);
         req.partitions.reserve(partitions);
@@ -165,6 +179,15 @@ struct topic_table_fixture {
         return total;
     }
 
+    struct set_config_node_id {
+        set_config_node_id() {
+            ss::smp::invoke_on_all([] {
+                config::node().node_id.set_value(model::node_id{1});
+            }).get();
+        }
+    };
+
+    set_config_node_id setter;
     ss::sharded<cluster::members_table> members;
     ss::sharded<features::feature_table> features;
     ss::sharded<cluster::partition_allocator> allocator;

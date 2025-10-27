@@ -23,6 +23,13 @@
 
 namespace cloud_storage_clients {
 
+// Corresponds to the Range HTTP header in the form <range-start>-<range-end>
+//
+// range-start: An integer in the given unit indicating the start position of
+// the request range.
+//
+// range-end: An integer in the given unit indicating the end position
+// of the requested range.
 using http_byte_range = std::pair<uint64_t, uint64_t>;
 
 class client {
@@ -101,8 +108,8 @@ public:
         bool is_truncated = false;
         ss::sstring prefix;
         ss::sstring next_continuation_token;
-        std::vector<list_bucket_item> contents;
-        std::vector<ss::sstring> common_prefixes;
+        chunked_vector<list_bucket_item> contents;
+        chunked_vector<ss::sstring> common_prefixes;
     };
 
     /// A predicate to allow list_objects to collect items selectively, saving

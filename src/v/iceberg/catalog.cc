@@ -55,7 +55,7 @@ catalog::load_or_create_table(
       table_ident);
     schema schema{
       .schema_struct = type.copy(),
-      .schema_id = schema::unassigned_id,
+      .schema_id = schema::default_id,
       .identifier_field_ids = {},
     };
     if (auto schm_res = schema.assign_fresh_ids(); schm_res.has_error()) {
@@ -65,8 +65,11 @@ catalog::load_or_create_table(
     if (!resolved_spec) {
         vlog(
           log.warn,
-          "Iceberg table {} failed to resolve partition spec",
-          table_ident);
+          "Iceberg table {} failed to resolve partition spec {} against schema "
+          "{}",
+          table_ident,
+          spec,
+          schema.schema_struct);
         co_return errc::unexpected_state;
     }
     auto create_res = co_await create_table(

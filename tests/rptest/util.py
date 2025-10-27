@@ -9,16 +9,21 @@
 
 import os
 import pprint
+import threading
 from contextlib import contextmanager
-from typing import Callable, Optional, Any
+from logging import Logger
+from typing import Any, Callable, ContextManager, Optional, Type, TypeVar
 
+from ducktape.cluster.remoteaccount import RemoteCommandError
+from ducktape.errors import TimeoutError
 from ducktape.utils.util import wait_until
 from requests.exceptions import HTTPError
 
 from rptest.clients.kafka_cli_tools import KafkaCliTools
 from rptest.services.storage import Segment
 
-from ducktape.cluster.remoteaccount import RemoteCommandError
+T = TypeVar("T")
+E = TypeVar("E", bound=Exception)
 
 
 class Scale:
@@ -30,12 +35,12 @@ class Scale:
     SCALES = (LOCAL, CI, RELEASE)
 
     def __init__(self, context):
-        self._scale = context.globals.get(Scale.KEY,
-                                          Scale.DEFAULT).strip().lower()
+        self._scale = context.globals.get(Scale.KEY, Scale.DEFAULT).strip().lower()
 
         if self._scale not in Scale.SCALES:
             raise RuntimeError(
-                f"Invalid scale {self._scale}. Available: {Scale.SCALES}")
+                f"Invalid scale {self._scale}. Available: {Scale.SCALES}"
+            )
 
     def __str__(self):
         return self._scale
@@ -56,8 +61,37 @@ class Scale:
         return self._scale == Scale.RELEASE
 
 
-def wait_until_result(condition: Callable[[], Any], *args: Any,
-                      **kwargs: Any) -> Any:
+def repeat_check(times: int):
+    def decorator(func):
+        """
+        Decorator to repeat a check function until it passes for a given number
+        of times in a line. The function should accept no arguments and return
+        either a tuple where the first element is a boolean
+        (for wait_until_result), or just a boolean (for plain wait_until).
+        """
+
+        def wrapper():
+            ret = func()
+            is_successful = ret[0] if isinstance(ret, tuple) else ret
+            if is_successful:
+                wrapper._passed += 1
+                if wrapper._passed >= times:
+                    wrapper._passed = 0  # in case we reuse the function
+                    return ret
+                return False, None if isinstance(ret, tuple) else False
+            else:
+                wrapper._passed = 0
+                return ret
+
+        # init the counter
+        wrapper._passed = 0
+
+        return wrapper
+
+    return decorator
+
+
+def wait_until_result(condition: Callable[[], Any], *args: Any, **kwargs: Any) -> Any:
     """
     a near drop-in replacement for ducktape's wait_util except that when
     the condition passes a result from the condition is passed back to the
@@ -95,6 +129,55 @@ def wait_until_result(condition: Callable[[], Any], *args: Any,
     return res
 
 
+def wait_until_with_progress_check(
+    check: Callable[[], Any],
+    condition: Callable[[], Any],
+    timeout_sec: int,
+    progress_sec: int,
+    backoff_sec: int,
+    err_msg: str | None = None,
+    logger: Logger | None = None,
+):
+    """
+    a wrapper around ducktape's wait_until that provides the ability to track
+    a crude approximation of progress
+
+    usage requires two timeouts:
+      - timeout_sec: the overall timeout, after which the function will throw a
+        TimeoutError no matter what
+      - progress_sec: an incremental timeout, after each expiry we check that the
+        value returned by a 'check' function has changed with respect to a cached
+        result. if not, immediately throw TimeoutError
+
+    params:
+      - check: the value we expect to change after each 'progress_sec'
+      - condition: passed to wait_until
+      - timeout_sec (see above)
+      - progress_sec (see above)
+      - err_msg: Passed down to wait_until
+      - logger: log progress after each progress_sec iteration
+    """
+    val = check()
+    while timeout_sec > 0:
+        try:
+            wait_until(
+                condition,
+                timeout_sec=progress_sec,
+                backoff_sec=backoff_sec,
+                err_msg=err_msg,
+            )
+        except TimeoutError as e:
+            next_v = check()
+            if next_v == val:
+                raise TimeoutError(f"Stopped making progress: {str(e)}")
+            if logger is not None:
+                logger.debug(f"Progress: prev: {val} curr: {next_v}...")
+            val = next_v
+            timeout_sec = timeout_sec - progress_sec
+        else:
+            break
+
+
 def segments_count(redpanda, topic, partition_idx):
     storage = redpanda.storage(scan_cache=False)
     topic_partitions = storage.partitions("kafka", topic)
@@ -115,64 +198,59 @@ def produce_total_bytes(redpanda, topic, bytes_to_produce, acks=-1):
         bytes_to_produce -= 10000 * 1024
         return bytes_to_produce < 0
 
-    wait_until(done,
-               timeout_sec=60,
-               backoff_sec=1,
-               err_msg="f{bytes_to_produce} bytes still left to produce")
+    wait_until(
+        done,
+        timeout_sec=60,
+        backoff_sec=1,
+        err_msg="f{bytes_to_produce} bytes still left to produce",
+    )
 
 
-def produce_until_segments(redpanda,
-                           topic,
-                           partition_idx,
-                           count,
-                           acks=-1,
-                           record_size=1024,
-                           batch_size=10000):
+def produce_until_segments(
+    redpanda, topic, partition_idx, count, acks=-1, record_size=1024, batch_size=10000
+):
     """
     Produce into the topic until given number of segments will appear
     """
     kafka_tools = KafkaCliTools(redpanda)
 
     def done():
-        kafka_tools.produce(topic,
-                            batch_size,
-                            record_size=record_size,
-                            acks=acks)
+        kafka_tools.produce(topic, batch_size, record_size=record_size, acks=acks)
         topic_partitions = segments_count(redpanda, topic, partition_idx)
         partitions = []
         for p in topic_partitions:
             partitions.append(p >= count)
         return all(partitions)
 
-    wait_until(done,
-               timeout_sec=120,
-               backoff_sec=2,
-               err_msg="Segments were not created")
+    wait_until(
+        done, timeout_sec=120, backoff_sec=2, err_msg="Segments were not created"
+    )
 
 
-def wait_until_segments(redpanda,
-                        topic,
-                        partition_idx,
-                        count,
-                        timeout_sec=180):
+def wait_until_segments(redpanda, topic, partition_idx, count, timeout_sec=180):
     def done():
         topic_partitions = segments_count(redpanda, topic, partition_idx)
         redpanda.logger.debug(
-            f'wait_until_segments: '
-            f'segment count: {list(segments_count(redpanda, topic, partition_idx))}'
+            f"wait_until_segments: "
+            f"segment count: {list(segments_count(redpanda, topic, partition_idx))}"
         )
         return all([p >= count for p in topic_partitions])
 
-    wait_until(done,
-               timeout_sec=timeout_sec,
-               backoff_sec=2,
-               err_msg=f"{count} segments were not created")
+    wait_until(
+        done,
+        timeout_sec=timeout_sec,
+        backoff_sec=2,
+        err_msg=f"{count} segments were not created",
+    )
 
 
-def wait_for_removal_of_n_segments(redpanda, topic: str, partition_idx: int,
-                                   n: int,
-                                   original_snapshot: dict[str,
-                                                           list[Segment]]):
+def wait_for_removal_of_n_segments(
+    redpanda,
+    topic: str,
+    partition_idx: int,
+    n: int,
+    original_snapshot: dict[str, list[Segment]],
+):
     """
     Wait until 'n' segments of a partition that are present in the
     provided snapshot are removed by all brokers.
@@ -183,10 +261,11 @@ def wait_for_removal_of_n_segments(redpanda, topic: str, partition_idx: int,
     :param n: number of removed segments to wait for
     :param original_snapshot: snapshot of segments to compare against
     """
+
     def segments_removed():
-        current_snapshot = redpanda.storage(all_nodes=True,
-                                            scan_cache=False).segments_by_node(
-                                                "kafka", topic, partition_idx)
+        current_snapshot = redpanda.storage(
+            all_nodes=True, scan_cache=False
+        ).segments_by_node("kafka", topic, partition_idx)
 
         redpanda.logger.debug(
             f"Current segment snapshot for topic {topic}: {pprint.pformat(current_snapshot, indent=1)}"
@@ -208,19 +287,23 @@ def wait_for_removal_of_n_segments(redpanda, topic: str, partition_idx: int,
 
         return True
 
-    wait_until(segments_removed,
-               timeout_sec=180,
-               backoff_sec=5,
-               err_msg="Segments were not removed from all nodes")
+    wait_until(
+        segments_removed,
+        timeout_sec=180,
+        backoff_sec=5,
+        err_msg="Segments were not removed from all nodes",
+    )
 
 
-def wait_for_local_storage_truncate(redpanda,
-                                    topic: str,
-                                    *,
-                                    target_bytes: int,
-                                    partition_idx: Optional[int] = None,
-                                    timeout_sec: Optional[int] = None,
-                                    nodes: Optional[list] = None):
+def wait_for_local_storage_truncate(
+    redpanda,
+    topic: str,
+    *,
+    target_bytes: int,
+    partition_idx: Optional[int] = None,
+    timeout_sec: Optional[int] = None,
+    nodes: Optional[list] = None,
+):
     """
     For use in tiered storage tests: wait until the locally retained data
     size for this partition is as close to the target threshold on all nodes.
@@ -233,7 +316,8 @@ def wait_for_local_storage_truncate(redpanda,
         timeout_sec = 120
 
     redpanda.logger.debug(
-        f"Waiting for local storage to be truncated to {target_bytes} bytes")
+        f"Waiting for local storage to be truncated to {target_bytes} bytes"
+    )
 
     sizes: list[int] = []
 
@@ -248,8 +332,9 @@ def wait_for_local_storage_truncate(redpanda,
             if nodes is not None and node_partition.node not in nodes:
                 continue
 
-            total_size = sum(s.size if s.size else 0
-                             for s in node_partition.segments.values())
+            total_size = sum(
+                s.size if s.size else 0 for s in node_partition.segments.values()
+            )
             redpanda.logger.debug(
                 f"  {topic}/{partition_idx} node {node_partition.node.name} local size {total_size} ({len(node_partition.segments)} segments)"
             )
@@ -263,8 +348,9 @@ def wait_for_local_storage_truncate(redpanda,
             # to determine if we reached the goal we subtract off the size of
             # the oldest segment
             try:
-                first_segment = min(node_partition.segments.values(),
-                                    key=lambda s: s.offset)
+                first_segment = min(
+                    node_partition.segments.values(), key=lambda s: s.offset
+                )
             except ValueError:
                 # Segment list is empty
                 continue
@@ -288,15 +374,17 @@ def wait_for_local_storage_truncate(redpanda,
         is_truncated,
         timeout_sec=timeout_sec,
         backoff_sec=1,
-        err_msg=lambda:
-        f"truncation couldn't be verified for {topic=} and {target_bytes=}. last run partition_sizes={sizes}"
+        err_msg=lambda: f"truncation couldn't be verified for {topic=} and {target_bytes=}. last run partition_sizes={sizes}",
     )
 
 
 @contextmanager
-def expect_exception(exception_klass, validator):
+def expect_exception(
+    exception_klass: Type[E] | tuple[Type[E], ...],
+    validator: Callable[[E], bool],
+):
     """
-    :param exception_klass: the expected exception type
+    :param exception_klass: the expected exception type or tuple of exception types
     :param validator: a callable that is expected to return true when passed the exception
     :return: None.  Raises on unexpected exception or no exception.
     """
@@ -309,6 +397,14 @@ def expect_exception(exception_klass, validator):
         raise RuntimeError("Expected an exception!")
 
 
+def expect_timeout():
+    """
+    expect_exception wrapper for the not uncommon case where the expected exception is
+    a ducktape.errors.TimeoutError and its contents are of no interest.
+    """
+    return expect_exception(TimeoutError, lambda _: True)
+
+
 def expect_http_error(status_code: int):
     """
     Context manager for HTTP calls expected to result in an HTTP exception
@@ -317,8 +413,7 @@ def expect_http_error(status_code: int):
     :param status_code: expected HTTP status code
     :return: None.  Raises on unexpected exception, no exception, or unexpected status code.
     """
-    return expect_exception(HTTPError,
-                            lambda e: e.response.status_code == status_code)
+    return expect_exception(HTTPError, lambda e: e.response.status_code == status_code)
 
 
 def inject_remote_script(node, script_name):
@@ -347,7 +442,8 @@ def _get_cluster_license(env_var):
         is_ci = os.environ.get("CI", "false")
         if is_ci == "true":
             raise RuntimeError(
-                f"Expected {env_var} variable to be set in this environment")
+                f"Expected {env_var} variable to be set in this environment"
+            )
 
     return license
 
@@ -363,6 +459,7 @@ def get_second_cluster_license():
 class firewall_blocked:
     """Temporary firewall barrier that isolates set of redpanda
     nodes from the ip-address"""
+
     def __init__(self, nodes, blocked_port, full_block=False):
         self._nodes = nodes
         self._port = blocked_port
@@ -386,7 +483,7 @@ class firewall_blocked:
         """Remove firewall rules that isolate ips from the nodes"""
         cmd = [
             f"iptables -D INPUT -p tcp --{self.mode_for_input} {self._port} -j DROP",
-            f"iptables -D OUTPUT -p tcp --dport {self._port} -j DROP"
+            f"iptables -D OUTPUT -p tcp --dport {self._port} -j DROP",
         ]
         cmd = " && ".join(cmd)
         for node in self._nodes:
@@ -394,9 +491,11 @@ class firewall_blocked:
 
 
 def search_logs_with_timeout(redpanda, pattern: str, timeout_s: int = 5):
-    wait_until(lambda: redpanda.search_log_any(pattern),
-               timeout_sec=timeout_s,
-               err_msg=f"Failed to find pattern: {pattern}")
+    wait_until(
+        lambda: redpanda.search_log_any(pattern),
+        timeout_sec=timeout_s,
+        err_msg=f"Failed to find pattern: {pattern}",
+    )
 
 
 def wait_for_recovery_throttle_rate(redpanda, new_rate: int):
@@ -407,9 +506,10 @@ def wait_for_recovery_throttle_rate(redpanda, new_rate: int):
             try:
                 metrics = list(redpanda.metrics(node))
                 family = filter(
-                    lambda fam: fam.name ==
-                    "vectorized_raft_recovery_partition_movement_assigned_bandwidth",
-                    metrics)
+                    lambda fam: fam.name
+                    == "vectorized_raft_recovery_partition_movement_assigned_bandwidth",
+                    metrics,
+                )
                 shard_rates = next(family).samples
                 num_shards = len(shard_rates)
                 # Account for rounding error
@@ -422,33 +522,36 @@ def wait_for_recovery_throttle_rate(redpanda, new_rate: int):
                 redpanda.logger.debug(
                     f"Node {node.name} has total rate: {current_rate}, expecting value in range: [{min_expected_rate}, {max_expected_rate}]"
                 )
-                return current_rate >= min_expected_rate and current_rate <= max_expected_rate
+                return (
+                    current_rate >= min_expected_rate
+                    and current_rate <= max_expected_rate
+                )
             except:
                 redpanda.logger.debug(
-                    f"Error getting throttle rate for {node}", exc_info=True)
+                    f"Error getting throttle rate for {node}", exc_info=True
+                )
                 return False
 
         brokers = redpanda._admin.get_brokers()
-        active_brokers = set([b['node_id'] for b in brokers])
+        active_brokers = set([b["node_id"] for b in brokers])
         assert active_brokers
         filtered = [
-            n for n in redpanda.started_nodes()
-            if redpanda.node_id(n) in active_brokers
+            n for n in redpanda.started_nodes() if redpanda.node_id(n) in active_brokers
         ]
         assert filtered
         return all([check_throttle_rate(n) for n in filtered])
 
-    wait_until(wait_for_throttle_update,
-               timeout_sec=90,
-               backoff_sec=1,
-               err_msg=f"Timed out waiting recovery rate to reach: {new_rate}")
+    wait_until(
+        wait_for_throttle_update,
+        timeout_sec=90,
+        backoff_sec=1,
+        err_msg=f"Timed out waiting recovery rate to reach: {new_rate}",
+    )
 
 
-def ssh_output_stderr(source_service,
-                      node,
-                      cmd,
-                      allow_fail=False,
-                      timeout_sec=None) -> tuple[bytes, bytes]:
+def ssh_output_stderr(
+    source_service, node, cmd, allow_fail=False, timeout_sec=None
+) -> tuple[bytes, bytes]:
     """Runs the command via SSH and captures stdout and stderr, returning it as a byte strings.
     this is a copy/mode of ssh_output, with the intention midterm to upstream it to ducktape
 
@@ -475,8 +578,7 @@ def ssh_output_stderr(source_service,
         exit_status = stdin.channel.recv_exit_status()
         if exit_status != 0:
             if not allow_fail:
-                raise RemoteCommandError(source_service, cmd, exit_status,
-                                         stderrdata)
+                raise RemoteCommandError(node.account, cmd, exit_status, stderrdata)
             else:
                 source_service.logger.debug(
                     f"Running ssh command {cmd} exited with status {exit_status} and message: {stderrdata}"
@@ -485,6 +587,58 @@ def ssh_output_stderr(source_service,
         stdin.close()
         stdout.close()
         stderr.close()
-    source_service.logger.debug(
-        f"Returning ssh command output:\n{stdoutdata}\n")
+    source_service.logger.debug(f"Returning ssh command output:\n{stdoutdata}\n")
     return stdoutdata, stderrdata
+
+
+def bg_thread_cm(func) -> Callable[..., ContextManager]:
+    """
+    Decorator for a context manager repeating an action in a background thread
+
+    Usage:
+    @bg_thread_cm
+    def some_action_repeater(parameters_if_needed):  # can be a method too
+        # Some preparations if needed
+        while (yield):
+            try:
+                # Some action we'd like to repeat
+            catch Exception as e:
+                # Handle exception, typically just log it.
+                # If we (re-)throw an exception, the background thread stops
+        # Some cleanup if needed
+
+    with some_action_repeater():
+        # do some checks while the background thread repeats the action
+    """
+
+    def ctx(*args, **kwargs):
+        stop_ev = threading.Event()
+
+        def loop():
+            gen = func(*args, **kwargs)
+            gen.send(None)  # prime the generator
+            while not stop_ev.is_set():
+                gen.send(True)  # tell gen loop to carry on
+            try:
+                gen.send(False)  # tell gen loop to stop
+            except StopIteration:
+                pass  # expected, gen loop stopped cleanly
+            else:
+                assert False, "Background thread function did not stop cleanly"
+
+        thread = threading.Thread(target=loop)
+        thread.daemon = True
+        thread.start()
+        try:
+            yield
+        finally:
+            stop_ev.set()
+            thread.join()
+
+    return contextmanager(ctx)
+
+
+def not_none(value: T | None) -> T:
+    if value is None:
+        raise ValueError("value was unexpectedly None")
+    return value

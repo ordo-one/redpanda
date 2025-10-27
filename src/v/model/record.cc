@@ -22,9 +22,10 @@ model::record record_batch_iterator::next() {
     ++_index;
     // if we're done, then check that we read all the buffer
     if (!has_next() && _parser.bytes_left()) [[unlikely]] {
-        throw std::out_of_range(fmt::format(
-          "Record iteration stopped with {} bytes remaining",
-          _parser.bytes_left()));
+        throw std::out_of_range(
+          fmt::format(
+            "Record iteration stopped with {} bytes remaining",
+            _parser.bytes_left()));
     }
     return r;
 }
@@ -44,4 +45,11 @@ std::ostream& operator<<(std::ostream& os, const tx_range& range) {
       os, "pid: {}, range: [{}, {}]", range.pid, range.first, range.last);
     return os;
 }
+
+void record_batch_header::reset_size_checksum_metadata(const iobuf& records) {
+    size_bytes = model::packed_record_batch_header_size + records.size_bytes();
+    crc = model::crc_record_batch(*this, records);
+    header_crc = model::internal_header_only_crc(*this);
+}
+
 } // namespace model

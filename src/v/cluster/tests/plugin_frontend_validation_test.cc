@@ -9,12 +9,14 @@
  * by the Apache License, Version 2.0
  */
 
+#include "absl/container/flat_hash_map.h"
 #include "cluster/commands.h"
 #include "cluster/data_migrated_resources.h"
 #include "cluster/fwd.h"
 #include "cluster/plugin_frontend.h"
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
+#include "config/node_config.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -25,7 +27,6 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sstring.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/range/irange.hpp>
 #include <gtest/gtest.h>
 
@@ -74,6 +75,10 @@ public:
     model::offset _latest_offset{0};
     model::transform_id _latest_id{0};
 
+    static void SetUpTestSuite() {
+        config::node().node_id.set_value(model::node_id{1});
+    }
+
     plugin_table _plugin_table;
     data_migrations::migrated_resources _migrated_resources;
     topic_table _topic_table{_migrated_resources};
@@ -92,10 +97,11 @@ public:
           /*replication_factor=*/1);
         topic_cfg.properties.read_replica = config.read_replica;
         std::vector<model::broker_shard> broker_shards;
-        broker_shards.push_back(model::broker_shard{
-          .node_id = model::node_id(1),
-          .shard = 0,
-        });
+        broker_shards.push_back(
+          model::broker_shard{
+            .node_id = model::node_id(1),
+            .shard = 0,
+          });
         ss::chunked_fifo<partition_assignment> partition_assignments;
         for (int i = 1; i <= config.partition_count; ++i) {
             partition_assignments.push_back(partition_assignment(

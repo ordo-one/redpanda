@@ -10,7 +10,6 @@
 
 #include "cluster/archival/tests/service_fixture.h"
 
-#include "archival/ntp_archiver_service.h"
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
@@ -19,16 +18,17 @@
 #include "cloud_storage/remote_segment.h"
 #include "cloud_storage_clients/configuration.h"
 #include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/archival/types.h"
 #include "cluster/members_table.h"
 #include "config/configuration.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/tests/random_batch.h"
 #include "random/generators.h"
 #include "storage/directories.h"
 #include "storage/disk_log_impl.h"
 #include "test_utils/async.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/smp.hh>
@@ -91,7 +91,12 @@ archiver_fixture::archiver_fixture()
     auto sharded_creds_source = ss::sharded_parameter(
       [cfg = remote_cfg] { return cfg.cloud_credentials_source; });
     pool.start(remote_cfg.connection_limit(), sharded_client_conf).get();
-    io.start(std::ref(pool), sharded_client_conf, sharded_creds_source).get();
+    io.start(
+        std::ref(pool),
+        sharded_client_conf,
+        sharded_creds_source,
+        ss::sharded_parameter([] { return ss::default_scheduling_group(); }))
+      .get();
     io.local().start().get();
 
     // Init remote api
@@ -110,7 +115,7 @@ archiver_fixture::~archiver_fixture() {
 
 static void write_batches(
   ss::lw_shared_ptr<storage::segment> seg,
-  ss::circular_buffer<model::record_batch> batches) { // NOLINT
+  chunked_circular_buffer<model::record_batch> batches) { // NOLINT
     vlog(fixt_log.trace, "num batches {}", batches.size());
     for (auto& b : batches) {
         b.header().header_crc = model::internal_header_only_crc(b.header());
@@ -196,6 +201,7 @@ archiver_fixture::get_configurations() {
     s3conf.access_key = cloud_roles::public_key_str("access-key");
     s3conf.secret_key = cloud_roles::private_key_str("secret-key");
     s3conf.region = cloud_roles::aws_region_name("us-east-1");
+    s3conf.service = cloud_roles::aws_service_name("s3");
     s3conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
     s3conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
       net::metrics_disabled::yes,
@@ -226,24 +232,6 @@ archiver_fixture::get_configurations() {
       ss::make_lw_shared<archival::configuration>(aconf), cconf);
 }
 
-std::unique_ptr<storage::disk_log_builder>
-archiver_fixture::get_started_log_builder(
-  model::ntp ntp, model::revision_id rev) {
-    storage::ntp_config ntp_cfg(
-      std::move(ntp),
-      config::node().data_directory().as_sstring(),
-      nullptr,
-      rev);
-
-    auto conf = storage::log_config(
-      config::node().data_directory().as_sstring(),
-      1_MiB,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config());
-    auto builder = std::make_unique<storage::disk_log_builder>(std::move(conf));
-    builder->start(std::move(ntp_cfg)).get();
-    return builder;
-}
 /// Wait unill all information will be replicated and the local node
 /// will become a leader for 'ntp'.
 void archiver_fixture::wait_for_partition_leadership(const model::ntp& ntp) {
@@ -272,7 +260,7 @@ void archiver_fixture::initialize_shard(
   storage::api& api,
   const std::vector<segment_desc>& segm,
   std::optional<storage::ntp_config::default_overrides> overrides,
-  bool fit_segments) {
+  bool) {
     absl::flat_hash_map<model::ntp, size_t> all_ntp;
     for (const auto& d : segm) {
         storage::ntp_config ntpc(d.ntp, data_dir.string());
@@ -283,7 +271,6 @@ void archiver_fixture::initialize_shard(
                        storage::ntp_config(d.ntp, data_dir.string()),
                        d.base_offset,
                        d.term,
-                       ss::default_priority_class(),
                        128_KiB,
                        10,
                        1_MiB)
@@ -380,8 +367,7 @@ void segment_matcher<Fixture>::verify_segment(
     auto segment = get_segment(ntp, name);
     auto pos = segment->offsets().get_base_offset();
     auto size = segment->size_bytes();
-    auto reader_handle
-      = segment->offset_data_stream(pos, ss::default_priority_class()).get();
+    auto reader_handle = segment->offset_data_stream(pos).get();
     auto tmp = reader_handle.stream().read_exactly(size).get();
     reader_handle.close().get();
     ss::sstring actual = {tmp.get(), tmp.size()};
@@ -402,8 +388,7 @@ void segment_matcher<Fixture>::verify_index(
     auto segment = get_segment(ntp, name);
     auto meta = pm.get(name);
     auto pos = segment->offsets().get_base_offset();
-    auto reader_handle
-      = segment->offset_data_stream(pos, ss::default_priority_class()).get();
+    auto reader_handle = segment->offset_data_stream(pos).get();
     cloud_storage::offset_index ix{
       meta->base_offset,
       meta->base_kafka_offset(),
@@ -453,7 +438,7 @@ void segment_matcher<Fixture>::verify_segments(
       [this, &ntp](auto n) { return get_segment(ntp, n); });
 
     storage::concat_segment_reader_view v{
-      segments, 0, segments.back()->size_bytes(), ss::default_priority_class()};
+      segments, 0, segments.back()->size_bytes()};
 
     auto expected_size = std::accumulate(
       segments.begin(),
@@ -487,7 +472,7 @@ void segment_matcher<Fixture>::verify_manifest(
         auto base = s->offsets().get_base_offset();
         auto comm = s->offsets().get_committed_offset();
         auto size = s->size_bytes();
-        auto comp = s->finished_self_compaction();
+        auto comp = s->has_self_compact_timestamp();
         auto m = man.get(sname);
         BOOST_REQUIRE(m.has_value());
         BOOST_REQUIRE_EQUAL(base, m->base_offset);
@@ -531,23 +516,6 @@ archival::remote_segment_path get_segment_index_path(
   const archival::segment_name& name) {
     return archival::remote_segment_path{
       fmt::format("{}.index", get_segment_path(manifest, name)().native())};
-}
-
-void populate_log(storage::disk_log_builder& b, const log_spec& spec) {
-    auto first = spec.segment_starts.begin();
-    auto second = std::next(first);
-    for (; second != spec.segment_starts.end(); ++first, ++second) {
-        auto num_records = *second - *first;
-        b | storage::add_segment(*first)
-          | storage::add_random_batch(*first, num_records);
-    }
-    b | storage::add_segment(*first)
-      | storage::add_random_batch(*first, spec.last_segment_num_records);
-
-    for (auto i : spec.compacted_segment_indices) {
-        b.get_segment(i).mark_as_finished_self_compaction();
-        b.get_segment(i).mark_as_finished_windowed_compaction();
-    }
 }
 
 ss::future<archival::ntp_archiver::batch_result>

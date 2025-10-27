@@ -10,6 +10,7 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "cluster/fwd.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/node/local_monitor.h"
@@ -18,13 +19,12 @@
 #include "model/metadata.h"
 #include "rpc/fwd.h"
 #include "ssx/semaphore.h"
+#include "storage/disk.h"
 #include "utils/mutex.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
-
-#include <absl/container/node_hash_map.h>
 
 #include <chrono>
 #include <vector>
@@ -106,6 +106,20 @@ public:
     bool does_raft0_have_leader();
 
     bool contains_node_health_report(model::node_id) const;
+    /**
+     * Returns maximum high watermark for a given partition across the cluster.
+     * It returns the high watermark for the partition replica with highest
+     * revision.
+     *
+     * NOTE: why not returning the high watermark from the leader replica ?
+     *
+     * The leader replica high watermark may be stale if leader health report is
+     * older than followers one. High watermark is monotonically increasing
+     * therefore it is always safe to return the highest value.
+     */
+    ss::future<result<std::optional<kafka::offset>>>
+      get_partition_high_watermark(
+        model::topic_namespace_view, model::partition_id);
 
 private:
     /**
@@ -198,6 +212,15 @@ private:
     };
 
     static aggregated_report aggregate_reports(const report_cache_t& reports);
+    /**
+     * Offline nodes are missing the health reports, therefore the partitions
+     * that replicas are only on those nodes will not be directly reported as
+     * leader less. Therefore, we need to check the partitions that are only on
+     * offline nodes and add them to the report.
+     */
+    ss::future<> fill_aggregate_with_offline_partitions(
+      const std::vector<model::node_id>& offline_nodes,
+      aggregated_report& aggr_report);
 
     ss::lw_shared_ptr<raft::consensus> _raft0;
     ss::sharded<members_table>& _members;

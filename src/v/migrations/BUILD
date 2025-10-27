@@ -7,6 +7,7 @@ redpanda_cc_library(
         "feature_migrator.cc",
         "rbac_migrator.cc",
         "shard_placement_migrator.cc",
+        "topic_id_migrator.cc",
     ],
     hdrs = [
         "cloud_storage_config.h",
@@ -14,15 +15,17 @@ redpanda_cc_library(
         "migrators.h",
         "rbac_migrator.h",
         "shard_placement_migrator.h",
+        "topic_id_migrator.h",
     ],
-    include_prefix = "migrations",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "//src/v/cluster",
         "//src/v/features",
+        "//src/v/model",
         "//src/v/security",
         "//src/v/ssx:future_util",
+        "//src/v/utils:uuid",
         "@seastar",
     ],
 )

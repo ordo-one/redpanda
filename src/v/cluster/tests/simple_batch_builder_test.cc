@@ -9,10 +9,12 @@
 
 #include "cluster/simple_batch_builder.h"
 #include "cluster/types.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/record_utils.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
 #include "test_utils/logs.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/testing/thread_test_case.hh>
 
@@ -74,11 +76,10 @@ SEASTAR_THREAD_TEST_CASE(round_trip_test) {
             .add_kv(pa_key, create_test_assignment(2, 1)))
           .build();
     int32_t current_crc = batch.header().crc;
-    ss::sstring base_dir = "test.dir_"
-                           + random_generators::gen_alphanum_string(4);
+    ss::sstring base_dir = test_env::random_dir_path();
     model::ntp test_ntp(
       model::ns("test_ns"), model::topic("test_topic"), model::partition_id(0));
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     batches.push_back(std::move(batch));
 
     tests::persist_log_file(base_dir, test_ntp, std::move(batches)).get();

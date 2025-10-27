@@ -5,7 +5,6 @@ redpanda_test_cc_library(
     hdrs = [
         "simple_raft_fixture.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -15,7 +14,8 @@ redpanda_test_cc_library(
         "//src/v/random:generators",
         "//src/v/rpc",
         "//src/v/storage",
-        "//src/v/test_utils:fixture",
+        "//src/v/test_utils:async",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:unresolved_address",
         "@seastar",
     ],
@@ -26,7 +26,6 @@ redpanda_test_cc_library(
     hdrs = [
         "simple_record_fixture.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -43,7 +42,6 @@ redpanda_test_cc_library(
     hdrs = [
         "raft_fixture_retry_policy.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         ":raft_fixture",
@@ -57,12 +55,41 @@ redpanda_test_cc_library(
     hdrs = [
         "failure_injectable_log.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "//src/v/storage",
-        "//src/v/test_utils:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "raft_fixture_base",
+    srcs = ["raft_fixture_base.cc"],
+    hdrs = [
+        "raft_fixture_base.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":failure_injectable_log",
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/config",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/random:generators",
+        "//src/v/rpc",
+        "//src/v/ssx:future_util",
+        "//src/v/ssx:sformat",
+        "//src/v/storage",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/test_utils:test_env",
+        "//src/v/utils:prefix_logger",
+        "//src/v/utils:unresolved_address",
+        "@abseil-cpp//absl/container:node_hash_map",
+        "@boost//:range",
         "@seastar",
     ],
 )
@@ -73,10 +100,10 @@ redpanda_test_cc_library(
     hdrs = [
         "raft_fixture.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         ":failure_injectable_log",
+        ":raft_fixture_base",
         "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
@@ -103,7 +130,6 @@ redpanda_test_cc_library(
     name = "stm_raft_fixture",
     hdrs = [
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -116,7 +142,6 @@ redpanda_test_cc_library(
         "//src/v/rpc",
         "//src/v/serde",
         "//src/v/storage",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:random",
         "@seastar",
     ],
@@ -144,18 +169,17 @@ redpanda_cc_btest(
     srcs = [
         "bootstrap_configuration_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":simple_record_fixture",
         "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/random:generators",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/storage",
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:random",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -188,14 +212,12 @@ redpanda_cc_btest(
     srcs = [
         "consensus_utils_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":simple_record_fixture",
         "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/random:generators",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/storage",
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:random",
@@ -214,25 +236,15 @@ redpanda_cc_gtest(
     srcs = [
         "group_configuration_tests.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":simple_record_fixture",
         "//src/v/base",
-        "//src/v/config",
-        "//src/v/model",
         "//src/v/raft",
-        "//src/v/random:generators",
-        "//src/v/resource_mgmt:io_priority",
-        "//src/v/storage",
-        "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random",
-        "//src/v/test_utils:seastar_boost",
-        "//src/v/utils:unresolved_address",
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -243,20 +255,14 @@ redpanda_cc_gtest(
         "snapshot_recovery_test.cc",
     ],
     cpu = 1,
-    tags = ["exclusive"],
     deps = [
         ":raft_fixture",
         ":raft_fixture_retry_policy",
-        "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
-        "//src/v/resource_mgmt:io_priority",
-        "//src/v/storage",
         "//src/v/test_utils:gtest",
-        "//src/v/utils:unresolved_address",
         "@fmt",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -266,18 +272,17 @@ redpanda_cc_btest(
     srcs = [
         "foreign_entry_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/raft",
         "//src/v/random:generators",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/storage",
         "//src/v/storage:record_batch_builder",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:random",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "//src/v/utils:copy_range",
         "@boost//:test",
         "@seastar",
@@ -293,6 +298,7 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/bytes:iobuf_parser",
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/raft",
@@ -354,16 +360,11 @@ redpanda_cc_gtest(
     srcs = [
         "membership_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":raft_fixture",
         ":raft_fixture_retry_policy",
-        "//src/v/model",
         "//src/v/raft",
-        "//src/v/raft/tests:stm_raft_fixture",
-        "//src/v/storage",
-        "//src/v/test_utils:fixture",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar//:testing",
     ],
@@ -375,15 +376,10 @@ redpanda_cc_gtest(
     srcs = [
         "leadership_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":raft_fixture",
-        "//src/v/finjector",
-        "//src/v/model",
-        "//src/v/raft",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "@googletest//:gtest",
-        "@seastar//:testing",
     ],
 )
 
@@ -393,17 +389,15 @@ redpanda_cc_gtest(
     srcs = [
         "state_removal_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":raft_fixture",
         ":raft_fixture_retry_policy",
         "//src/v/raft",
         "//src/v/raft/tests:stm_raft_fixture",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "//src/v/utils:directory_walker",
         "@googletest//:gtest",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -413,7 +407,6 @@ redpanda_cc_btest(
     srcs = [
         "offset_monitor_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/raft",
@@ -430,11 +423,9 @@ redpanda_cc_btest(
     srcs = [
         "mutex_buffer_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/raft",
         "//src/v/ssx:sformat",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:mutex",
         "@boost//:test",
@@ -450,7 +441,6 @@ redpanda_cc_btest(
     srcs = [
         "configuration_manager_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/config",
@@ -459,9 +449,9 @@ redpanda_cc_btest(
         "//src/v/raft",
         "//src/v/random:generators",
         "//src/v/storage",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:random",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -477,8 +467,8 @@ redpanda_cc_btest(
     deps = [
         "//src/v/config",
         "//src/v/raft",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:seastar_boost",
+        "@boost//:range",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -491,7 +481,6 @@ redpanda_cc_gtest(
     srcs = [
         "basic_raft_fixture_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/model",
         "//src/v/raft",
@@ -500,8 +489,28 @@ redpanda_cc_gtest(
         "//src/v/raft/tests:stm_raft_fixture",
         "//src/v/random:generators",
         "//src/v/storage:record_batch_builder",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:gtest",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "coordinated_compaction_test",
+    timeout = "short",
+    srcs = [
+        "coordinated_compaction_test.cc",
+    ],
+    deps = [
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/raft/tests:raft_fixture",
+        "//src/v/raft/tests:raft_fixture_retry_policy",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:gtest",
+        "@fmt",
         "@googletest//:gtest",
         "@seastar",
         "@seastar//:testing",
@@ -514,8 +523,8 @@ redpanda_cc_gtest(
     srcs = [
         "stm_manager_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/raft/tests:raft_fixture_retry_policy",
         "//src/v/raft/tests:stm_raft_fixture",
         "//src/v/raft/tests:stm_test_fixture",
@@ -530,7 +539,6 @@ redpanda_test_cc_library(
     hdrs = [
         "stm_test_fixture.h",
     ],
-    include_prefix = "raft/tests",
     visibility = ["//visibility:public"],
     deps = [
         ":raft_fixture",
@@ -558,7 +566,6 @@ redpanda_cc_gtest(
     ],
     cpu = 4,
     memory = "6GiB",
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/bytes",
@@ -569,8 +576,8 @@ redpanda_cc_gtest(
         "//src/v/random:generators",
         "//src/v/serde",
         "//src/v/ssx:future_util",
+        "//src/v/ssx:watchdog",
         "//src/v/storage:record_batch_builder",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random",
         "//src/v/test_utils:random_bytes",
@@ -584,12 +591,12 @@ redpanda_cc_gtest(
 
 redpanda_cc_gtest(
     name = "persisted_stm_test",
-    timeout = "short",
+    timeout = "long",
     srcs = [
         "persisted_stm_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/raft/tests:raft_fixture",
@@ -613,12 +620,10 @@ redpanda_cc_gtest(
     srcs = [
         "replication_monitor_tests.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/model",
         "//src/v/raft/tests:raft_fixture",
         "//src/v/raft/tests:stm_raft_fixture",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",
@@ -632,7 +637,6 @@ redpanda_cc_gtest(
     srcs = [
         "mux_state_machine_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/model",
@@ -642,13 +646,26 @@ redpanda_cc_gtest(
         "//src/v/reflection:adl",
         "//src/v/storage:record_batch_builder",
         "//src/v/storage/tests:disk_log_builder",
-        "//src/v/test_utils:fixture",
         "//src/v/test_utils:gtest",
         "@boost//:range",
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
         "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "buffered_protocol_test",
+    timeout = "short",
+    srcs = [
+        "buffered_protocol_test.cc",
+    ],
+    deps = [
+        "//src/v/raft",
+        "//src/v/random:generators",
+        "//src/v/test_utils:gtest",
+        "@seastar",
     ],
 )
 
@@ -659,6 +676,17 @@ redpanda_cc_bench(
         "//src/v/raft",
         "//src/v/random:generators",
         "//src/v/test_utils:random",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "raft_replicate_rpbench",
+    srcs = ["raft_replicate_benchmark.cc"],
+    deps = [
+        "//src/v/raft",
+        "//src/v/raft/tests:raft_fixture_base",
         "@seastar",
         "@seastar//:benchmark",
     ],

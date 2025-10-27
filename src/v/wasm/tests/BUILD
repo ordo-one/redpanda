@@ -3,7 +3,6 @@ load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest", "redpanda_tes
 redpanda_test_cc_library(
     name = "logger",
     hdrs = ["wasm_logger.h"],
-    include_prefix = "wasm/tests",
     deps = [
         "//src/v/base",
         "//src/v/wasm:wasi_logger",
@@ -15,20 +14,20 @@ redpanda_test_cc_library(
     name = "wasm_fixture",
     srcs = ["wasm_fixture.cc"],
     hdrs = ["wasm_fixture.h"],
-    include_prefix = "wasm/tests",
     deps = [
         ":logger",
         "//src/v/base",
         "//src/v/bytes",
         "//src/v/model",
         "//src/v/model/tests:random",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/schema:registry",
         "//src/v/schema/tests:fake_registry",
         "//src/v/serde",
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random_bytes",
+        "//src/v/test_utils:runfiles",
         "//src/v/wasm:api",
         "//src/v/wasm:transform_probe",
         "//src/v/wasm:wasmtime",
@@ -77,6 +76,19 @@ redpanda_cc_gtest(
     ],
 )
 
+filegroup(
+    name = "wasm_test_assets",
+    srcs = [
+        "//src/transform-sdk/go/transform/internal/testdata/dynamic",
+        "//src/transform-sdk/go/transform/internal/testdata/identity",
+        "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
+        "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
+        "//src/transform-sdk/go/transform/internal/testdata/transform-error",
+        "//src/transform-sdk/go/transform/internal/testdata/transform-panic",
+        "//src/transform-sdk/go/transform/internal/testdata/wasi",
+    ],
+)
+
 redpanda_cc_gtest(
     name = "wasi_test",
     timeout = "moderate",
@@ -84,12 +96,7 @@ redpanda_cc_gtest(
         "wasi_test.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/wasi",
-    ],
-    env = {
-        "WASI_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/wasi)",
-    },
+    data = [":wasm_test_assets"],
     memory = "128MiB",
     deps = [
         ":wasm_fixture",
@@ -108,19 +115,12 @@ redpanda_cc_gtest(
 
 redpanda_cc_gtest(
     name = "wasm_transform_test",
-    timeout = "moderate",
+    timeout = "long",
     srcs = [
         "wasm_transform_test.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/dynamic",
-        "//src/transform-sdk/go/transform/internal/testdata/identity",
-    ],
-    env = {
-        "IDENTITY_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/identity)",
-        "DYNAMIC_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/dynamic)",
-    },
+    data = [":wasm_test_assets"],
     memory = "128MiB",
     deps = [
         ":wasm_fixture",
@@ -139,12 +139,7 @@ redpanda_cc_gtest(
         "wasm_sr_test.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
-    ],
-    env = {
-        "SCHEMA-REGISTRY_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/schema-registry)",
-    },
+    data = [":wasm_test_assets"],
     memory = "128MiB",
     deps = [
         ":wasm_fixture",
@@ -153,7 +148,7 @@ redpanda_cc_gtest(
         "//src/v/bytes:iobuf",
         "//src/v/bytes:streambuf",
         "//src/v/model",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/test_utils:gtest",
         "//src/v/wasm:api",
         "@avro",
@@ -164,23 +159,12 @@ redpanda_cc_gtest(
 
 redpanda_cc_gtest(
     name = "wasm_lifecycle_test",
-    timeout = "moderate",
+    timeout = "long",
     srcs = [
         "wasm_lifecycle_test.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/identity",
-        "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
-        "//src/transform-sdk/go/transform/internal/testdata/transform-error",
-        "//src/transform-sdk/go/transform/internal/testdata/transform-panic",
-    ],
-    env = {
-        "IDENTITY_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/identity)",
-        "SETUP-PANIC_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/setup-panic)",
-        "TRANSFORM-PANIC_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/transform-panic)",
-        "TRANSFORM-ERROR_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/transform-error)",
-    },
+    data = [":wasm_test_assets"],
     memory = "128MiB",
     deps = [
         ":wasm_fixture",
@@ -200,12 +184,7 @@ redpanda_cc_gtest(
         "wasm_resources_test.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/dynamic",
-    ],
-    env = {
-        "DYNAMIC_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/dynamic)",
-    },
+    data = [":wasm_test_assets"],
     memory = "128MiB",
     deps = [
         ":wasm_fixture",
@@ -230,12 +209,12 @@ redpanda_cc_gtest(
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/random:generators",
+        "//src/v/ssx:future_util",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random_bytes",
         "//src/v/wasm:api",
         "//src/v/wasm:cache",
         "//src/v/wasm:wasi_logger",
-        "@abseil-cpp//absl/algorithm:container",
         "@googletest//:gtest",
         "@seastar",
     ],
@@ -252,9 +231,9 @@ redpanda_cc_gtest(
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/test_utils:gtest",
+        "//src/v/test_utils:metrics",
         "//src/v/wasm:engine_probe",
         "//src/v/wasm:logger",
-        "@abseil-cpp//absl/algorithm:container",
         "@googletest//:gtest",
         "@seastar",
     ],
@@ -262,17 +241,12 @@ redpanda_cc_gtest(
 
 redpanda_cc_bench(
     name = "wasm_transform_rpbench",
-    timeout = "moderate",
+    timeout = "long",
     srcs = [
         "wasm_transform_bench.cc",
     ],
     cpu = 1,
-    data = [
-        "//src/transform-sdk/go/transform/internal/testdata/identity",
-    ],
-    env = {
-        "IDENTITY_WASM_BINARY": "$(rootpath //src/transform-sdk/go/transform/internal/testdata/identity)",
-    },
+    data = [":wasm_test_assets"],
     memory = "512MiB",
     deps = [
         ":logger",
@@ -280,7 +254,9 @@ redpanda_cc_bench(
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/schema:registry",
+        "//src/v/ssx:future_util",
         "//src/v/test_utils:random",
+        "//src/v/test_utils:runfiles",
         "//src/v/wasm:api",
         "//src/v/wasm:logger",
         "//src/v/wasm:transform_probe",

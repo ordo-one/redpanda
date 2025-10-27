@@ -94,6 +94,18 @@ public:
          * replication part is done in this scheduling group.
          */
         _produce = co_await ss::create_scheduling_group("produce", 1000);
+        /**
+         * Group used to handle tiered storage reads.
+         * Lower priority than raft writes, to mitigate promotion to tiered
+         * storage cache starving out producers.
+         */
+        _ts_read = co_await ss::create_scheduling_group("ts_read", 500);
+        /**
+         * Group used to handle cluster linking tasks. It includes tasks
+         * synchronizing metadata as well as replication.
+         */
+        _cluster_linking = co_await ss::create_scheduling_group(
+          "cluster_linking", 600);
     }
 
     ss::future<> destroy_groups() {
@@ -111,6 +123,8 @@ public:
         co_await destroy_scheduling_group(_transforms);
         co_await destroy_scheduling_group(_datalake);
         co_await destroy_scheduling_group(_produce);
+        co_await destroy_scheduling_group(_ts_read);
+        co_await destroy_scheduling_group(_cluster_linking);
     }
 
     ss::scheduling_group admin_sg() { return _admin; }
@@ -147,6 +161,10 @@ public:
      */
     ss::scheduling_group produce_sg() { return _produce; }
 
+    ss::scheduling_group ts_read_sg() { return _ts_read; }
+
+    ss::scheduling_group cluster_linking_sg() { return _cluster_linking; }
+
     std::vector<std::reference_wrapper<const ss::scheduling_group>>
     all_scheduling_groups() const {
         return {
@@ -164,7 +182,9 @@ public:
           std::cref(_fetch),
           std::cref(_transforms),
           std::cref(_datalake),
-          std::cref(_produce)};
+          std::cref(_produce),
+          std::cref(_ts_read),
+          std::cref(_cluster_linking)};
     }
 
 private:
@@ -184,4 +204,6 @@ private:
     ss::scheduling_group _transforms;
     ss::scheduling_group _datalake;
     ss::scheduling_group _produce;
+    ss::scheduling_group _ts_read;
+    ss::scheduling_group _cluster_linking;
 };

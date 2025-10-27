@@ -46,15 +46,31 @@ public:
     ss::future<ppsr::schema_getter*> synced_getter() const override {
         auto [reader, writer] = co_await service();
         co_await writer->read_sync();
+        _last_sync_time = ss::lowres_clock::now();
         co_return reader;
     }
 
-    ss::future<ppsr::canonical_schema_definition>
+    ss::future<ss::lowres_clock::time_point>
+    sync(ss::lowres_clock::duration max_age) override {
+        auto now = ss::lowres_clock::now();
+
+        if (
+          now - _last_sync_time > max_age
+          || max_age == ss::lowres_clock::duration{}) {
+            auto [reader, writer] = co_await service();
+            co_await writer->read_sync();
+            _last_sync_time = now;
+        }
+
+        co_return _last_sync_time;
+    }
+
+    ss::future<ppsr::schema_definition>
     get_schema_definition(ppsr::schema_id id) const override {
         auto [reader, _] = co_await service();
         co_return co_await reader->get_schema_definition(id);
     }
-    ss::future<ppsr::subject_schema> get_subject_schema(
+    ss::future<ppsr::stored_schema> get_subject_schema(
       ppsr::subject sub,
       std::optional<ppsr::schema_version> version) const override {
         auto [reader, _] = co_await service();
@@ -62,9 +78,10 @@ public:
           sub, version, ppsr::include_deleted::no);
     }
     ss::future<ppsr::schema_id>
-    create_schema(ppsr::unparsed_schema schema) override {
+    create_schema(ppsr::subject_schema schema) override {
         auto [reader, writer] = co_await service();
         co_await writer->read_sync();
+        _last_sync_time = ss::lowres_clock::now();
         auto parsed = co_await reader->make_canonical_schema(std::move(schema));
         co_return co_await writer->write_subject_version(
           {.schema = std::move(parsed)});
@@ -79,6 +96,7 @@ private:
     }
 
     ss::sharded<ppsr::service>* _service;
+    mutable ss::lowres_clock::time_point _last_sync_time{};
 };
 
 class disabled_schema_registry : public registry {
@@ -93,17 +111,22 @@ public:
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
     }
-    ss::future<ppsr::canonical_schema_definition>
+    ss::future<ss::lowres_clock::time_point>
+    sync(ss::lowres_clock::duration) override {
+        throw std::logic_error(
+          "invalid attempted usage of a disabled schema registry");
+    }
+    ss::future<ppsr::schema_definition>
     get_schema_definition(ppsr::schema_id) const override {
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
     }
-    ss::future<ppsr::subject_schema> get_subject_schema(
+    ss::future<ppsr::stored_schema> get_subject_schema(
       ppsr::subject, std::optional<ppsr::schema_version>) const override {
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
     }
-    ss::future<ppsr::schema_id> create_schema(ppsr::unparsed_schema) override {
+    ss::future<ppsr::schema_id> create_schema(ppsr::subject_schema) override {
         throw std::logic_error(
           "invalid attempted usage of a disabled schema registry");
     }
@@ -126,23 +149,18 @@ registry::get_valid_schema(ppsr::schema_id schema_id) const {
             co_return std::nullopt;
         }
     }
-    auto& schema_def = *schema_def_opt;
-    auto schema_type = schema_def.type();
-    switch (schema_type) {
+    switch (schema_def_opt->type()) {
     case ppsr::schema_type::json: {
         co_return co_await ppsr::make_json_schema_definition(
-          *reader,
-          {ppsr::subject("r"), {std::move(schema_def).raw(), schema_type}});
+          *reader, {ppsr::subject("r"), std::move(*schema_def_opt)});
     }
     case ppsr::schema_type::avro: {
         co_return co_await ppsr::make_avro_schema_definition(
-          *reader,
-          {ppsr::subject("r"), {std::move(schema_def).raw(), schema_type}});
+          *reader, {ppsr::subject("r"), std::move(*schema_def_opt)});
     }
     case ppsr::schema_type::protobuf: {
         co_return co_await ppsr::make_protobuf_schema_definition(
-          *reader,
-          {ppsr::subject("r"), {std::move(schema_def).raw(), schema_type}});
+          *reader, {ppsr::subject("r"), std::move(*schema_def_opt)});
     }
     }
 }

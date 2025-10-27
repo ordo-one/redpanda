@@ -10,11 +10,13 @@
  */
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "bytes/bytes.h"
 #include "model/fundamental.h"
 #include "utils/named_type.h"
 
-#include <absl/container/btree_map.h>
+#include <seastar/core/sstring.hh>
+
 #include <boost/numeric/conversion/cast.hpp>
 
 #include <concepts>
@@ -87,35 +89,6 @@ enum class describe_configs_source : int8_t {
     // DYNAMIC_BROKER_CONFIG((byte) 2),
     // DYNAMIC_DEFAULT_BROKER_CONFIG((byte) 3),
     // DYNAMIC_BROKER_LOGGER_CONFIG((byte) 6);
-};
-
-/**
- * Immutable UUID, represents a 128 bit value of the variant 2 (Leach-Salz)
- * version 4 UUID type. Conversions to/from string will expect or perform a b64
- * encoding/decoding
- */
-class uuid {
-public:
-    static constexpr auto length = 16;
-    using underlying_t = std::array<uint8_t, length>;
-
-    uuid() = default;
-
-    static uuid from_string(std::string_view encoded);
-
-    explicit uuid(const underlying_t& uuid)
-      : _uuid(uuid) {}
-
-    bytes_view view() const { return {_uuid.data(), _uuid.size()}; }
-
-    ss::sstring to_string() const;
-
-    friend bool operator==(const uuid&, const uuid&) = default;
-
-    friend std::ostream& operator<<(std::ostream& os, const uuid& u);
-
-private:
-    underlying_t _uuid{};
 };
 
 /// Types for tags and tagged fields
@@ -209,13 +182,18 @@ std::ostream& operator<<(std::ostream& os, describe_configs_source s);
  * batch encoding utility in protocol/wire.h can remove the dependency on this,
  * for example by having the caller in the server perform this conversion.
  */
-inline kafka::leader_epoch leader_epoch_from_term(model::term_id term) {
-    try {
-        return kafka::leader_epoch(
-          boost::numeric_cast<kafka::leader_epoch::type>(term()));
-    } catch (const boost::bad_numeric_cast&) {
-        return kafka::invalid_leader_epoch;
-    }
+inline kafka::leader_epoch
+leader_epoch_from_term(std::optional<model::term_id> term) {
+    return term
+      .and_then([](auto&& term) {
+          try {
+              return std::make_optional<kafka::leader_epoch>(
+                boost::numeric_cast<kafka::leader_epoch::type>(term()));
+          } catch (const boost::bad_numeric_cast&) {
+              return std::optional<kafka::leader_epoch>{};
+          }
+      })
+      .value_or(kafka::invalid_leader_epoch);
 }
 
 /// Kafka API request correlation.
@@ -248,5 +226,27 @@ enum class config_resource_operation : int8_t {
 };
 
 std::ostream& operator<<(std::ostream& os, config_resource_operation);
+
+using scram_user_name = named_type<ss::sstring, struct scram_user_name_tag>;
+
+enum class scram_mechanism : int8_t {
+    unknown = 0,
+    scram_sha_256 = 1,
+    scram_sha_512 = 2,
+};
+
+std::ostream& operator<<(std::ostream& os, scram_mechanism);
+
+using topic_authorized_operations
+  = named_type<int32_t, struct topic_authorized_operations_tag>;
+
+inline constexpr topic_authorized_operations
+  topic_authorized_operations_not_set(-2147483648);
+
+using cluster_authorized_operations
+  = named_type<int32_t, struct cluster_authorized_operations_tag>;
+
+inline constexpr cluster_authorized_operations
+  cluster_authorized_operations_not_set(-2147483648);
 
 } // namespace kafka

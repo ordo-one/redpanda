@@ -12,7 +12,7 @@
 #include "storage.h"
 
 #include "base/vlog.h"
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cluster/node/local_monitor.h"
 #include "cluster/partition_manager.h"
 #include "datalake/datalake_manager.h"
@@ -35,7 +35,7 @@ disk_space_manager::disk_space_manager(
   ss::sharded<cluster::node::local_monitor>* local_monitor,
   ss::sharded<storage::api>* storage,
   ss::sharded<storage::node>* storage_node,
-  ss::sharded<cloud_storage::cache>* cache,
+  ss::sharded<cloud_io::cache>* cache,
   ss::sharded<cluster::partition_manager>* pm)
   : _enabled(std::move(enabled))
   , _enabled_override(std::move(enabled_override))
@@ -92,12 +92,34 @@ ss::future<> disk_space_manager::stop() {
         _storage_node->local().unregister_disk_notification(
           node::disk_type::data, _data_disk_nid);
     }
+    _as.request_abort();
     _control_sem.broken();
     co_await _gate.close();
 }
 
 ss::future<> disk_space_manager::run_loop() {
     vassert(ss::this_shard_id() == run_loop_core, "Run on wrong core");
+
+    // Always wait for the trim interval after startup to ensure that
+    // partitions are fully started. Known sources of skew early in the node
+    // startup phase:
+    // 1. controller_backend::start() doesn't wait for the first reconciliation
+    // round, so not all partitions may yet exist in the partition manager.
+    // 2. Even though partition::start() waits for STMs to apply local snapshots
+    // (and therefore have a recent-enough state), some STMs don't return
+    // a sensible max_collectible_offset until later. For example:
+    //   * rm_stm waits until it is replayed up to raft committed index
+    //   * archival_metadata_stm waits until the state is marked "clean"
+    //     (i.e. until the corresponding manifest is uploaded to the cloud).
+    //     Moreover, because the snapshot stores only the boolean "dirty" flag,
+    //     we can't reliably restore the "last clean at" offset just from the
+    //     snapshot.
+    try {
+        co_await ss::sleep_abortable(
+          config::shard_local_cfg().retention_local_trim_interval(), _as);
+    } catch (ss::sleep_aborted&) {
+        co_return;
+    }
 
     while (!_gate.is_closed()) {
         try {
@@ -199,7 +221,7 @@ void eviction_policy::schedule::seek(size_t cursor) {
         cursor -= count;
     }
 
-    vassert(false, "Seek could not find cursor location");
+    vunreachable("Seek could not find cursor location");
 }
 
 void eviction_policy::schedule::next() {
@@ -262,12 +284,12 @@ ss::future<eviction_policy::schedule> eviction_policy::create_new_schedule() {
     co_return sched;
 }
 
-ss::future<fragmented_vector<eviction_policy::partition>>
+ss::future<chunked_vector<eviction_policy::partition>>
 eviction_policy::collect_reclaimable_offsets() {
     /*
      * build a lightweight copy to avoid invalidations during iteration
      */
-    fragmented_vector<ss::lw_shared_ptr<cluster::partition>> partitions;
+    chunked_vector<ss::lw_shared_ptr<cluster::partition>> partitions;
     for (const auto& p : _pm->local().partitions()) {
         if (!p.second->remote_partition()) {
             continue;
@@ -287,7 +309,7 @@ eviction_policy::collect_reclaimable_offsets() {
      * in smallish batches partitions are queried for their reclaimable
      * segments. all of this information is bundled up and returned.
      */
-    fragmented_vector<partition> res;
+    chunked_vector<partition> res;
     co_await ss::max_concurrent_for_each(
       partitions.begin(), partitions.end(), 20, [&res, cfg](const auto& p) {
           auto log = p->log();
@@ -602,8 +624,12 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
      * into the cloud.
      */
     if (adjusted_target_excess > usage.reclaim.retention) {
-        vlog(
-          rlog.info,
+        auto schedule = co_await _policy.create_new_schedule();
+
+        vlogl(
+          rlog,
+          schedule.sched_size > 0 ? seastar::log_level::info
+                                  : seastar::log_level::debug,
           "Log storage usage {} > target size {} by {} (adjusted {}). Garbage "
           "collection expected to remove {}. Space management of tiered "
           "storage topics to remove {}. Total estimated available to remove "
@@ -616,7 +642,6 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
           human::bytes(adjusted_target_excess - usage.reclaim.retention),
           human::bytes(usage.reclaim.available));
 
-        auto schedule = co_await _policy.create_new_schedule();
         if (schedule.sched_size > 0) {
             auto estimate = _policy.evict_until_local_retention(
               schedule, adjusted_target_excess);
@@ -658,7 +683,7 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
             co_await _policy.install_schedule(std::move(schedule));
         } else {
             vlog(
-              rlog.info,
+              rlog.debug,
               "No tiered storage partitions were found, unable to reclaim");
         }
     } else {
@@ -702,75 +727,95 @@ void disk_space_manager::probe::setup_metrics() {
      *
      * If space management is disabled the metric value is 0.
      */
-    defs.emplace_back(sm::make_gauge(
-      "target_disk_size_bytes",
-      [this]() { return _sm->enabled() ? _sm->_target_size : 0; },
-      sm::description("Target maximum number of stored bytes.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "target_disk_size_bytes",
+        [this]() { return _sm->enabled() ? _sm->_target_size : 0; },
+        sm::description("Target maximum number of stored bytes.")));
 
-    defs.emplace_back(sm::make_gauge(
-      "disk_usage_bytes",
-      [this]() { return _total_usage; },
-      sm::description(
-        "Total amount of disk usage under control of space management.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "disk_usage_bytes",
+        [this]() { return _total_usage; },
+        sm::description(
+          "Total amount of disk usage under control of space management.")));
 
-    defs.emplace_back(sm::make_gauge(
-      "datalake_disk_usage_bytes",
-      [this]() { return _total_datalake_usage; },
-      sm::description("Total amount of disk usage by datalake.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "datalake_disk_usage_bytes",
+        [this]() { return _total_datalake_usage; },
+        sm::description("Total amount of disk usage by datalake.")));
 
-    defs.emplace_back(sm::make_gauge(
-      "retention_reclaimable_bytes",
-      [this]() { return _retention_reclaimable; },
-      sm::description("Total amount of reclaimable data through standard "
-                      "retention policy (ref: retention.{ms,bytes}).")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "retention_reclaimable_bytes",
+        [this]() { return _retention_reclaimable; },
+        sm::description(
+          "Total amount of reclaimable data through standard "
+          "retention policy (ref: retention.{ms,bytes}).")));
 
-    defs.emplace_back(sm::make_gauge(
-      "available_reclaimable_bytes",
-      [this]() { return _available_reclaimable; },
-      sm::description("Total amount of available reclaimable data by space "
-                      "management.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "available_reclaimable_bytes",
+        [this]() { return _available_reclaimable; },
+        sm::description(
+          "Total amount of available reclaimable data by space "
+          "management.")));
 
-    defs.emplace_back(sm::make_gauge(
-      "local_retention_reclaimable_bytes",
-      [this]() { return _local_retention_reclaimable; },
-      sm::description(
-        "Total amount of reclaimable data above the local "
-        "retention target (ref: retention.local.target.{ms,bytes}).")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "local_retention_reclaimable_bytes",
+        [this]() { return _local_retention_reclaimable; },
+        sm::description(
+          "Total amount of reclaimable data above the local "
+          "retention target (ref: retention.local.target.{ms,bytes}).")));
 
-    defs.emplace_back(sm::make_gauge(
-      "target_excess_bytes",
-      [this]() { return _target_excess; },
-      sm::description("Amount of data usage that exceeds target threshold.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "target_excess_bytes",
+        [this]() { return _target_excess; },
+        sm::description(
+          "Amount of data usage that exceeds target threshold.")));
 
-    defs.emplace_back(sm::make_gauge(
-      "reclaim_local_bytes",
-      [this]() { return _reclaim_local; },
-      sm::description("Estimated amount of data above local retention to be "
-                      "reclaimed by space management")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "reclaim_local_bytes",
+        [this]() { return _reclaim_local; },
+        sm::description(
+          "Estimated amount of data above local retention to be "
+          "reclaimed by space management")));
 
-    defs.emplace_back(sm::make_gauge(
-      "reclaim_low_non_hinted_bytes",
-      [this]() { return _reclaim_low_non_hinted; },
-      sm::description("Estimated amount of data above the non-hinted low-space "
-                      "threshold to be reclaimed by space management")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "reclaim_low_non_hinted_bytes",
+        [this]() { return _reclaim_low_non_hinted; },
+        sm::description(
+          "Estimated amount of data above the non-hinted low-space "
+          "threshold to be reclaimed by space management")));
 
-    defs.emplace_back(sm::make_gauge(
-      "reclaim_low_hinted_bytes",
-      [this]() { return _reclaim_low_hinted; },
-      sm::description("Estimated amount of data above the hinted low-space "
-                      "threshold to be reclaimed by space management")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "reclaim_low_hinted_bytes",
+        [this]() { return _reclaim_low_hinted; },
+        sm::description(
+          "Estimated amount of data above the hinted low-space "
+          "threshold to be reclaimed by space management")));
 
-    defs.emplace_back(sm::make_gauge(
-      "reclaim_active_segment_bytes",
-      [this]() { return _reclaim_active_segment; },
-      sm::description("Estimated amount of data above the active segment to be "
-                      "reclaimed by space management")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "reclaim_active_segment_bytes",
+        [this]() { return _reclaim_active_segment; },
+        sm::description(
+          "Estimated amount of data above the active segment to be "
+          "reclaimed by space management")));
 
-    defs.emplace_back(sm::make_gauge(
-      "reclaim_estimate_bytes",
-      [this]() { return _reclaim_estimate; },
-      sm::description("Estimated amount of data to be reclaimed by space "
-                      "management in last schedule.")));
+    defs.emplace_back(
+      sm::make_gauge(
+        "reclaim_estimate_bytes",
+        [this]() { return _reclaim_estimate; },
+        sm::description(
+          "Estimated amount of data to be reclaimed by space "
+          "management in last schedule.")));
 
     _metrics.add_group(group_name, std::move(defs), {}, {sm::shard_label});
 }

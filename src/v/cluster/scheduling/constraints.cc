@@ -10,6 +10,7 @@
  */
 #include "cluster/scheduling/constraints.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/members_table.h"
 #include "cluster/scheduling/allocation_node.h"
 #include "cluster/scheduling/allocation_state.h"
@@ -17,7 +18,6 @@
 #include "model/metadata.h"
 #include "ssx/sformat.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <fmt/ostream.h>
 
 #include <ios>
@@ -230,8 +230,9 @@ hard_constraint disk_not_overflowed_by_partition(
           _node_disk_reports;
     };
 
-    return hard_constraint(std::make_unique<impl>(
-      max_disk_usage_ratio, partition_size, node_disk_reports));
+    return hard_constraint(
+      std::make_unique<impl>(
+        max_disk_usage_ratio, partition_size, node_disk_reports));
 }
 
 soft_constraint max_final_capacity() {
@@ -316,8 +317,9 @@ soft_constraint least_disk_filled(
           _node_disk_reports;
     };
 
-    return soft_constraint(std::make_unique<impl>(
-      max_disk_usage_ratio, partition_size, node_disk_reports));
+    return soft_constraint(
+      std::make_unique<impl>(
+        max_disk_usage_ratio, partition_size, node_disk_reports));
 }
 
 soft_constraint distinct_rack_preferred(const members_table& members) {

@@ -10,7 +10,7 @@
 #pragma once
 
 #include "base/outcome.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/state.h"
 #include "datalake/coordinator/translated_offset_range.h"
 #include "model/fundamental.h"
@@ -57,15 +57,19 @@ struct add_files_update
 struct mark_files_committed_update
   : public serde::envelope<
       mark_files_committed_update,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     static constexpr auto key{update_key::mark_files_committed};
     static checked<mark_files_committed_update, stm_update_error> build(
       const topics_state&,
       const model::topic_partition&,
       model::revision_id topic_revision,
-      kafka::offset);
-    auto serde_fields() { return std::tie(tp, topic_revision, new_committed); }
+      kafka::offset,
+      uint64_t kafka_bytes_processed);
+    auto serde_fields() {
+        return std::tie(
+          tp, topic_revision, new_committed, kafka_bytes_processed);
+    }
 
     checked<std::nullopt_t, stm_update_error> can_apply(const topics_state&);
     checked<std::nullopt_t, stm_update_error> apply(topics_state&);
@@ -78,6 +82,10 @@ struct mark_files_committed_update
     // All pending entries whose offset range falls entirely below this offset
     // (inclusive) should be removed.
     kafka::offset new_committed;
+
+    // Number of Kafka bytes processed to translate the files included in this
+    // update.
+    uint64_t kafka_bytes_processed{0};
 };
 
 // An update to change topic lifecycle state after it has been deleted.

@@ -10,23 +10,22 @@
  */
 
 #pragma once
+#include "absl/container/btree_map.h"
 #include "base/units.h"
 #include "base/vassert.h"
+#include "container/chunked_circular_buffer.h"
 #include "container/intrusive_list_helpers.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "resource_mgmt/available_memory.h"
 #include "ssx/semaphore.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/weak_ptr.hh>
-
-#include <absl/container/btree_map.h>
 
 #include <limits>
 #include <type_traits>
@@ -505,7 +504,7 @@ class batch_cache_index {
 
 public:
     struct read_result {
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_circular_buffer<model::record_batch> batches;
         size_t memory_usage{0};
         model::offset next_batch;
         std::optional<model::offset> next_cached_batch;
@@ -532,6 +531,8 @@ public:
     batch_cache_index& operator=(const batch_cache_index&) = delete;
 
     ss::future<> clear_async();
+    // Requires that a `lock_guard` for `this` is held elsewhere.
+    ss::future<> clear_async_unlocked();
     bool empty() const { return _index.empty(); }
 
     void
@@ -620,6 +621,13 @@ public:
      */
     bool testing_exists_in_index(model::offset offset) {
         return _index.find(offset) != _index.end();
+    }
+
+    // Leaves the batch_cache_index in a fully clean, re-usable state.
+    ss::future<> reset() {
+        lock_guard lk(*this);
+        co_await clear_async_unlocked();
+        _small_batches_range = nullptr;
     }
 
 private:

@@ -10,7 +10,10 @@
 #include "cloud_io/auth_refresh_bg_op.h"
 
 #include "cloud_io/logger.h"
+#include "cloud_roles/refresh_credentials.h"
 #include "ssx/future-util.h"
+
+#include <optional>
 
 namespace cloud_io {
 
@@ -25,9 +28,11 @@ auth_refresh_bg_op::auth_refresh_bg_op(
   , _cloud_credentials_source(cloud_credentials_source) {}
 
 void auth_refresh_bg_op::maybe_start_auth_refresh_op(
-  cloud_roles::credentials_update_cb_t credentials_update_cb) {
+  cloud_roles::credentials_update_cb_t credentials_update_cb,
+  ss::sstring metrics_tag) {
     if (ss::this_shard_id() == auth_refresh_shard_id) {
-        do_start_auth_refresh_op(std::move(credentials_update_cb));
+        do_start_auth_refresh_op(
+          std::move(credentials_update_cb), std::move(metrics_tag));
     }
 }
 
@@ -42,7 +47,8 @@ void auth_refresh_bg_op::set_client_config(
 }
 
 void auth_refresh_bg_op::do_start_auth_refresh_op(
-  cloud_roles::credentials_update_cb_t credentials_update_cb) {
+  cloud_roles::credentials_update_cb_t credentials_update_cb,
+  ss::sstring metrics_tag) {
     if (is_static_config()) {
         // If credentials are static IE not changing, we just need to set the
         // credential object once on all cores with static strings.
@@ -60,24 +66,31 @@ void auth_refresh_bg_op::do_start_auth_refresh_op(
         // Create an implementation of refresh_credentials based on the setting
         // cloud_credentials_source.
         try {
-            auto region_name = ss::visit(
+            auto [service_name, region_name] = ss::visit(
               _client_conf,
               [](const cloud_storage_clients::s3_configuration& cfg) {
-                  // S3 needs a region name to compose requests, this extracts
-                  // it from s3_configuration
-                  return cloud_roles::aws_region_name{cfg.region};
+                  // S3 needs both service and region names to compose requests
+                  return std::make_pair(cfg.service, cfg.region);
               },
               [](const cloud_storage_clients::abs_configuration&) {
-                  // Azure Blob Storage does not need a region name to compose
-                  // the requests, so this value is defaulted since it's ignored
+                  // Azure Blob Storage does not need service or region names,
+                  // so these values are defaulted since they're ignored
                   // downstream
-                  return cloud_roles::aws_region_name{};
+                  return std::make_pair(
+                    cloud_roles::aws_service_name{},
+                    cloud_roles::aws_region_name{});
               });
-            _refresh_credentials.emplace(cloud_roles::make_refresh_credentials(
-              _cloud_credentials_source,
-              _as,
-              std::move(credentials_update_cb),
-              region_name));
+
+            _refresh_credentials.emplace(
+              cloud_roles::make_refresh_credentials(
+                _cloud_credentials_source,
+                _as,
+                std::move(credentials_update_cb),
+                service_name,
+                region_name,
+                std::nullopt,
+                cloud_roles::default_retry_params,
+                std::move(metrics_tag)));
 
             vlog(
               log.info,
@@ -109,7 +122,8 @@ cloud_roles::credentials auth_refresh_bg_op::build_static_credentials() const {
             cfg.access_key.value(),
             cfg.secret_key.value(),
             std::nullopt,
-            cfg.region};
+            cfg.region,
+            cfg.service};
       },
       [](const cloud_storage_clients::abs_configuration& cfg)
         -> cloud_roles::credentials {

@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
+#include "absl/container/node_hash_map.h"
 #include "base/outcome.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
@@ -24,14 +26,12 @@
 #include "model/metadata.h"
 #include "raft/group_configuration.h"
 #include "storage/api.h"
+#include "utils/adjustable_semaphore.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
-
-#include <absl/container/btree_map.h>
-#include <absl/container/node_hash_map.h>
 
 #include <cstdint>
 #include <iosfwd>
@@ -215,6 +215,8 @@ public:
       config::binding<std::chrono::milliseconds>
         retention_local_target_ms_default,
       config::binding<bool> retention_local_strict,
+      config::binding<uint32_t> controller_backend_reconciliation_concurrency,
+      ss::scheduling_group scheduling_group,
       ss::sharded<seastar::abort_source>&);
     ~controller_backend();
 
@@ -243,6 +245,8 @@ public:
     /// start().
     ss::future<> transfer_partitions_from_extra_shard(
       storage::kvstore&, shard_placement_table&);
+
+    ss::future<std::error_code> remake_partition(const model::ntp&);
 
 private:
     struct ntp_reconciliation_state;
@@ -295,7 +299,8 @@ private:
       model::revision_id log_revision,
       replicas_t initial_replicas,
       const replicas_revision_map& replicas_revisions,
-      force_reconfiguration is_force_reconfigured);
+      force_reconfiguration is_force_reconfigured,
+      const topic_metadata& topic_md);
 
     ss::future<> add_to_shard_table(
       model::ntp,
@@ -381,6 +386,8 @@ private:
       reconfiguration_policy policy,
       const ss::lw_shared_ptr<partition>& partition) const;
 
+    ss::future<std::error_code> do_remake_partition(const model::ntp&);
+
     ss::sharded<topic_table>& _topics;
     shard_placement_table& _shard_placement;
     ss::sharded<shard_table>& _shard_table;
@@ -402,6 +409,8 @@ private:
     config::binding<std::chrono::milliseconds>
       _retention_local_target_ms_default;
     config::binding<bool> _retention_local_strict;
+    config::binding<uint32_t> _controller_backend_reconciliation_concurrency;
+    ss::scheduling_group _scheduling_group;
     ss::sharded<ss::abort_source>& _as;
 
     absl::btree_map<model::ntp, ss::lw_shared_ptr<ntp_reconciliation_state>>
@@ -415,7 +424,7 @@ private:
     // Limits the number of concurrently executing reconciliation fibers.
     // Initially reconciliation is blocked and we deposit a non-zero amount of
     // units when we are ready to start reconciling.
-    ssx::semaphore _reconciliation_sem{0, "c/controller-be"};
+    adjustable_semaphore _reconciliation_sem{0, "c/controller-be"};
     ss::gate _gate;
 
     metrics::internal_metric_groups _metrics;

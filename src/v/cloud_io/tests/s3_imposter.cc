@@ -10,13 +10,9 @@
 
 #include "cloud_io/tests/s3_imposter.h"
 
-#include "base/seastarx.h"
-#include "bytes/iobuf.h"
-#include "bytes/iobuf_parser.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_storage_clients/client_probe.h"
-#include "test_utils/async.h"
-#include "test_utils/test_macros.h"
+#include "http/tests/utils.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
@@ -371,8 +367,9 @@ struct s3_imposter_fixture::content_handler {
             }
 
             return R"xml(<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>)xml";
+        } else {
+            vunreachable("Unhandled request method {}", request._method);
         }
-        RPTEST_ADD_FAIL("Unexpected request");
         return "";
     }
     expectation_map_t expectations;
@@ -389,6 +386,7 @@ s3_imposter_fixture::get_configuration() {
     conf.access_key = cloud_roles::public_key_str("access-key");
     conf.secret_key = cloud_roles::private_key_str("secret-key");
     conf.region = cloud_roles::aws_region_name("us-east-1");
+    conf.service = cloud_roles::aws_service_name("s3");
     conf.url_style = url_style;
     conf.server_addr = server_addr;
     conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
@@ -501,11 +499,11 @@ void s3_imposter_fixture::set_routes(
     using reply = ss::http::reply;
     _content_handler = ss::make_shared<content_handler>(
       expectations, *this, std::move(headers_to_store));
-    _handler = std::make_unique<function_handler>(
-      [this](const_req req, reply& repl) {
+    _handler = std::make_unique<http::test_utils::flexible_function_handler>(
+      [this](const_req req, reply& repl, [[maybe_unused]] ss::sstring& type) {
           return _content_handler->handle(req, repl);
       },
-      "txt");
+      "xml");
     r.add_default_handler(_handler.get());
 }
 

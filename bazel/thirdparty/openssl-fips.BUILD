@@ -8,9 +8,20 @@ filegroup(
 
 configure_make(
     name = "openssl-fips",
+    args = [
+        "-j$OPENSSL_BUILD_JOBS",
+        # This will cause OpenSSL to ignore the prefix flag and install at the specified DESTDIR
+        "DESTDIR=$BUILD_TMPDIR/openssl-fips",
+    ],
     configure_command = "Configure",
     configure_options = [
+        # OpenSSL will look for system certs in a path relative to the OPENSSLDIR macro
+        # This macro is defined as <prefix>/<openssldir>
+        # Most linux environments install system certs in /etc/ssl/certs, so we set
+        # the OPENSSLDIR macro to /etc/ssl
         "enable-fips",
+        "--prefix=/",
+        "--openssldir=/etc/ssl",
         "--libdir=lib",
         "no-tests",
     ] + select({
@@ -18,6 +29,9 @@ configure_make(
         "@openssl//:release_mode": ["--release"],
         "//conditions:default": [],
     }),
+    env = {
+        "OPENSSL_BUILD_JOBS": "$(BUILD_JOBS)",
+    },
     lib_source = ":srcs",
     out_shared_libs = [
         "ossl-modules/fips.so",
@@ -26,6 +40,7 @@ configure_make(
         "",
         "install_fips",
     ],
+    toolchains = ["@openssl//:build_jobs"],
     visibility = [
         "//visibility:public",
     ],
@@ -53,7 +68,7 @@ genrule(
     name = "fipsmodule_cnf",
     srcs = [":gen_dir"],
     outs = ["fipsmodule.cnf"],
-    cmd = "cp -L $(SRCS)/ssl/fipsmodule.cnf $@",
+    cmd = "cp -L $(SRCS)/etc/ssl/fipsmodule.cnf $@ && sed -i '/activate = 1/d' $@",
     visibility = [
         "//visibility:public",
     ],

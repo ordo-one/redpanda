@@ -7,7 +7,6 @@ redpanda_cc_library(
     hdrs = [
         "logger.h",
     ],
-    include_prefix = "cloud_roles",
     deps = [
         "//src/v/base",
         "@seastar",
@@ -22,7 +21,6 @@ redpanda_cc_library(
     hdrs = [
         "types.h",
     ],
-    include_prefix = "cloud_roles",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -41,7 +39,6 @@ redpanda_cc_library(
     hdrs = [
         "request_response_helpers.h",
     ],
-    include_prefix = "cloud_roles",
     deps = [
         ":logger",
         ":types",
@@ -62,7 +59,6 @@ redpanda_cc_library(
     hdrs = [
         "signature.h",
     ],
-    include_prefix = "cloud_roles",
     deps = [
         ":logger",
         ":request_response_helpers",
@@ -96,24 +92,23 @@ redpanda_cc_library(
         "apply_gcp_credentials.cc",
         "apply_gcp_credentials.h",
         "aws_refresh_impl.cc",
-        "aws_refresh_impl.h",
         "aws_sts_refresh_impl.cc",
-        "aws_sts_refresh_impl.h",
         "azure_aks_refresh_impl.cc",
-        "azure_aks_refresh_impl.h",
         "azure_vm_refresh_impl.cc",
-        "azure_vm_refresh_impl.h",
         "gcp_refresh_impl.cc",
-        "gcp_refresh_impl.h",
         "probe.cc",
         "refresh_credentials.cc",
     ],
     hdrs = [
         "apply_credentials.h",
+        "aws_refresh_impl.h",
+        "aws_sts_refresh_impl.h",
+        "azure_aks_refresh_impl.h",
+        "azure_vm_refresh_impl.h",
+        "gcp_refresh_impl.h",
         "probe.h",
         "refresh_credentials.h",
     ],
-    include_prefix = "cloud_roles",
     visibility = ["//visibility:public"],
     deps = [
         ":logger",
@@ -133,13 +128,15 @@ redpanda_cc_library(
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/net",
+        "//src/v/net:tls",
         "//src/v/ssx:future_util",
         "//src/v/ssx:sformat",
-        "//src/v/thirdparty/ada",
+        "//src/v/strings:utf8",
         "//src/v/utils:base64",
         "//src/v/utils:file_io",
         "//src/v/utils:named_type",
         "@abseil-cpp//absl/strings",
+        "@ada",
         "@boost//:algorithm",
         "@boost//:property_tree",
         "@fmt",

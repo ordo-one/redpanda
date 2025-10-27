@@ -1,21 +1,37 @@
 load("//bazel:build.bzl", "redpanda_cc_library")
 
-package(default_visibility = ["//src/v/cloud_topics/reconciler/tests:__pkg__"])
+package(default_visibility = [":__subpackages__"])
 
 redpanda_cc_library(
-    name = "range_batch_consumer",
+    name = "reconciliation_consumer",
     srcs = [
-        "range_batch_consumer.cc",
+        "reconciliation_consumer.cc",
     ],
     hdrs = [
-        "range_batch_consumer.h",
+        "reconciliation_consumer.h",
     ],
-    include_prefix = "cloud_topics/reconciler",
     deps = [
+        ":reconciler_probe",
         "//src/v/base",
-        "//src/v/bytes:iobuf",
+        "//src/v/cloud_topics/level_one/common:object",
         "//src/v/model",
         "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "reconciler_probe",
+    srcs = [
+        "reconciler_probe.cc",
+    ],
+    hdrs = [
+        "reconciler_probe.h",
+    ],
+    deps = [
+        "//src/v/config",
+        "//src/v/metrics",
+        "//src/v/utils:log_hist",
         "@seastar",
     ],
 )
@@ -24,31 +40,44 @@ redpanda_cc_library(
     name = "reconciler",
     srcs = [
         "reconciler.cc",
+        "reconciliation_source.cc",
     ],
     hdrs = [
         "reconciler.h",
+        "reconciliation_source.h",
     ],
     implementation_deps = [
-        "//src/v/kafka/data:partition_proxy",
+        "//src/v/cloud_topics:logger",
+        "//src/v/cloud_topics/frontend",
+        "//src/v/cloud_topics/level_zero/stm:ctp_stm_api",
+        "//src/v/kafka/utils:txn_reader",
+        "//src/v/utils:retry_chain_node",
     ],
-    include_prefix = "cloud_topics/reconciler",
     visibility = ["//visibility:public"],
     deps = [
-        ":range_batch_consumer",
+        ":reconciler_probe",
+        ":reconciliation_consumer",
         "//src/v/base",
-        "//src/v/cloud_io:remote",
-        "//src/v/cloud_storage",
-        "//src/v/cloud_topics:dl_overlay",
+        "//src/v/cloud_storage_clients",
+        "//src/v/cloud_topics:data_plane_api",
+        "//src/v/cloud_topics:log_reader_config",
+        "//src/v/cloud_topics:object_utils",
         "//src/v/cloud_topics:types",
-        "//src/v/cloud_topics/dl_stm:dl_stm_api",
+        "//src/v/cloud_topics/level_one/common:abstract_io",
+        "//src/v/cloud_topics/level_one/common:object",
+        "//src/v/cloud_topics/level_one/common:object_id",
+        "//src/v/cloud_topics/level_one/common:object_utils",
+        "//src/v/cloud_topics/level_one/metastore",
+        "//src/v/cloud_topics/level_one/metastore:replicated_metastore",
+        "//src/v/cloud_topics/level_one/metastore:retry",
         "//src/v/cluster",
-        "//src/v/cluster:notification",
-        "//src/v/container:fragmented_vector",
-        "//src/v/kafka/utils:txn_reader",
+        "//src/v/container:chunked_hash_map",
+        "//src/v/container:chunked_vector",
         "//src/v/model",
         "//src/v/random:generators",
+        "//src/v/ssx:future_util",
+        "//src/v/utils:retry_chain_node",
         "@abseil-cpp//absl/container:btree",
-        "@abseil-cpp//absl/container:node_hash_map",
         "@seastar",
     ],
 )

@@ -13,7 +13,7 @@
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/shard_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/heartbeat.h"
 #include "kafka/protocol/join_group.h"
@@ -24,6 +24,7 @@
 #include "kafka/protocol/schemata/delete_groups_response.h"
 #include "kafka/protocol/sync_group.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
+#include "kafka/server/group_initializer.h"
 #include "kafka/server/group_manager.h"
 
 #include <seastar/core/reactor.hh>
@@ -48,12 +49,14 @@ public:
       ss::smp_service_group smp_group,
       ss::sharded<group_manager>& gr_manager,
       ss::sharded<cluster::shard_table>& shards,
-      ss::sharded<coordinator_ntp_mapper>& coordinators)
+      ss::sharded<coordinator_ntp_mapper>& coordinators,
+      group_initializer& group_initializer)
       : _sg(sched_group)
       , _ssg(smp_group)
       , _group_manager(gr_manager)
       , _shards(shards)
-      , _coordinators(coordinators) {}
+      , _coordinators(coordinators)
+      , _group_initializer(group_initializer) {}
 
     group::join_group_stages join_group(join_group_request&& request);
 
@@ -64,7 +67,7 @@ public:
     ss::future<leave_group_response> leave_group(leave_group_request&& request);
 
     ss::future<offset_fetch_response>
-    offset_fetch(offset_fetch_request&& request);
+    offset_fetch(offset_fetch_request request);
 
     ss::future<offset_delete_response>
     offset_delete(offset_delete_request&& request);
@@ -96,6 +99,8 @@ public:
         return _coordinators;
     }
 
+    group_initializer& group_initializer() { return _group_initializer; }
+
     ss::sharded<group_manager>& get_group_manager() { return _group_manager; }
 
 private:
@@ -108,21 +113,27 @@ private:
     template<typename Request, typename FwdFunc>
     auto route_stages(Request r, FwdFunc func);
 
-    using sharded_groups = absl::
-      node_hash_map<ss::shard_id, std::vector<std::pair<model::ntp, group_id>>>;
+    using sharded_groups = absl::node_hash_map<
+      ss::shard_id,
+      chunked_vector<std::pair<model::ntp, group_id>>>;
 
     std::optional<std::pair<model::ntp, ss::shard_id>>
     shard_for(const group_id& group) {
-        if (auto ntp = coordinator_mapper().local().ntp_for(group); ntp) {
-            if (auto shard_id = _shards.local().shard_for(*ntp); shard_id) {
-                return std::make_pair(std::move(*ntp), *shard_id);
+        if (auto p_id = coordinator_mapper().local().partition_for(group);
+            p_id) {
+            model::ntp ntp(
+              model::kafka_namespace,
+              model::kafka_consumer_offsets_topic,
+              *p_id);
+            if (auto shard_id = _shards.local().shard_for(ntp); shard_id) {
+                return std::make_pair(std::move(ntp), *shard_id);
             }
         }
         return std::nullopt;
     }
 
-    ss::future<std::vector<deletable_group_result>> route_delete_groups(
-      ss::shard_id, std::vector<std::pair<model::ntp, group_id>>);
+    ss::future<chunked_vector<deletable_group_result>> route_delete_groups(
+      ss::shard_id, chunked_vector<std::pair<model::ntp, group_id>>);
 
     ss::future<> parallel_route_delete_groups(
       std::vector<deletable_group_result>&, sharded_groups&);
@@ -132,6 +143,7 @@ private:
     ss::sharded<group_manager>& _group_manager;
     ss::sharded<cluster::shard_table>& _shards;
     ss::sharded<coordinator_ntp_mapper>& _coordinators;
+    kafka::group_initializer& _group_initializer;
 };
 
 } // namespace kafka

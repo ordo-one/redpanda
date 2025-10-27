@@ -1,19 +1,13 @@
 load("//bazel:build.bzl", "redpanda_cc_library")
 
 package(default_visibility = [
-    "//src/v/cloud_topics/L0_read_path:__pkg__",
-    "//src/v/cloud_topics/L0_read_path/tests:__pkg__",
-    "//src/v/cloud_topics/batcher:__pkg__",
-    "//src/v/cloud_topics/batcher/tests:__pkg__",
+    "//src/v/cloud_topics/batch_cache:__pkg__",
     "//src/v/cloud_topics/core:__pkg__",
     "//src/v/cloud_topics/core/tests:__pkg__",
-    "//src/v/cloud_topics/dl_stm:__pkg__",
-    "//src/v/cloud_topics/dl_stm/tests:__pkg__",
-    "//src/v/cloud_topics/reconciler:__pkg__",
-    "//src/v/cloud_topics/reconciler/tests:__pkg__",
+    "//src/v/cloud_topics/frontend:__pkg__",
+    "//src/v/cloud_topics/level_zero:__subpackages__",
     "//src/v/cloud_topics/tests:__pkg__",
-    "//src/v/cloud_topics/throttler:__pkg__",
-    "//src/v/cloud_topics/throttler/tests:__pkg__",
+    "//src/v/kafka/data:__pkg__",
 ])
 
 redpanda_cc_library(
@@ -24,7 +18,7 @@ redpanda_cc_library(
     hdrs = [
         "logger.h",
     ],
-    include_prefix = "cloud_topics",
+    visibility = ["//visibility:public"],
     deps = [
         "@seastar",
     ],
@@ -39,8 +33,9 @@ redpanda_cc_library(
         "errc.h",
         "types.h",
     ],
-    include_prefix = "cloud_topics",
+    visibility = [":__subpackages__"],
     deps = [
+        "//src/v/serde",
         "//src/v/utils:named_type",
         "//src/v/utils:uuid",
         "@fmt",
@@ -48,63 +43,27 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
-    name = "dl_overlay",
-    srcs = [
-        "dl_overlay.cc",
-    ],
+    name = "data_plane_api",
     hdrs = [
-        "dl_overlay.h",
+        "data_plane_api.h",
     ],
-    include_prefix = "cloud_topics",
+    visibility = [
+        "//src/v/cloud_topics/frontend:__pkg__",
+        "//src/v/cloud_topics/frontend/tests:__pkg__",
+        "//src/v/cloud_topics/level_one/frontend_reader:__pkg__",
+        "//src/v/cloud_topics/level_one/frontend_reader/tests:__pkg__",
+        "//src/v/cloud_topics/level_zero/frontend_reader:__pkg__",
+        "//src/v/cloud_topics/reconciler:__pkg__",
+        "//src/v/kafka/data:__pkg__",
+        "//src/v/redpanda:__pkg__",
+    ],
     deps = [
-        ":types",
+        "//src/v/base",
+        "//src/v/cloud_topics/level_zero/common:extent_meta",
+        "//src/v/container:chunked_vector",
         "//src/v/model",
-        "//src/v/serde",
-        "@abseil-cpp//absl/container:btree",
-        "@fmt",
-    ],
-)
-
-redpanda_cc_library(
-    name = "placeholder",
-    hdrs = [
-        "dl_placeholder.h",
-    ],
-    include_prefix = "cloud_topics",
-    deps = [
-        ":types",
-        "//src/v/serde",
-        "//src/v/serde:named_type",
-        "//src/v/serde:uuid",
-        "//src/v/utils:named_type",
-        "//src/v/utils:uuid",
-    ],
-)
-
-redpanda_cc_library(
-    name = "dl_version",
-    hdrs = ["dl_version.h"],
-    include_prefix = "cloud_topics",
-    deps = ["//src/v/utils:named_type"],
-)
-
-redpanda_cc_library(
-    name = "dl_snapshot",
-    srcs = [
-        "dl_snapshot.cc",
-    ],
-    hdrs = [
-        "dl_snapshot.h",
-    ],
-    implementation_deps = [
-        "@fmt",
-    ],
-    include_prefix = "cloud_topics",
-    deps = [
-        ":dl_overlay",
-        ":dl_version",
-        "//src/v/container:fragmented_vector",
-        "//src/v/serde",
+        "//src/v/storage",
+        "@seastar",
     ],
 )
 
@@ -117,20 +76,145 @@ redpanda_cc_library(
         "app.h",
     ],
     implementation_deps = [
-        "//src/v/cloud_io:remote",
-        "//src/v/cloud_storage",
-        "//src/v/cloud_topics/L0_read_path:L0_fetch_handler",
-        "//src/v/cloud_topics/batcher",
-        "//src/v/cloud_topics/core:read_pipeline",
-        "//src/v/cloud_topics/core:write_pipeline",
-        "//src/v/cloud_topics/interfaces:cluster_partition_manager",
-        "//src/v/cloud_topics/reconciler",
-        "//src/v/cloud_topics/throttler",
-        "//src/v/model",
+        ":cluster_services_interface",
+        ":data_plane_impl",
+        "//src/v/cloud_topics/housekeeper:manager",
+        "//src/v/cloud_topics/level_one/metastore:topic_purger",
+        "//src/v/cloud_topics/level_zero/gc:level_zero_gc",
+        "//src/v/cloud_topics/manager",
     ],
-    include_prefix = "cloud_topics",
+    visibility = [
+        "//src/v/cloud_topics/frontend:__pkg__",
+        "//src/v/cloud_topics/frontend/tests:__pkg__",
+        "//src/v/cloud_topics/level_one/metastore/tests:__pkg__",
+        "//src/v/cloud_topics/level_zero/reader:__pkg__",
+        "//src/v/cloud_topics/reconciler:__pkg__",
+        "//src/v/cloud_topics/tests:__pkg__",
+        "//src/v/kafka/data:__pkg__",
+        "//src/v/redpanda:__pkg__",
+    ],
+    deps = [
+        ":data_plane_api",
+        "//src/v/base",
+        "//src/v/cloud_topics:state_accessors",
+        "//src/v/cloud_topics/level_one/common:file_io",
+        "//src/v/cloud_topics/level_one/domain:domain_supervisor",
+        "//src/v/cloud_topics/level_one/metastore:frontend",
+        "//src/v/cloud_topics/level_one/metastore:replicated_metastore",
+        "//src/v/cloud_topics/level_zero/common:extent_meta",
+        "//src/v/cloud_topics/reconciler",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/ssx:sharded_service_container",
+        "//src/v/storage",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "data_plane_impl",
+    srcs = [
+        "data_plane_impl.cc",
+    ],
+    hdrs = [
+        "data_plane_impl.h",
+    ],
+    implementation_deps = [
+        "//src/v/base",
+        "//src/v/cloud_io:cache",
+        "//src/v/cloud_io:remote",
+        "//src/v/cloud_topics:cluster_services_interface",
+        "//src/v/cloud_topics:data_plane_api",
+        "//src/v/cloud_topics/batch_cache",
+        "//src/v/cloud_topics/level_zero/batcher",
+        "//src/v/cloud_topics/level_zero/cluster_services_impl",
+        "//src/v/cloud_topics/level_zero/pipeline:read_pipeline",
+        "//src/v/cloud_topics/level_zero/pipeline:write_pipeline",
+        "//src/v/cloud_topics/level_zero/reader:fetch_handler",
+        "//src/v/cloud_topics/level_zero/write_request_scheduler",
+        "//src/v/model",
+        "//src/v/ssx:sharded_service_container",
+        "//src/v/storage",
+    ],
     visibility = ["//src/v/redpanda:__pkg__"],
     deps = [
         "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "object_utils",
+    srcs = [
+        "object_utils.cc",
+    ],
+    hdrs = [
+        "object_utils.h",
+    ],
+    implementation_deps = [
+        "//src/v/base",
+    ],
+    visibility = [
+        ":__subpackages__",
+        "//src/v/cloud_topics/reconciler:__pkg__",
+    ],
+    deps = [
+        ":cluster_services_interface",
+        ":types",
+        "//src/v/cloud_storage_clients",
+        "//src/v/ssx:sformat",
+        "//src/v/utils:uuid",
+        "@fmt",
+    ],
+)
+
+redpanda_cc_library(
+    name = "state_accessors",
+    hdrs = [
+        "state_accessors.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+    ],
+)
+
+redpanda_cc_library(
+    name = "cluster_services_interface",
+    hdrs = [
+        "cluster_services.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":types",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ephemeral_cluster_services",
+    hdrs = [
+        "ephemeral_cluster_services.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":cluster_services_interface",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "log_reader_config",
+    srcs = [
+        "log_reader_config.cc",
+    ],
+    hdrs = [
+        "log_reader_config.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/model",
+        "//src/v/utils:to_string",
     ],
 )

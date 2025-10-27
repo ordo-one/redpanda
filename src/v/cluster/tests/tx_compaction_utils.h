@@ -11,8 +11,10 @@
 
 #include "cluster/logger.h"
 #include "cluster/rm_stm.h"
-#include "storage/tests/storage_test_fixture.h"
-#include "storage/tests/utils/disk_log_builder.h"
+#include "model/record.h"
+#include "storage/segment.h"
+#include "storage/tests/batch_generators.h"
+#include "storage/types.h"
 #include "test_utils/async.h"
 #include "test_utils/randoms.h"
 #include "test_utils/test_macros.h"
@@ -102,15 +104,18 @@ public:
             }
             return log->apply_segment_ms().then([&] {
                 return log
-                  ->housekeeping(storage::housekeeping_config{
-                    model::timestamp(
-                      model::timestamp::now().value() - ret_duration.count()),
-                    std::nullopt,
-                    log->stm_manager()->max_collectible_offset(),
-                    std::nullopt,
-                    ss::default_priority_class(),
-                    dummy_as,
-                  })
+                  ->housekeeping(
+                    storage::housekeeping_config{
+                      model::timestamp(
+                        model::timestamp::now().value() - ret_duration.count()),
+                      std::nullopt,
+                      log->stm_manager()->max_removable_local_log_offset(),
+                      log->stm_manager()->max_tombstone_remove_offset(),
+                      std::nullopt,
+                      std::nullopt,
+                      std::chrono::milliseconds{0},
+                      dummy_as,
+                    })
                   .handle_exception_type(
                     [](const storage::segment_closed_exception&) {});
             });
@@ -125,13 +130,10 @@ public:
         }
     }
 
-    ss::future<>
-    validate(ss::shared_ptr<storage::log> log, int expected_fences) {
+    ss::future<> validate(ss::shared_ptr<storage::log> log) {
         auto lstats = log->offsets();
-        storage::log_reader_config cfg(
-          lstats.start_offset,
-          lstats.committed_offset,
-          ss::default_priority_class());
+        auto cfg = storage::local_log_reader_config(
+          lstats.start_offset, lstats.committed_offset);
         auto reader = co_await log->make_reader(cfg);
         auto batches = co_await copy_to_mem(reader);
 
@@ -155,7 +157,9 @@ public:
                 fence_batch_count++;
             }
         }
-        RPTEST_REQUIRE_EQ_CORO(fence_batch_count, expected_fences);
+
+        // Fence batches should be removed.
+        RPTEST_REQUIRE_CORO(fence_batch_count == 0);
     }
 
     void run_random_workload(
@@ -190,29 +194,37 @@ public:
             // Every tx has 3 ops, a begin, data, <commit/abort>
             // Last op is controlled by tx_types param in the spec.
             // For mixed type spec, we randomly pick a commit/abort.
-            ops.emplace(ss::make_shared(
-              begin_op{tx_op_ctx{_data_gen, stm, log, pid, term}, weight0}));
-            ops.emplace(ss::make_shared(
-              data_op{tx_op_ctx{_data_gen, stm, log, pid, term}, weight1}));
+            ops.emplace(
+              ss::make_shared(
+                begin_op{tx_op_ctx{_data_gen, stm, log, pid, term}, weight0}));
+            ops.emplace(
+              ss::make_shared(
+                data_op{tx_op_ctx{_data_gen, stm, log, pid, term}, weight1}));
 
             if (
               s._types == tx_types::commit_only
               || (s._types == tx_types::mixed && tests::random_bool())) {
                 _committed_pids.insert(pid);
-                ops.emplace(ss::make_shared(commit_op{
-                  tx_op_ctx{_data_gen, stm, log, pid, term}, weight2}));
+                ops.emplace(
+                  ss::make_shared(
+                    commit_op{
+                      tx_op_ctx{_data_gen, stm, log, pid, term}, weight2}));
             } else {
                 _aborted_pids.insert(pid);
-                ops.emplace(ss::make_shared(abort_op{
-                  tx_op_ctx{_data_gen, stm, log, pid, term}, weight2}));
+                ops.emplace(
+                  ss::make_shared(
+                    abort_op{
+                      tx_op_ctx{_data_gen, stm, log, pid, term}, weight2}));
             }
         }
 
         // Sprinkle log rolls randomly.
         for ([[maybe_unused]] auto _ : boost::irange(s._num_rolls)) {
-            ops.emplace(ss::make_shared(roll_op{
-              tx_op_ctx{_data_gen, stm, log, {}},
-              random_generators::get_int(1, num_ops)}));
+            ops.emplace(
+              ss::make_shared(
+                roll_op{
+                  tx_op_ctx{_data_gen, stm, log, {}},
+                  random_generators::get_int(1, num_ops)}));
         }
 
         //----- Step 2: Execute ops
@@ -220,7 +232,7 @@ public:
 
         //---- Step 3: Force a roll and compact the log.
         log->flush().get();
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
         if (!s._compact) {
             return;
         }
@@ -229,8 +241,10 @@ public:
           model::timestamp::min(),
           std::nullopt,
           model::offset::max(),
+          model::offset::max(),
           std::nullopt,
-          ss::default_priority_class(),
+          std::nullopt,
+          std::chrono::milliseconds{0},
           as);
         // Compacts until a single sealed segment remains, other than the
         // currently active one.
@@ -243,8 +257,7 @@ public:
 
         // 1. There are no aborted keys (tracked in _aborted_xxx)
         // 2. There are no tx control markers
-        // 3. Only tx control data batches allowed is fence type.
-        validate(log, s._num_txes).get();
+        validate(log).get();
     }
 
     auto& data_gen() { return _data_gen; }
@@ -255,8 +268,12 @@ public:
           : tx_op(std::move(ctx), weight) {}
 
         ss::future<> execute() override {
-            RPTEST_REQUIRE_CORO(co_await _ctx._stm->begin_tx(
-              _ctx._pid, model::tx_seq{0}, tx_timeout, model::partition_id(0)));
+            RPTEST_REQUIRE_CORO(
+              co_await _ctx._stm->begin_tx(
+                _ctx._pid,
+                model::tx_seq{0},
+                tx_timeout,
+                model::partition_id(0)));
         }
 
         tx_op_type type() override { return tx_op_type::begin; }
@@ -344,9 +361,7 @@ public:
     public:
         explicit roll_op(tx_op_ctx&& ctx, int weight)
           : tx_op(std::move(ctx), weight) {}
-        ss::future<> execute() override {
-            co_await _ctx._log->force_roll(ss::default_priority_class());
-        }
+        ss::future<> execute() override { co_await _ctx._log->force_roll(); }
         tx_op_type type() override { return tx_op_type::roll; }
         ss::sstring debug() override { return "roll log"; }
     };

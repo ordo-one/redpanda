@@ -77,8 +77,9 @@ private:
 
 std::optional<retention_calculator> retention_calculator::factory(
   const cloud_storage::partition_manifest& manifest,
-  const storage::ntp_config& ntp_config) {
-    if (!ntp_config.is_collectable()) {
+  const storage::ntp_config& ntp_config,
+  std::optional<kafka::offset> pinned_offset) {
+    if (!ntp_config.is_remotely_collectable()) {
         vlog(
           archival_log.trace, "{} Partition not collectible", ntp_config.ntp());
         return std::nullopt;
@@ -90,11 +91,12 @@ std::optional<retention_calculator> retention_calculator::factory(
     vlog(
       archival_log.debug,
       "{} Creating retention calculator, ntp_config: {}, archive start offset: "
-      "{}, start offset: {}",
+      "{}, start offset: {}, pinned kafka offset: {}",
       ntp_config.ntp(),
       ntp_config,
       arch_so,
-      last_so);
+      last_so,
+      pinned_offset);
 
     if (arch_so != model::offset{} && arch_so != last_so) {
         // Retention should be applied to the archive area of the log first
@@ -125,7 +127,7 @@ std::optional<retention_calculator> retention_calculator::factory(
               overshot_by);
         }
     }
-
+    auto manifest_end = manifest.end();
     if (ntp_config.retention_duration()) {
         model::timestamp oldest_allowed_timestamp{
           model::timestamp::now().value()
@@ -134,10 +136,11 @@ std::optional<retention_calculator> retention_calculator::factory(
         if (manifest.size() > 0) {
             auto first_seg = manifest.first_addressable_segment();
             if (
-              first_seg != manifest.end()
+              first_seg != manifest_end
               && first_seg->max_timestamp < oldest_allowed_timestamp) {
-                strats.push_back(std::make_unique<time_based_strategy>(
-                  oldest_allowed_timestamp));
+                strats.push_back(
+                  std::make_unique<time_based_strategy>(
+                    oldest_allowed_timestamp));
                 vlog(
                   archival_log.trace,
                   "{} time based retention strategy added, oldest allowed "
@@ -153,7 +156,7 @@ std::optional<retention_calculator> retention_calculator::factory(
     if (start_kafka_override > kafka::offset(0)) {
         auto first_seg = manifest.first_addressable_segment();
         if (
-          first_seg != manifest.end()
+          first_seg != manifest_end
           && start_kafka_override > first_seg->last_kafka_offset()) {
             // The user has passed in a start override via DeleteRecords, and
             // there exists at least one segment below this offset. Remove up
@@ -175,19 +178,34 @@ std::optional<retention_calculator> retention_calculator::factory(
         return std::nullopt;
     }
 
-    return retention_calculator{manifest, std::move(strats)};
+    return retention_calculator{manifest, std::move(strats), pinned_offset};
 }
 
 retention_calculator::retention_calculator(
   const cloud_storage::partition_manifest& manifest,
-  std::vector<std::unique_ptr<retention_strategy>> strategies)
+  std::vector<std::unique_ptr<retention_strategy>> strategies,
+  std::optional<kafka::offset> pinned_offset)
   : _manifest(manifest)
-  , _strategies(std::move(strategies)) {}
+  , _strategies(std::move(strategies))
+  , _pinned_offset(pinned_offset) {}
 
 std::optional<model::offset> retention_calculator::next_start_offset() {
     auto it = _manifest.first_addressable_segment();
-    for (; it != _manifest.end(); ++it) {
+    auto end_it = _manifest.end();
+    for (; it != end_it; ++it) {
         const auto& entry = *it;
+        if (_pinned_offset && entry.last_kafka_offset() >= *_pinned_offset) {
+            // The pin is blocking us from removing this segment and beyond.
+            vlog(
+              archival_log.debug,
+              "{} retention is blocked on segment [{}, {}] by pin at Kafka "
+              "offset {}",
+              _manifest.get_ntp(),
+              entry.base_kafka_offset(),
+              entry.last_kafka_offset(),
+              *_pinned_offset);
+            break;
+        }
         const auto all_done = std::all_of(
           _strategies.begin(), _strategies.end(), [&](auto& strat) {
               return strat->done(entry);
@@ -196,10 +214,13 @@ std::optional<model::offset> retention_calculator::next_start_offset() {
             break;
         }
     }
+    if (it == _manifest.first_addressable_segment()) {
+        return std::nullopt;
+    }
 
     // We made it to the end of our strategies and our policies are still not
     // satisfied. Return just past the end -- we will truncate all segments.
-    if (it == _manifest.end()) {
+    if (it == end_it) {
         return model::next_offset(_manifest.get_last_offset());
     }
 

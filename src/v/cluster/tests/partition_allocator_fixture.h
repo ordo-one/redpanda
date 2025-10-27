@@ -22,7 +22,6 @@
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "random/fast_prng.h"
 #include "random/generators.h"
 #include "utils/unresolved_address.h"
 
@@ -64,12 +63,13 @@ struct partition_allocator_fixture {
               ss::format("unable to apply add node cmd: {}", ec.message()));
         }
 
-        allocator().register_node(std::make_unique<cluster::allocation_node>(
-          broker.id(),
-          broker.properties().cores,
-          config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
-          partitions_reserve_shard0.bind(),
-          kafka_internal_topics.bind()));
+        allocator().register_node(
+          std::make_unique<cluster::allocation_node>(
+            broker.id(),
+            broker.properties().cores,
+            config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+            partitions_reserve_shard0.bind(),
+            kafka_internal_topics.bind()));
     }
 
     void saturate_all_machines() {
@@ -141,7 +141,7 @@ struct partition_allocator_fixture {
     ss::sharded<features::feature_table> features;
     ss::sharded<cluster::partition_allocator> _allocator;
 
-    fast_prng prng;
+    random_generators::rng prng;
 
     uint32_t partitions_per_shard;
 

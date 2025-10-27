@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+import pandas as pd
+
 
 @dataclass(kw_only=True)
 class TopicScaleTestProfile:
@@ -13,15 +15,23 @@ class TopicScaleTestProfile:
     use_kafka_batching: bool
     profile_name: str
     message_count: int
-    messages_per_second_per_producer: int
+    message_period: str
+    topics_per_client: int
 
     @property
     def topic_name_prefix(self):
-        return f"{self.profile_name}-" \
-               f"p{self.num_partitions}-r{self.num_replicas}"
+        return f"{self.profile_name}-p{self.num_partitions}-r{self.num_replicas}"
+
+    def total_running_time(self) -> float:
+        mp = pd.Timedelta(self.message_period)
+        return (mp * self.message_count).total_seconds()
+
+    def message_rate(self) -> float:
+        mp = pd.Timedelta(self.message_period)
+        return 1 / mp.total_seconds()
 
 
-class ProfileDefinitions():
+class ProfileDefinitions:
     # Minimal load
     # 2 vcpus, 1 msg/sec, min batch sizing
     default = {
@@ -33,7 +43,8 @@ class ProfileDefinitions():
         "use_kafka_batching": True,
         "profile_name": "topic-scale-default",
         "message_count": 100,
-        "messages_per_second_per_producer": 1
+        "message_period": "1s",
+        "topics_per_client": 1,
     }
     topic_profile_t10k_p1 = {
         "topic_count": 10000,
@@ -44,7 +55,20 @@ class ProfileDefinitions():
         "use_kafka_batching": True,
         "profile_name": "topic-scale-t10k_p1",
         "message_count": 1000,
-        "messages_per_second_per_producer": 1
+        "message_period": "1s",
+        "topics_per_client": 1,
+    }
+    topic_profile_t20k_p1 = {
+        "topic_count": 19_998,
+        "batch_size": 2048,
+        "topic_name_length": 200,
+        "num_partitions": 1,
+        "num_replicas": 3,
+        "use_kafka_batching": True,
+        "profile_name": "topic-scale-t20k_p1",
+        "message_period": "6s",
+        "message_count": 2 * (60 // 6),  # 2 mins
+        "topics_per_client": 1,
     }
     topic_profile_t10k_p4 = {
         "topic_count": 10000,
@@ -55,7 +79,8 @@ class ProfileDefinitions():
         "use_kafka_batching": True,
         "profile_name": "topic-scale-t10k-p4",
         "message_count": 1000,
-        "messages_per_second_per_producer": 1
+        "message_period": "1s",
+        "topics_per_client": 1,
     }
     topic_profile_t1_p40k = {
         "topic_count": 1,
@@ -66,7 +91,8 @@ class ProfileDefinitions():
         "use_kafka_batching": True,
         "profile_name": "topic-scale-t1-p40k",
         "message_count": 1000,
-        "messages_per_second_per_producer": 1
+        "message_period": "1s",
+        "topics_per_client": 1,
     }
     topic_profile_t40k_p1 = {
         "topic_count": 39_996,
@@ -76,12 +102,13 @@ class ProfileDefinitions():
         "num_replicas": 3,
         "use_kafka_batching": True,
         "profile_name": "topic-scale-t40k-p1",
-        "message_count": 1000,
-        "messages_per_second_per_producer": 1
+        "message_count": 6 * 60,  # 6 mins
+        "message_period": "1s",
+        "topics_per_client": 22,
     }
 
 
-class TopicScaleProfileManager():
+class TopicScaleProfileManager:
     def __init__(self):
         self.profiles = ProfileDefinitions()
 
@@ -91,8 +118,10 @@ class TopicScaleProfileManager():
     def _load_profile_data(self, profile_name):
         _profile_data = getattr(self.profiles, profile_name, None)
         if _profile_data is None:
-            raise RuntimeError(f"Profile '{profile_name}' is not found among: "
-                               f"{', '.join(self._list_profiles())}")
+            raise RuntimeError(
+                f"Profile '{profile_name}' is not found among: "
+                f"{', '.join(self._list_profiles())}"
+            )
         else:
             return _profile_data
 
@@ -108,5 +137,6 @@ class TopicScaleProfileManager():
             # rethrow Exception with good message
             raise RuntimeError(
                 "Invalid custom data provided "
-                f"for base profile of '{base_profile_name}'") from e
+                f"for base profile of '{base_profile_name}'"
+            ) from e
         return _profile

@@ -11,22 +11,22 @@
 
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "absl/container/node_hash_map.h"
+#include "absl/hash/hash.h"
+#include "container/chunked_vector.h"
 #include "kafka/client/assignment_plans.h"
 #include "kafka/client/brokers.h"
 #include "kafka/client/configuration.h"
 #include "kafka/client/fetch_session.h"
 #include "kafka/client/logger.h"
 #include "kafka/client/topic_cache.h"
+#include "kafka/client/utils.h"
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/offset_commit.h"
 #include "kafka/protocol/offset_fetch.h"
 
 #include <seastar/core/shared_ptr.hh>
-
-#include <absl/container/node_hash_map.h>
-#include <absl/hash/hash.h>
 
 #include <chrono>
 #include <iterator>
@@ -51,14 +51,16 @@ public:
     /// The consumer may become inactive of its own accord through a timeout.
     /// This callback can be used as a notification system for cleanup.
     consumer(
-      const configuration& config,
+      consumer_configuration config,
+      retries_configuration& retries_cfg,
       topic_cache& topic_cache,
       brokers& brokers,
       shared_broker_t coordinator,
       group_id group_id,
       member_id name,
       ss::noncopyable_function<void(const member_id&)> on_stopped,
-      ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater);
+      ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater,
+      prefix_logger& logger);
 
     const kafka::group_id& group_id() const { return _group_id; }
     const kafka::member_id& member_id() const { return _member_id; }
@@ -72,9 +74,9 @@ public:
     ss::future<leave_group_response> leave();
     ss::future<> subscribe(chunked_vector<model::topic> topics);
     ss::future<offset_fetch_response>
-    offset_fetch(std::vector<offset_fetch_request_topic> topics);
+    offset_fetch(chunked_vector<offset_fetch_request_topic> topics);
     ss::future<offset_commit_response>
-    offset_commit(std::vector<offset_commit_request_topic> topics);
+    offset_commit(chunked_vector<offset_commit_request_topic> topics);
     ss::future<fetch_response>
     fetch(std::chrono::milliseconds timeout, std::optional<int32_t> max_bytes);
 
@@ -107,7 +109,7 @@ private:
       typename std::invoke_result_t<RequestFactory>::api_type::response_type>
     req_res(RequestFactory req) {
         using api_t = typename std::invoke_result_t<RequestFactory>::api_type;
-        using response_t = typename api_t::response_type;
+        using resp_t = typename api_t::response_type;
         return ss::try_with_gate(_gate, [this, req{std::move(req)}]() mutable {
             auto r = req();
             kclog.debug(
@@ -116,8 +118,12 @@ private:
               api_t::name,
               r,
               _coordinator->id());
-            return _coordinator->dispatch(std::move(r))
-              .then([this, req{std::move(req)}](response_t res) mutable {
+            return _coordinator
+              ->dispatch(std::move(r), api_version_for(api_t::key), _as)
+              .then([](response_t resp) {
+                  return std::get<resp_t>(std::move(resp));
+              })
+              .then([this, req{std::move(req)}](resp_t res) mutable {
                   kclog.debug(
                     "Consumer: {}: {} res: {}, coordinator {}",
                     *this,
@@ -152,7 +158,8 @@ private:
       typename std::invoke_result_t<request_factory>::api_type::response_type>
     reset_coordinator_and_retry_request(request_factory req);
 
-    const configuration& _config;
+    consumer_configuration _config;
+    retries_configuration& _retries_cfg;
     topic_cache& _topic_cache;
     brokers& _brokers;
     shared_broker_t _coordinator;
@@ -175,6 +182,7 @@ private:
     ss::noncopyable_function<void(const kafka::member_id&)> _on_stopped;
     ss::noncopyable_function<ss::future<>(std::exception_ptr)>
       _external_mitigate;
+    prefix_logger* _logger;
 
     friend std::ostream& operator<<(std::ostream& os, const consumer& c) {
         fmt::print(
@@ -190,14 +198,16 @@ private:
 using shared_consumer_t = ss::lw_shared_ptr<consumer>;
 
 ss::future<shared_consumer_t> make_consumer(
-  const configuration& config,
+  const consumer_configuration& config,
+  retries_configuration& retries_cfg,
   topic_cache& topic_cache,
   brokers& brokers,
   shared_broker_t coordinator,
   group_id group_id,
   member_id name,
   ss::noncopyable_function<void(const member_id&)> _on_stopped,
-  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater);
+  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater,
+  prefix_logger& logger);
 
 namespace detail {
 

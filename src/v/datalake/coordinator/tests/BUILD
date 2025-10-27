@@ -8,15 +8,16 @@ redpanda_test_cc_library(
     hdrs = [
         "state_test_utils.h",
     ],
-    include_prefix = "datalake/coordinator/tests",
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/datalake/coordinator:file_committer",
         "//src/v/datalake/coordinator:state",
         "//src/v/datalake/coordinator:translated_offset_range",
         "//src/v/iceberg:table_identifier",
         "//src/v/model",
+        "//src/v/random:generators",
         "@googletest//:gtest",
+        "@seastar",
     ],
 )
 
@@ -57,7 +58,6 @@ redpanda_cc_gtest(
         "iceberg_file_committer_test.cc",
     ],
     cpu = 1,
-    tags = ["exclusive"],
     deps = [
         ":state_test_utils",
         "//src/v/cloud_io:remote",
@@ -94,7 +94,6 @@ redpanda_cc_gtest(
         "iceberg_snapshot_remover_test.cc",
     ],
     cpu = 1,
-    tags = ["exclusive"],
     deps = [
         ":state_test_utils",
         "//src/v/cloud_io:remote",
@@ -123,7 +122,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         ":state_test_utils",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/datalake/coordinator:state",
         "//src/v/datalake/coordinator:state_update",
         "//src/v/datalake/coordinator:translated_offset_range",
@@ -143,6 +142,7 @@ redpanda_cc_gtest(
     deps = [
         ":state_test_utils",
         "//src/v/cluster",
+        "//src/v/config",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:record_schema_resolver",
         "//src/v/datalake/coordinator",

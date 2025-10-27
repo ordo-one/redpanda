@@ -11,6 +11,8 @@
 
 #include "kafka/server/group_tx_tracker_stm.h"
 
+#include "ssx/future-util.h"
+
 namespace kafka {
 
 group_tx_tracker_stm::group_tx_tracker_stm(
@@ -19,8 +21,7 @@ group_tx_tracker_stm::group_tx_tracker_stm(
   ss::sharded<features::feature_table>& feature_table)
   : raft::persisted_stm<>("group_tx_tracker_stm.snapshot", logger, raft)
   , group_data_parser<group_tx_tracker_stm>()
-  , _feature_table(feature_table)
-  , _serializer(make_consumer_offsets_serializer()) {
+  , _feature_table(feature_table) {
     _stale_tx_fence_gc_timer.set_callback([this] {
         ssx::spawn_with_gate(
           _gate, [this] { return gc_expired_tx_fence_transactions(); });
@@ -106,7 +107,7 @@ ss::future<> group_tx_tracker_stm::do_apply(const model::record_batch& b) {
           features::feature::group_tx_fence_dedicated_batch_type))) {
         // This is only relevant for upgrades from 24.1.x to 24.2.x where a
         // mixed mode cluster has this feature disabled until the upgrade is
-        // done. Holding off stm updates ensures that max_collectible offset
+        // done. Holding off stm updates ensures that max_removable offset
         // does not progress for the duration of the upgrade, which is ok since
         // group compaction was not considering any control batches in 24.1.x,
         // so nothing was being compacted.
@@ -116,7 +117,7 @@ ss::future<> group_tx_tracker_stm::do_apply(const model::record_batch& b) {
     co_await parse(b.copy());
 }
 
-model::offset group_tx_tracker_stm::max_collectible_offset() {
+model::offset group_tx_tracker_stm::max_removable_local_log_offset() {
     auto result = last_applied_offset();
     for (const auto& [_, group_state] : _all_txs) {
         if (!group_state.begin_offsets.empty()) {
@@ -138,6 +139,8 @@ group_tx_tracker_stm::apply_local_snapshot(
     iobuf_parser parser(std::move(snap_buf));
     auto snap = co_await serde::read_async<snapshot>(parser);
     _all_txs = std::move(snap.transactions);
+    _blocked_groups.insert(
+      snap.blocked_groups.cbegin(), snap.blocked_groups.cend());
     co_return raft::local_snapshot_applied::yes;
 }
 
@@ -146,11 +149,13 @@ group_tx_tracker_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
     auto holder = _gate.hold();
     // Copy over the snapshot state for a consistent view.
     auto offset = last_applied_offset();
-    snapshot snap;
-    snap.transactions = _all_txs;
-    iobuf snap_buf;
+    snapshot snap{
+      .transactions{_all_txs},
+      .blocked_groups{std::from_range, _blocked_groups},
+    };
     apply_units.return_all();
-    co_await serde::write_async(snap_buf, snap);
+    iobuf snap_buf;
+    co_await serde::write_async(snap_buf, std::move(snap));
     co_return raft::stm_snapshot::create(
       supported_local_snapshot_version, offset, std::move(snap_buf));
 }
@@ -162,20 +167,21 @@ ss::future<> group_tx_tracker_stm::apply_raft_snapshot(const iobuf&) {
     return ss::now();
 }
 
-ss::future<iobuf> group_tx_tracker_stm::take_snapshot(model::offset) {
+ss::future<iobuf> group_tx_tracker_stm::take_raft_snapshot(model::offset) {
     return ss::make_ready_future<iobuf>(iobuf());
 }
 
 ss::future<> group_tx_tracker_stm::handle_raft_data(model::record_batch batch) {
     co_await model::for_each_record(batch, [this](model::record& r) {
-        auto record_type = _serializer.get_metadata_type(r.key().copy());
+        auto record_type = group_metadata_serializer::get_metadata_type(
+          r.key().copy());
         switch (record_type) {
         case offset_commit:
         case noop:
             return;
         case group_metadata:
             handle_group_metadata(
-              _serializer.decode_group_metadata(std::move(r)));
+              group_metadata_serializer::decode_group_metadata(std::move(r)));
             return;
         }
         __builtin_unreachable();
@@ -183,6 +189,9 @@ ss::future<> group_tx_tracker_stm::handle_raft_data(model::record_batch batch) {
 }
 
 void group_tx_tracker_stm::handle_group_metadata(group_metadata_kv md) {
+    if (is_group_blocked_verbose(md.key.group_id, "group metadata")) {
+        return;
+    }
     if (md.value) {
         vlog(cg_klog.trace, "[group: {}] update", md.key.group_id);
         // A group may checkpoint periodically as the member's state changes,
@@ -268,6 +277,20 @@ ss::future<> group_tx_tracker_stm::handle_version_fence(
     return ss::now();
 }
 
+void group_tx_tracker_stm::handle_group_block(kafka::group_block gb) {
+    if (gb.is_blocked) {
+        _blocked_groups.insert(gb.group_id);
+        // there shouldn't be any transactions in progress, doing just in case
+        _all_txs.erase(gb.group_id);
+    } else {
+        _blocked_groups.erase(gb.group_id);
+    }
+}
+
+bool group_tx_tracker_stm::is_group_blocked(kafka::group_id group_id) const {
+    return _blocked_groups.contains(group_id);
+}
+
 bool group_tx_tracker_stm_factory::is_applicable_for(
   const storage::ntp_config& config) const {
     const auto& ntp = config.ntp();
@@ -280,7 +303,9 @@ group_tx_tracker_stm_factory::group_tx_tracker_stm_factory(
   : _feature_table(feature_table) {}
 
 void group_tx_tracker_stm_factory::create(
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config&) {
     auto stm = builder.create_stm<kafka::group_tx_tracker_stm>(
       cg_klog, raft, _feature_table);
     raft->log()->stm_manager()->add_stm(stm);
@@ -352,13 +377,13 @@ bool group_tx_tracker_stm::producer_tx_state::expired_deprecated_fence_tx()
     // transaction.
     // After this buggy compaction, these uncleaned tx_fence batches are
     // accounted as open transactions when computing
-    // max_collectible_offset thus blocking further compaction after
+    // max_removable_local_log_offset thus blocking further compaction after
     // upgrade to 24.2.x.
     if (fence_type != model::record_batch_type::tx_fence) {
         return false;
     }
     // note: this is a heuristic to ignore any transactions that have long been
-    // expired and we do not want them to block max collectible offset.
+    // expired and we do not want them to block max removable offset.
     // clamp the timeout, incase timeout is unset
     auto max_timeout
       = std::chrono::duration_cast<model::timeout_clock::duration>(

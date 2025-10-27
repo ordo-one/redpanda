@@ -35,10 +35,11 @@ namespace rpc {
 namespace detail {
 inline void check_out_of_range(size_t got, size_t expected) {
     if (unlikely(got != expected)) {
-        throw std::out_of_range(fmt::format(
-          "parse_utils out of range. got:{} bytes and expected:{} bytes",
-          got,
-          expected));
+        throw std::out_of_range(
+          fmt::format(
+            "parse_utils out of range. got:{} bytes and expected:{} bytes",
+            got,
+            expected));
     }
 }
 } // namespace detail
@@ -77,10 +78,11 @@ inline void validate_payload_and_header(const iobuf& io, const header& h) {
     detail::check_out_of_range(consumed, h.payload_size);
     const auto got_checksum = hasher.digest();
     if (h.payload_checksum != got_checksum) {
-        throw std::runtime_error(fmt::format(
-          "invalid rpc checksum. got:{}, expected:{}",
-          got_checksum,
-          h.payload_checksum));
+        throw std::runtime_error(
+          fmt::format(
+            "invalid rpc checksum. got:{}, expected:{}",
+            got_checksum,
+            h.payload_checksum));
     }
 }
 
@@ -131,32 +133,19 @@ concept is_rpc_serde_exempt = requires { typename T::rpc_serde_exempt; };
 template<typename T>
 ss::future<transport_version>
 encode_for_version(iobuf& out, T msg, transport_version version) {
-    static_assert(!is_rpc_adl_exempt<T> || !is_rpc_serde_exempt<T>);
+    /*
+     * RPC messages are now serde envelopes, without exceptions.
+     */
+    static_assert(!is_rpc_adl_exempt<T>);
+    static_assert(!is_rpc_serde_exempt<T>);
+    static_assert(serde::is_envelope<T>);
 
-    if constexpr (is_rpc_serde_exempt<T>) {
-        return reflection::async_adl<T>{}.to(out, std::move(msg)).then([] {
-            return transport_version::v0;
+    vassert(version >= transport_version::v2, "Can't encode serde <= v2");
+    return ss::do_with(std::move(msg), [&out, version](T& msg) {
+        return serde::write_async(out, std::move(msg)).then([version] {
+            return version;
         });
-    } else if constexpr (is_rpc_adl_exempt<T>) {
-        vassert(version >= transport_version::v2, "Can't encode serde <= v2");
-        return ss::do_with(std::move(msg), [&out, version](T& msg) {
-            return serde::write_async(out, std::move(msg)).then([version] {
-                return version;
-            });
-        });
-    } else {
-        if (version < transport_version::v2) {
-            return reflection::async_adl<T>{}
-              .to(out, std::move(msg))
-              .then([version] { return version; });
-        } else {
-            return ss::do_with(std::move(msg), [&out, version](T& msg) {
-                return serde::write_async(out, std::move(msg)).then([version] {
-                    return version;
-                });
-            });
-        }
-    }
+    });
 }
 
 /*
@@ -165,31 +154,21 @@ encode_for_version(iobuf& out, T msg, transport_version version) {
 template<typename T>
 ss::future<T>
 decode_for_version(iobuf_parser& parser, transport_version version) {
-    static_assert(!is_rpc_adl_exempt<T> || !is_rpc_serde_exempt<T>);
+    /*
+     * RPC messages are now serde envelopes, without exceptions.
+     */
+    static_assert(!is_rpc_adl_exempt<T>);
+    static_assert(!is_rpc_serde_exempt<T>);
+    static_assert(serde::is_envelope<T>);
 
-    if constexpr (is_rpc_serde_exempt<T>) {
-        if (version != transport_version::v0) {
-            return ss::make_exception_future<T>(std::runtime_error(fmt::format(
-              "Unexpected adl-only message {} at {} != v0",
-              typeid(T).name(),
-              version)));
-        }
-        return reflection::async_adl<T>{}.from(parser);
-    } else if constexpr (is_rpc_adl_exempt<T>) {
-        if (version < transport_version::v2) {
-            return ss::make_exception_future<T>(std::runtime_error(fmt::format(
-              "Unexpected serde-only message {} at {} < v2",
-              typeid(T).name(),
-              version)));
-        }
-        return serde::read_async<T>(parser);
-    } else {
-        if (version < transport_version::v2) {
-            return reflection::async_adl<T>{}.from(parser);
-        } else {
-            return serde::read_async<T>(parser);
-        }
+    if (version < transport_version::v2) {
+        return ss::make_exception_future<T>(std::runtime_error(
+          fmt::format(
+            "Unexpected serde-only message {} at {} < v2",
+            typeid(T).name(),
+            version)));
     }
+    return serde::read_async<T>(parser);
 }
 
 /*
@@ -246,7 +225,7 @@ struct v0_message_codec {
     template<typename T>
     static ss::future<T> decode(iobuf_parser& parser, transport_version) {
         if constexpr (is_rpc_adl_exempt<T>) {
-            vassert(false, "Cannot use serde-only types in v0 server");
+            vunreachable("Cannot use serde-only types in v0 server");
         } else {
             return reflection::async_adl<T>{}.from(parser);
         }
@@ -260,7 +239,7 @@ struct v0_message_codec {
     static ss::future<transport_version>
     encode(iobuf& out, T msg, transport_version) {
         if constexpr (is_rpc_adl_exempt<T>) {
-            vassert(false, "Cannot use serde-only types in v0 server");
+            vunreachable("Cannot use serde-only types in v0 server");
         } else {
             return reflection::async_adl<T>{}.to(out, std::move(msg)).then([] {
                 return transport_version::v0;

@@ -13,14 +13,13 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/container/node_hash_set.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "security/fwd.h"
 #include "security/role.h"
 #include "security/types.h"
 
 #include <seastar/util/noncopyable_function.hh>
 
-#include <absl/algorithm/container.h>
 #include <boost/range/iterator_range.hpp>
 
 #include <ranges>
@@ -80,7 +79,7 @@ class role_store {
     using role_accessor = std::pair<
       role_name_view, /* role_name */
       ss::noncopyable_function<const members_store_type&(void)>>;
-    using range_query_container_type = fragmented_vector<role_name_view>;
+    using range_query_container_type = chunked_vector<role_name_view>;
 
 public:
     using roles_range

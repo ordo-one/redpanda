@@ -9,8 +9,10 @@
  */
 #include "datalake/coordinator/catalog_factory.h"
 
+#include "absl/strings/numbers.h"
 #include "config/configuration.h"
 #include "config/types.h"
+#include "datalake/credential_manager.h"
 #include "datalake/logger.h"
 #include "iceberg/catalog.h"
 #include "iceberg/filesystem_catalog.h"
@@ -19,66 +21,55 @@
 #include "iceberg/rest_client/client_probe.h"
 #include "net/tls.h"
 #include "net/tls_certificate_probe.h"
-#include "thirdparty/ada/ada.h"
 
-#include <absl/strings/numbers.h>
+#include <ada.h>
 namespace datalake::coordinator {
 namespace {
 template<typename T>
 void throw_if_not_present(const config::property<std::optional<T>>& property) {
     if (!property().has_value()) {
-        throw std::runtime_error(ssx::sformat(
-          "Configuration property {} value must be present when using REST "
-          "Iceberg catalog",
-          property.name()));
+        throw std::runtime_error(
+          ssx::sformat(
+            "Configuration property {} value must be present when using REST "
+            "Iceberg catalog",
+            property.name()));
     }
+}
+
+std::optional<net::certificate> get_truststore(config::configuration& cfg) {
+    if (cfg.iceberg_rest_catalog_trust().has_value()) {
+        return net::certificate(cfg.iceberg_rest_catalog_trust().value());
+    }
+    if (cfg.iceberg_rest_catalog_trust_file().has_value()) {
+        return net::certificate(
+          std::filesystem::path(cfg.iceberg_rest_catalog_trust_file().value()));
+    }
+    return std::nullopt;
+}
+
+std::optional<net::certificate> get_crl(config::configuration& cfg) {
+    if (cfg.iceberg_rest_catalog_crl().has_value()) {
+        return net::certificate(cfg.iceberg_rest_catalog_crl().value());
+    }
+    if (cfg.iceberg_rest_catalog_crl_file().has_value()) {
+        return net::certificate(
+          std::filesystem::path(cfg.iceberg_rest_catalog_crl_file().value()));
+    }
+    return std::nullopt;
 }
 
 ss::future<ss::shared_ptr<ss::tls::certificate_credentials>>
 build_tls_credentials(config::configuration& cfg) {
-    ss::tls::credentials_builder cred_builder;
-    cred_builder.set_cipher_string(
-      {config::tlsv1_2_cipher_string.data(),
-       config::tlsv1_2_cipher_string.size()});
-    cred_builder.set_ciphersuites(
-      {config::tlsv1_3_ciphersuites.data(),
-       config::tlsv1_3_ciphersuites.size()});
-    cred_builder.set_minimum_tls_version(from_config(cfg.tls_min_version()));
-    if (auto trust = cfg.iceberg_rest_catalog_trust(); trust.has_value()) {
-        vlog(datalake_log.info, "Using non-default trust");
-        cred_builder.set_x509_trust(*trust, ss::tls::x509_crt_format::PEM);
-    } else if (auto trust_file = cfg.iceberg_rest_catalog_trust_file();
-               trust_file.has_value()) {
-        auto file = trust_file.value();
-        vlog(datalake_log.info, "Using non-default trust file {}", file);
-        co_await cred_builder.set_x509_trust_file(
-          file, ss::tls::x509_crt_format::PEM);
-    } else {
-        // Use system defaults, might not work on all systems
-        auto ca_file = co_await net::find_ca_file();
-        if (ca_file) {
-            vlog(
-              datalake_log.info,
-              "Using automatically discovered trust file {}",
-              ca_file.value());
-            co_await cred_builder.set_x509_trust_file(
-              ca_file.value(), ss::tls::x509_crt_format::PEM);
-        } else {
-            vlog(
-              datalake_log.info,
-              "Trust file can't be detected automatically, using system "
-              "default");
-            co_await cred_builder.set_system_trust();
-        }
-    }
-    if (auto crl = cfg.iceberg_rest_catalog_crl(); crl.has_value()) {
-        cred_builder.set_x509_crl(*crl, ss::tls::x509_crt_format::PEM);
-    } else if (auto crl_file = cfg.iceberg_rest_catalog_crl_file();
-               crl_file.has_value()) {
-        co_await cred_builder.set_x509_crl_file(
-          *crl_file, ss::tls::x509_crt_format::PEM);
-    }
-    co_return co_await cred_builder.build_reloadable_certificate_credentials();
+    auto creds_builder = co_await net::get_credentials_builder({
+      .truststore = get_truststore(cfg),
+      .k_store = std::nullopt,
+      .crl = get_crl(cfg),
+      .min_tls_version = from_config(cfg.tls_min_version()),
+      .enable_renegotiation = false,
+      .require_client_auth = false,
+    });
+
+    co_return co_await creds_builder.build_reloadable_certificate_credentials();
 };
 struct endpoint_information {
     net::unresolved_address address;
@@ -89,8 +80,9 @@ struct endpoint_information {
 endpoint_information endpoint_to_address(const ss::sstring& url_str) {
     auto url = ada::parse(url_str);
     if (!url) {
-        throw std::invalid_argument(fmt::format(
-          "Malformed Iceberg REST catalog endpoint url: {}", url_str));
+        throw std::invalid_argument(
+          fmt::format(
+            "Malformed Iceberg REST catalog endpoint url: {}", url_str));
     }
     // Default port as used by the Iceberg catalogs
     uint16_t port = url->type == ada::scheme::HTTPS ? 443 : 8181;
@@ -100,10 +92,11 @@ endpoint_information endpoint_to_address(const ss::sstring& url_str) {
         if (
           !parsed || port_from_uri < 0
           || port_from_uri > std::numeric_limits<uint16_t>::max()) {
-            throw std::invalid_argument(fmt::format(
-              "Malformed Iceberg REST catalog endpoint url: {}, unable to "
-              "parse port",
-              url_str));
+            throw std::invalid_argument(
+              fmt::format(
+                "Malformed Iceberg REST catalog endpoint url: {}, unable to "
+                "parse port",
+                url_str));
         }
         port = static_cast<uint16_t>(port_from_uri);
     }
@@ -131,7 +124,7 @@ filesystem_catalog_factory::filesystem_catalog_factory(
   , bucket_(bucket) {}
 
 ss::future<std::unique_ptr<iceberg::catalog>>
-filesystem_catalog_factory::create_catalog() {
+filesystem_catalog_factory::create_catalog(ss::abort_source&) {
     vlog(
       datalake_log.info,
       "Creating filesystem catalog with bucket: {} and location: {}",
@@ -144,11 +137,15 @@ filesystem_catalog_factory::create_catalog() {
 rest_catalog_factory::~rest_catalog_factory() {}
 
 rest_catalog_factory::rest_catalog_factory(
-  config::configuration& config, ss::metrics::label_instance label)
+  config::configuration& config,
+  ss::metrics::label_instance label,
+  datalake::credential_manager& cred_mgr)
   : config_(&config)
-  , client_probe_(ss::make_shared<iceberg::rest_client::client_probe>(
-      net::public_metrics_disabled(config.disable_public_metrics()),
-      std::move(label))) {}
+  , client_probe_(
+      ss::make_shared<iceberg::rest_client::client_probe>(
+        net::public_metrics_disabled(config.disable_public_metrics()),
+        std::move(label)))
+  , credential_manager_(cred_mgr) {}
 
 rest_catalog_factory::credentials_and_token
 rest_catalog_factory::make_credentials_or_token() {
@@ -175,12 +172,21 @@ rest_catalog_factory::make_credentials_or_token() {
             config_->iceberg_rest_catalog_oauth2_scope());
         break;
     }
+    case config::datalake_catalog_auth_mode::aws_sigv4: {
+        // SigV4 credentials are handled by the applier and
+        // background refresh op.
+        break;
+    }
+    case config::datalake_catalog_auth_mode::gcp: {
+        // GCP credentials are handled by the applier and background refresh op.
+        break;
+    }
     }
     return creds_and_token;
 }
 
 ss::future<std::unique_ptr<iceberg::catalog>>
-rest_catalog_factory::create_catalog() {
+rest_catalog_factory::create_catalog(ss::abort_source& as) {
     // TODO: add config level validation
     throw_if_not_present(config_->iceberg_rest_catalog_endpoint);
 
@@ -191,6 +197,7 @@ rest_catalog_factory::create_catalog() {
       .server_addr = endpoint_information.address,
     };
     if (endpoint_information.needs_tls) {
+        transport_config.tls_sni_hostname = endpoint_information.address.host();
         try {
             transport_config.credentials = co_await build_tls_credentials(
               *config_);
@@ -202,10 +209,8 @@ rest_catalog_factory::create_catalog() {
             throw;
         }
     }
-    std::unique_ptr<http::abstract_client> http_client
-      = static_cast<std::unique_ptr<http::abstract_client>>(
-        std::make_unique<http::client>(
-          std::move(transport_config), nullptr, client_probe_));
+    auto http_client = std::make_unique<http::client>(
+      std::move(transport_config), &as, client_probe_);
 
     auto creds_and_token = make_credentials_or_token();
 
@@ -220,10 +225,10 @@ rest_catalog_factory::create_catalog() {
       endpoint_information.address,
       endpoint_information.base_path,
       warehouse);
-    // TODO: support OAuth token here
     auto client = std::make_unique<iceberg::rest_client::catalog_client>(
       std::move(http_client),
       config_->iceberg_rest_catalog_endpoint().value(),
+      credential_manager_,
       std::move(creds_and_token.credentials),
       std::move(endpoint_information.base_path),           // base_path
       std::move(warehouse),                                // warehouse
@@ -231,25 +236,29 @@ rest_catalog_factory::create_catalog() {
       std::move(creds_and_token.token),                    // token
       nullptr,                                             // retry_policy
       config_->iceberg_rest_catalog_authentication_mode(), // auth_mode
-      client_probe_);
+      client_probe_);                                      // probe
 
     co_return std::make_unique<iceberg::rest_catalog>(
       std::move(client),
-      config_->iceberg_rest_catalog_request_timeout_ms.bind());
+      config_->iceberg_rest_catalog_request_timeout_ms.bind(),
+      config_->iceberg_rest_catalog_base_location());
 }
 
 std::unique_ptr<catalog_factory> get_catalog_factory(
   config::configuration& config,
   cloud_io::remote& remote,
   const cloud_storage_clients::bucket_name& bucket,
-  ss::metrics::label_instance label) {
+  ss::metrics::label_instance label,
+  datalake::credential_manager& cred_mgr) {
     if (
       config.iceberg_catalog_type()
       == config::datalake_catalog_type::object_storage) {
         return std::make_unique<filesystem_catalog_factory>(
           config, remote, bucket);
     } else {
-        return std::make_unique<rest_catalog_factory>(config, std::move(label));
+        return std::make_unique<rest_catalog_factory>(
+          config, std::move(label), cred_mgr);
     }
 }
+
 } // namespace datalake::coordinator

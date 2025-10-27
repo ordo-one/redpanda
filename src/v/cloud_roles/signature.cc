@@ -10,6 +10,8 @@
 
 #include "signature.h"
 
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "base/vlog.h"
 #include "bytes/bytes.h"
 #include "cloud_roles/logger.h"
@@ -23,8 +25,6 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 
-#include <absl/strings/str_join.h>
-#include <absl/strings/str_split.h>
 #include <boost/algorithm/string/compare.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -148,7 +148,7 @@ ss::sstring time_source::format(auto fmt) const {
 struct target_parts {
     /// \brief URI Encoded canonical URI
     /// Canonical URI is everything that follows domain name starting with '/'
-    /// without parameters (everythng after '?' including '?'). The uri is URI
+    /// without parameters (everything after '?' including '?'). The uri is URI
     /// encoded. e.g. https://foo.bar/canonical-url?param=value
     ss::sstring canonical_uri;
     /// \brief Query parameters extracted from target
@@ -302,9 +302,10 @@ get_canonical_headers(const http::client::request_header& request) {
 /// <SignedHeaders>\n
 /// <HashedPayload>
 inline result<ss::sstring> create_canonical_request(
-  const canonical_headers& hdr,
-  const http::client::request_header& header,
-  std::string_view hashed_payload) {
+  const canonical_headers& hdr, const http::client::request_header& header) {
+    static constexpr boost::beast::string_view x_amz_content_sha256
+      = "x-amz-content-sha256";
+
     auto method = std::string(header.method_string());
     auto target = std::string(header.target());
     if (target.empty() || target.at(0) != '/') {
@@ -326,7 +327,7 @@ inline result<ss::sstring> create_canonical_request(
       canonical_query,
       hdr.canonical_headers,
       hdr.signed_headers,
-      hashed_payload);
+      header.at(x_amz_content_sha256));
 }
 
 /// Genertes string-to-sign (in spec terms), example:
@@ -355,13 +356,14 @@ ss::sstring redact_headers_from_string(const std::string_view original) {
     std::set<std::string_view> redacted{};
     const auto redacted_fields = http::redacted_fields();
     for (const auto& rf : redacted_fields) {
-        redacted.insert(ss::visit(
-          rf,
-          [](const boost::beast::http::field& f) {
-              const auto view = to_string(f);
-              return std::string_view{view.data(), view.size()};
-          },
-          [](const std::string& s) { return std::string_view{s}; }));
+        redacted.insert(
+          ss::visit(
+            rf,
+            [](const boost::beast::http::field& f) {
+                const auto view = to_string(f);
+                return std::string_view{view.data(), view.size()};
+            },
+            [](const std::string& s) { return std::string_view{s}; }));
     }
 
     const auto lines = absl::StrSplit(original, "\n");
@@ -371,8 +373,9 @@ ss::sstring redact_headers_from_string(const std::string_view original) {
             const auto tokens = absl::StrSplit(line, ":");
             const auto key = *tokens.begin();
             if (redacted.contains(key)) {
-                result.emplace_back(fmt::format(
-                  "{}:{}", *tokens.begin(), config::secret_placeholder));
+                result.emplace_back(
+                  fmt::format(
+                    "{}:{}", *tokens.begin(), config::secret_placeholder));
                 continue;
             }
         }
@@ -381,23 +384,22 @@ ss::sstring redact_headers_from_string(const std::string_view original) {
     return absl::StrJoin(result, "\n");
 }
 
-std::error_code signature_v4::sign_header(
-  http::client::request_header& header, std::string_view sha256) const {
+std::error_code
+signature_v4::sign_header(http::client::request_header& header) const {
     ss::sstring date_str = _sig_time.format_date();
-    ss::sstring service = "s3";
-    auto sign_key = gen_sig_key(_private_key(), date_str, _region(), service);
+    auto sign_key = gen_sig_key(
+      _private_key(), date_str, _region(), _service());
     auto cred_scope = ssx::sformat(
-      "{}/{}/{}/aws4_request", date_str, _region(), service);
+      "{}/{}/{}/aws4_request", date_str, _region(), _service());
     vlog(clrl_log.trace, "Credentials updated:\n[scope]\n{}\n", cred_scope);
     auto amz_date = _sig_time.format_datetime();
     header.set("x-amz-date", {amz_date.data(), amz_date.size()});
-    header.set("x-amz-content-sha256", {sha256.data(), sha256.size()});
     auto canonical_headers = get_canonical_headers(header);
     if (!canonical_headers) {
         return canonical_headers.error();
     }
     auto canonical_req = create_canonical_request(
-      canonical_headers.value(), header, sha256);
+      canonical_headers.value(), header);
     if (!canonical_req) {
         return canonical_req.error();
     }
@@ -425,11 +427,13 @@ std::error_code signature_v4::sign_header(
 }
 
 signature_v4::signature_v4(
+  aws_service_name service,
   aws_region_name region,
   public_key_str access_key,
   private_key_str private_key,
   time_source&& ts)
   : _sig_time(std::move(ts))
+  , _service(service)
   , _region(std::move(region))
   , _access_key(std::move(access_key))
   , _private_key(std::move(private_key)) {}

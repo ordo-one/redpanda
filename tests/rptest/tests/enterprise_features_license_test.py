@@ -1,22 +1,25 @@
-import time
 import json
 from enum import IntEnum
-import requests
 
-from rptest.utils.rpenv import sample_license
+import requests
+from ducktape.mark import matrix
+from ducktape.utils.util import wait_until
+
 from rptest.clients.rpk import RpkTool
-from rptest.services.admin import Admin, EnterpriseLicenseStatus, RolesList, RoleDescription
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, SecurityConfig, SchemaRegistryConfig
-from rptest.tests.redpanda_test import RedpandaTest
+from rptest.services.admin import (
+    Admin,
+    EnterpriseLicenseStatus,
+    RolesList,
+)
 from rptest.services.cluster import cluster
-from rptest.services.redpanda_installer import RedpandaInstaller, wait_for_num_versions
+from rptest.services.redpanda import (
+    SchemaRegistryConfig,
+    SecurityConfig,
+    CLOUD_TOPICS_CONFIG_STR,
+)
+from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import expect_exception
 from rptest.utils.mode_checks import skip_fips_mode
-
-from ducktape.errors import TimeoutError as DucktapeTimeoutError
-from ducktape.utils.util import wait_until
-from ducktape.mark import parametrize, matrix
-from rptest.util import wait_until_result, expect_exception
 
 
 class EnterpriseFeaturesTestBase(RedpandaTest):
@@ -41,33 +44,55 @@ class Feature(IntEnum):
     fips = 8
     datalake_iceberg = 9
     leadership_pinning = 10
+    gssapi_override = 11
+    oidc_override = 12
+    shadow_linking = 13
+    cloud_topics = 14
 
+
+def to_enterprise_feature(feature):
+    # These are different ways to enable the same enterprise features
+    mappings = {
+        Feature.gssapi_override: Feature.gssapi,
+        Feature.oidc_override: Feature.oidc,
+    }
+    if feature not in mappings:
+        return feature
+    return mappings[feature]
+
+
+enterprise_features = set([to_enterprise_feature(f) for f in Feature])
+autoenable_features = set(
+    [Feature.partition_auto_balancing_continuous, Feature.core_balancing_continuous]
+)
 
 FEATURE_DEPENDENT_CONFIG = {
-    Feature.audit_logging: 'audit_enabled',
-    Feature.cloud_storage: 'cloud_storage_enabled',
-    Feature.partition_auto_balancing_continuous:
-    'partition_autobalancing_mode',
-    Feature.core_balancing_continuous: 'core_balancing_continuous',
-    Feature.gssapi: 'sasl_mechanisms',
-    Feature.oidc: 'sasl_mechanisms',
-    Feature.schema_id_validation: 'enable_schema_id_validation',
-    Feature.datalake_iceberg: 'datalake_iceberg',
-    Feature.leadership_pinning: 'default_leaders_preference',
+    Feature.audit_logging: "audit_enabled",
+    Feature.cloud_storage: "cloud_storage_enabled",
+    Feature.partition_auto_balancing_continuous: "partition_autobalancing_mode",
+    Feature.core_balancing_continuous: "core_balancing_continuous",
+    Feature.gssapi: "sasl_mechanisms",
+    Feature.oidc: "sasl_mechanisms",
+    Feature.schema_id_validation: "enable_schema_id_validation",
+    Feature.datalake_iceberg: "datalake_iceberg",
+    Feature.leadership_pinning: "default_leaders_preference",
+    Feature.gssapi_override: "sasl_mechanisms_overrides",
+    Feature.oidc_override: "sasl_mechanisms_overrides",
+    Feature.shadow_linking: "enable_shadow_linking",
+    Feature.cloud_topics: CLOUD_TOPICS_CONFIG_STR,
 }
 
 SKIP_FEATURES = [
-    Feature.audit_logging,  # NOTE(oren): omit due to shutdown issues
-    Feature.
-    cloud_storage,  # TODO(oren): initially omitted because it's a bit complicated to initialize infra
+    Feature.cloud_storage,  # TODO(oren): initially omitted because it's a bit complicated to initialize infra
     Feature.datalake_iceberg,  # TODO: also depends on cloud infra
-    Feature.fips  # NOTE(oren): omit because it's too much of a pain for CDT
+    Feature.fips,  # NOTE(oren): omit because it's too much of a pain for CDT
+    Feature.cloud_topics,  # TODO: also depends on cloud infra
 ]
 
 
 class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
     OIDC_UPDATE_FAILURE_LOGS = [
-        # Example: security - oidc_service.cc:232 - Error updating jwks: security::exception (Invalid jwks: Invalid response from jwks_uri: https://auth.prd.cloud.redpanda.com:443/.well-known/jwks.json)"
+        # Example: security - oidc_service.cc:232 - Error updating jwks: security::exception (Invalid jwks: Invalid response from jwks_uri: https://auth.prd.cloud.redpanda.com:443/.well-known/jwks.json)"
         "Error updating jwks",
         "Error updating metadata",
     ]
@@ -85,7 +110,7 @@ class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
         self.security = SecurityConfig()
         self.security.enable_sasl = True
         self.kafka_enable_authorization = True
-        self.endpoint_authn_method = 'sasl'
+        self.endpoint_authn_method = "sasl"
         self.redpanda.set_security_settings(self.security)
 
     def check_feature(
@@ -96,71 +121,99 @@ class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
     ) -> dict[Feature, bool]:
         rsp = self.admin.get_enterprise_features().json()
         feature_statuses: dict[Feature, bool] = {
-            Feature[f['name']]: f['enabled']
-            for f in rsp.get('features', [])
+            Feature[f["name"]]: f["enabled"] for f in rsp.get("features", [])
         }
         ELS = EnterpriseLicenseStatus
 
-        compliant = license_valid or not enabled
-        violation = not compliant
-
-        assert feature_statuses.get(feature) == enabled, \
+        assert feature_statuses.get(feature) == enabled, (
             f"Expected {feature.name} {enabled=}"
-        assert (ELS(rsp.get('license_status')) == ELS.valid) is license_valid, \
+        )
+        assert (ELS(rsp.get("license_status")) == ELS.valid) is license_valid, (
             f"Expected {license_valid=} (got {rsp.get('license_status')})"
-        assert rsp.get('violation') == violation, \
-            f"Expected {violation=} got {rsp.get('violation')}"
+        )
 
         return feature_statuses
 
     @skip_fips_mode
     @cluster(num_nodes=3)
-    @matrix(with_license=[
-        True,
-        False,
-    ])
+    @matrix(
+        with_license=[
+            True,
+            False,
+        ]
+    )
     def test_get_enterprise(self, with_license):
         if not with_license:
             self.redpanda.set_environment(
-                dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE='1'))
+                dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE="1")
+            )
 
         self.redpanda.start()
 
-        statuses = self.check_feature(Feature.audit_logging,
-                                      enabled=False,
-                                      license_valid=with_license)
+        statuses = self.check_feature(
+            Feature.audit_logging, enabled=False, license_valid=with_license
+        )
 
-        assert not any(statuses[f] for f in Feature), \
-            f"Unexpected status: {json.dumps(statuses)}"
+        expected_statuses = {
+            f: {"status": statuses[f], "expected": f in autoenable_features}
+            for f in enterprise_features
+        }
+
+        assert all(
+            [s["status"] == s["expected"] for _, s in expected_statuses.items()]
+        ), f"Unexpected feature status: {json.dumps(expected_statuses, indent=1)}"
 
     def try_enable_feature(self, feature):
         if feature == Feature.audit_logging:
             self.redpanda.set_cluster_config(
                 {
-                    'audit_enabled': True,
+                    "audit_enabled": True,
+                    "audit_use_rpc": True,
                 },
                 expect_restart=True,
             )
         elif feature == Feature.cloud_storage:
-            self.redpanda.set_cluster_config({'cloud_storage_enabled': 'true'},
-                                             expect_restart=True)
+            self.redpanda.set_cluster_config(
+                {"cloud_storage_enabled": "true"}, expect_restart=True
+            )
         elif feature == Feature.partition_auto_balancing_continuous:
             self.redpanda.set_cluster_config(
-                {'partition_autobalancing_mode': 'continuous'})
+                {"partition_autobalancing_mode": "continuous"}
+            )
         elif feature == Feature.core_balancing_continuous:
-            self.redpanda.set_cluster_config(
-                {'core_balancing_continuous': 'true'})
+            self.redpanda.set_cluster_config({"core_balancing_continuous": "true"})
         elif feature == Feature.gssapi:
+            self.redpanda.set_cluster_config({"sasl_mechanisms": ["SCRAM", "GSSAPI"]})
+        elif feature == Feature.gssapi_override:
             self.redpanda.set_cluster_config(
-                {'sasl_mechanisms': ['SCRAM', 'GSSAPI']})
+                {
+                    "sasl_mechanisms_overrides": [
+                        {
+                            "listener": "some_listener",
+                            "sasl_mechanisms": ["SCRAM", "GSSAPI"],
+                        }
+                    ]
+                }
+            )
         elif feature == Feature.oidc:
             # Note: the default OIDC server is flaky in CI, so use `OIDC_UPDATE_FAILURE_LOGS`
             # to ignore the related error logs in the background updater.
             self.redpanda.set_cluster_config(
-                {'sasl_mechanisms': ['SCRAM', 'OAUTHBEARER']})
-        elif feature == Feature.schema_id_validation:
+                {"sasl_mechanisms": ["SCRAM", "OAUTHBEARER"]}
+            )
+        elif feature == Feature.oidc_override:
             self.redpanda.set_cluster_config(
-                {'enable_schema_id_validation': 'compat'})
+                {
+                    "sasl_mechanisms_overrides": [
+                        {
+                            "listener": "some_listener",
+                            "sasl_mechanisms": ["SCRAM", "OAUTHBEARER"],
+                        }
+                    ]
+                }
+            )
+        elif feature == Feature.schema_id_validation:
+            self.redpanda.set_cluster_config({"enable_schema_id_validation": "compat"})
         elif feature == Feature.rbac:
             # NOTE(oren): make sure the role has propagated to every node since we don't know
             # where the get_enterprise request will go
@@ -168,54 +221,63 @@ class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
                 return all(
                     len(
                         RolesList.from_response(
-                            self.admin.list_roles(filter=r, node=n)).roles) > 0
-                    for n in self.redpanda.nodes)
+                            self.admin.list_roles(filter=r, node=n)
+                        ).roles
+                    )
+                    > 0
+                    for n in self.redpanda.nodes
+                )
 
-            self.admin.create_role('dummy')
-            wait_until(lambda: has_role('dummy'),
-                       timeout_sec=30,
-                       backoff_sec=1)
+            self.admin.create_role("dummy")
+            wait_until(lambda: has_role("dummy"), timeout_sec=30, backoff_sec=1)
         elif feature == Feature.fips:
             self.redpanda.rolling_restart_nodes(
                 self.redpanda.nodes,
                 override_cfg_params={
-                    'fips_mode':
-                    'permissive',
-                    "openssl_config_file":
-                    self.redpanda.get_openssl_config_file_path(),
-                    "openssl_module_directory":
-                    self.redpanda.get_openssl_modules_directory()
-                })
+                    "fips_mode": "permissive",
+                    "openssl_config_file": self.redpanda.get_openssl_config_file_path(),
+                    "openssl_module_directory": self.redpanda.get_openssl_modules_directory(),
+                },
+            )
         elif feature == Feature.datalake_iceberg:
-            self.redpanda.set_cluster_config({'iceberg_enabled': 'true'},
-                                             expect_restart=True)
+            self.redpanda.set_cluster_config(
+                {"iceberg_enabled": "true"}, expect_restart=True
+            )
         elif feature == Feature.leadership_pinning:
             self.redpanda.set_cluster_config(
-                {"default_leaders_preference": "racks:rack1"},
-                expect_restart=True)
+                {"default_leaders_preference": "racks:rack1"}, expect_restart=True
+            )
             RpkTool(self.redpanda).create_topic(
                 "foo",
                 partitions=1,
                 replicas=1,
-                config={"redpanda.leaders.preference": "racks:rack1"})
+                config={"redpanda.leaders.preference": "racks:rack1"},
+            )
+        elif feature == Feature.shadow_linking:
+            self.redpanda.set_cluster_config({"enable_shadow_linking": "true"})
+        elif feature == Feature.cloud_topics:
+            self.redpanda.set_cluster_config({CLOUD_TOPICS_CONFIG_STR: "true"})
         else:
             assert False, f"Unexpected feature={feature}"
 
     @skip_fips_mode
     @cluster(num_nodes=3, log_allow_list=OIDC_UPDATE_FAILURE_LOGS)
-    @matrix(feature=[f for f in Feature if f not in SKIP_FEATURES],
-            install_license=[
-                True,
-                False,
-            ],
-            disable_trial=[
-                False,
-                True,
-            ])
+    @matrix(
+        feature=[f for f in Feature if f not in SKIP_FEATURES],
+        install_license=[
+            True,
+            False,
+        ],
+        disable_trial=[
+            False,
+            True,
+        ],
+    )
     def test_enable_features(self, feature, install_license, disable_trial):
         if disable_trial:
             self.redpanda.set_environment(
-                dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE='1'))
+                dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE="1")
+            )
 
         self.redpanda.start()
 
@@ -224,30 +286,41 @@ class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
 
         has_license = not disable_trial or install_license
 
-        expect_rejected = not has_license
+        is_autoenable = feature in autoenable_features
 
-        if expect_rejected:
-            with expect_exception(
-                    requests.exceptions.HTTPError, \
-                    lambda e: e.response.status_code == 403 or FEATURE_DEPENDENT_CONFIG[
-                        feature] in e.response.json().keys()):
-                self.try_enable_feature(feature)
-        else:
+        if has_license:
             self.try_enable_feature(feature)
+        else:
+            with expect_exception(
+                requests.exceptions.HTTPError,
+                lambda e: e.response.status_code == 403
+                or FEATURE_DEPENDENT_CONFIG[feature] in e.response.json().keys(),
+            ):
+                self.try_enable_feature(feature)
 
         self.logger.debug(f"Check that {feature.name} has the expected state")
 
+        efeature = to_enterprise_feature(feature)
+
         statuses = self.check_feature(
-            feature,
-            enabled=not expect_rejected,
+            efeature,
+            enabled=has_license or is_autoenable,
             license_valid=has_license,
         )
 
         self.logger.debug(
-            "Everything else should still be off regardless of license status")
+            "Everything else should be in the default state regardless of license status"
+        )
 
-        assert not any([statuses[f] for f in Feature if f != feature]), \
-            f"Features unexpectedly enabled: {json.dumps(statuses, indent=1)}"
+        other_features = [f for f in enterprise_features if f != efeature]
+        other_statuses = {
+            f: {"status": statuses[f], "expected": f in autoenable_features}
+            for f in other_features
+        }
+
+        assert all([s["status"] == s["expected"] for _, s in other_statuses.items()]), (
+            f"Unexpected feature status: {json.dumps(other_statuses, indent=1)}"
+        )
 
     @skip_fips_mode
     @cluster(num_nodes=3)
@@ -256,22 +329,21 @@ class EnterpriseFeaturesTest(EnterpriseFeaturesTestBase):
             "Suppress the trial license before starting redpanda the first time"
         )
         self.redpanda.set_environment(
-            dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE='1'))
+            dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE="1")
+        )
 
         self.logger.debug("Switch on any old enterprise feature and start")
         feature = Feature.core_balancing_continuous
-        self.redpanda._extra_rp_conf.update(
-            {FEATURE_DEPENDENT_CONFIG[feature]: True})
+        self.redpanda._extra_rp_conf.update({FEATURE_DEPENDENT_CONFIG[feature]: True})
         self.redpanda.start()
 
-        self.logger.debug(
-            "Confirm license violation per GET /features/enterprise")
+        self.logger.debug("Confirm license violation per GET /features/enterprise")
         self.check_feature(feature, enabled=True, license_valid=False)
 
-        self.redpanda.set_cluster_config(
-            {FEATURE_DEPENDENT_CONFIG[feature]: 'false'})
+        self.redpanda.set_cluster_config({FEATURE_DEPENDENT_CONFIG[feature]: "false"})
 
         self.logger.debug(
-            "We should be able to revert to a compliant setting without issue")
+            "We should be able to revert to a compliant setting without issue"
+        )
 
         self.check_feature(feature, enabled=False, license_valid=False)

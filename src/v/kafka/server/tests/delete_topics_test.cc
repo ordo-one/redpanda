@@ -7,7 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "container/fragmented_vector.h"
+#include "absl/container/flat_hash_map.h"
+#include "cluster/security_frontend.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/delete_topics.h"
 #include "kafka/protocol/errors.h"
@@ -17,11 +19,11 @@
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/sleep.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <algorithm>
@@ -48,22 +50,35 @@ public:
         }};
 
         auto client = make_kafka_client().get();
+        auto deferred_close = ss::defer([&client] { client.stop().get(); });
         client.connect().get();
         auto resp
           = client.dispatch(std::move(req), kafka::api_version(2)).get();
     }
 
-    kafka::delete_topics_response
-    send_delete_topics_request(kafka::delete_topics_request req) {
+    struct scram_user {
+        ss::sstring username;
+        ss::sstring password;
+    };
+    kafka::delete_topics_response send_delete_topics_request(
+      kafka::delete_topics_request req,
+      kafka::api_version v = kafka::api_version{2},
+      std::optional<scram_user> suser = std::nullopt) {
         auto client = make_kafka_client().get();
+        auto deferred_close = ss::defer([&client] { client.stop().get(); });
         client.connect().get();
+        if (suser.has_value()) {
+            authn_kafka_client<security::scram_sha256_authenticator>(
+              client, suser->username, suser->password);
+        }
 
-        return client.dispatch(std::move(req), kafka::api_version(2)).get();
+        return client.dispatch(std::move(req), v).get();
     }
 
-    void
-    validate_valid_delete_topics_request(kafka::delete_topics_request req) {
-        auto resp = send_delete_topics_request(std::move(req));
+    void validate_valid_delete_topics_request(
+      kafka::delete_topics_request req,
+      kafka::api_version v = kafka::api_version{2}) {
+        auto resp = send_delete_topics_request(std::move(req), v);
         // response have no errors
         for (const auto& r : resp.data.responses) {
             BOOST_REQUIRE_EQUAL(r.error_code, kafka::error_code::none);
@@ -77,14 +92,21 @@ public:
 
     kafka::metadata_response get_topic_metadata(const model::topic& tp) {
         auto client = make_kafka_client().get();
+        auto deferred_close = ss::defer([&client] { client.stop().get(); });
         client.connect().get();
         chunked_vector<kafka::metadata_request_topic> topics;
-        topics.push_back(kafka::metadata_request_topic{tp});
+        topics.push_back(kafka::metadata_request_topic{.name{tp}});
         kafka::metadata_request md_req{
           .data
           = {.topics = std::move(topics), .allow_auto_topic_creation = false},
           .list_all_topics = false};
-        return client.dispatch(std::move(md_req)).get();
+        return client.dispatch(std::move(md_req), kafka::api_version(7)).get();
+    }
+
+    std::optional<model::topic_id> get_app_topic_id(const model::topic& tp) {
+        auto md = app.metadata_cache.local().get_topic_cfg(
+          model::topic_namespace_view{model::kafka_namespace, tp});
+        return md ? md->tp_id : std::nullopt;
     }
 
     ss::future<kafka::metadata_response> get_all_metadata() {
@@ -138,6 +160,24 @@ public:
               tp_r.error_code, expected_response.find(*tp_r.name)->second);
         }
     }
+
+    void validate_error_delete_topic_id_request(
+      kafka::delete_topics_request req,
+      const absl::flat_hash_map<model::topic_id, kafka::error_code>&
+        expected_response,
+      kafka::api_version v = kafka::api_version{6},
+      std::optional<scram_user> suser = std::nullopt) {
+        auto resp = send_delete_topics_request(
+          std::move(req), v, std::move(suser));
+
+        BOOST_REQUIRE_EQUAL(
+          resp.data.responses.size(), expected_response.size());
+
+        for (const auto& tp_r : resp.data.responses) {
+            BOOST_REQUIRE_EQUAL(
+              tp_r.error_code, expected_response.find(tp_r.topic_id)->second);
+        }
+    }
 };
 
 // https://github.com/apache/kafka/blob/8e161580b859b2fcd54c59625e232b99f3bb48d0/core/src/test/scala/unit/kafka/server/DeleteTopicsRequestTest.scala#L35
@@ -156,6 +196,277 @@ FIXTURE_TEST(delete_valid_topics, delete_topics_request_fixture) {
       chunked_vector<model::topic>{
         {model::topic("topic-2"), model::topic("topic-3")}},
       10s));
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v5_unknown_name, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topic_names = {{model::topic{"topic-1"}}}, .timeout_ms = 10s}},
+      kafka::api_version{5});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].name, model::topic("topic-1"));
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, model::topic_id{});
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code,
+      kafka::error_code::unknown_topic_or_partition);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "This server does not host this topic-partition.");
+}
+
+FIXTURE_TEST(delete_valid_topics_v6_name, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    create_topic("topic-1", 1, 1);
+
+    // Single topic
+    validate_valid_delete_topics_request(
+      kafka::delete_topics_request{
+        .data = {.topics = {{.name{"topic-1"}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    create_topic("topic-2", 1, 1);
+    create_topic("topic-3", 1, 1);
+
+    validate_valid_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.name{"topic-2"}}, {.name{"topic-3"}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+}
+
+FIXTURE_TEST(delete_valid_topics_v6_id, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    create_topic("topic-1", 1, 1);
+    auto tp_1_id = get_app_topic_id(model::topic("topic-1"));
+    BOOST_REQUIRE(tp_1_id);
+
+    // Single topic
+    validate_valid_delete_topics_request(
+      kafka::delete_topics_request{
+        .data = {.topics = {{.topic_id{*tp_1_id}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    // Multi topic
+    create_topic("topic-2", 5, 1);
+    create_topic("topic-3", 1, 1);
+    auto tp_2_id = get_app_topic_id(model::topic("topic-2"));
+    auto tp_3_id = get_app_topic_id(model::topic("topic-3"));
+
+    validate_valid_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.topic_id{*tp_2_id}}, {.topic_id{*tp_3_id}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+}
+
+FIXTURE_TEST(
+  delete_valid_topics_v6_id_unauth_user, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    // Create user
+    constexpr auto user_name_256 = "test_user_256";
+    constexpr auto password_256 = "password256";
+    auto creds_256 = security::scram_sha256::make_credentials(
+      password_256, security::scram_sha256::min_iterations);
+    app.controller->get_security_frontend()
+      .local()
+      .create_user(
+        security::credential_user(user_name_256),
+        std::move(creds_256),
+        model::timeout_clock::now() + 5s)
+      .get();
+
+    create_topic("topic-1", 1, 1);
+    create_topic("topic-2", 5, 1);
+    create_topic("topic-3", 1, 1);
+    create_topic("topic-4", 1, 1);
+    create_topic("topic-5", 1, 1);
+
+    enable_sasl();
+    auto disable_sasl_defer = ss::defer([this] { disable_sasl(); });
+
+    // Single topic
+    auto tp_1_id = get_app_topic_id(model::topic("topic-1"));
+    BOOST_REQUIRE(tp_1_id);
+    validate_error_delete_topic_id_request(
+      kafka::delete_topics_request{
+        .data = {.topics = {{.topic_id{*tp_1_id}}}, .timeout_ms = 30s}},
+      {{*tp_1_id, kafka::error_code::topic_authorization_failed}},
+      kafka::api_version{6},
+      scram_user{.username = user_name_256, .password = password_256});
+
+    // Multi topic
+    auto tp_2_id = get_app_topic_id(model::topic("topic-2"));
+    BOOST_REQUIRE(tp_2_id);
+    auto tp_3_id = get_app_topic_id(model::topic("topic-3"));
+    BOOST_REQUIRE(tp_3_id);
+    auto tp_4_id = get_app_topic_id(model::topic("topic-4"));
+    BOOST_REQUIRE(tp_4_id);
+    auto tp_5_id = get_app_topic_id(model::topic("topic-5"));
+    BOOST_REQUIRE(tp_5_id);
+
+    validate_error_delete_topic_id_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.topic_id{*tp_2_id}}, {.topic_id{*tp_3_id}}, {.topic_id{*tp_4_id}}, {.topic_id{*tp_5_id}}}, .timeout_ms = 30s}},
+      {{*tp_2_id, kafka::error_code::topic_authorization_failed},
+       {*tp_3_id, kafka::error_code::topic_authorization_failed},
+       {*tp_4_id, kafka::error_code::topic_authorization_failed},
+       {*tp_5_id, kafka::error_code::topic_authorization_failed}},
+      kafka::api_version{6},
+      scram_user{.username = user_name_256, .password = password_256});
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_unknown_name, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data = {.topics = {{.name{"topic-1"}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].name, model::topic("topic-1"));
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, model::topic_id{});
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code,
+      kafka::error_code::unknown_topic_or_partition);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "This server does not host this topic-partition.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_no_name_or_id, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{.data = {.topics = {{}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE(!resp.data.responses[0].name.has_value());
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, model::topic_id{});
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::invalid_request);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "Neither topic name nor id were specified.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_name_and_id, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto topic_id = model::topic_id{uuid_t::create()};
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.name{"name"}, .topic_id{topic_id}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].name, model::topic{"name"});
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::invalid_request);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "You may not specify both topic name and topic id.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_unknown_id, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto topic_id = model::topic_id{uuid_t::create()};
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data = {.topics = {{.topic_id{topic_id}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE(!resp.data.responses[0].name.has_value());
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::unknown_topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "This server does not host this topic ID.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_duplicate_name, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.name{"topic-1"}}, {.name{"topic-1"}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].name, model::topic("topic-1"));
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, model::topic_id{});
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::invalid_request);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message, "Duplicate topic name.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_duplicate_id, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    auto topic_id = model::topic_id{uuid_t::create()};
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.topic_id{topic_id}}, {.topic_id{topic_id}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE(!resp.data.responses[0].name.has_value());
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::invalid_request);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message, "Duplicate topic id.");
+}
+
+FIXTURE_TEST(
+  delete_invalid_topics_v6_duplicate_mixed, delete_topics_request_fixture) {
+    wait_for_controller_leadership().get();
+
+    create_topic("topic-1", 1, 1);
+    auto topic_id = get_app_topic_id(model::topic("topic-1"));
+    BOOST_REQUIRE(topic_id);
+
+    auto resp = send_delete_topics_request(
+      kafka::delete_topics_request{
+        .data
+        = {.topics = {{.topic_id{*topic_id}}, {.name{"topic-1"}}}, .timeout_ms = 10s}},
+      kafka::api_version{6});
+
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].name, model::topic("topic-1"));
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_code, kafka::error_code::invalid_request);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].error_message,
+      "The provided topic name maps to an ID that was already supplied.");
 }
 
 #if 0

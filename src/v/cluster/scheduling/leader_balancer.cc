@@ -24,7 +24,7 @@
 #include "cluster/topic_table.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/enterprise_feature_messages.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -94,7 +94,7 @@ leader_balancer::leader_balancer(
 }
 
 void leader_balancer::check_if_controller_leader(
-  model::ntp, model::term_id, model::node_id) {
+  const model::ntp&, model::term_id, model::node_id) {
     // Don't bother doing anything if it's not enabled
     if (should_stop_balance()) {
         return;
@@ -121,7 +121,7 @@ void leader_balancer::check_if_controller_leader(
 }
 
 void leader_balancer::on_leadership_change(
-  model::ntp ntp, model::term_id, model::node_id) {
+  const model::ntp& ntp, model::term_id, model::node_id) {
     if (should_stop_balance()) {
         return;
     }
@@ -173,8 +173,28 @@ void leader_balancer::on_maintenance_change(
     // if a node transitions out of maintenance wake up the balancer early to
     // transfer leadership back to it.
     if (ms == model::maintenance_state::inactive) {
-        schedule_sooner(leader_activation_delay);
+        schedule_sooner(node_status_changed_delay);
     }
+}
+
+void leader_balancer::handle_node_health_report(
+  const node_health_report& report,
+  std::optional<node_health_report_ptr> previous_report) {
+    if (!can_schedule_sooner()) {
+        return;
+    }
+
+    // Do not schedule a tick if the report was already present for current
+    // node.
+    if (previous_report) {
+        return;
+    }
+
+    vlog(
+      clusterlog.trace,
+      "node {} health report appeared, scheduling balance",
+      report.id);
+    schedule_sooner(node_status_changed_delay);
 }
 
 void leader_balancer::handle_topic_deltas(
@@ -247,8 +267,9 @@ void leader_balancer::handle_topic_deltas(
 void leader_balancer::check_register_leadership_change_notification() {
     if (!_leadership_change_notify_handle && _in_flight_changes.size() > 0) {
         _leadership_change_notify_handle
-          = _leaders.register_leadership_change_notification(std::bind_front(
-            std::mem_fn(&leader_balancer::on_leadership_change), this));
+          = _leaders.register_leadership_change_notification(
+            std::bind_front(
+              std::mem_fn(&leader_balancer::on_leadership_change), this));
     }
 }
 
@@ -278,13 +299,17 @@ ss::future<> leader_balancer::start() {
         std::mem_fn(&leader_balancer::check_if_controller_leader), this));
 
     _maintenance_state_notify_handle
-      = _members.register_maintenance_state_change_notification(std::bind_front(
-        std::mem_fn(&leader_balancer::on_maintenance_change), this));
+      = _members.register_maintenance_state_change_notification(
+        std::bind_front(
+          std::mem_fn(&leader_balancer::on_maintenance_change), this));
 
     _topic_deltas_handle = _topics.register_topic_delta_notification(
       std::bind_front(
         std::mem_fn(&leader_balancer::handle_topic_deltas), this));
 
+    _health_monitor_handle = _health_monitor.register_node_callback(
+      std::bind_front(
+        std::mem_fn(&leader_balancer::handle_node_health_report), this));
     /*
      * register_leadership_notification above may run callbacks synchronously
      * during registration, so make sure the timer is unarmed before arming.
@@ -311,6 +336,7 @@ ss::future<> leader_balancer::stop() {
     _members.unregister_maintenance_state_change_notification(
       _maintenance_state_notify_handle);
     _topics.unregister_topic_delta_notification(_topic_deltas_handle);
+    _health_monitor.unregister_node_callback(_health_monitor_handle);
     _timer.cancel();
     return _gate.close();
 }
@@ -658,8 +684,9 @@ ss::future<ss::stop_iteration> leader_balancer::balance() {
           });
 
         if (min_timeout != _in_flight_changes.end()) {
-            _timer.arm(std::chrono::abs(
-              min_timeout->second.expires - clock_type::now()));
+            _timer.arm(
+              std::chrono::abs(
+                min_timeout->second.expires - clock_type::now()));
         } else {
             _timer.arm(_mute_timeout());
         }
@@ -906,8 +933,7 @@ leader_balancer::collect_group_replicas_from_health_report(
 
             co_await ssx::async_for_each_counter(
               counter,
-              partitions.begin(),
-              partitions.end(),
+              partitions | std::views::values,
               [&](const partition_status& partition) {
                   auto as_it = meta.get_assignments().find(partition.id);
                   if (as_it != meta.get_assignments().end()) {
@@ -1056,7 +1082,7 @@ leader_balancer::index_type leader_balancer::build_index(
                       replicas.cend(),
                       std::back_inserter(leader),
                       1,
-                      random_generators::internal::gen);
+                      random_generators::global().engine());
                     // replicas.empty() is checked above
                     vassert(!leader.empty(), "Failed to select replica");
                     leader_core = leader.front();

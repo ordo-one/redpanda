@@ -19,6 +19,7 @@
 #include "config/endpoint_tls_config.h"
 #include "config/leaders_preference.h"
 #include "config/property.h"
+#include "config/sasl_mechanisms.h"
 #include "config/throughput_control_group.h"
 #include "config/tls_config.h"
 #include "config/types.h"
@@ -156,6 +157,8 @@ struct configuration final : public config_store {
     bounded_property<uint32_t> topic_partitions_memory_allocation_percent;
     property<std::chrono::milliseconds>
       partition_manager_shutdown_watchdog_timeout;
+    property<std::optional<size_t>> topic_label_aggregation_limit;
+    bounded_property<uint32_t> controller_backend_reconciliation_concurrency;
 
     // Admin API
     property<bool> admin_api_require_auth;
@@ -168,7 +171,7 @@ struct configuration final : public config_store {
     deprecated_property min_version;
     deprecated_property max_version;
     bounded_property<std::optional<size_t>> raft_max_recovery_memory;
-    bounded_property<size_t> raft_recovery_default_read_size;
+    deprecated_property raft_recovery_default_read_size;
     property<bool> raft_enable_lw_heartbeat;
     bounded_property<size_t> raft_recovery_concurrency_per_shard;
     property<std::optional<size_t>> raft_replica_max_pending_flush_bytes;
@@ -227,10 +230,14 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> alter_topic_cfg_timeout_ms;
     property<model::cleanup_policy_bitflags> log_cleanup_policy;
     enum_property<model::timestamp_type> log_message_timestamp_type;
-    bounded_property<std::optional<std::chrono::milliseconds>>
-      log_message_timestamp_alert_before_ms;
+    deprecated_property log_message_timestamp_alert_before_ms;
+    deprecated_property log_message_timestamp_alert_after_ms;
     bounded_property<std::chrono::milliseconds>
-      log_message_timestamp_alert_after_ms;
+      log_message_timestamp_before_max_ms;
+    bounded_property<std::chrono::milliseconds>
+      log_message_timestamp_after_max_ms;
+    enum_property<model::kafka_batch_validation_mode>
+      kafka_produce_batch_validation;
     enum_property<model::compression> log_compression_type;
     property<size_t> fetch_max_bytes;
     property<bool> use_fetch_scheduler_group;
@@ -256,10 +263,16 @@ struct configuration final : public config_store {
     property<std::optional<std::chrono::milliseconds>> tombstone_retention_ms;
     bounded_property<std::optional<double>, numeric_bounds>
       min_cleanable_dirty_ratio;
+    property<std::chrono::milliseconds> min_compaction_lag_ms;
+    property<std::chrono::milliseconds> max_compaction_lag_ms;
     property<bool> log_disable_housekeeping_for_tests;
     property<bool> log_compaction_use_sliding_window;
-    property<std::optional<size_t>>
-      log_compaction_adjacent_merge_self_compaction_count;
+    property<bool> log_compaction_pause_use_sliding_window;
+    deprecated_property log_compaction_adjacent_merge_self_compaction_count;
+    property<std::optional<uint32_t>>
+      log_compaction_merge_max_segments_per_range;
+    property<std::optional<uint32_t>> log_compaction_merge_max_ranges;
+    property<bool> log_compaction_disable_tx_batch_removal;
     // same as retention.size in kafka - TODO: size not implemented
     property<std::optional<size_t>> retention_bytes;
     property<int32_t> group_topic_partitions;
@@ -334,6 +347,8 @@ struct configuration final : public config_store {
     property<int16_t> id_allocator_batch_size;
     property<bool> enable_sasl;
     enterprise<property<std::vector<ss::sstring>>> sasl_mechanisms;
+    enterprise<property<std::vector<config::sasl_mechanisms_override>>>
+      sasl_mechanisms_overrides;
     property<ss::sstring> sasl_kerberos_config;
     property<ss::sstring> sasl_kerberos_keytab;
     property<ss::sstring> sasl_kerberos_principal;
@@ -352,6 +367,9 @@ struct configuration final : public config_store {
     property<uint32_t> kafka_batch_max_bytes;
     property<std::vector<ss::sstring>> kafka_nodelete_topics;
     property<std::vector<ss::sstring>> kafka_noproduce_topics;
+    property<std::optional<uint32_t>> kafka_topics_max;
+    bounded_property<std::optional<int32_t>>
+      kafka_max_message_size_upper_limit_bytes;
 
     // Compaction controller
     property<std::chrono::milliseconds> compaction_ctrl_update_interval_ms;
@@ -382,6 +400,8 @@ struct configuration final : public config_store {
     property<std::vector<ss::sstring>> audit_enabled_event_types;
     property<std::vector<ss::sstring>> audit_excluded_topics;
     property<std::vector<ss::sstring>> audit_excluded_principals;
+    enum_property<audit_failure_policy> audit_failure_policy;
+    property<bool> audit_use_rpc;
 
     // Archival storage
     enterprise<property<bool>> cloud_storage_enabled;
@@ -447,6 +467,7 @@ struct configuration final : public config_store {
     property<bool> cloud_storage_disable_read_replica_loop_for_tests;
     property<bool> disable_cluster_recovery_loop_for_tests;
     property<bool> enable_cluster_metadata_upload_loop;
+    property<std::optional<ss::sstring>> cloud_storage_cluster_name;
     property<size_t> cloud_storage_max_segments_pending_deletion_per_partition;
     property<bool> cloud_storage_enable_compacted_topic_reupload;
     property<size_t> cloud_storage_recovery_temporary_retention_bytes_default;
@@ -454,6 +475,7 @@ struct configuration final : public config_store {
     enum_property<model::recovery_validation_mode>
       cloud_storage_recovery_topic_validation_mode;
     property<uint32_t> cloud_storage_recovery_topic_validation_depth;
+    property<std::chrono::milliseconds> cloud_storage_client_lease_timeout_ms;
 
     property<std::optional<size_t>> cloud_storage_segment_size_target;
     property<std::optional<size_t>> cloud_storage_segment_size_min;
@@ -676,6 +698,7 @@ struct configuration final : public config_store {
       enable_schema_id_validation;
     config::property<size_t> kafka_schema_id_validation_cache_capacity;
 
+    enterprise<property<bool>> schema_registry_enable_authorization;
     property<bool> schema_registry_always_normalize;
     deprecated_property schema_registry_protobuf_renderer_v2;
     property<std::optional<uint32_t>> pp_sr_smp_max_non_local_requests;
@@ -683,7 +706,7 @@ struct configuration final : public config_store {
     bounded_property<size_t> max_in_flight_pandaproxy_requests_per_shard;
 
     bounded_property<double, numeric_bounds> kafka_memory_share_for_fetch;
-    property<size_t> kafka_memory_batch_size_estimate_for_fetch;
+    deprecated_property kafka_memory_batch_size_estimate_for_fetch;
     // debug controls
     property<bool> cpu_profiler_enabled;
     bounded_property<std::chrono::milliseconds> cpu_profiler_sample_period_ms;
@@ -711,6 +734,8 @@ struct configuration final : public config_store {
 
     enum_property<tls_version> tls_min_version;
     property<bool> tls_enable_renegotiation;
+    property<ss::sstring> tls_v1_2_cipher_suites;
+    property<ss::sstring> tls_v1_3_cipher_suites;
 
     // datalake configurations
     enterprise<property<bool>> iceberg_enabled;
@@ -719,6 +744,7 @@ struct configuration final : public config_store {
     bounded_property<std::chrono::milliseconds>
       iceberg_latest_schema_cache_ttl_ms;
     property<ss::sstring> iceberg_catalog_base_location;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_base_location;
     bounded_property<std::chrono::seconds>
       datalake_coordinator_snapshot_max_delay_secs;
 
@@ -738,10 +764,17 @@ struct configuration final : public config_store {
     property<ss::sstring> iceberg_rest_catalog_oauth2_scope;
     enum_property<datalake_catalog_auth_mode>
       iceberg_rest_catalog_authentication_mode;
+    property<ss::sstring> iceberg_rest_catalog_aws_service_name;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_aws_access_key;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_aws_secret_key;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_aws_region;
+    enum_property<std::optional<model::cloud_credentials_source>>
+      iceberg_rest_catalog_aws_credentials_source;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_gcp_user_project;
     property<double> iceberg_backlog_controller_p_coeff;
     property<double> iceberg_backlog_controller_i_coeff;
     bounded_property<uint32_t> iceberg_target_backlog_size;
-    property<double> iceberg_throttle_backlog_size_ratio;
+    property<std::optional<double>> iceberg_throttle_backlog_size_ratio;
 
     property<bool> iceberg_delete;
     property<ss::sstring> iceberg_default_partition_spec;
@@ -750,6 +783,7 @@ struct configuration final : public config_store {
     bounded_property<std::chrono::milliseconds> iceberg_target_lag_ms;
     property<bool> iceberg_disable_snapshot_tagging;
     property<bool> iceberg_disable_automatic_snapshot_expiry;
+    property<std::optional<ss::sstring>> iceberg_topic_name_dot_replacement;
 
     property<bool> enable_host_metrics;
 
@@ -760,17 +794,25 @@ struct configuration final : public config_store {
       datalake_scheduler_time_slice_ms;
     bounded_property<size_t> datalake_translator_flush_bytes;
     property<bool> datalake_disk_space_monitor_enable;
-    bounded_property<std::chrono::milliseconds>
-      datalake_disk_space_monitor_interval;
+    deprecated_property datalake_disk_space_monitor_interval;
     property<size_t> datalake_scratch_space_size_bytes;
+    bounded_property<double, numeric_bounds>
+      datalake_scratch_space_soft_limit_size_percent;
     property<double> datalake_disk_usage_overage_coeff;
+    bounded_property<size_t> datalake_scheduler_disk_reservation_block_size;
+    property<bool> consumer_offsets_topic_batch_cache_enabled;
+    enterprise<property<bool>> enable_shadow_linking;
 
     configuration();
 
     error_map_t load(const YAML::Node& root_node);
 
 public:
-    development_feature_property<bool> development_enable_cloud_topics;
+    enterprise<property<bool>> cloud_topics_enabled;
+    property<size_t> cloud_topics_produce_batching_size_threshold;
+    property<std::chrono::milliseconds> cloud_topics_produce_upload_interval;
+    property<size_t> cloud_topics_produce_cardinality_threshold;
+    property<bool> cloud_topics_disable_reconciliation_loop;
 
     development_feature_property<int> development_feature_property_testing_only;
 

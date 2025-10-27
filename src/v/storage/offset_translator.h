@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "base/units.h"
 #include "model/fundamental.h"
 #include "raft/fundamental.h"
@@ -23,8 +24,6 @@
 #include "utils/prefix_logger.h"
 
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace storage {
 
@@ -73,7 +72,7 @@ public:
 
     /// Searches for non-data batches up to the tip of the log. After this
     /// method succeeds, offset translator is usable.
-    ss::future<> sync_with_log(storage::log&, storage::opt_abort_source_t);
+    ss::future<> sync_with_log(storage::log&, model::opt_abort_source_t);
 
     /// Process the batch and add it to offset translation state if it is not
     /// a data batch.

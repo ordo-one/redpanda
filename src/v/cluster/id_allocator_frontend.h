@@ -149,7 +149,7 @@ public:
     ss::future<reset_id_allocator_reply>
     reset_next_id(model::producer_id, model::timeout_clock::duration timeout);
 
-    ss::future<> stop() { return _allocator_router.shutdown(); }
+    ss::future<> stop() { return _allocator_router.stop(); }
 
     allocate_id_router& allocator_router() { return _allocator_router; }
     reset_id_router& id_reset_router() { return _id_reset_router; }
@@ -166,7 +166,7 @@ private:
     // Sets the underlying stm's next id to the given id, returning an error if
     // there was a problem (e.g. not leader, timed out, etc).
     ss::future<allocate_id_reply>
-      do_reset_next_id(int64_t, model::timeout_clock::duration);
+    do_reset_next_id(int64_t, model::timeout_clock::duration);
 
     ss::future<bool> try_create_id_allocator_topic();
     ss::future<bool> ensure_id_allocator_topic_exists();

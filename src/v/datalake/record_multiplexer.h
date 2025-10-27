@@ -25,6 +25,10 @@
 
 #include <memory>
 
+namespace features {
+class feature_table;
+}
+
 namespace datalake {
 class record_translator;
 class schema_manager;
@@ -56,11 +60,8 @@ public:
         kafka::offset start_offset;
         // last offset of the last translated batch (inclusive)
         kafka::offset last_offset;
-        // vector containing a list of files that were written during
-        // translation.
-        chunked_vector<partitioning_writer::partitioned_file> data_files;
-        // files with invalid records
-        chunked_vector<partitioning_writer::partitioned_file> dlq_files;
+        // Total number of kafka bytes processed by the multiplexer
+        uint64_t kafka_bytes_processed{0};
     };
     explicit record_multiplexer(
       const model::ntp& ntp,
@@ -72,7 +73,8 @@ public:
       table_creator&,
       model::iceberg_invalid_record_action,
       location_provider,
-      translation_probe&);
+      translation_probe&,
+      features::feature_table* features);
 
     /**
      * Multiplex the data from a reader into writers per schema and partition.
@@ -102,12 +104,19 @@ public:
      */
     ss::future<writer_error> flush_writers();
 
+    struct finished_files {
+        // vector containing a list of files that were written during
+        // translation.
+        chunked_vector<partitioning_writer::partitioned_file> data_files;
+        // files with invalid records
+        chunked_vector<partitioning_writer::partitioned_file> dlq_files;
+    };
     /**
      * Cleanup and return the result. Should be the last operation to
      * be called. May not be called in parallel while multiplexing is in
      * progress.
      */
-    ss::future<result<write_result, writer_error>> finish() &&;
+    ss::future<result<write_result, writer_error>> finish(finished_files&) &&;
 
     size_t buffered_bytes() const;
 
@@ -124,6 +133,7 @@ private:
       std::optional<iobuf>,
       std::optional<iobuf>,
       model::timestamp,
+      model::timestamp_type ts_t,
       chunked_vector<std::pair<std::optional<iobuf>, std::optional<iobuf>>>,
       ss::abort_source&);
 
@@ -138,6 +148,7 @@ private:
     model::iceberg_invalid_record_action _invalid_record_action;
     location_provider _location_provider;
     translation_probe& _translation_probe;
+    [[maybe_unused]] features::feature_table* _features;
     chunked_hash_map<
       record_schema_components,
       std::unique_ptr<partitioning_writer>>
@@ -146,6 +157,8 @@ private:
 
     std::optional<writer_error> _error;
     std::optional<write_result> _result;
+    // Total number of kafka bytes processed by the multiplexer
+    uint64_t _reader_bytes_processed = 0;
 };
 
 } // namespace datalake

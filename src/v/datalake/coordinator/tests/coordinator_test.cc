@@ -10,6 +10,7 @@
 #include "cluster/data_migrated_resources.h"
 #include "cluster/topic_table.h"
 #include "config/mock_property.h"
+#include "config/node_config.h"
 #include "datalake/catalog_schema_manager.h"
 #include "datalake/coordinator/coordinator.h"
 #include "datalake/coordinator/file_committer.h"
@@ -43,7 +44,7 @@ public:
     }
 
     ss::future<checked<std::nullopt_t, errc>>
-    drop_table(const iceberg::table_identifier&) const final {
+    drop_table(const iceberg::table_identifier&, purge_data) const final {
         co_return std::nullopt;
     }
 
@@ -205,6 +206,9 @@ public:
     }
 
     void SetUp() override {
+        ss::smp::invoke_on_all([] {
+            config::node().node_id.set_value(model::node_id{1});
+        }).get();
         cfg.get("raft_heartbeat_interval_ms").set_value(50ms);
         cfg.get("raft_heartbeat_timeout_ms").set_value(500ms);
         auto args = param();

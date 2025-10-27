@@ -14,7 +14,6 @@
 #include "config/configuration.h"
 #include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
-#include "model/metadata.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
 
 #include <seastar/core/metrics.hh>
@@ -24,13 +23,15 @@ namespace cluster {
 static const ss::sstring cluster_metrics_name
   = prometheus_sanitize::metrics_name("cluster:partition");
 
-static constexpr int64_t follower_iceberg_lag_metric = 0;
-
 replicated_partition_probe::replicated_partition_probe(
   const partition& p) noexcept
-  : _partition(p) {
+  : _partition(p)
+  , _enable_scrubbing_bind(
+      config::shard_local_cfg().cloud_storage_enable_scrubbing.bind()) {
     config::shard_local_cfg().enable_schema_id_validation.bind().watch(
       [this]() { reconfigure_metrics(); });
+
+    _enable_scrubbing_bind.watch([this]() { reconfigure_metrics(); });
 }
 
 void replicated_partition_probe::reconfigure_metrics() {
@@ -48,16 +49,6 @@ void replicated_partition_probe::setup_metrics(const model::ntp& ntp) {
     setup_public_metrics(ntp);
 }
 
-int64_t replicated_partition_probe::iceberg_translation_offset_lag() const {
-    return _partition.is_leader() ? _iceberg_translation_offset_lag
-                                  : follower_iceberg_lag_metric;
-}
-
-int64_t replicated_partition_probe::iceberg_commit_offset_lag() const {
-    return _partition.is_leader() ? _iceberg_commit_offset_lag
-                                  : follower_iceberg_lag_metric;
-}
-
 void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
     namespace sm = ss::metrics;
 
@@ -65,14 +56,10 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
         return;
     }
 
-    auto ns_label = sm::label("namespace");
-    auto topic_label = sm::label("topic");
-    auto partition_label = sm::label("partition");
-
     const std::vector<sm::label_instance> labels = {
-      ns_label(ntp.ns()),
-      topic_label(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 
     // The following few metrics uses a separate add_group call which doesn't
@@ -120,8 +107,9 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
         sm::make_gauge(
           "committed_offset",
           [this] { return _partition.committed_offset(); },
-          sm::description("Partition commited offset. i.e. safely persisted on "
-                          "majority of replicas"),
+          sm::description(
+            "Partition commited offset. i.e. safely persisted on "
+            "majority of replicas"),
           labels),
         sm::make_gauge(
           "end_offset",
@@ -158,8 +146,9 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
         sm::make_total_bytes(
           "bytes_fetched_total",
           [this] { return _bytes_fetched; },
-          sm::description("Total number of bytes fetched (not all might be "
-                          "returned to the client)"),
+          sm::description(
+            "Total number of bytes fetched (not all might be "
+            "returned to the client)"),
           labels),
         sm::make_total_bytes(
           "bytes_fetched_from_follower_total",
@@ -177,53 +166,13 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
                            .segments_metadata_bytes()
                        : 0;
           },
-          sm::description("Current number of bytes consumed by remote segments "
-                          "managed for this partition"),
+          sm::description(
+            "Current number of bytes consumed by remote segments "
+            "managed for this partition"),
           labels),
       },
       {},
-      {sm::shard_label, partition_label});
-
-    if (model::is_user_topic(_partition.ntp())) {
-        // Metrics are reported as follows
-        // -2 (default initialized state)
-        // -1 (iceberg disabled state)
-        //  0 (iceberg enabled but follower replicas)
-        // <actual lag> leader replicas
-        _metrics.add_group(
-          cluster_metrics_name,
-          {
-            sm::make_gauge(
-              "iceberg_offsets_pending_translation",
-              [this] {
-                  return _partition.log()->config().iceberg_enabled()
-                           ? iceberg_translation_offset_lag()
-                           : metric_feature_disabled_state;
-              },
-              sm::description(
-                "Total number of offsets that are pending "
-                "translation to iceberg. Lag is reported only on leader "
-                "replicas while followers report 0. -1 is reported if iceberg "
-                "is disabled while -2 indicates the lag is "
-                "not yet computed."),
-              labels),
-            sm::make_gauge(
-              "iceberg_offsets_pending_commit",
-              [this] {
-                  return _partition.log()->config().iceberg_enabled()
-                           ? iceberg_commit_offset_lag()
-                           : metric_feature_disabled_state;
-              },
-              sm::description(
-                "Total number of offsets that are pending "
-                "commit to iceberg catalog.  Lag is reported only on leader "
-                "while followers report 0. -1 is reported if iceberg is "
-                "disabled while -2 indicates the lag is not yet computed."),
-              labels),
-          },
-          {},
-          {sm::shard_label, partition_label});
-    }
+      {sm::shard_label, metrics::partition_label});
 
     if (
       config::shard_local_cfg().enable_schema_id_validation()
@@ -237,7 +186,7 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
               sm::description(
                 "Number of records that failed schema ID validation"),
               labels)
-              .aggregate({sm::shard_label, partition_label}),
+              .aggregate({sm::shard_label, metrics::partition_label}),
           });
     }
 }
@@ -306,8 +255,9 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
                     return fm.under_replicated;
                 });
           },
-          sm::description("Number of under replicated replicas (i.e. replicas "
-                          "that are live, but not at the latest offest)"),
+          sm::description(
+            "Number of under replicated replicas (i.e. replicas "
+            "that are live, but not at the latest offest)"),
           labels)
           .aggregate({sm::shard_label}),
         // Topic Level Metrics
@@ -368,7 +318,6 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
               .aggregate({sm::shard_label, partition_label}),
           });
     }
-
     setup_public_scrubber_metric(ntp);
 }
 
@@ -377,8 +326,8 @@ void replicated_partition_probe::setup_public_scrubber_metric(
     namespace sm = ss::metrics;
 
     // No point in setting up the scrubber metrics if there's no
-    // archival metadata STM to pull values from.
-    if (!_partition.archival_meta_stm()) {
+    // archival metadata STM to pull values from or if scrubbing is not enabled
+    if (!_partition.archival_meta_stm() || !_enable_scrubbing_bind()) {
         return;
     }
 

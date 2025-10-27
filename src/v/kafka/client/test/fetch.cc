@@ -21,6 +21,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "redpanda/tests/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/unresolved_address.h"
 
 #include <boost/test/tools/old/interface.hpp>
@@ -35,8 +36,8 @@ FIXTURE_TEST(fetch, kafka_client_fixture) {
 
     info("Connecting client");
     auto client = make_connected_client();
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(1));
+    client.set_retry_base_backoff(10ms);
+    client.set_max_retries(size_t(1));
     client.connect().get();
 
     {
@@ -44,9 +45,9 @@ FIXTURE_TEST(fetch, kafka_client_fixture) {
         auto ntp = make_default_ntp(
           model::topic("unknown"), model::partition_id(0));
         auto res{
-          client.fetch_partition(ntp.tp, model::offset(0), 1024, 1000ms).get()};
-        const auto& p = res.data.topics[0];
-        BOOST_REQUIRE_EQUAL(p.name, ntp.tp.topic);
+          client.fetch_partition(ntp.tp, model::offset(0), 1000ms, 1024).get()};
+        const auto& p = res.data.responses[0];
+        BOOST_REQUIRE_EQUAL(p.topic, ntp.tp.topic);
         BOOST_REQUIRE_EQUAL(p.partitions.size(), 1);
         BOOST_REQUIRE_EQUAL(p.partitions[0].partition_index, ntp.tp.partition);
         BOOST_REQUIRE_EQUAL(
@@ -63,11 +64,11 @@ FIXTURE_TEST(fetch, kafka_client_fixture) {
 
     {
         info("Fetching from nonempty known topic");
-        client.config().retries.set_value(size_t(3));
+        client.set_max_retries(size_t(3));
         auto res{
-          client.fetch_partition(ntp.tp, model::offset(0), 1024, 1000ms).get()};
-        const auto& p = res.data.topics[0];
-        BOOST_REQUIRE_EQUAL(p.name, ntp.tp.topic);
+          client.fetch_partition(ntp.tp, model::offset(0), 1000ms, 1024).get()};
+        const auto& p = res.data.responses[0];
+        BOOST_REQUIRE_EQUAL(p.topic, ntp.tp.topic);
         BOOST_REQUIRE_EQUAL(p.partitions.size(), 1);
         const auto& r = p.partitions[0];
         BOOST_REQUIRE_EQUAL(r.partition_index, ntp.tp.partition);

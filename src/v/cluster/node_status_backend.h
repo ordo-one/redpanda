@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/node_status_rpc_types.h"
@@ -26,8 +27,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/timer.hh>
-
-#include <absl/container/flat_hash_set.h>
 
 namespace cluster {
 
@@ -83,7 +82,7 @@ private:
     ss::future<result<node_status>>
       send_node_status_request(model::node_id, node_status_request);
 
-    ss::future<> maybe_create_client(model::node_id, net::unresolved_address);
+    ss::future<> maybe_update_client(model::node_id, net::unresolved_address);
 
     void setup_metrics(metrics::metric_groups_base&);
 
@@ -98,9 +97,9 @@ private:
         return target % ss::smp::count;
     }
 
-    rpc::backoff_policy create_backoff_policy() const {
+    backoff_policy create_backoff_policy() const {
         static constexpr auto default_backoff_base = 1000ms;
-        return rpc::make_exponential_backoff_policy<rpc::backoff_policy>(
+        return make_exponential_backoff_policy<backoff_policy>(
           std::min(default_backoff_base, _max_reconnect_backoff()),
           _max_reconnect_backoff());
     }
@@ -114,7 +113,12 @@ private:
     config::tls_config _rpc_tls_config;
     rpc::connection_set _node_connection_set;
 
-    absl::flat_hash_set<model::node_id> _discovered_peers;
+    struct peer_data {
+        uint64_t consecutive_timeouts = 0;
+    };
+
+    absl::flat_hash_map<model::node_id, peer_data> _discovered_peers;
+
     ss::gate _gate;
     ss::timer<ss::lowres_clock> _timer;
     notification_id_type _members_table_notification_handle;

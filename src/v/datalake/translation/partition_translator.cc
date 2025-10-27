@@ -12,7 +12,8 @@
 
 #include "config/configuration.h"
 #include "datalake/logger.h"
-#include "resource_mgmt/io_priority.h"
+#include "ssx/watchdog.h"
+#include "utils/retry_chain_node.h"
 #include "utils/to_string.h"
 
 #include <seastar/coroutine/as_future.hh>
@@ -72,27 +73,16 @@ partition_translator::partition_translator(
   std::unique_ptr<data_source> data_source,
   std::unique_ptr<translation_context> translation_ctx,
   std::unique_ptr<translation_lag_tracker> lag_tracker,
-  jitter_t jitter,
-  std::chrono::milliseconds retry_max_timeout,
-  std::chrono::milliseconds retry_initial_backoff)
+  jitter_t jitter)
   : _sg(sg)
   , _coordinator(std::move(coordinator))
   , _data_source(std::move(data_source))
   , _translation_ctx(std::move(translation_ctx))
   , _lag_tracking(std::move(lag_tracker))
   , _jitter{std::move(jitter)}
-  , _retry_max_timeout(retry_max_timeout)
-  , _retry_initial_backoff(retry_initial_backoff)
   , _term(_data_source->term())
   , _logger(
       datalake_log, fmt::format("{}-term-{}", _data_source->ntp(), _term)) {}
-
-void partition_translator::reconcile_properties() noexcept {
-    if (_gate.is_closed()) {
-        return;
-    }
-    _translation_ctx->reconcile_properties();
-}
 
 ss::future<coordinator::fetch_latest_translated_offset_reply>
 partition_translator::fetch_latest_translated_offset(retry_chain_node& rcn) {
@@ -168,11 +158,28 @@ partition_translator::fetch_translation_offsets(retry_chain_node& rcn) {
     // if we reach this point before the most recent batch of files has
     // been committed, the commit lag metric will be out of sync at
     // least until 'wait_for_data' returns and we re-enter the loop.
-    _data_source->update_commit_lag(last_committed_offset);
+    auto max_translatable_offset = _data_source->max_offset_for_translation();
+    if (
+      max_translatable_offset.value_or(kafka::offset::min())
+      >= kafka::offset{0}) {
+        int64_t lag = max_translatable_offset.value()
+                      - last_committed_offset.value_or(kafka::offset{-1});
+        _translation_ctx->report_commit_lag(lag);
+    }
 
-    // LTO stands for last translated offset
-    const auto checkpointed_lto = result.last_added_offset.value_or(
-      kafka::prev_offset(_data_source->min_offset_for_translation()));
+    auto next_start_offset = result.last_added_offset
+                               ? kafka::next_offset(*result.last_added_offset)
+                               : _data_source->min_offset_for_translation();
+
+    // Replicate an initialized last translated offset to unblock the max
+    // removable offset while pinning this Kafka offset from
+    // application-facing retention or compaction.
+    //
+    // NOTE: kafka::prev_offset(0) is kafka::offset::min() (uninitialized).
+    // in this case we want -1 to differentiate from uninitialized.
+    auto checkpointed_lto = next_start_offset == kafka::offset{0}
+                              ? kafka::offset{-1}
+                              : kafka::prev_offset(next_start_offset);
     /**
      * We do not replicate the timestamp of the highest translated offset
      * here as this information is not present in coordinator. This is fine
@@ -202,7 +209,13 @@ partition_translator::fetch_translation_offsets(retry_chain_node& rcn) {
     if (
       !current_translation_lto || checkpointed_lto > current_translation_lto) {
         _lag_tracking->notify_data_translated(checkpointed_lto);
-        _data_source->update_translation_lag(checkpointed_lto);
+        if (
+          max_translatable_offset.value_or(kafka::offset::min())
+          >= kafka::offset{0}) {
+            int64_t lag = max_translatable_offset.value()
+                          - std::max(checkpointed_lto, kafka::offset{-1});
+            _translation_ctx->report_translation_lag(lag);
+        }
         current_translation_lto = checkpointed_lto;
     }
 
@@ -253,8 +266,7 @@ partition_translator::run_one_translation_iteration(
          * change such as finishing the on-going translation.
          */
         as.check();
-        auto reader = co_await _data_source->make_log_reader(
-          begin_offset, datalake_priority(), as);
+        auto reader = co_await _data_source->make_log_reader(begin_offset, as);
         if (!reader) {
             co_return result;
         }
@@ -301,6 +313,9 @@ partition_translator::run_one_translation_iteration(
         vlog(
           _logger.debug,
           "Translation attempt exceeded scheduler time limit quota");
+    } catch (const translator_out_of_disk_error&) {
+        // Finishing will free up scratch space on disk
+        result = finish_immediately::yes;
     } catch (...) {
         // unknown exception or shutdown exception.
         unexpected_ex = std::current_exception();
@@ -351,7 +366,7 @@ ss::future<bool> partition_translator::finish_inflight_translation(
     if (expected_begin != translation_result.start_offset) {
         // This is possible if there is a gap in offsets range, eg from
         // compaction. Normally that shouldn't be the case, as translation
-        // enforces max_collectible_offset which prevents compaction or
+        // enforces max_removable_local_log_offset which prevents compaction or
         // other forms of retention from kicking in before translation
         // actually happens. However there could be a sequence of enabling /
         // disabling iceberg configuration on the topic that can temporarily
@@ -367,8 +382,9 @@ ss::future<bool> partition_translator::finish_inflight_translation(
     }
 
     auto last_translated_offset = translation_result.last_offset;
+    auto checkpoint_rcn = retry_chain_node(1min, 100ms, &rcn);
     auto checkpoint_result = co_await checkpoint_translation_result(
-      rcn, std::move(translation_result));
+      checkpoint_rcn, std::move(translation_result));
     if (checkpoint_result.errc != coordinator::errc::ok) {
         vlog(
           _logger.warn,
@@ -390,9 +406,13 @@ ss::future<bool> partition_translator::finish_inflight_translation(
       last_translated_offset,
       translated_offset_ts);
 
+    // Generous timeout to let STM catch up and avoid throwing work away on slow
+    // operations. By this point we have accumulated translation data and
+    // erroring out here would mean we need to re-translate the data.
+    // Better wait a bit longer.
     auto replicate_result
       = co_await _data_source->replicate_highest_translated_offset(
-        last_translated_offset, translated_offset_ts, _term, wait_timeout, _as);
+        last_translated_offset, translated_offset_ts, _term, 1min, _as);
     if (replicate_result) {
         vlog(
           _logger.warn,
@@ -414,7 +434,6 @@ ss::future<> partition_translator::translate_until_stopped() {
         if (needs_jitter) {
             co_await ss::sleep_abortable(_jitter.next_duration(), _as);
         }
-        retry_chain_node rcn{_as, _retry_max_timeout, _retry_initial_backoff};
         // We'll keep track of if we exit early out of this iteration, in which
         // case the next iteration should see some jitter.
         auto scoped_set_jitter = ss::defer(
@@ -427,7 +446,8 @@ ss::future<> partition_translator::translate_until_stopped() {
         auto clear_finish_request = ss::defer(
           [this] { _finish_translation_requested = false; });
 
-        auto offsets = co_await fetch_translation_offsets(rcn);
+        retry_chain_node fetch_offsets_rcn{_as, 1min, 100ms};
+        auto offsets = co_await fetch_translation_offsets(fetch_offsets_rcn);
         // this test of the finish translation request flag works here because
         // we are executing in a polling loop.
         auto finish_now = _finish_translation_requested
@@ -451,8 +471,30 @@ ss::future<> partition_translator::translate_until_stopped() {
             finish_now = translate_f.get();
         }
         if (finish_now || should_finish_inflight_translation()) {
+            // No global timeout for finishing. We are not blocking the
+            // scheduler here and if we can't make progress on this partition
+            // timing out/retrying can't help but wastes work.
+            retry_chain_node finish_rcn{
+              _as, ss::lowres_clock::time_point::max(), 100ms};
+
+            ssx::watchdog wd1min(1min, [ntp = _data_source->ntp()] {
+                vlog(
+                  datalake_log.debug,
+                  "Finishing inflight translation is taking more than 5min for "
+                  "{}",
+                  ntp);
+            });
+
+            ssx::watchdog wd5min(5min, [ntp = _data_source->ntp()] {
+                vlog(
+                  datalake_log.debug,
+                  "Finishing inflight translation is taking more than 5min "
+                  "for {}",
+                  ntp);
+            });
+
             auto success = co_await finish_inflight_translation(
-              offsets->coordinator_lto, rcn);
+              offsets->coordinator_lto, finish_rcn);
             if (!success) {
                 continue;
             }
@@ -546,15 +588,21 @@ void partition_translator::start_translation(
     _ready_to_translate.broadcast();
 }
 
-void partition_translator::stop_translation() {
+void partition_translator::stop_translation(translator::stop_reason reason) {
     if (_gate.is_closed() || !_inflight_translation_state) {
         return;
     }
 
-    // Currently only preempted on exceeding memory budget, if the policy
-    // changes to preempt on other errors, should be updated accordingly.
-    _inflight_translation_state->as.request_abort_ex(
-      translator_out_of_memory_error{});
+    switch (reason) {
+    case stop_reason::oom:
+        _inflight_translation_state->as.request_abort_ex(
+          translator_out_of_memory_error{});
+        break;
+    case stop_reason::out_of_disk:
+        _inflight_translation_state->as.request_abort_ex(
+          translator_out_of_disk_error{});
+        break;
+    }
 }
 
 void partition_translator::set_finish_translation() {

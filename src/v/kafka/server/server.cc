@@ -9,17 +9,24 @@
 
 #include "server.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "base/vlog.h"
+#include "cluster/cluster_link/frontend.h"
+#include "cluster/cluster_link/types.h"
 #include "cluster/id_allocator_frontend.h"
 #include "cluster/security_frontend.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/tx_gateway_frontend.h"
+#include "cluster_link/model/filter_utils.h"
 #include "config/broker_authn_endpoint.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
+#include "config/sasl_mechanisms.h"
+#include "container/chunked_hash_map.h"
 #include "features/enterprise_feature_messages.h"
 #include "features/feature_table.h"
 #include "kafka/protocol/errors.h"
+#include "kafka/protocol/offset_fetch.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/list_groups_response.h"
 #include "kafka/server/connection_context.h"
@@ -58,6 +65,7 @@
 #include "kafka/server/usage_manager.h"
 #include "model/record.h"
 #include "net/connection.h"
+#include "random/generators.h"
 #include "security/acl.h"
 #include "security/audit/schemas/iam.h"
 #include "security/audit/schemas/utils.h"
@@ -72,6 +80,7 @@
 #include "security/scram_authenticator.h"
 #include "ssx/future-util.h"
 #include "ssx/thread_worker.h"
+#include "ssx/when_all.h"
 #include "strings/string_switch.h"
 #include "strings/utf8.h"
 
@@ -85,15 +94,15 @@
 #include <seastar/net/tls.hh>
 #include <seastar/util/log.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/container/flat_hash_map.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <ranges>
 #include <vector>
 
 namespace kafka {
@@ -114,6 +123,14 @@ security::audit::authentication_event_options make_auth_event_options(
       .uid = mtls_state.subject().value_or("")
     }
   };
+}
+
+model::topic_namespace as_tp_ns(model::topic tp) {
+    return {model::kafka_namespace, std::move(tp)};
+}
+
+model::topic_namespace_view as_tp_ns_view(const model::topic& tp) {
+    return {model::kafka_namespace, tp};
 }
 } // namespace
 
@@ -144,6 +161,7 @@ server::server(
   ss::sharded<cluster::controller_api>& controller_api,
   ss::sharded<cluster::tx_gateway_frontend>& tx_gateway_frontend,
   ss::sharded<kafka::datalake_throttle_manager>& datalake_throttle_manager,
+  ss::sharded<cluster::cluster_link::frontend>& clfe,
   std::optional<qdc_monitor_config> qdc_config,
   ssx::singleton_thread_worker& tw,
   const std::unique_ptr<pandaproxy::schema_registry::api>& sr) noexcept
@@ -181,6 +199,7 @@ server::server(
   , _controller_api(controller_api)
   , _tx_gateway_frontend(tx_gateway_frontend)
   , _datalake_throttle_manager(datalake_throttle_manager)
+  , _cluster_link_frontend(clfe)
   , _mtls_principal_mapper(
       config::shard_local_cfg().kafka_mtls_principal_mapping_rules.bind())
   , _gssapi_principal_mapper(
@@ -191,6 +210,12 @@ server::server(
         cfg->local().max_service_memory_per_core
         * config::shard_local_cfg().kafka_memory_share_for_fetch()),
       "kafka/server-mem-fetch")
+  , _fetch_units_manager(
+      memory(),
+      memory_fetch_sem(),
+      [this] -> fetch_memory_units_manager& {
+          return container().local().fetch_units_manager();
+      })
   , _probe(std::make_unique<class kafka_probe>())
   , _sasl_probe(std::make_unique<class sasl_probe>())
   , _read_dist_probe(std::make_unique<read_distribution_probe>())
@@ -211,6 +236,29 @@ server::server(
 
     _sasl_probe->setup_metrics(cfg->local().name);
     _read_dist_probe->setup_metrics();
+    _fetch_metadata_cache.setup_metrics();
+}
+ss::future<> server::stop() {
+    co_await net::server::stop();
+    co_await _fetch_units_manager.stop();
+}
+
+bool server::is_cluster_link_active() const {
+    const auto& clfe = _cluster_link_frontend.local();
+    return clfe.cluster_linking_enabled() && clfe.cluster_link_active();
+}
+
+chunked_vector<ss::lw_shared_ptr<const connection_context>>
+server::list_connections() const {
+    using ret_t = chunked_vector<ss::lw_shared_ptr<const connection_context>>;
+    return _connections | std::views::transform([](const auto& conn) {
+               return conn.shared_from_this();
+           })
+           | std::ranges::to<ret_t>();
+}
+
+closed_connections_t server::list_closed_connections() const {
+    return _closed_connections;
 }
 
 void server::setup_metrics() {
@@ -225,8 +273,9 @@ void server::setup_metrics() {
         sm::make_total_bytes(
           "fetch_avail_mem_bytes",
           [this] { return _memory_fetch_sem.current(); },
-          sm::description(ssx::sformat(
-            "{}: Memory available for fetch request processing", cfg.name))),
+          sm::description(
+            ssx::sformat(
+              "{}: Memory available for fetch request processing", cfg.name))),
       });
 }
 
@@ -250,39 +299,6 @@ ss::scheduling_group server::get_request_handler_sg() const {
 
 coordinator_ntp_mapper& server::coordinator_mapper() {
     return _group_router.local().coordinator_mapper().local();
-}
-
-config::broker_authn_method get_authn_method(const net::connection& conn) {
-    // If authn_method is set on the endpoint
-    //    Use it
-    // Else if kafka_enable_authorization is not set
-    //    Use sasl if enable_sasl
-    // Else if has mtls mapping rules
-    //    Use mtls_identity
-    // Else
-    //    Disable AuthN
-
-    std::optional<config::broker_authn_method> authn_method;
-    auto n = conn.name();
-    const auto& kafka_api = config::node().kafka_api.value();
-    auto ep_it = std::find_if(
-      kafka_api.begin(),
-      kafka_api.end(),
-      [&n](const config::broker_authn_endpoint& ep) { return ep.name == n; });
-    if (ep_it != kafka_api.end()) {
-        authn_method = ep_it->authn_method;
-    }
-    if (authn_method.has_value()) {
-        return *authn_method;
-    }
-    const auto& config = config::shard_local_cfg();
-    // if kafka_enable_authorization is not set, use sasl iff enable_sasl
-    if (
-      !config.kafka_enable_authorization().has_value()
-      && config.enable_sasl()) {
-        return config::broker_authn_method::sasl;
-    }
-    return config::broker_authn_method::none;
 }
 
 ss::future<security::tls::mtls_state> get_mtls_principal_state(
@@ -341,10 +357,8 @@ ss::future<security::tls::mtls_state> get_mtls_principal_state(
 }
 
 ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
-    const bool authz_enabled
-      = config::shard_local_cfg().kafka_enable_authorization().value_or(
-        config::shard_local_cfg().enable_sasl());
-    const auto authn_method = get_authn_method(*conn);
+    const bool authz_enabled = config::kafka_authz_enabled();
+    const auto authn_method = config::get_authn_method(conn->name());
 
     const auto sasl_max_reauth
       = config::shard_local_cfg().kafka_sasl_max_reauth_ms();
@@ -370,6 +384,7 @@ ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
 
     auto ctx = ss::make_lw_shared<connection_context>(
       _connections,
+      _closed_connections,
       *this,
       conn,
       std::move(sasl),
@@ -488,6 +503,12 @@ ss::future<response_ptr> heartbeat_handler::handle(
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
+    ctx.connection()->attributes().last_group_id.update(request.data.group_id);
+    ctx.connection()->attributes().last_group_instance_id.update(
+      request.data.group_instance_id);
+    ctx.connection()->attributes().last_group_member_id.update(
+      request.data.member_id);
+
     if (unlikely(ctx.recovery_mode_enabled())) {
         co_return co_await ctx.respond(
           heartbeat_response(error_code::policy_violation));
@@ -599,6 +620,12 @@ process_result_stages sync_group_handler::handle(
     sync_group_request request;
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
+
+    ctx.connection()->attributes().last_group_id.update(request.data.group_id);
+    ctx.connection()->attributes().last_group_instance_id.update(
+      request.data.group_instance_id);
+    ctx.connection()->attributes().last_group_member_id.update(
+      request.data.member_id);
 
     if (ctx.recovery_mode_enabled()) {
         return process_result_stages::single_stage(
@@ -739,10 +766,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
     log_request(ctx.header(), request);
     vlog(klog.debug, "Received SASL_HANDSHAKE {}", request);
 
-    const auto& configured = config::shard_local_cfg().sasl_mechanisms();
-    auto supports = [&configured](std::string_view value) {
-        return absl::c_find(configured, value) != configured.end();
-    };
+    const auto& listener = ctx.connection()->listener();
 
     /*
      * configure sasl for the current connection context. see the sasl
@@ -751,7 +775,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
     auto error = error_code::none;
 
     chunked_vector<ss::sstring> supported_sasl_mechanisms;
-    if (supports("SCRAM")) {
+    if (config::has_sasl_mechanism(listener, config::scram)) {
         supported_sasl_mechanisms.emplace_back(
           security::scram_sha256_authenticator::name);
         supported_sasl_mechanisms.emplace_back(
@@ -773,7 +797,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
         }
     }
 
-    if (supports("PLAIN")) {
+    if (config::has_sasl_mechanism(listener, config::plain)) {
         supported_sasl_mechanisms.emplace_back(
           security::plain_authenticator::name);
         if (request.data.mechanism == security::plain_authenticator::name) {
@@ -783,7 +807,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
         }
     }
 
-    if (supports("GSSAPI")) {
+    if (config::has_sasl_mechanism(listener, config::gssapi)) {
         supported_sasl_mechanisms.emplace_back(
           security::gssapi_authenticator::name);
 
@@ -797,7 +821,7 @@ ss::future<response_ptr> sasl_handshake_handler::handle(
         }
     }
 
-    if (supports(security::oidc::sasl_authenticator::name)) {
+    if (config::has_sasl_mechanism(listener, config::oauthbearer)) {
         supported_sasl_mechanisms.emplace_back(
           security::oidc::sasl_authenticator::name);
 
@@ -836,6 +860,12 @@ process_result_stages join_group_handler::handle(
       fmt::format("{}", ctx.connection()->client_host()));
     log_request(ctx.header(), request);
 
+    ctx.connection()->attributes().last_group_id.update(request.data.group_id);
+    ctx.connection()->attributes().last_group_instance_id.update(
+      request.data.group_instance_id);
+    ctx.connection()->attributes().last_group_member_id.update(
+      request.data.member_id);
+
     if (ctx.recovery_mode_enabled()) {
         return process_result_stages::single_stage(
           ctx.respond(join_group_response(error_code::policy_violation)));
@@ -859,6 +889,8 @@ process_result_stages join_group_handler::handle(
       std::move(ctx),
       [f = std::move(stages.result)](request_context& ctx) mutable {
           return f.then([&ctx](join_group_response response) {
+              ctx.connection()->attributes().last_group_member_id.update(
+                response.data.member_id);
               return ctx.respond(std::move(response));
           });
       });
@@ -909,10 +941,11 @@ ss::future<response_ptr> delete_groups_handler::handle(
     }
 
     for (auto& group : unauthorized) {
-        results.push_back(deletable_group_result{
-          .group_id = std::move(group),
-          .error_code = error_code::group_authorization_failed,
-        });
+        results.push_back(
+          deletable_group_result{
+            .group_id = std::move(group),
+            .error_code = error_code::group_authorization_failed,
+          });
     }
 
     co_return co_await ctx.respond(delete_groups_response(std::move(results)));
@@ -925,6 +958,10 @@ ss::future<response_ptr> end_txn_handler::handle(
         end_txn_request request;
         request.decode(ctx.reader(), ctx.header().version);
         log_request(ctx.header(), request);
+
+        ctx.connection()->attributes().last_transactional_id.update(
+          request.data.transactional_id);
+
         if (ctx.recovery_mode_enabled()) {
             end_txn_response response;
             response.data.error_code = error_code::policy_violation;
@@ -968,6 +1005,11 @@ add_offsets_to_txn_handler::handle(request_context ctx, ss::smp_service_group) {
         add_offsets_to_txn_request request;
         request.decode(ctx.reader(), ctx.header().version);
         log_request(ctx.header(), request);
+
+        ctx.connection()->attributes().last_transactional_id.update(
+          request.data.transactional_id);
+        ctx.connection()->attributes().last_group_id.update(
+          request.data.group_id);
 
         if (unlikely(ctx.recovery_mode_enabled())) {
             add_offsets_to_txn_response response;
@@ -1022,6 +1064,9 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
         request.decode(ctx.reader(), ctx.header().version);
         log_request(ctx.header(), request);
 
+        ctx.connection()->attributes().last_transactional_id.update(
+          request.data.transactional_id);
+
         if (ctx.recovery_mode_enabled()) {
             add_partitions_to_txn_response response{
               request, error_code::policy_violation};
@@ -1044,8 +1089,9 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
         }
 
         if (!ctx.audit()) {
-            return ctx.respond(add_partitions_to_txn_response{
-              request, error_code::broker_not_available});
+            return ctx.respond(
+              add_partitions_to_txn_response{
+                request, error_code::broker_not_available});
         }
 
         if (!unauthorized_topics.empty()) {
@@ -1099,92 +1145,218 @@ ss::future<response_ptr> add_partitions_to_txn_handler::handle(
     });
 }
 
+namespace {
+
+auto partition_auth_describe(
+  request_context& ctx,
+  auto& resources,
+  auto projection,
+  authz_quiet quiet_authz) {
+    return std::ranges::partition(
+      resources,
+      [&ctx, quiet_authz](const auto& resource) {
+          return ctx.authorized(
+            security::acl_operation::describe, resource, quiet_authz);
+      },
+      projection);
+};
+
+void convert_to_latest(offset_fetch_request& req, api_version current_version) {
+    if (current_version >= api_version{8}) {
+        return;
+    }
+    auto& group = req.data.groups.emplace_back();
+    group.group_id = std::move(req.data.group_id);
+    if (req.data.topics.has_value()) {
+        group.topics = chunked_vector<offset_fetch_request_topics>{};
+        group.topics->reserve(req.data.topics->size());
+        for (auto& topic : *req.data.topics) {
+            group.topics->push_back(
+              offset_fetch_request_topics{
+                .name = std::move(topic.name),
+                .partition_indexes{
+                  topic.partition_indexes.begin(),
+                  topic.partition_indexes.end()},
+                .unknown_tags = std::move(topic.unknown_tags)});
+        }
+        req.data.topics.reset();
+    }
+}
+
+void convert_to(offset_fetch_response& res, api_version target_version) {
+    if (target_version >= api_version{8}) {
+        return;
+    }
+    if (res.data.groups.size() != 1) {
+        res.data.groups.clear();
+        res.data.topics.clear();
+        res.data.error_code = error_code::invalid_request;
+        vlog(
+          klog.warn,
+          "offset_fetch v{} only supports a single group, got: {}",
+          target_version,
+          fmt::join(
+            res.data.groups
+              | std::views::transform(&offset_fetch_response_group::group_id),
+            ", "));
+        return;
+    }
+    auto& group = res.data.groups[0];
+    res.data.error_code = group.error_code;
+    res.data.topics.reserve(group.topics.size());
+    for (auto& topic : group.topics) {
+        chunked_vector<offset_fetch_response_partition> partitions;
+        partitions.reserve(topic.partitions.size());
+        for (auto& partition : topic.partitions) {
+            partitions.push_back(
+              offset_fetch_response_partition{
+                .partition_index = partition.partition_index,
+                .committed_offset = partition.committed_offset,
+                .committed_leader_epoch = partition.committed_leader_epoch,
+                .metadata = std::move(partition.metadata),
+                .error_code = partition.error_code,
+                .unknown_tags = std::move(partition.unknown_tags)});
+        }
+        res.data.topics.push_back(
+          offset_fetch_response_topic{
+            .name = std::move(topic.name),
+            .partitions = std::move(partitions),
+            .unknown_tags = std::move(topic.unknown_tags)});
+    }
+    res.data.groups.clear();
+}
+
+} // namespace
+
 template<>
 ss::future<response_ptr>
 offset_fetch_handler::handle(request_context ctx, ss::smp_service_group) {
     offset_fetch_request request;
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
-    if (!ctx.authorized(
-          security::acl_operation::describe, request.data.group_id)) {
-        if (!ctx.audit()) {
-            co_return co_await ctx.respond(
-              offset_fetch_response(error_code::broker_not_available));
-        } else {
-            co_return co_await ctx.respond(
-              offset_fetch_response(error_code::group_authorization_failed));
-        }
+    convert_to_latest(request, ctx.header().version);
+
+    if (request.data.groups.size() == 1) {
+        ctx.connection()->attributes().last_group_id.update(
+          request.data.groups[0].group_id);
     }
+
+    constexpr auto has_topics = [](const auto& g) {
+        return g.topics.has_value();
+    };
+
+    constexpr auto pre_filter_authorized_topics = [](auto& ctx, auto& group) {
+        offset_fetch_response_group response{.group_id = group.group_id};
+
+        auto unauthorized_rng = partition_auth_describe(
+          ctx,
+          group.topics.value(),
+          &offset_fetch_request_topics::name,
+          authz_quiet::no);
+
+        if (!ctx.audit()) {
+            response.error_code = error_code::broker_not_available;
+            return response;
+        }
+
+        chunked_vector<offset_fetch_request_topics> unauthorized{
+          std::from_range, unauthorized_rng | std::views::as_rvalue};
+
+        // remove unauthorized topics from request
+        group.topics->erase_to_end(unauthorized_rng.begin());
+
+        // add requested (but unauthorized) topics into response
+        for (auto& req_topic : unauthorized) {
+            auto& topic = response.topics.emplace_back();
+            topic.name = std::move(req_topic.name);
+            for (auto partition_index : req_topic.partition_indexes) {
+                auto& partition = topic.partitions.emplace_back();
+                partition.partition_index = partition_index;
+                partition.committed_offset = model::offset{-1};
+                partition.error_code = error_code::topic_authorization_failed;
+            }
+        }
+        return response;
+    };
+
+    constexpr auto post_filter_authorized_topics = [](auto& ctx, auto& group) {
+        if (group.error_code != error_code::none) {
+            return;
+        }
+        /*
+         * quiet authz failures. this is checking for visibility across
+         * all topics not specifically requested topics.
+         */
+        auto unauthorized_rng = partition_auth_describe(
+          ctx,
+          group.topics,
+          &offset_fetch_response_topics::name,
+          authz_quiet::yes);
+
+        if (!ctx.audit()) {
+            group.topics.clear();
+            group.error_code = error_code::broker_not_available;
+            return;
+        }
+
+        group.topics.erase_to_end(unauthorized_rng.begin());
+        return;
+    };
+
+    chunked_hash_map<group_id, offset_fetch_response_group> unauthorized;
 
     /*
-     * request is for all group offsets
+     * pre-filter authorized groups in request
      */
-    if (!request.data.topics) {
-        auto resp = co_await ctx.groups().offset_fetch(std::move(request));
-        if (resp.data.error_code != error_code::none) {
-            co_return co_await ctx.respond(std::move(resp));
-        }
+    auto unauthorized_rng = partition_auth_describe(
+      ctx,
+      request.data.groups,
+      &offset_fetch_request_group::group_id,
+      authz_quiet::no);
 
-        // remove unauthorized topics from response
-        auto unauthorized = std::partition(
-          resp.data.topics.begin(),
-          resp.data.topics.end(),
-          [&ctx](const offset_fetch_response_topic& topic) {
-              /*
-               * quiet authz failures. this is checking for visibility across
-               * all topics not specifically requested topics.
-               */
-              return ctx.authorized(
-                security::acl_operation::describe,
-                topic.name,
-                authz_quiet{true});
-          });
-
-        if (!ctx.audit()) {
-            resp.data.topics.clear();
-            resp.data.error_code = error_code::broker_not_available;
-            co_return co_await ctx.respond(std::move(resp));
-        }
-
-        resp.data.topics.erase_to_end(unauthorized);
-
-        co_return co_await ctx.respond(std::move(resp));
+    for (auto& group : unauthorized_rng) {
+        auto& response = unauthorized[group.group_id];
+        response.group_id = std::move(group.group_id);
+        response.error_code = !ctx.audit()
+                                ? error_code::broker_not_available
+                                : error_code::group_authorization_failed;
     }
+    request.data.groups.erase_to_end(unauthorized_rng.begin());
 
     /*
      * pre-filter authorized topics in request
      */
-    auto unauthorized_it = std::partition(
-      request.data.topics->begin(),
-      request.data.topics->end(),
-      [&ctx](const offset_fetch_request_topic& topic) {
-          return ctx.authorized(security::acl_operation::describe, topic.name);
-      });
-
-    if (!ctx.audit()) {
-        co_return co_await ctx.respond(
-          offset_fetch_response(error_code::broker_not_available));
+    for (auto& group : request.data.groups | std::views::filter(has_topics)) {
+        unauthorized.emplace(
+          group.group_id, pre_filter_authorized_topics(ctx, group));
     }
 
-    std::vector<offset_fetch_request_topic> unauthorized(
-      std::make_move_iterator(unauthorized_it),
-      std::make_move_iterator(request.data.topics->end()));
-
-    // remove unauthorized topics from request
-    request.data.topics->erase(unauthorized_it, request.data.topics->end());
     auto resp = co_await ctx.groups().offset_fetch(std::move(request));
 
-    // add requested (but unauthorized) topics into response
-    for (auto& req_topic : unauthorized) {
-        auto& topic = resp.data.topics.emplace_back();
-        topic.name = std::move(req_topic.name);
-        for (auto partition_index : req_topic.partition_indexes) {
-            auto& partition = topic.partitions.emplace_back();
-            partition.partition_index = partition_index;
-            partition.error_code = error_code::group_authorization_failed;
+    for (auto& group : resp.data.groups) {
+        auto it = unauthorized.find(group.group_id);
+        if (it != unauthorized.end()) {
+            /*
+             * merge pre-filtered unauthorized topics into response
+             */
+            std::ranges::move(
+              it->second.topics, std::back_inserter(group.topics));
+            unauthorized.erase(it);
+        } else {
+            /*
+             * post-filter unauthorized topics in response
+             */
+            post_filter_authorized_topics(ctx, group);
         }
     }
 
+    /*
+     * merge pre-filtered unauthorized groups into response
+     */
+    std::ranges::move(
+      unauthorized | std::views::values, std::back_inserter(resp.data.groups));
+
+    convert_to(resp, ctx.header().version);
     co_return co_await ctx.respond(std::move(resp));
 }
 
@@ -1231,15 +1403,15 @@ offset_delete_handler::handle(request_context ctx, ss::smp_service_group) {
           topic.partitions.end(),
           [&topic, &ctx](const offset_delete_request_partition& partition) {
               return ctx.metadata_cache().contains(
-                model::topic_namespace_view(model::kafka_namespace, topic.name),
-                partition.partition_index);
+                as_tp_ns_view(topic.name), partition.partition_index);
           });
         if (std::distance(unknowns_it, topic.partitions.end()) > 0) {
-            unknowns.push_back(offset_delete_request_topic{
-              .name = topic.name,
-              .partitions = std::vector<offset_delete_request_partition>(
-                std::make_move_iterator(unknowns_it),
-                std::make_move_iterator(topic.partitions.end()))});
+            unknowns.push_back(
+              offset_delete_request_topic{
+                .name = topic.name,
+                .partitions = std::vector<offset_delete_request_partition>(
+                  std::make_move_iterator(unknowns_it),
+                  std::make_move_iterator(topic.partitions.end()))});
             topic.partitions.erase(unknowns_it, topic.partitions.end());
         }
     }
@@ -1287,31 +1459,180 @@ delete_topics_handler::handle(request_context ctx, ss::smp_service_group) {
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
-    auto unauthorized_it = std::partition(
-      request.data.topic_names.begin(),
-      request.data.topic_names.end(),
-      [&ctx](const model::topic& topic) {
-          return ctx.authorized(security::acl_operation::remove, topic);
-      });
+    // Determine the names and IDs that have been provided, and detect
+    // duplicates.
+    chunked_hash_set<model::topic> provided_names;
+    chunked_hash_set<model::topic> duplicate_provided_names;
+    chunked_hash_set<model::topic_id> provided_ids;
+    chunked_hash_set<model::topic_id> duplicate_provided_ids;
+
+    // Ensure that the value exists either in provided or in duplicates
+    constexpr auto add_provided =
+      [](auto& provided, auto& duplicates, const auto& t) {
+          if (duplicates.contains(t)) {
+              provided.erase(t);
+          } else {
+              auto [it, inserted] = provided.insert(t);
+              if (!inserted) {
+                  provided.erase(it);
+                  duplicates.insert(t);
+              }
+          }
+      };
+
+    delete_topics_response resp;
+    resp.data.responses.reserve(
+      request.data.topic_names.size() + request.data.topics.size());
+
+    for (const auto& name : request.data.topic_names) {
+        add_provided(provided_names, duplicate_provided_names, name);
+    }
+
+    for (const auto& t : request.data.topics) {
+        if (!t.name.has_value()) {
+            if (t.topic_id == model::topic_id{}) {
+                resp.data.responses.push_back(
+                  {.error_code = error_code::invalid_request,
+                   .error_message
+                   = "Neither topic name nor id were specified."});
+            } else {
+                add_provided(provided_ids, duplicate_provided_ids, t.topic_id);
+            }
+        } else {
+            if (t.topic_id == model::topic_id{}) {
+                add_provided(
+                  provided_names, duplicate_provided_names, t.name.value());
+            } else {
+                resp.data.responses.push_back(
+                  {.name = t.name,
+                   .topic_id = t.topic_id,
+                   .error_code = error_code::invalid_request,
+                   .error_message
+                   = "You may not specify both topic name and topic id."});
+            }
+        }
+    }
+
+    for (auto& topic : duplicate_provided_names) {
+        resp.data.responses.push_back(
+          {.name = topic,
+           .error_code = error_code::invalid_request,
+           .error_message = "Duplicate topic name."});
+    }
+    duplicate_provided_names.clear();
+
+    for (const auto& id : duplicate_provided_ids) {
+        resp.data.responses.push_back(
+          {.topic_id = id,
+           .error_code = error_code::invalid_request,
+           .error_message = "Duplicate topic id."});
+    }
+    duplicate_provided_ids.clear();
+
+    chunked_vector<model::topic> to_authenticate(
+      std::make_move_iterator(provided_names.begin()),
+      std::make_move_iterator(provided_names.end()));
+
+    chunked_hash_map<model::topic_id, model::topic> id_to_name;
+    for (const auto& id : provided_ids) {
+        auto tp_ns = ctx.metadata_cache().get_name_by_id(id);
+        if (!tp_ns.has_value() || tp_ns->ns != model::kafka_namespace) {
+            resp.data.responses.push_back(
+              {.topic_id = id,
+               .error_code = error_code::unknown_topic_id,
+               .error_message = "This server does not host this topic ID."});
+        } else {
+            to_authenticate.push_back(tp_ns->tp);
+            id_to_name.emplace(id, std::move(tp_ns->tp));
+        }
+    }
+    provided_ids.clear();
+
+    const auto unauthorized_topic = [&ctx, &resp](const auto& elem) {
+        const auto& [id, name] = elem;
+        if (ctx.authorized(security::acl_operation::remove, name)) {
+            return false;
+        }
+
+        if (ctx.authorized(security::acl_operation::describe, name)) {
+            resp.data.responses.push_back(
+              {.name = name,
+               .topic_id = id,
+               .error_code = error_code::topic_authorization_failed,
+               .error_message = "Authorized to describe but not allowed to "
+                                "delete this topic ID."});
+            return true;
+        }
+
+        resp.data.responses.push_back(
+          {.topic_id = id,
+           .error_code = error_code::topic_authorization_failed,
+           .error_message
+           = "Not authorized to describe or delete this topic ID."});
+        return true;
+    };
+    erase_if(id_to_name, unauthorized_topic);
+
+    for (const auto& name : provided_names) {
+        auto tp_ns{as_tp_ns_view(name)};
+        const auto cfg = ctx.metadata_cache().get_topic_metadata_ref(tp_ns);
+        const auto id = cfg ? cfg->get().get_configuration().tp_id
+                            : std::nullopt;
+
+        if (!ctx.authorized(security::acl_operation::describe, name)) {
+            resp.data.responses.push_back(
+              {.name = name,
+               .error_code = error_code::topic_authorization_failed,
+               .error_message = "Not authorized to describe this topic."});
+        } else if (!id) {
+            resp.data.responses.push_back(
+              {.name = name,
+               .error_code = error_code::unknown_topic_or_partition,
+               .error_message
+               = "This server does not host this topic-partition."});
+        } else if (ctx.authorized(security::acl_operation::remove, name)) {
+            auto failed = duplicate_provided_ids.contains(*id)
+                          || !id_to_name.insert_or_assign(*id, name).second;
+            if (failed) {
+                duplicate_provided_ids.emplace(*id);
+                id_to_name.erase(*id);
+                resp.data.responses.push_back(
+                  {.name = name,
+                   .topic_id = *id,
+                   .error_code = error_code::invalid_request,
+                   .error_message = "The provided topic name maps to an ID "
+                                    "that was already supplied."});
+            }
+        } else {
+            resp.data.responses.push_back(
+              {.name = name,
+               .error_code = error_code::topic_authorization_failed,
+               .error_message = "Authorized to describe but not allowed to "
+                                "delete this topic."});
+        }
+    }
+    provided_names.clear();
 
     if (!ctx.audit()) {
         delete_topics_response resp;
-        std::transform(
-          request.data.topic_names.begin(),
-          request.data.topic_names.end(),
+        resp.data.responses.reserve(
+          request.data.topic_names.size() + request.data.topics.size());
+
+        std::ranges::transform(
+          request.data.topic_names,
           std::back_inserter(resp.data.responses),
           [](const model::topic& t) {
               return deletable_topic_result{
                 .name = t, .error_code = error_code::broker_not_available};
           });
 
-        std::transform(
-          request.data.topics.begin(),
-          request.data.topics.end(),
+        std::ranges::transform(
+          request.data.topics,
           std::back_inserter(resp.data.responses),
           [](const delete_topic_state& t) {
               return deletable_topic_result{
                 .name = t.name,
+                .topic_id = t.topic_id,
                 .error_code = error_code::broker_not_available,
               };
           });
@@ -1319,11 +1640,14 @@ delete_topics_handler::handle(request_context ctx, ss::smp_service_group) {
         co_return co_await ctx.respond(std::move(resp));
     }
 
-    std::vector<model::topic> unauthorized(
-      std::make_move_iterator(unauthorized_it),
-      std::make_move_iterator(request.data.topic_names.end()));
-
-    request.data.topic_names.erase_to_end(unauthorized_it);
+    chunked_vector<model::topic> topic_names;
+    topic_names.reserve(id_to_name.size());
+    for (auto&& [_, name] : id_to_name) {
+        topic_names.push_back(std::move(name));
+    }
+    id_to_name.clear();
+    auto valid_topic_names = std::ranges::subrange(
+      topic_names.begin(), topic_names.end());
 
     auto kafka_nodelete_topics
       = config::shard_local_cfg().kafka_nodelete_topics();
@@ -1333,33 +1657,31 @@ delete_topics_handler::handle(request_context ctx, ss::smp_service_group) {
     if (config::shard_local_cfg().data_transforms_enabled()) {
         kafka_nodelete_topics.push_back(model::transform_log_internal_topic());
     }
-    auto nodelete_it = std::partition(
-      request.data.topic_names.begin(),
-      request.data.topic_names.end(),
-      [&kafka_nodelete_topics](const model::topic& topic) {
-          return std::find(
-                   kafka_nodelete_topics.begin(),
-                   kafka_nodelete_topics.end(),
-                   topic)
-                 == kafka_nodelete_topics.end();
+
+    auto nodelete_topics = std::ranges::partition(
+      valid_topic_names, [&kafka_nodelete_topics](const model::topic& topic) {
+          return !std::ranges::contains(kafka_nodelete_topics, topic);
       });
-    std::vector<model::topic> nodelete_topics(
-      std::make_move_iterator(nodelete_it),
-      std::make_move_iterator(request.data.topic_names.end()));
+    valid_topic_names = std::ranges::subrange(
+      valid_topic_names.begin(), nodelete_topics.begin());
 
-    request.data.topic_names.erase_to_end(nodelete_it);
-
-    std::vector<cluster::topic_result> res;
+    auto& cl_frontend = ctx.connection()->server().cluster_link_frontend();
+    const auto is_autocreate_mirror_topic = [&cl_frontend](const auto& topic) {
+        return !cl_frontend.is_autocreate_mirror_topic(topic);
+    };
+    auto autocreate_shadow_topics = std::ranges::partition(
+      valid_topic_names, is_autocreate_mirror_topic);
+    valid_topic_names = std::ranges::subrange(
+      valid_topic_names.begin(), autocreate_shadow_topics.begin());
 
     // Measure the partition mutation rate
     auto resp_delay = 0ms;
     const auto now = quota_manager::clock::now();
     auto quota_exceeded_it = co_await ssx::partition(
-      request.data.topic_names.begin(),
-      request.data.topic_names.end(),
+      valid_topic_names.begin(),
+      valid_topic_names.end(),
       [&ctx, &resp_delay, now](const model::topic& t) {
-          const auto cfg = ctx.metadata_cache().get_topic_cfg(
-            model::topic_namespace_view(model::kafka_namespace, t));
+          const auto cfg = ctx.metadata_cache().get_topic_cfg(as_tp_ns_view(t));
           const auto mutations = cfg ? cfg->partition_count : 0;
           /// Capture before next scheduling point below
           auto& resp_delay_ref = resp_delay;
@@ -1371,49 +1693,10 @@ delete_topics_handler::handle(request_context ctx, ss::smp_service_group) {
             });
       });
 
-    std::vector<model::topic> quota_exceeded(
-      std::make_move_iterator(quota_exceeded_it),
-      std::make_move_iterator(request.data.topic_names.end()));
-
-    request.data.topic_names.erase_to_end(quota_exceeded_it);
-
-    if (!request.data.topic_names.empty()) {
-        // construct namespaced topic set from request
-        std::vector<model::topic_namespace> topics;
-        topics.reserve(request.data.topic_names.size());
-        std::transform(
-          std::begin(request.data.topic_names),
-          std::end(request.data.topic_names),
-          std::back_inserter(topics),
-          [](model::topic& tp) {
-              return model::topic_namespace(
-                model::kafka_namespace, std::move(tp));
-          });
-        auto tout = request.data.timeout_ms + model::timeout_clock::now();
-        res = co_await ctx.topics_frontend().delete_topics(
-          std::move(topics), tout);
-    }
-
-    // initialize response with topic placeholders
-    delete_topics_response resp;
-    resp.data.responses.reserve(res.size());
-    std::transform(
-      res.begin(),
-      res.end(),
-      std::back_inserter(resp.data.responses),
-      [](cluster::topic_result tr) {
-          return deletable_topic_result{
-            .name = std::move(tr.tp_ns.tp),
-            .error_code = map_topic_error_code(tr.ec)};
-      });
-
-    resp.data.throttle_time_ms = resp_delay;
-    for (auto& topic : unauthorized) {
-        resp.data.responses.push_back(deletable_topic_result{
-          .name = std::move(topic),
-          .error_code = error_code::topic_authorization_failed,
-        });
-    }
+    std::ranges::subrange quota_exceeded(
+      quota_exceeded_it, valid_topic_names.end());
+    valid_topic_names = std::ranges::subrange(
+      valid_topic_names.begin(), quota_exceeded.begin());
 
     for (auto& topic : quota_exceeded) {
         /// The throttling_quota_exceeded code is only respected by newer
@@ -1422,11 +1705,92 @@ delete_topics_handler::handle(request_context ctx, ss::smp_service_group) {
         const auto ec = (ctx.header().version >= api_version(5))
                           ? error_code::throttling_quota_exceeded
                           : error_code::unknown_server_error;
-        resp.data.responses.push_back(deletable_topic_result{
-          .name = std::move(topic),
-          .error_code = ec,
-          .error_message = "Too many partition mutations requested"});
+        resp.data.responses.push_back(
+          {.name = std::move(topic),
+           .error_code = ec,
+           .error_message = "Too many partition mutations requested."});
     }
+
+    for (auto& topic : nodelete_topics) {
+        resp.data.responses.push_back(
+          deletable_topic_result{
+            .name = std::move(topic),
+            .error_code = error_code::topic_authorization_failed,
+            .error_message = "Topic is protected by 'kafka_nodelete_topics'.",
+          });
+    }
+
+    for (auto& topic : autocreate_shadow_topics) {
+        resp.data.responses.push_back(
+          deletable_topic_result{
+            .name = std::move(topic),
+            .error_code = error_code::policy_violation,
+            .error_message = "Auto-mirrored topic cannot be deleted.",
+          });
+    }
+
+    const auto is_mirror_topic = [&cl_frontend](const auto& topic) {
+        return !cl_frontend.find_link_id_by_topic(topic).has_value();
+    };
+    auto shadow_topics = std::ranges::partition(
+      valid_topic_names, is_mirror_topic);
+    // Shadow topics are missing from this range.
+    // They need to be re-inserted before this range is forwarded to topic
+    // frontend.
+    valid_topic_names = std::ranges::subrange(
+      valid_topic_names.begin(), shadow_topics.begin());
+
+    auto timeout = request.data.timeout_ms + model::timeout_clock::now();
+    auto mirror_topic_results = co_await cl_frontend.delete_mirror_topics(
+      {shadow_topics.begin(), shadow_topics.end()}, timeout);
+    auto failed_mirror_topic_deletions = std::ranges::partition(
+      mirror_topic_results, [](const auto& tr) {
+          return tr.ec == cluster::cluster_link::errc::success;
+      });
+    auto successful_mirror_topic_deletions = std::ranges::subrange(
+      mirror_topic_results.begin(), failed_mirror_topic_deletions.begin());
+
+    for (auto& tr : failed_mirror_topic_deletions) {
+        resp.data.responses.push_back(
+          deletable_topic_result{
+            .name = std::move(tr.topic),
+            .error_code = map_cluster_link_errc(tr.ec),
+            .error_message = "Failed to delete shadow topic.",
+          });
+    }
+
+    // Merge valid_topic names with successful shadow topics
+    const auto move_to_namespace = std::views::as_rvalue
+                                   | std::views::transform(&as_tp_ns);
+    auto valid_ns_topics = valid_topic_names | move_to_namespace;
+    auto shadow_ns_topics = successful_mirror_topic_deletions
+                            | std::views::transform(
+                              &cluster::cluster_link::topic_result::topic)
+                            | move_to_namespace;
+
+    std::vector<model::topic_namespace> ns_topics;
+    ns_topics.reserve(valid_ns_topics.size() + shadow_ns_topics.size());
+    ns_topics.insert(
+      ns_topics.end(), valid_ns_topics.begin(), valid_ns_topics.end());
+    ns_topics.insert(
+      ns_topics.end(), shadow_ns_topics.begin(), shadow_ns_topics.end());
+
+    // construct namespaced topic set from request
+    auto tout = request.data.timeout_ms + model::timeout_clock::now();
+    std::vector<cluster::topic_result> do_delete_res
+      = co_await ctx.topics_frontend().delete_topics(
+        std::move(ns_topics), tout);
+
+    resp.data.throttle_time_ms = resp_delay;
+
+    for (auto& tr : do_delete_res) {
+        resp.data.responses.push_back(
+          {.name = std::move(tr.tp_ns.tp),
+           .error_code = map_topic_error_code(tr.ec)});
+    }
+
+    std::ranges::shuffle(
+      resp.data.responses, random_generators::global().engine());
 
     co_return co_await ctx.respond(std::move(resp));
 }
@@ -1438,6 +1802,9 @@ ss::future<response_ptr> init_producer_id_handler::handle(
         init_producer_id_request request;
         request.decode(ctx.reader(), ctx.header().version);
         log_request(ctx.header(), request);
+
+        ctx.connection()->attributes().last_transactional_id.update(
+          request.data.transactional_id);
 
         if (unlikely(ctx.recovery_mode_enabled())) {
             init_producer_id_response reply;
@@ -1579,10 +1946,11 @@ ss::future<response_ptr> create_acls_handler::handle(
             bindings.push_back(std::move(binding));
 
         } catch (const details::acl_conversion_error& e) {
-            result_index.emplace_back(creatable_acl_result{
-              .error_code = error_code::invalid_request,
-              .error_message = e.what(),
-            });
+            result_index.emplace_back(
+              creatable_acl_result{
+                .error_code = error_code::invalid_request,
+                .error_message = e.what(),
+              });
         }
     }
 
@@ -1667,6 +2035,12 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
+    ctx.connection()->attributes().last_group_id.update(request.data.group_id);
+    ctx.connection()->attributes().last_group_instance_id.update(
+      request.data.group_instance_id);
+    ctx.connection()->attributes().last_group_member_id.update(
+      request.data.member_id);
+
     // check authorization for this group
     const auto group_authorized = ctx.authorized(
       security::acl_operation::read, request.data.group_id);
@@ -1680,13 +2054,13 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
         // for these are patched back into the final response after processing.
         absl::flat_hash_map<
           model::topic,
-          std::vector<offset_commit_response_partition>>
+          chunked_vector<offset_commit_response_partition>>
           nonexistent_tps;
 
         // topic partitions that principal is not authorized to read
         absl::flat_hash_map<
           model::topic,
-          std::vector<offset_commit_response_partition>>
+          chunked_vector<offset_commit_response_partition>>
           unauthorized_tps;
 
         offset_commit_ctx(
@@ -1714,86 +2088,85 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
      * flag to mark topic-partitions to be ignored by the group membership
      * subsystem.
      */
-    for (auto it = octx.request.data.topics.begin();
-         it != octx.request.data.topics.end();) {
+    chunked_vector<offset_commit_request_topic> valid_topics;
+    valid_topics.reserve(octx.request.data.topics.size());
+    for (auto& topic : octx.request.data.topics) {
         /*
          * not authorized for this group. all topics in the request are
          * responded to with a group authorization failed error code.
          */
         if (!group_authorized) {
-            auto& parts = octx.unauthorized_tps[it->name];
-            parts.reserve(it->partitions.size());
-            for (const auto& part : it->partitions) {
-                parts.push_back(offset_commit_response_partition{
-                  .partition_index = part.partition_index,
-                  .error_code = error_code::group_authorization_failed,
-                });
+            auto& parts = octx.unauthorized_tps[topic.name];
+            parts.reserve(topic.partitions.size());
+            for (const auto& part : topic.partitions) {
+                parts.push_back(
+                  offset_commit_response_partition{
+                    .partition_index = part.partition_index,
+                    .error_code = error_code::group_authorization_failed,
+                  });
             }
-            it = octx.request.data.topics.erase(it);
             continue;
         }
 
         /*
          * check topic authorization
          */
-        if (!octx.rctx.authorized(security::acl_operation::read, it->name)) {
-            auto& parts = octx.unauthorized_tps[it->name];
-            parts.reserve(it->partitions.size());
-            for (const auto& part : it->partitions) {
-                parts.push_back(offset_commit_response_partition{
-                  .partition_index = part.partition_index,
-                  .error_code = error_code::topic_authorization_failed,
-                });
+        if (!octx.rctx.authorized(security::acl_operation::read, topic.name)) {
+            auto& parts = octx.unauthorized_tps[topic.name];
+            parts.reserve(topic.partitions.size());
+            for (const auto& part : topic.partitions) {
+                parts.push_back(
+                  offset_commit_response_partition{
+                    .partition_index = part.partition_index,
+                    .error_code = error_code::topic_authorization_failed,
+                  });
             }
-            it = octx.request.data.topics.erase(it);
             continue;
         }
 
         /*
          * check if topic exists
          */
-        const auto topic_name = model::topic(it->name);
-        model::topic_namespace_view tn(model::kafka_namespace, topic_name);
+        auto tn{as_tp_ns_view(topic.name)};
 
-        if (octx.rctx.metadata_cache().contains(tn)) {
-            /*
-             * check if each partition exists
-             */
-            auto split = std::partition(
-              it->partitions.begin(),
-              it->partitions.end(),
-              [&octx, &tn](const offset_commit_request_partition& p) {
-                  return octx.rctx.metadata_cache().contains(
-                    tn, p.partition_index);
-              });
-            /*
-             * build responses for nonexistent topic partitions
-             */
-            if (split != it->partitions.end()) {
-                auto& parts = octx.nonexistent_tps[it->name];
-                for (auto part = split; part != it->partitions.end(); part++) {
-                    parts.push_back(offset_commit_response_partition{
-                      .partition_index = part->partition_index,
-                      .error_code = error_code::unknown_topic_or_partition,
-                    });
-                }
-                it->partitions.erase(split, it->partitions.end());
-            }
-            ++it;
-        } else {
+        if (!octx.rctx.metadata_cache().contains(tn)) {
             /*
              * the topic doesn't exist. build all partition responses.
              */
-            auto& parts = octx.nonexistent_tps[it->name];
-            for (const auto& part : it->partitions) {
-                parts.push_back(offset_commit_response_partition{
-                  .partition_index = part.partition_index,
-                  .error_code = error_code::unknown_topic_or_partition,
-                });
+            auto& parts = octx.nonexistent_tps[topic.name];
+            for (const auto& part : topic.partitions) {
+                parts.push_back(
+                  offset_commit_response_partition{
+                    .partition_index = part.partition_index,
+                    .error_code = error_code::unknown_topic_or_partition,
+                  });
             }
-            it = octx.request.data.topics.erase(it);
+            continue;
         }
+        chunked_vector<offset_commit_request_partition> valid_partitions;
+        valid_partitions.reserve(topic.partitions.size());
+        for (auto& p : topic.partitions) {
+            // non existing partition, build a response
+            if (octx.rctx.metadata_cache().contains(tn, p.partition_index)) {
+                valid_partitions.push_back(std::move(p));
+                continue;
+            }
+
+            auto& parts = octx.nonexistent_tps[topic.name];
+            parts.push_back(
+              offset_commit_response_partition{
+                .partition_index = p.partition_index,
+                .error_code = error_code::unknown_topic_or_partition,
+              });
+        }
+
+        valid_topics.push_back({
+          .name = std::move(topic.name),
+          .partitions = std::move(valid_partitions),
+          .unknown_tags = std::move(topic.unknown_tags),
+        });
     }
+    octx.request.data.topics = std::move(valid_topics);
 
     if (!octx.rctx.audit()) {
         offset_commit_response resp(
@@ -1820,16 +2193,18 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
     if (unlikely(octx.request.data.topics.empty())) {
         offset_commit_response resp;
         for (auto& topic : octx.nonexistent_tps) {
-            resp.data.topics.push_back(offset_commit_response_topic{
-              .name = topic.first,
-              .partitions = std::move(topic.second),
-            });
+            resp.data.topics.push_back(
+              offset_commit_response_topic{
+                .name = topic.first,
+                .partitions = std::move(topic.second),
+              });
         }
         for (auto& topic : octx.unauthorized_tps) {
-            resp.data.topics.push_back(offset_commit_response_topic{
-              .name = topic.first,
-              .partitions = std::move(topic.second),
-            });
+            resp.data.topics.push_back(
+              offset_commit_response_topic{
+                .name = topic.first,
+                .partitions = std::move(topic.second),
+              });
         }
         return process_result_stages::single_stage(
           octx.rctx.respond(std::move(resp)));
@@ -1851,10 +2226,11 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
                   for (auto& topic : resp.data.topics) {
                       auto it = octx.nonexistent_tps.find(topic.name);
                       if (it != octx.nonexistent_tps.end()) {
-                          topic.partitions.insert(
-                            topic.partitions.end(),
+                          std::copy(
                             it->second.begin(),
-                            it->second.end());
+                            it->second.end(),
+                            std::back_inserter(topic.partitions));
+
                           octx.nonexistent_tps.erase(it);
                       }
                   }
@@ -1863,19 +2239,21 @@ offset_commit_handler::handle(request_context ctx, ss::smp_service_group ssg) {
                    * response directly.
                    */
                   for (auto& topic : octx.nonexistent_tps) {
-                      resp.data.topics.push_back(offset_commit_response_topic{
-                        .name = topic.first,
-                        .partitions = std::move(topic.second),
-                      });
+                      resp.data.topics.push_back(
+                        offset_commit_response_topic{
+                          .name = topic.first,
+                          .partitions = std::move(topic.second),
+                        });
                   }
               }
               // no need to handle partial sets of partitions here because
               // authorization occurs all or nothing on a level
               for (auto& topic : octx.unauthorized_tps) {
-                  resp.data.topics.push_back(offset_commit_response_topic{
-                    .name = topic.first,
-                    .partitions = std::move(topic.second),
-                  });
+                  resp.data.topics.push_back(
+                    offset_commit_response_topic{
+                      .name = topic.first,
+                      .partitions = std::move(topic.second),
+                    });
               }
               return octx.rctx.respond(std::move(resp));
           });
@@ -1922,31 +2300,39 @@ describe_groups_handler::handle(request_context ctx, ss::smp_service_group) {
     describe_groups_response response;
 
     if (likely(!request.data.groups.empty())) {
-        std::vector<ss::future<described_group>> described;
+        chunked_vector<ss::future<described_group>> described;
         described.reserve(request.data.groups.size());
         for (auto& group_id : request.data.groups) {
             described.push_back(ctx.groups().describe_group(group_id).then(
               [&ctx, &request, group_id](auto res) {
                   if (request.data.include_authorized_operations) {
                       res.authorized_operations = details::to_bit_field(
-                        details::authorized_operations(ctx, group_id));
+                        details::authorized_operations<kafka::group_id>(
+                          [&ctx](
+                            security::acl_operation op,
+                            const kafka::group_id& resource,
+                            authz_quiet q,
+                            audit_authz_check c) {
+                              return ctx.authorized(op, resource, q, c);
+                          },
+                          group_id));
                   }
                   return res;
               }));
         }
-        auto group_v = co_await ss::when_all_succeed(
-          described.begin(), described.end());
+        auto group_v
+          = co_await ssx::when_all_succeed<chunked_vector<described_group>>(
+            std::move(described));
 
-        response.data.groups = {
-          std::make_move_iterator(group_v.begin()),
-          std::make_move_iterator(group_v.end())};
+        response.data.groups = std::move(group_v);
     }
 
     for (auto& group : unauthorized) {
-        response.data.groups.push_back(described_group{
-          .error_code = error_code::group_authorization_failed,
-          .group_id = std::move(group),
-        });
+        response.data.groups.push_back(
+          described_group{
+            .error_code = error_code::group_authorization_failed,
+            .group_id = std::move(group),
+          });
     }
 
     co_return co_await ctx.respond(std::move(response));

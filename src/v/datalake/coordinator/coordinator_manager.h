@@ -20,6 +20,13 @@
 #include "raft/fwd.h"
 #include "raft/notification.h"
 
+namespace features {
+class feature_table;
+}
+namespace datalake {
+class credential_manager;
+} // namespace datalake
+
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -35,7 +42,8 @@ class snapshot_remover;
 
 // Manages the lifecycle of datalake coordinators, each of which operate on a
 // single partition of the control topic.
-class coordinator_manager {
+class coordinator_manager
+  : public ss::peering_sharded_service<coordinator_manager> {
 public:
     coordinator_manager(
       model::node_id self,
@@ -47,7 +55,8 @@ public:
       pandaproxy::schema_registry::api*,
       std::unique_ptr<catalog_factory>,
       ss::sharded<cloud_io::remote>&,
-      cloud_storage_clients::bucket_name);
+      cloud_storage_clients::bucket_name,
+      features::feature_table*);
     ~coordinator_manager();
 
     ss::future<> start();
@@ -65,6 +74,7 @@ private:
     ss::future<checked<std::nullopt_t, coordinator::errc>>
     remove_tombstone(const model::topic&, model::revision_id);
 
+    ss::abort_source as_;
     ss::gate gate_;
     model::node_id self_;
     storage::api& storage_;
@@ -73,6 +83,7 @@ private:
     cluster::topic_table& topics_;
     ss::sharded<cluster::topics_frontend>& topics_fe_;
     std::unique_ptr<schema::registry> schema_registry_;
+    features::feature_table* features_;
 
     // Underlying IO is expected to outlive this class.
     iceberg::manifest_io manifest_io_;

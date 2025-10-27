@@ -115,7 +115,6 @@ redpanda_cc_library(
         "api-doc/cluster_config.json.hh",
         "cluster_config_schema_util.h",
     ],
-    include_prefix = "redpanda/admin",
     visibility = ["//visibility:public"],
     deps = [
         ":cluster_config",
@@ -134,7 +133,6 @@ redpanda_cc_library(
     hdrs = [
         "data_migration_utils.h",
     ],
-    include_prefix = "redpanda/admin",
     visibility = ["//visibility:public"],
     deps = [
         ":migration",
@@ -146,8 +144,90 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "aip_common_config",
+    hdrs = ["aip_common_config.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/serde/protobuf:base",
+        "//src/v/serde/protobuf:rpc",
+        "@fmt",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "aip_filter",
+    srcs = [
+        "aip_filter.cc",
+    ],
+    hdrs = [
+        "aip_filter.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":aip_common_config",
+        "//src/v/base",
+        "//src/v/serde/protobuf:base",
+        "//src/v/serde/protobuf:field_mask",
+        "//src/v/serde/protobuf:rpc",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/time",
+        "@fmt",
+        "@lexy",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "aip_ordering",
+    srcs = [
+        "aip_ordering.cc",
+    ],
+    hdrs = [
+        "aip_ordering.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":aip_common_config",
+        "//src/v/base",
+        "//src/v/serde/protobuf:base",
+        "//src/v/serde/protobuf:field_mask",
+        "//src/v/serde/protobuf:rpc",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/time",
+        "@fmt",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "kafka_connections_service",
+    srcs = [
+        "kafka_connections_service.cc",
+    ],
+    hdrs = [
+        "kafka_connections_service.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":aip_filter",
+        ":aip_ordering",
+        "//proto/redpanda/core/admin/v2:cluster_redpanda_proto",
+        "//proto/redpanda/core/admin/v2:kafka_connections_redpanda_proto",
+        "//src/v/base",
+        "//src/v/container:priority_queue",
+        "//src/v/kafka/server",
+        "//src/v/redpanda/admin/proxy:client",
+        "//src/v/serde/protobuf:rpc",
+        "//src/v/ssx:async_algorithm",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "admin",
     srcs = [
+        "cluster_recovery.cc",
         "debug.cc",
         "debug_bundle.cc",
         "kafka.cc",
@@ -188,8 +268,8 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         "//src/v/features:enterprise_feature_messages",
+        "//src/v/utils:uuid",
     ],
-    include_prefix = "redpanda/admin",
     visibility = ["//visibility:public"],
     deps = [
         ":broker",
@@ -202,6 +282,7 @@ redpanda_cc_library(
         ":debug_bundle",
         ":features",
         ":hbadger",
+        ":kafka_connections_service",
         ":migration",
         ":partition",
         ":raft",
@@ -213,11 +294,13 @@ redpanda_cc_library(
         ":transform",
         ":usage",
         "//src/v/base",
+        "//src/v/bytes:iostream",
         "//src/v/bytes:streambuf",
+        "//src/v/cloud_io:cache",
         "//src/v/cloud_storage",
         "//src/v/cluster",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/container:lw_shared_container",
         "//src/v/debug_bundle",
         "//src/v/debug_bundle:error",
@@ -227,13 +310,18 @@ redpanda_cc_library(
         "//src/v/features:enterprise_features",
         "//src/v/finjector",
         "//src/v/json",
+        "//src/v/kafka/client:config_utils",
+        "//src/v/kafka/client:configuration",
+        "//src/v/kafka/data:partition_proxy",
         "//src/v/kafka/server",
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/net",
-        "//src/v/pandaproxy",
-        "//src/v/pandaproxy:config",
+        "//src/v/pandaproxy/rest:server",
+        "//src/v/pandaproxy/schema_registry:config",
+        "//src/v/pandaproxy/schema_registry:server",
         "//src/v/raft",
+        "//src/v/redpanda/admin/services:broker",
         "//src/v/reflection:type_traits",
         "//src/v/resource_mgmt:cpu_profiler",
         "//src/v/resource_mgmt:memory_sampling",
@@ -243,6 +331,7 @@ redpanda_cc_library(
         "//src/v/security/audit",
         "//src/v/security/audit:types",
         "//src/v/serde",
+        "//src/v/serde/protobuf:rpc",
         "//src/v/ssx:async_algorithm",
         "//src/v/ssx:sformat",
         "//src/v/storage",

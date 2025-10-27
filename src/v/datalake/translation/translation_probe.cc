@@ -32,7 +32,42 @@ translation_probe::translation_probe(model::ntp ntp)
         register_created_files_metrics();
         register_invalid_record_metric();
         register_throughput_metrics();
+        register_lag_metrics();
     }
+}
+
+void translation_probe::register_lag_metrics() {
+    namespace sm = ss::metrics;
+    std::vector<sm::label_instance> labels{
+      namespace_label(_ntp.ns()),
+      topic_label(_ntp.tp.topic()),
+      partition_label(_ntp.tp.partition()),
+    };
+    _public_metrics->add_group(
+      prometheus_sanitize::metrics_name("iceberg"),
+      {
+        sm::make_gauge(
+          "pending_translation_lag",
+          _translation_offset_lag,
+          sm::description(
+            "Total number of offsets that are pending translation to iceberg."),
+          labels)
+          .aggregate({
+            sm::shard_label,
+            partition_label,
+          }),
+        sm::make_gauge(
+          "pending_commit_lag",
+          _commit_offset_lag,
+          sm::description(
+            "Total number of offsets that are pending commit to iceberg "
+            "catalog."),
+          labels)
+          .aggregate({
+            sm::shard_label,
+            partition_label,
+          }),
+      });
 }
 
 void translation_probe::register_created_files_metrics() {
@@ -68,8 +103,9 @@ void translation_probe::register_created_files_metrics() {
         sm::make_counter(
           "parquet_rows_added",
           _parquet_rows_added,
-          sm::description("Number of rows in created parquet files (not "
-                          "counting the DLQ table)"),
+          sm::description(
+            "Number of rows in created parquet files (not "
+            "counting the DLQ table)"),
           labels)
           .aggregate({
             sm::shard_label,
@@ -78,8 +114,9 @@ void translation_probe::register_created_files_metrics() {
         sm::make_counter(
           "parquet_bytes_added",
           _parquet_bytes_added,
-          sm::description("Number of bytes in created parquet files (not "
-                          "counting the DLQ table)"),
+          sm::description(
+            "Number of bytes in created parquet files (not "
+            "counting the DLQ table)"),
           labels)
           .aggregate({
             sm::shard_label,

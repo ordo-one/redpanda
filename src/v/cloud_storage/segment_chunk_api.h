@@ -10,16 +10,15 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "cloud_storage/segment_chunk.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/metadata.h"
 #include "random/simple_time_jitter.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace cloud_storage {
 
@@ -139,7 +138,7 @@ private:
 
     uint64_t _max_hydrated_chunks;
     ss::condition_variable _bg_cvar;
-    fragmented_vector<ss::future<segment_chunk::handle_t>> _prefetches;
+    chunked_vector<ss::future<segment_chunk::handle_t>> _prefetches;
 };
 
 class chunk_eviction_strategy {

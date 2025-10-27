@@ -9,17 +9,20 @@
 
 #include "redpanda/application.h"
 
+#include "absl/log/globals.h"
 #include "base/vlog.h"
 #include "cli_parser.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_io/remote.h"
-#include "cloud_storage/cache_service.h"
 #include "cloud_storage/configuration.h"
 #include "cloud_storage/inventory/inv_ops.h"
 #include "cloud_storage/inventory/types.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage_clients/client_pool.h"
 #include "cloud_storage_clients/configuration.h"
-#include "cloud_topics/dl_stm/dl_stm_factory.h"
+#include "cloud_topics/level_one/metastore/service.h"
+#include "cloud_topics/level_one/metastore/simple_stm.h"
+#include "cloud_topics/level_zero/stm/ctp_stm_factory.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/archiver_manager.h"
 #include "cluster/archival/ntp_archiver_service.h"
@@ -78,13 +81,18 @@
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/tx_topic_manager.h"
 #include "cluster/types.h"
+#include "cluster/utils/partition_change_notifier_impl.h"
+#include "cluster_link/rpc_service.h"
+#include "cluster_link/service.h"
 #include "compression/async_stream_zstd.h"
 #include "compression/lz4_decompression_buffers.h"
 #include "compression/stream_zstd.h"
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
 #include "config/node_config.h"
+#include "config/property.h"
 #include "config/seed_server.h"
+#include "config/tls_config.h"
 #include "config/types.h"
 #include "crash_tracker/signals.h"
 #include "crypto/ossl_context_service.h"
@@ -95,6 +103,7 @@
 #include "datalake/coordinator/service.h"
 #include "datalake/coordinator/state_machine.h"
 #include "datalake/datalake_manager.h"
+#include "datalake/datalake_usage_aggregator.h"
 #include "datalake/translation/state_machine.h"
 #include "debug_bundle/debug_bundle_service.h"
 #include "features/feature_table_snapshot.h"
@@ -104,6 +113,7 @@
 #include "kafka/server/consumer_group_lag_metrics_frontend.h"
 #include "kafka/server/consumer_group_lag_metrics_service.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
+#include "kafka/server/data_migration_group_proxy_impl.h"
 #include "kafka/server/group_manager.h"
 #include "kafka/server/group_router.h"
 #include "kafka/server/group_tx_tracker_stm.h"
@@ -112,9 +122,11 @@
 #include "kafka/server/rm_group_frontend.h"
 #include "kafka/server/snc_quota_manager.h"
 #include "kafka/server/usage_manager.h"
+#include "kafka/server/write_at_offset_stm.h"
 #include "metrics/prometheus_sanitize.h"
 #include "migrations/migrators.h"
 #include "migrations/rbac_migrator.h"
+#include "migrations/topic_id_migrator.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "net/dns.h"
@@ -126,8 +138,16 @@
 #include "raft/coordinated_recovery_throttle.h"
 #include "raft/group_manager.h"
 #include "raft/service.h"
+#include "redpanda/admin/kafka_connections_service.h"
+#include "redpanda/admin/proxy/client.h"
+#include "redpanda/admin/proxy/service.h"
 #include "redpanda/admin/server.h"
-#include "resource_mgmt/io_priority.h"
+#include "redpanda/admin/services/cluster.h"
+#include "redpanda/admin/services/datalake/datalake.h"
+#include "redpanda/admin/services/internal/breakglass.h"
+#include "redpanda/admin/services/internal/debug.h"
+#include "redpanda/admin/services/internal/metastore.h"
+#include "redpanda/admin/services/shadow_link/shadow_link.h"
 #include "resource_mgmt/memory_groups.h"
 #include "resource_mgmt/memory_sampling.h"
 #include "resource_mgmt/scheduling_groups_probe.h"
@@ -135,6 +155,7 @@
 #include "rpc/rpc_utils.h"
 #include "security/audit/audit_log_manager.h"
 #include "ssx/abort_source.h"
+#include "ssx/sharded_service_container.h"
 #include "ssx/thread_worker.h"
 #include "storage/backlog_controller.h"
 #include "storage/chunk_cache.h"
@@ -169,8 +190,8 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
-#include <absl/log/globals.h>
 #include <fmt/format.h>
+
 #if __has_include(<google/protobuf/runtime_version.h>)
 #include <google/protobuf/runtime_version.h>
 #endif
@@ -273,35 +294,36 @@ static void set_auditing_kafka_client_defaults(
 }
 
 application::application(ss::sstring logger_name)
-  : _log(std::move(logger_name)) {};
+  : ssx::sharded_service_container(logger_name) {}
 
-application::~application() {
-    while (!_deferred.empty()) {
-        _deferred.pop_back();
-    }
-}
+application::~application() {}
 
 void application::shutdown() {
     storage.invoke_on_all(&storage::api::stop_cluster_uuid_waiters).get();
     // Stop accepting new requests.
     if (_kafka_server.ref().local_is_initialized()) {
-        _kafka_server.shutdown_input().get();
+        shutdown_with_watchdog(_kafka_server, [](auto& kafka_server) {
+            return kafka_server.shutdown_input();
+        });
     }
     if (_rpc.local_is_initialized()) {
-        _rpc.invoke_on_all(&rpc::rpc_server::shutdown_input).get();
+        shutdown_with_watchdog(_rpc, [](auto& rpc_server) {
+            return rpc_server.invoke_on_all(&rpc::rpc_server::shutdown_input);
+        });
     }
     // Stop routing upload requests, as each may take a while to finish.
     if (offsets_upload_router.local_is_initialized()) {
-        offsets_upload_router
-          .invoke_on_all(
-            &cluster::cloud_metadata::offsets_upload_router::request_stop)
-          .get();
+        shutdown_with_watchdog(
+          offsets_upload_router, [](auto& offsets_upload_router) {
+              return offsets_upload_router.invoke_on_all(
+                &cluster::cloud_metadata::offsets_upload_router::request_stop);
+          });
     }
     if (offsets_uploader.local_is_initialized()) {
-        offsets_uploader
-          .invoke_on_all(
-            &cluster::cloud_metadata::offsets_uploader::request_stop)
-          .get();
+        shutdown_with_watchdog(offsets_uploader, [](auto& offsets_uploader) {
+            return offsets_uploader.invoke_on_all(
+              &cluster::cloud_metadata::offsets_uploader::request_stop);
+        });
     }
 
     // We schedule shutting down controller input and aborting its operation as
@@ -309,41 +331,48 @@ void application::shutdown() {
     // operations before shutting down the RPC server, preventing it from
     // waiting on background dispatch gate `close` call.
     if (controller) {
-        controller->shutdown_input().get();
+        shutdown_with_watchdog(controller, [](auto& controller) {
+            return controller->shutdown_input();
+        });
     }
 
-    ss::do_for_each(
-      _migrators,
-      [](std::unique_ptr<features::feature_migrator>& fm) {
-          return fm->stop();
-      })
-      .get();
+    shutdown_with_watchdog(_migrators, [](auto& migrators) {
+        return ss::do_for_each(
+          migrators, [](std::unique_ptr<features::feature_migrator>& fm) {
+              return fm->stop();
+          });
+    });
 
     // Stop processing heartbeats before stopping the partition manager (and
     // the underlying Raft consensus instances). Otherwise we'd process
     // heartbeats for consensus objects that no longer exist.
     if (raft_group_manager.local_is_initialized()) {
-        raft_group_manager.invoke_on_all(&raft::group_manager::stop_heartbeats)
-          .get();
+        shutdown_with_watchdog(raft_group_manager, [](auto& mgr) {
+            return mgr.invoke_on_all(&raft::group_manager::stop_heartbeats);
+        });
     }
 
     if (topic_recovery_service.local_is_initialized()) {
-        topic_recovery_service
-          .invoke_on_all(
-            &cloud_storage::topic_recovery_service::shutdown_recovery)
-          .get();
+        shutdown_with_watchdog(
+          topic_recovery_service, [](auto& topic_recovery_service) {
+              return topic_recovery_service.invoke_on_all(
+                &cloud_storage::topic_recovery_service::shutdown_recovery);
+          });
     }
 
     // Stop any I/O to object store: this will cause any readers in flight
     // to abort and enables partition shutdown to proceed reliably.
     if (cloud_storage_clients.local_is_initialized()) {
-        cloud_storage_clients
-          .invoke_on_all(
-            &cloud_storage_clients::client_pool::shutdown_connections)
-          .get();
+        shutdown_with_watchdog(
+          cloud_storage_clients, [](auto& cloud_storage_clients) {
+              return cloud_storage_clients.invoke_on_all(
+                &cloud_storage_clients::client_pool::shutdown_connections);
+          });
     }
     if (cloud_io.local_is_initialized()) {
-        cloud_io.invoke_on_all(&cloud_io::remote::request_stop).get();
+        shutdown_with_watchdog(cloud_io, [](auto& cloud_io) {
+            return cloud_io.invoke_on_all(&cloud_io::remote::request_stop);
+        });
     }
     /**
      * Shutdown the datalake services before stopping all the partitions.
@@ -352,42 +381,61 @@ void application::shutdown() {
      * possible.
      */
     if (_datalake_coordinator_mgr.local_is_initialized()) {
-        _datalake_coordinator_mgr
-          .invoke_on_all(&datalake::coordinator::coordinator_manager::shutdown)
-          .get();
+        shutdown_with_watchdog(_datalake_coordinator_mgr, [](auto& mgr) {
+            return mgr.invoke_on_all(
+              &datalake::coordinator::coordinator_manager::shutdown);
+        });
     }
     if (_datalake_manager.local_is_initialized()) {
-        _datalake_manager.invoke_on_all(&datalake::datalake_manager::shutdown)
-          .get();
+        shutdown_with_watchdog(_datalake_manager, [](auto& mgr) {
+            return mgr.invoke_on_all(&datalake::datalake_manager::shutdown);
+        });
     }
-
+    if (_datalake_credential_mgr.local_is_initialized()) {
+        shutdown_with_watchdog(_datalake_credential_mgr, [](auto& mgr) {
+            return mgr.invoke_on_all(&datalake::credential_manager::stop);
+        });
+    }
+    if (cloud_topics_app) {
+        shutdown_with_watchdog(
+          cloud_topics_app, [](auto& app) { return app->stop(); });
+    }
     // Stop all partitions before destructing the subsystems (transaction
     // coordinator, etc). This interrupts ongoing replication requests,
     // allowing higher level state machines to shutdown cleanly.
     if (partition_manager.local_is_initialized()) {
-        partition_manager
-          .invoke_on_all(&cluster::partition_manager::stop_partitions)
-          .get();
+        shutdown_with_watchdog(partition_manager, [](auto& partition_manager) {
+            return partition_manager.invoke_on_all(
+              &cluster::partition_manager::stop_partitions);
+        });
     }
 
     // Wait for all requests to finish before destructing services that may be
     // used by pending requests.
     if (_kafka_server.ref().local_is_initialized()) {
-        _kafka_server.wait_for_shutdown().get();
-        _kafka_server.stop().get();
+        shutdown_with_watchdog(_kafka_server, [](auto& kafka_server) {
+            return kafka_server.wait_for_shutdown();
+        });
+        shutdown_with_watchdog(_kafka_server, [](auto& kafka_server) {
+            return kafka_server.stop();
+        });
     }
     if (_kafka_conn_quotas.local_is_initialized()) {
-        _kafka_conn_quotas.stop().get();
+        shutdown_with_watchdog(_kafka_conn_quotas, [](auto& conn_quotas) {
+            return conn_quotas.stop();
+        });
     }
     if (_rpc.local_is_initialized()) {
-        _rpc.invoke_on_all(&rpc::rpc_server::wait_for_shutdown).get();
-        _rpc.stop().get();
+        shutdown_with_watchdog(_rpc, [](auto& rpc_server) {
+            return rpc_server.invoke_on_all(
+              &rpc::rpc_server::wait_for_shutdown);
+        });
+        shutdown_with_watchdog(_rpc, [](auto& rpc_server) {
+            return rpc_server.invoke_on_all(&rpc::rpc_server::stop);
+        });
     }
 
-    // Shut down services in reverse order to which they were registered.
-    while (!_deferred.empty()) {
-        _deferred.pop_back();
-    }
+    ssx::sharded_service_container::shutdown();
 }
 
 static void log_system_resources(
@@ -454,7 +502,7 @@ int application::run(int ac, char** av) {
       "node-id-overrides",
       po::value<std::vector<config::node_id_override>>()->multitoken(),
       "Override node UUID and ID iff current UUID matches "
-      "- usage: <current UUID>:<new UUID>:<new ID>");
+      "- usage: <current UUID>:<new UUID>:<new ID>[/ignore_existing_node_id]?");
 
     // Validate command line args using options registered by the app and
     // seastar. Keep the resulting variables in a temporary map so they don't
@@ -741,8 +789,9 @@ void application::setup_public_metrics() {
                      return static_cast<unsigned int>(
                        config::node().fips_mode());
                  },
-                 sm::description("Identifies whether or not Redpanda is "
-                                 "running in FIPS mode."))
+                 sm::description(
+                   "Identifies whether or not Redpanda is "
+                   "running in FIPS mode."))
                  .aggregate({sm::shard_label})});
         })
       .get();
@@ -973,7 +1022,7 @@ void application::check_environment() {
     storage::directories::initialize(
       config::node().data_directory().as_sstring())
       .get();
-    cloud_storage::cache::initialize(config::node().cloud_storage_cache_path())
+    cloud_io::cache::initialize(config::node().cloud_storage_cache_path())
       .get();
 
     if (config::shard_local_cfg().storage_strict_data_init()) {
@@ -984,20 +1033,22 @@ void application::check_environment() {
         auto file_exists = ss::file_exists(strict_data_dir_file).get();
 
         if (!file_exists) {
-            throw std::invalid_argument(ssx::sformat(
-              "Data directory not in expected state: {} not found, is the "
-              "expected filesystem mounted?",
-              strict_data_dir_file));
+            throw std::invalid_argument(
+              ssx::sformat(
+                "Data directory not in expected state: {} not found, is the "
+                "expected filesystem mounted?",
+                strict_data_dir_file));
         }
     }
 
     if (config::fips_mode_enabled(config::node().fips_mode())) {
         if (!ss::file_exists(fips_enabled_file).get()) {
             if (config::node().fips_mode() == config::fips_mode_flag::enabled) {
-                throw std::runtime_error(fmt::format(
-                  "File '{}' does not exist.  Redpanda cannot start in FIPS "
-                  "mode",
-                  fips_enabled_file));
+                throw std::runtime_error(
+                  fmt::format(
+                    "File '{}' does not exist.  Redpanda cannot start in FIPS "
+                    "mode",
+                    fips_enabled_file));
             } else if (
               config::node().fips_mode()
               == config::fips_mode_flag::permissive) {
@@ -1072,7 +1123,7 @@ admin_server_cfg_from_global_cfg(scheduling_groups& sgs) {
       .sg = sgs.admin_sg()};
 }
 
-void application::configure_admin_server() {
+void application::configure_admin_server(model::node_id node_id) {
     if (config::node().admin().empty()) {
         return;
     }
@@ -1104,7 +1155,41 @@ void application::configure_admin_server() {
       std::ref(_tx_manager_migrator),
       std::ref(_kafka_server.ref()),
       std::ref(tx_gateway_frontend),
-      std::ref(_debug_bundle_service))
+      std::ref(_debug_bundle_service),
+      std::ref(_kafka_connections_service))
+      .get();
+    _admin
+      .invoke_on_all([this, node_id](admin_server& s) {
+          auto create_client = [node_id, this]() {
+              return admin::proxy::client(node_id, &_connection_cache, [this] {
+                  return controller->get_members_table().local().node_ids();
+              });
+          };
+          // Add RPC services
+          s.add_service(
+            std::make_unique<admin::shadow_link_service_impl>(
+              create_client(), &_cluster_link_service, &metadata_cache));
+          s.add_service(
+            std::make_unique<admin::debug_service_impl>(
+              create_client(), stress_fiber_manager));
+          s.add_service(
+            std::make_unique<admin::datalake_service_impl>(
+              create_client(), &_datalake_coordinator_fe));
+          s.add_service(
+            std::make_unique<admin::cluster_service_impl>(
+              create_client(),
+              std::ref(_kafka_connections_service),
+              controller->get_feature_table()));
+          s.add_service(
+            std::make_unique<admin::internal::breakglass_service_impl>(
+              controller.get()));
+          if (cloud_topics_app) {
+              s.add_service(
+                std::make_unique<admin::metastore_service_impl>(
+                  cloud_topics_app->get_sharded_replicated_metastore(),
+                  &controller->get_topics_state()));
+          }
+      })
       .get();
 }
 
@@ -1151,7 +1236,6 @@ static storage::log_config manager_config_from_global_config(
       config::shard_local_cfg().max_compacted_log_segment_size.bind(),
       storage::jitter_percents(
         config::shard_local_cfg().log_segment_size_jitter_percent()),
-      priority_manager::local().compaction_priority(),
       config::shard_local_cfg().retention_bytes.bind(),
       config::shard_local_cfg().log_compaction_interval_ms.bind(),
       config::shard_local_cfg().log_retention_ms.bind(),
@@ -1169,26 +1253,26 @@ static storage::log_config manager_config_from_global_config(
       std::move(sanitizer_config));
 }
 
-static storage::backlog_controller_config compaction_controller_config(
-  ss::scheduling_group sg, const ss::io_priority_class& iopc) {
-    auto space_info = std::filesystem::space(
-      config::node().data_directory().path);
-    /**
-     * By default we set desired compaction backlog size to 10% of disk
-     * capacity.
-     */
-    static const int64_t backlog_capacity_percents = 10;
-    int64_t backlog_size
-      = config::shard_local_cfg().compaction_ctrl_backlog_size().value_or(
-        (space_info.capacity / 100) * backlog_capacity_percents
-        / ss::smp::count);
+static storage::backlog_controller_config
+compaction_controller_config(ss::scheduling_group sg, uint64_t fs_avail) {
+    auto backlog_size_function = [fs_avail] {
+        /**
+         * By default we set desired compaction backlog size to 10% of disk
+         * availability.
+         */
+        static const int64_t backlog_avail_percents = 10;
+        return config::shard_local_cfg()
+          .compaction_ctrl_backlog_size()
+          .value_or((fs_avail / 100) * backlog_avail_percents / ss::smp::count);
+    };
 
     /**
-     * We normalize internals using disk capacity to make controller settings
-     * independent from disk space. After normalization all values equal to disk
-     * capacity will be represented in the controller with value equal 1000.
+     * We normalize internals using disk availability to make controller
+     * settings independent from disk space. After normalization all values
+     * equal to disk availability will be represented in the controller with
+     * value equal 1000.
      *
-     * Set point = 10% of disk capacity will always be equal to 100.
+     * Set point = 10% of disk availability will always be equal to 100.
      *
      * This way we can calculate proportional coefficient.
      *
@@ -1199,24 +1283,23 @@ static storage::backlog_controller_config compaction_controller_config(
      *  k_p = 1000 / 80 = 12.5
      *
      */
-    auto normalization = space_info.capacity / (1000 * ss::smp::count);
+    auto normalization = fs_avail / (1000 * ss::smp::count);
 
     return storage::backlog_controller_config(
-      config::shard_local_cfg().compaction_ctrl_p_coeff(),
-      config::shard_local_cfg().compaction_ctrl_i_coeff(),
-      config::shard_local_cfg().compaction_ctrl_d_coeff(),
+      config::shard_local_cfg().compaction_ctrl_p_coeff.bind(),
+      config::shard_local_cfg().compaction_ctrl_i_coeff.bind(),
+      config::shard_local_cfg().compaction_ctrl_d_coeff.bind(),
       normalization,
-      backlog_size,
+      std::move(backlog_size_function),
       200,
-      config::shard_local_cfg().compaction_ctrl_update_interval_ms(),
+      config::shard_local_cfg().compaction_ctrl_update_interval_ms.bind(),
       sg,
-      iopc,
-      config::shard_local_cfg().compaction_ctrl_min_shares(),
-      config::shard_local_cfg().compaction_ctrl_max_shares());
+      config::shard_local_cfg().compaction_ctrl_min_shares.bind(),
+      config::shard_local_cfg().compaction_ctrl_max_shares.bind());
 }
 
 static storage::backlog_controller_config
-make_upload_controller_config(ss::scheduling_group sg) {
+make_upload_controller_config(ss::scheduling_group sg, uint64_t fs_avail) {
     // This settings are similar to compaction_controller_config.
     // The desired setpoint for archival is set to 0 since the goal is to upload
     // all data that we have.
@@ -1228,24 +1311,21 @@ make_upload_controller_config(ss::scheduling_group sg) {
     // once integral part will rump up high enough it won't be able to go down
     // even if everything is uploaded.
 
-    auto available
-      = ss::fs_avail(config::node().data_directory().path.string()).get();
-    int64_t setpoint = 0;
-    int64_t normalization = static_cast<int64_t>(available)
+    auto setpoint_function = []() { return 0; };
+    int64_t normalization = static_cast<int64_t>(fs_avail)
                             / (1000 * ss::smp::count);
     return {
-      config::shard_local_cfg().cloud_storage_upload_ctrl_p_coeff(),
-      0,
-      config::shard_local_cfg().cloud_storage_upload_ctrl_d_coeff(),
+      config::shard_local_cfg().cloud_storage_upload_ctrl_p_coeff.bind(),
+      config::mock_binding(0.0),
+      config::shard_local_cfg().cloud_storage_upload_ctrl_d_coeff.bind(),
       normalization,
-      setpoint,
-      static_cast<int>(
-        priority_manager::local().archival_priority().get_shares()),
-      config::shard_local_cfg().cloud_storage_upload_ctrl_update_interval_ms(),
+      std::move(setpoint_function),
+      static_cast<int>(sg.get_shares()),
+      config::shard_local_cfg()
+        .cloud_storage_upload_ctrl_update_interval_ms.bind(),
       sg,
-      priority_manager::local().archival_priority(),
-      config::shard_local_cfg().cloud_storage_upload_ctrl_min_shares(),
-      config::shard_local_cfg().cloud_storage_upload_ctrl_max_shares()};
+      config::shard_local_cfg().cloud_storage_upload_ctrl_min_shares.bind(),
+      config::shard_local_cfg().cloud_storage_upload_ctrl_max_shares.bind()};
 }
 
 // add additional services in here
@@ -1274,6 +1354,7 @@ void application::wire_up_runtime_services(
           memory_groups().kafka_total_memory(),
           *_schema_reg_client_config,
           *_schema_reg_config,
+          &metadata_cache,
           std::reference_wrapper(controller),
           std::ref(audit_mgr));
     }
@@ -1288,7 +1369,7 @@ void application::wire_up_runtime_services(
         construct_service(
           _transform_rpc_service,
           ss::sharded_parameter([this] {
-              return transform::rpc::topic_metadata_cache::make_default(
+              return kafka::data::rpc::topic_metadata_cache::make_default(
                 &metadata_cache);
           }),
           ss::sharded_parameter([this] {
@@ -1305,16 +1386,12 @@ void application::wire_up_runtime_services(
           _transform_rpc_client,
           node_id,
           ss::sharded_parameter([this] {
-              return transform::rpc::partition_leader_cache::make_default(
+              return kafka::data::rpc::partition_leader_cache::make_default(
                 &controller->get_partition_leaders());
           }),
           ss::sharded_parameter([this] {
-              return transform::rpc::topic_metadata_cache::make_default(
+              return kafka::data::rpc::topic_metadata_cache::make_default(
                 &metadata_cache);
-          }),
-          ss::sharded_parameter([this] {
-              return transform::rpc::topic_creator::make_default(
-                controller.get());
           }),
           ss::sharded_parameter([this] {
               return transform::rpc::cluster_members_cache::make_default(
@@ -1322,6 +1399,8 @@ void application::wire_up_runtime_services(
           }),
           &_connection_cache,
           &_transform_rpc_service,
+          &_kafka_data_rpc_client,
+          &controller->get_feature_table(),
           ss::sharded_parameter([] {
               return config::shard_local_cfg()
                 .data_transforms_binary_max_size.bind();
@@ -1351,6 +1430,12 @@ void application::wire_up_runtime_services(
         // Construct datalake subsystems, now that dependencies are
         // already constructed.
         syschecks::systemd_message("Starting datalake services").get();
+
+        // Start credential manager first to provide shared credentials
+        construct_service(_datalake_credential_mgr).get();
+        _datalake_credential_mgr
+          .invoke_on_all(&datalake::credential_manager::start)
+          .get();
         construct_service(
           _datalake_coordinator_mgr,
           node_id,
@@ -1361,17 +1446,21 @@ void application::wire_up_runtime_services(
           std::ref(controller->get_topics_frontend()),
           _schema_registry.get(),
           ss::sharded_parameter(
-            [bucket](cloud_io::remote& remote)
+            [bucket](
+              cloud_io::remote& remote, datalake::credential_manager& cred_mgr)
               -> std::unique_ptr<datalake::coordinator::catalog_factory> {
                 return datalake::coordinator::get_catalog_factory(
                   config::shard_local_cfg(),
                   remote,
                   *bucket,
-                  ss::metrics::label_instance{"role", "coordinator"});
+                  ss::metrics::label_instance{"role", "coordinator"},
+                  cred_mgr);
             },
-            std::ref(cloud_io)),
+            std::ref(cloud_io),
+            std::ref(_datalake_credential_mgr)),
           std::ref(cloud_io),
-          std::ref(*bucket))
+          std::ref(*bucket),
+          ss::sharded_parameter([this] { return &feature_table.local(); }))
           .get();
         construct_service(
           _datalake_coordinator_fe,
@@ -1389,25 +1478,30 @@ void application::wire_up_runtime_services(
         construct_service(
           _datalake_manager,
           node_id,
-          &raft_group_manager,
+          ss::sharded_parameter([this] {
+              return cluster::partition_change_notifier_impl::make_default(
+                raft_group_manager,
+                partition_manager,
+                controller->get_topics_state());
+          }),
           &partition_manager,
           &controller->get_topics_state(),
-          &controller->get_topics_frontend(),
-          &controller->get_partition_leaders(),
-          &controller->get_shard_table(),
           &feature_table,
           &_datalake_coordinator_fe,
           &cloud_io,
           ss::sharded_parameter(
-            [bucket](cloud_io::remote& remote)
+            [bucket](
+              cloud_io::remote& remote, datalake::credential_manager& cred_mgr)
               -> std::unique_ptr<datalake::coordinator::catalog_factory> {
                 return datalake::coordinator::get_catalog_factory(
                   config::shard_local_cfg(),
                   remote,
                   *bucket,
-                  ss::metrics::label_instance{"role", "translator"});
+                  ss::metrics::label_instance{"role", "translator"},
+                  cred_mgr);
             },
-            std::ref(cloud_io)),
+            std::ref(cloud_io),
+            std::ref(_datalake_credential_mgr)),
           _schema_registry.get(),
           &_as,
           *bucket,
@@ -1423,12 +1517,13 @@ void application::wire_up_runtime_services(
         construct_service(
           datalake_throttle_manager,
           [&mgr = _datalake_manager] {
-              return ssx::now(kafka::datalake_throttle_manager::status{
-                .max_shares_assigned = mgr.local().max_shares_assigned(),
-                .total_translation_backlog
-                = mgr.local().total_translation_backlog(),
+              return ssx::now(
+                kafka::datalake_throttle_manager::status{
+                  .max_shares_assigned = mgr.local().max_shares_assigned(),
+                  .total_translation_backlog
+                  = mgr.local().total_translation_backlog(),
 
-              });
+                });
           },
           std::ref(storage_node),
           ss::sharded_parameter([] {
@@ -1448,13 +1543,55 @@ void application::wire_up_runtime_services(
           .invoke_on_all(&kafka::datalake_throttle_manager::start)
           .get();
     }
+
+    construct_service(
+      _cluster_link_service,
+      node_id,
+      ss::sharded_parameter([]() {
+          return config::shard_local_cfg().enable_shadow_linking.bind();
+      }),
+      &controller->get_cluster_link_frontend(),
+      ss::sharded_parameter([this] {
+          return cluster::partition_change_notifier_impl::make_default(
+            raft_group_manager,
+            partition_manager,
+            controller->get_topics_state());
+      }),
+      &partition_manager,
+      &controller->get_partition_leaders(),
+      &controller->get_shard_table(),
+      &metadata_cache,
+      &_connection_cache,
+      controller.get(),
+      &group_router,
+      &snc_quota_mgr,
+      &controller->get_health_monitor(),
+      &controller->get_security_frontend(),
+      &_kafka_data_rpc_client,
+      smp_service_groups.cluster_link_smp_sg(),
+      sched_groups.cluster_linking_sg())
+      .get();
+
+    syschecks::systemd_message("Creating kafka usage manager frontend").get();
+    construct_service(
+      usage_manager,
+      controller.get(),
+      std::ref(controller->get_health_monitor()),
+      std::ref(storage),
+      ss::sharded_parameter(
+        [this] { return make_datalake_usage_aggregator(); }))
+      .get();
+
     construct_single_service(_monitor_unsafe, std::ref(feature_table));
 
     construct_service(_debug_bundle_service, &storage.local().kvs()).get();
 
     construct_single_service(_host_metrics_watcher, std::ref(_log));
 
-    configure_admin_server();
+    construct_service(_kafka_connections_service, std::ref(_kafka_server.ref()))
+      .get();
+
+    configure_admin_server(node_id);
 }
 
 void application::wire_up_redpanda_services(
@@ -1533,15 +1670,9 @@ void application::wire_up_redpanda_services(
                   .bind(),
             };
         },
-        [] {
-            return raft::recovery_memory_quota::configuration{
-              .max_recovery_memory
-              = config::shard_local_cfg().raft_max_recovery_memory.bind(),
-              .default_read_buffer_size
-              = config::shard_local_cfg()
-                  .raft_recovery_default_read_size.bind(),
-            };
-        },
+        ss::sharded_parameter([] {
+            return config::shard_local_cfg().raft_max_recovery_memory.bind();
+        }),
         std::ref(_connection_cache),
         std::ref(storage),
         std::ref(recovery_throttle),
@@ -1603,7 +1734,8 @@ void application::wire_up_redpanda_services(
             [&cloud_configs] { return cloud_configs.local().client_config; }),
           ss::sharded_parameter([&cloud_configs] {
               return cloud_configs.local().cloud_credentials_source;
-          }))
+          }),
+          ss::sharded_parameter([this] { return sched_groups.ts_read_sg(); }))
           .get();
         cloud_io.invoke_on_all(&cloud_io::remote::start).get();
         bucket_name = cloud_configs.local().bucket_name;
@@ -1662,6 +1794,20 @@ void application::wire_up_redpanda_services(
     producer_manager.invoke_on_all(&cluster::tx::producer_state_manager::start)
       .get();
 
+    if (config::shard_local_cfg().cloud_topics_enabled()) {
+        vassert(
+          archival_storage_enabled(),
+          "cloud topics currently requires archival storage to be enabled");
+        syschecks::systemd_message("Initializing cloud topics subsystems")
+          .get();
+
+        // Initialize the cloud topics app to be able to pass it around to the
+        // partition manager.
+        // NOTE: this only instantiates the app; underlying services are
+        // constructed separately once more of the subsystems are available.
+        cloud_topics_app = std::make_unique<cloud_topics::app>(
+          fmt::format("{}/cloud_topics", _log.name()));
+    }
     syschecks::systemd_message("Adding partition manager").get();
     construct_service(
       partition_manager,
@@ -1672,12 +1818,11 @@ void application::wire_up_redpanda_services(
       std::ref(shadow_index_cache),
       ss::sharded_parameter(
         [sg = sched_groups.archival_upload(),
-         p = archival_priority(),
          enabled = archival_storage_enabled()]()
           -> ss::lw_shared_ptr<archival::configuration> {
             if (enabled) {
                 return ss::make_lw_shared<archival::configuration>(
-                  archival::get_archival_service_config(sg, p));
+                  archival::get_archival_service_config(sg));
             } else {
                 return nullptr;
             }
@@ -1687,7 +1832,8 @@ void application::wire_up_redpanda_services(
       ss::sharded_parameter([] {
           return config::shard_local_cfg()
             .partition_manager_shutdown_watchdog_timeout.bind();
-      }))
+      }),
+      cloud_topics_app ? cloud_topics_app->get_state() : nullptr)
       .get();
     vlog(_log.info, "Partition manager started");
     construct_service(
@@ -1714,7 +1860,8 @@ void application::wire_up_redpanda_services(
       std::ref(cloud_storage_api),
       std::ref(shadow_index_cache),
       std::ref(node_status_table),
-      std::ref(metadata_cache));
+      std::ref(metadata_cache),
+      sched_groups.cluster_sg());
     controller->wire_up().get();
 
     if (config::node().recovery_mode_enabled()) {
@@ -1792,12 +1939,11 @@ void application::wire_up_redpanda_services(
           std::ref(archival_upload_housekeeping),
           ss::sharded_parameter(
             [sg = sched_groups.archival_upload(),
-             p = archival_priority(),
              enabled = archival_storage_enabled()]()
               -> ss::lw_shared_ptr<const archival::configuration> {
                 if (enabled) {
                     return ss::make_lw_shared<const archival::configuration>(
-                      archival::get_archival_service_config(sg, p));
+                      archival::get_archival_service_config(sg));
                 } else {
                     return nullptr;
                 }
@@ -1859,13 +2005,51 @@ void application::wire_up_redpanda_services(
     construct_service(quota_mgr, std::ref(controller->get_quota_store())).get();
     construct_service(snc_quota_mgr, std::ref(snc_node_quota)).get();
 
+    // TODO(oren): separate service group for kafka data
+    construct_service(
+      _kafka_data_rpc_service,
+      ss::sharded_parameter([this] {
+          return kafka::data::rpc::topic_metadata_cache::make_default(
+            &metadata_cache);
+      }),
+      ss::sharded_parameter([this] {
+          return kafka::data::rpc::partition_manager::make_default(
+            &shard_table,
+            &partition_manager,
+            smp_service_groups.transform_smp_sg());
+      }))
+      .get();
+
+    construct_service(
+      _kafka_data_rpc_client,
+      node_id,
+      ss::sharded_parameter([this] {
+          return kafka::data::rpc::partition_leader_cache::make_default(
+            &controller->get_partition_leaders());
+      }),
+      ss::sharded_parameter([this] {
+          return kafka::data::rpc::topic_creator::make_default(
+            controller.get());
+      }),
+      ss::sharded_parameter([this] {
+          return kafka::data::rpc::topic_metadata_cache::make_default(
+            &metadata_cache);
+      }),
+      &_connection_cache,
+      &_kafka_data_rpc_service)
+      .get();
+
     syschecks::systemd_message("Creating auditing subsystem").get();
+    if (!_audit_log_client_config.has_value()) {
+        _audit_log_client_config.emplace();
+    }
     construct_service(
       audit_mgr,
       node_id,
       controller.get(),
-      std::ref(*_audit_log_client_config),
-      &metadata_cache)
+      &metadata_cache,
+      &_kafka_data_rpc_client,
+      std::ref(_audit_log_client_config.value()))
       .get();
 
     syschecks::systemd_message("Creating metadata dissemination service").get();
@@ -1881,6 +2065,8 @@ void application::wire_up_redpanda_services(
       std::ref(feature_table))
       .get();
 
+    auto fs_avail
+      = ss::fs_avail(config::node().data_directory().path.string()).get();
     if (archival_storage_enabled()) {
         syschecks::systemd_message("Starting shadow indexing cache").get();
         auto redpanda_dir = config::node().data_directory.value();
@@ -1924,14 +2110,16 @@ void application::wire_up_redpanda_services(
         });
 
         shadow_index_cache
-          .invoke_on_all(
-            [](cloud_storage::cache& cache) { return cache.start(); })
+          .invoke_on_all([](cloud_io::cache& cache) { return cache.start(); })
           .get();
 
         construct_service(
           _archival_upload_controller,
           std::ref(partition_manager),
-          make_upload_controller_config(sched_groups.archival_upload()))
+          ss::sharded_parameter(
+            [sg = sched_groups.archival_upload(), fs_avail] {
+                return make_upload_controller_config(sg, fs_avail);
+            }))
           .get();
 
         construct_service(
@@ -1967,10 +2155,11 @@ void application::wire_up_redpanda_services(
             const auto supported = cloud_storage::inventory::
               validate_backend_supported_for_inventory_scrub(backend);
             if (!manual_setup && !supported) {
-                throw std::runtime_error(fmt::format(
-                  "cloud storage backend inferred as {} which is "
-                  "not supported for inventory based scrubbing",
-                  backend));
+                throw std::runtime_error(
+                  fmt::format(
+                    "cloud storage backend inferred as {} which is "
+                    "not supported for inventory based scrubbing",
+                    backend));
             }
 
             std::shared_ptr<cluster::leaders_provider> leaders_provider
@@ -2025,16 +2214,20 @@ void application::wire_up_redpanda_services(
       &shadow_index_cache,
       &partition_manager);
 
-    if (config::shard_local_cfg().development_enable_cloud_topics()) {
-        vassert(
-          archival_storage_enabled(),
-          "cloud topics currently requires archival storage to be enabled");
-        construct_service(
-          _reconciler,
-          &partition_manager,
-          &cloud_io,
-          &shadow_index_cache,
-          bucket)
+    if (cloud_topics_app) {
+        syschecks::systemd_message("Starting cloud topics subsystems").get();
+        cloud_topics_app
+          ->construct(
+            node_id,
+            controller.get(),
+            &controller->get_partition_leaders(),
+            &controller->get_shard_table(),
+            &cloud_io,
+            &shadow_index_cache,
+            &metadata_cache,
+            &_connection_cache,
+            bucket,
+            &storage)
           .get();
     }
 
@@ -2055,8 +2248,7 @@ void application::wire_up_redpanda_services(
       std::ref(controller->get_topics_state()),
       std::ref(tx_gateway_frontend),
       std::ref(controller->get_feature_table()),
-      std::ref(_consumer_group_lag_metrics_frontend),
-      &kafka::make_consumer_offsets_serializer)
+      std::ref(controller->get_health_monitor()))
       .get();
     construct_service(
       offsets_recoverer,
@@ -2084,14 +2276,26 @@ void application::wire_up_redpanda_services(
       std::ref(metadata_cache),
       model::kafka_consumer_offsets_nt)
       .get();
+    construct_service(
+      group_initializer,
+      ref_to_local(coordinator_ntp_mapper),
+      std::ref(controller->get_topics_frontend()),
+      std::ref(controller->get_members_table()),
+      std::ref(controller->get_api()))
+      .get();
+    construct_service(
+      _data_migrations_group_proxy, ss::sharded_parameter([&]() {
+          return std::make_unique<kafka::data_migration_group_proxy_impl>(
+            coordinator_ntp_mapper.local(),
+            _group_manager.local(),
+            group_initializer.local());
+      }))
+      .get();
 
     offsets_recovery_manager
       = ss::make_shared<cluster::cloud_metadata::offsets_recovery_manager>(
-        std::ref(offsets_recovery_router),
-        std::ref(coordinator_ntp_mapper),
-        controller->get_members_table(),
-        controller->get_api(),
-        std::ref(controller->get_topics_frontend()));
+        std::ref(offsets_recovery_router), group_initializer.local());
+
     syschecks::systemd_message("Creating kafka group router").get();
     construct_service(
       group_router,
@@ -2099,7 +2303,8 @@ void application::wire_up_redpanda_services(
       smp_service_groups.kafka_smp_sg(),
       std::ref(_group_manager),
       std::ref(shard_table),
-      std::ref(coordinator_ntp_mapper))
+      std::ref(coordinator_ntp_mapper),
+      ref_to_local(group_initializer))
       .get();
 
     syschecks::systemd_message("Creating tx coordinator mapper").get();
@@ -2127,13 +2332,15 @@ void application::wire_up_redpanda_services(
 
     syschecks::systemd_message("Creating group resource manager frontend")
       .get();
+
     construct_service(
       rm_group_frontend,
       std::ref(metadata_cache),
       std::ref(_connection_cache),
       std::ref(controller->get_partition_leaders()),
       controller.get(),
-      std::ref(group_router))
+      std::ref(group_router),
+      ref_to_local(group_initializer))
       .get();
 
     _rm_group_proxy = std::make_unique<kafka::rm_group_proxy_impl>(
@@ -2152,19 +2359,10 @@ void application::wire_up_redpanda_services(
       controller.get())
       .get();
 
-    syschecks::systemd_message("Creating kafka usage manager frontend").get();
-    construct_service(
-      usage_manager,
-      controller.get(),
-      std::ref(controller->get_health_monitor()),
-      std::ref(storage))
-      .get();
-
     syschecks::systemd_message("Creating tx coordinator frontend").get();
     construct_single_service_sharded(
       tx_topic_manager,
       std::ref(*controller),
-      std::ref(feature_table),
       config::shard_local_cfg().transaction_coordinator_partitions.bind(),
       config::shard_local_cfg().transaction_coordinator_log_segment_size.bind(),
       config::shard_local_cfg()
@@ -2298,16 +2496,17 @@ void application::wire_up_redpanda_services(
 
               c.connection_rate_bindings.emplace(std::move(bindings));
 
-              c.tcp_keepalive_bindings.emplace(net::tcp_keepalive_bindings{
-                .keepalive_idle_time
-                = config::shard_local_cfg()
-                    .kafka_tcp_keepalive_idle_timeout_seconds.bind(),
-                .keepalive_interval
-                = config::shard_local_cfg()
-                    .kafka_tcp_keepalive_probe_interval_seconds.bind(),
-                .keepalive_probes
-                = config::shard_local_cfg().kafka_tcp_keepalive_probes.bind(),
-              });
+              c.tcp_keepalive_bindings.emplace(
+                net::tcp_keepalive_bindings{
+                  .keepalive_idle_time
+                  = config::shard_local_cfg()
+                      .kafka_tcp_keepalive_idle_timeout_seconds.bind(),
+                  .keepalive_interval
+                  = config::shard_local_cfg()
+                      .kafka_tcp_keepalive_probe_interval_seconds.bind(),
+                  .keepalive_probes
+                  = config::shard_local_cfg().kafka_tcp_keepalive_probes.bind(),
+                });
           });
       })
       .get();
@@ -2356,6 +2555,7 @@ void application::wire_up_redpanda_services(
         std::ref(controller->get_api()),
         std::ref(tx_gateway_frontend),
         std::ref(datalake_throttle_manager),
+        std::ref(controller->get_cluster_link_frontend()),
         qdc_config,
         std::ref(*thread_worker),
         std::ref(_schema_registry))
@@ -2363,9 +2563,9 @@ void application::wire_up_redpanda_services(
     construct_service(
       _compaction_controller,
       std::ref(storage),
-      compaction_controller_config(
-        sched_groups.compaction_sg(),
-        priority_manager::local().compaction_priority()))
+      ss::sharded_parameter([sg = sched_groups.compaction_sg(), fs_avail] {
+          return compaction_controller_config(sg, fs_avail);
+      }))
       .get();
 }
 
@@ -2390,6 +2590,18 @@ bool application::wasm_data_transforms_enabled() {
 bool application::datalake_enabled() {
     return config::shard_local_cfg().iceberg_enabled()
            && !config::node().recovery_mode_enabled();
+}
+
+ss::shared_ptr<kafka::datalake_usage_api>
+application::make_datalake_usage_aggregator() {
+    if (datalake_enabled()) {
+        return ss::make_shared<datalake::default_datalake_usage_api_impl>(
+          controller.get(),
+          &controller->get_topics_state(),
+          &_datalake_coordinator_fe);
+    }
+    return ss::make_shared<datalake::disabled_datalake_usage_api_impl>(
+      controller.get());
 }
 
 ss::future<>
@@ -2522,9 +2734,29 @@ void application::wire_up_bootstrap_services() {
                 = config::shard_local_cfg().rpc_server_tcp_recv_buf;
               c.tcp_send_buf
                 = config::shard_local_cfg().rpc_server_tcp_send_buf;
+              config::tls_config tls_config{
+                config::node().rpc_server_tls().is_enabled(),
+                config::node().rpc_server_tls().get_key_cert_files(),
+                config::node().rpc_server_tls().get_truststore_file(),
+                config::node().rpc_server_tls().get_crl_file(),
+                config::node().rpc_server_tls().get_require_client_auth(),
+                config::node()
+                  .rpc_server_tls()
+                  .get_tls_v1_2_cipher_suites()
+                  .value_or(ss::sstring{}),
+                config::node()
+                  .rpc_server_tls()
+                  .get_tls_v1_3_cipher_suites()
+                  .value_or(ss::sstring{net::tls_v1_3_cipher_suites_strict}),
+                config::node().rpc_server_tls().get_min_tls_version().value_or(
+                  config::tls_version::v1_3),
+                config::node()
+                  .rpc_server_tls()
+                  .get_enable_renegotiation()
+                  .value_or(false)};
               auto credentials
                 = net::build_reloadable_server_credentials_with_probe(
-                    config::node().rpc_server_tls(),
+                    tls_config,
                     "rpc",
                     "",
                     [this](
@@ -2632,10 +2864,11 @@ void application::start_bootstrap_services() {
         if (
           configured_node_id != std::nullopt
           && *configured_node_id != stored_node_id) {
-            throw std::invalid_argument(ssx::sformat(
-              "Configured node ID {} doesn't match stored node ID {}",
-              *configured_node_id,
-              stored_node_id));
+            throw std::invalid_argument(
+              ssx::sformat(
+                "Configured node ID {} doesn't match stored node ID {}",
+                *configured_node_id,
+                stored_node_id));
         }
         ss::smp::invoke_on_all([stored_node_id] {
             config::node().node_id.set_value(
@@ -2726,15 +2959,19 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     cluster::cluster_discovery cd(
       node_uuid, storage.local(), app_signal.abort_source());
 
-    bool ever_ran_controller = storage.local()
-                                 .kvs()
-                                 .get(
-                                   storage::kvstore::key_space::controller,
-                                   cluster::controller::invariants_key())
-                                 .has_value();
+    auto invariants_buf = storage.local().kvs().get(
+      storage::kvstore::key_space::controller,
+      cluster::controller::invariants_key());
+
+    bool ever_ran_controller = invariants_buf.has_value();
+
+    bool has_id = config::node().node_id().has_value() && ever_ran_controller;
+
+    bool force_override = _node_overrides.node_id().has_value()
+                          && _node_overrides.ignore_existing_node_id();
 
     model::node_id node_id;
-    if (config::node().node_id().has_value() && ever_ran_controller) {
+    if (has_id && !force_override) {
         vlog(
           _log.info,
           "Running with already-established node ID {}",
@@ -2743,15 +2980,31 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     } else if (auto id = _node_overrides.node_id(); id.has_value()) {
         vlog(
           _log.warn,
-          "Overriding node ID: {} -> {}",
+          "Overriding node ID: {} -> {} [ignore_existing_node_id? {}]",
           config::node().node_id(),
-          id);
+          id,
+          has_id && force_override);
         node_id = id.value();
         // null out the config'ed ID indiscriminately; it will be set outside
         // the conditional
         ss::smp::invoke_on_all([] {
             config::node().node_id.set_value(std::nullopt);
         }).get();
+        if (invariants_buf.has_value()) {
+            auto invariants
+              = reflection::from_iobuf<cluster::configuration_invariants>(
+                std::move(invariants_buf.value()));
+            invariants.node_id = node_id;
+            storage.local()
+              .kvs()
+              .put(
+                storage::kvstore::key_space::controller,
+                cluster::controller::invariants_key(),
+                reflection::to_iobuf(
+                  cluster::configuration_invariants{invariants}))
+              .get();
+            vlog(_log.debug, "Force-updated local node_id to {}", node_id);
+        }
     } else {
         auto registration_result = cd.register_with_cluster().get();
         node_id = registration_result.assigned_node_id;
@@ -2841,6 +3094,9 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
         _migrators.push_back(
           std::make_unique<features::migrators::shard_placement_migrator>(
             *controller));
+        _migrators.push_back(
+          std::make_unique<features::migrators::topic_id_migrator>(
+            *controller));
     }
 
     if (cd.is_cluster_founder().get()) {
@@ -2900,6 +3156,8 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
         _transform_service.invoke_on_all(&transform::service::start).get();
     }
 
+    _cluster_link_service.invoke_on_all(&cluster_link::service::start).get();
+
     construct_service(_aggregate_metrics_watcher).get();
 
     _admin.invoke_on_all([](admin_server& admin) { admin.set_ready(); }).get();
@@ -2917,24 +3175,21 @@ void application::start_runtime_services(
     syschecks::systemd_message("Starting the partition manager").get();
     partition_manager
       .invoke_on_all([this](cluster::partition_manager& pm) {
-          pm.register_factory<cluster::tm_stm_factory>(feature_table);
+          pm.register_factory<cluster::tm_stm_factory>();
           pm.register_factory<cluster::id_allocator_stm_factory>();
-          pm.register_factory<transform::transform_offsets_stm_factory>(
-            controller->get_topics_state());
+          pm.register_factory<transform::transform_offsets_stm_factory>();
           pm.register_factory<cluster::rm_stm_factory>(
             config::shard_local_cfg().enable_transactions.value(),
             config::shard_local_cfg().enable_idempotence.value(),
             tx_gateway_frontend,
             producer_manager,
-            feature_table,
-            controller->get_topics_state());
+            feature_table);
           pm.register_factory<cluster::log_eviction_stm_factory>(
             storage.local().kvs());
           pm.register_factory<cluster::archival_metadata_stm_factory>(
             config::shard_local_cfg().cloud_storage_enabled(),
             cloud_storage_api,
-            feature_table,
-            controller->get_topics_state());
+            feature_table);
           pm.register_factory<kafka::group_tx_tracker_stm_factory>(
             feature_table);
           pm.register_factory<cluster::partition_properties_stm_factory>(
@@ -2943,9 +3198,12 @@ void application::start_runtime_services(
           pm.register_factory<datalake::coordinator::stm_factory>();
           pm.register_factory<datalake::translation::stm_factory>(
             config::shard_local_cfg().iceberg_enabled());
-          if (config::shard_local_cfg().development_enable_cloud_topics()) {
-              pm.register_factory<experimental::cloud_topics::dl_stm_factory>();
+          if (config::shard_local_cfg().cloud_topics_enabled()) {
+              pm.register_factory<cloud_topics::l0::ctp_stm_factory>();
+              pm.register_factory<cloud_topics::l1::stm_factory>();
           }
+          pm.register_factory<kafka::write_at_offset_stm_factory>(
+            storage.local().kvs(), model::offset_translator_batch_types());
       })
       .get();
     partition_manager.invoke_on_all(&cluster::partition_manager::start).get();
@@ -2968,16 +3226,17 @@ void application::start_runtime_services(
         _rpc
           .invoke_on_all([this](rpc::rpc_server& s) {
               std::vector<std::unique_ptr<rpc::service>> runtime_services;
-              runtime_services.push_back(std::make_unique<raft::service<
-                                           cluster::partition_manager,
-                                           cluster::shard_table>>(
-                sched_groups.raft_recv_sg(),
-                smp_service_groups.raft_smp_sg(),
-                sched_groups.raft_heartbeats(),
-                partition_manager,
-                shard_table.local(),
-                config::shard_local_cfg().raft_heartbeat_interval_ms(),
-                config::node().node_id().value()));
+              runtime_services.push_back(
+                std::make_unique<raft::service<
+                  cluster::partition_manager,
+                  cluster::shard_table>>(
+                  sched_groups.raft_recv_sg(),
+                  smp_service_groups.raft_smp_sg(),
+                  sched_groups.raft_heartbeats(),
+                  partition_manager,
+                  shard_table.local(),
+                  config::shard_local_cfg().raft_heartbeat_interval_ms(),
+                  config::node().node_id().value()));
               s.add_services(std::move(runtime_services));
           })
           .get();
@@ -3007,7 +3266,8 @@ void application::start_runtime_services(
         std::move(offsets_upload_requestor),
         producer_id_recovery_manager,
         std::move(offsets_recovery_requestor),
-        redpanda_start_time)
+        redpanda_start_time,
+        _data_migrations_group_proxy)
       .get();
 
     if (archiver_manager.local_is_initialized()) {
@@ -3034,52 +3294,57 @@ void application::start_runtime_services(
               std::ref(offsets_lookup),
               std::ref(offsets_recovery_router),
               std::ref(offsets_upload_router)));
-          runtime_services.push_back(std::make_unique<cluster::id_allocator>(
-            sched_groups.raft_recv_sg(),
-            smp_service_groups.raft_smp_sg(),
-            std::ref(id_allocator_frontend)));
+          runtime_services.push_back(
+            std::make_unique<cluster::id_allocator>(
+              sched_groups.raft_recv_sg(),
+              smp_service_groups.raft_smp_sg(),
+              std::ref(id_allocator_frontend)));
           // _rm_group_proxy is wrap around a sharded service with only
           // `.local()' access so it's ok to share without foreign_ptr
-          runtime_services.push_back(std::make_unique<cluster::tx_gateway>(
-            sched_groups.raft_recv_sg(),
-            smp_service_groups.raft_smp_sg(),
-            std::ref(tx_gateway_frontend),
-            _rm_group_proxy.get(),
-            std::ref(rm_partition_frontend)));
+          runtime_services.push_back(
+            std::make_unique<cluster::tx_gateway>(
+              sched_groups.raft_recv_sg(),
+              smp_service_groups.raft_smp_sg(),
+              std::ref(tx_gateway_frontend),
+              _rm_group_proxy.get(),
+              std::ref(rm_partition_frontend)));
 
           if (!start_raft_rpc_early) {
-              runtime_services.push_back(std::make_unique<raft::service<
-                                           cluster::partition_manager,
-                                           cluster::shard_table>>(
-                sched_groups.raft_recv_sg(),
-                smp_service_groups.raft_smp_sg(),
-                sched_groups.raft_heartbeats(),
-                partition_manager,
-                shard_table.local(),
-                config::shard_local_cfg().raft_heartbeat_interval_ms(),
-                config::node().node_id().value()));
+              runtime_services.push_back(
+                std::make_unique<raft::service<
+                  cluster::partition_manager,
+                  cluster::shard_table>>(
+                  sched_groups.raft_recv_sg(),
+                  smp_service_groups.raft_smp_sg(),
+                  sched_groups.raft_heartbeats(),
+                  partition_manager,
+                  shard_table.local(),
+                  config::shard_local_cfg().raft_heartbeat_interval_ms(),
+                  config::node().node_id().value()));
           }
 
-          runtime_services.push_back(std::make_unique<cluster::service>(
-            sched_groups.cluster_sg(),
-            smp_service_groups.cluster_smp_sg(),
-            controller.get(),
-            std::ref(controller->get_topics_frontend()),
-            std::ref(controller->get_plugin_frontend()),
-            std::ref(controller->get_members_manager()),
-            std::ref(metadata_cache),
-            std::ref(controller->get_security_frontend()),
-            std::ref(controller->get_api()),
-            std::ref(controller->get_members_frontend()),
-            std::ref(controller->get_config_frontend()),
-            std::ref(controller->get_config_manager()),
-            std::ref(controller->get_feature_manager()),
-            std::ref(controller->get_feature_table()),
-            std::ref(controller->get_health_monitor()),
-            std::ref(_connection_cache),
-            std::ref(controller->get_partition_manager()),
-            std::ref(node_status_backend),
-            std::ref(controller->get_quota_frontend())));
+          runtime_services.push_back(
+            std::make_unique<cluster::service>(
+              sched_groups.cluster_sg(),
+              smp_service_groups.cluster_smp_sg(),
+              controller.get(),
+              std::ref(controller->get_topics_frontend()),
+              std::ref(controller->get_plugin_frontend()),
+              std::ref(controller->get_members_manager()),
+              std::ref(metadata_cache),
+              std::ref(controller->get_security_frontend()),
+              std::ref(controller->get_api()),
+              std::ref(controller->get_members_frontend()),
+              std::ref(controller->get_config_frontend()),
+              std::ref(controller->get_config_manager()),
+              std::ref(controller->get_feature_manager()),
+              std::ref(controller->get_feature_table()),
+              std::ref(controller->get_health_monitor()),
+              std::ref(_connection_cache),
+              std::ref(controller->get_partition_manager()),
+              std::ref(node_status_backend),
+              std::ref(controller->get_quota_frontend()),
+              std::ref(controller->get_cluster_link_frontend())));
           runtime_services.push_back(
             std::make_unique<cluster::metadata_dissemination_handler>(
               sched_groups.cluster_sg(),
@@ -3109,6 +3374,12 @@ void application::start_runtime_services(
               sched_groups.cluster_sg(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(controller->get_ephemeral_credential_frontend())));
+
+          runtime_services.push_back(
+            std::make_unique<kafka::data::rpc::network_service>(
+              sched_groups.transforms_sg(),
+              smp_service_groups.transform_smp_sg(),
+              &_kafka_data_rpc_service));
 
           if (wasm_data_transforms_enabled()) {
               runtime_services.push_back(
@@ -3141,7 +3412,8 @@ void application::start_runtime_services(
               sched_groups.cluster_sg(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(controller->get_data_migration_frontend()),
-              std::ref(controller->get_data_migration_irpc_frontend())));
+              std::ref(controller->get_data_migration_irpc_frontend()),
+              std::ref(controller->get_data_migration_router())));
           if (datalake_enabled()) {
               runtime_services.push_back(
                 std::make_unique<datalake::coordinator::rpc::service>(
@@ -3154,6 +3426,33 @@ void application::start_runtime_services(
               sched_groups.cluster_sg(),
               smp_service_groups.cluster_smp_sg(),
               std::ref(_consumer_group_lag_metrics_frontend)));
+          if (
+            config::shard_local_cfg().cloud_topics_enabled()
+            && cloud_topics_app) {
+              runtime_services.push_back(
+                std::make_unique<cloud_topics::l1::rpc::service>(
+                  sched_groups.datalake_sg(),
+                  smp_service_groups.datalake_sg(),
+                  cloud_topics_app->get_sharded_l1_metastore_fe()));
+          }
+          runtime_services.push_back(
+            std::make_unique<admin::proxy::service_impl>(
+              sched_groups.admin_sg(),
+              smp_service_groups.cluster_smp_sg(),
+              [this](serde::pb::rpc::context ctx, iobuf buf) {
+                  if (!_admin.local_is_initialized()) {
+                      throw std::runtime_error(
+                        "admin service is not initialized");
+                  }
+                  return _admin.local().handle_rpc_request(
+                    std::move(ctx), std::move(buf));
+              }));
+
+          runtime_services.push_back(
+            std::make_unique<cluster_link::rpc::service_impl>(
+              sched_groups.cluster_sg(),
+              smp_service_groups.cluster_smp_sg(),
+              _cluster_link_service));
 
           s.add_services(std::move(runtime_services));
 
@@ -3206,6 +3505,10 @@ void application::start_runtime_services(
         })
       .get();
 
+    if (cloud_topics_app) {
+        cloud_topics_app->start().get();
+    }
+
     _debug_bundle_service.invoke_on_all(&debug_bundle::service::start).get();
 
     if (!config::node().admin().empty()) {
@@ -3223,10 +3526,6 @@ void application::start_runtime_services(
     }
 
     space_manager->start().get();
-
-    if (config::shard_local_cfg().development_enable_cloud_topics()) {
-        _reconciler.invoke_on_all([](auto& app) { return app.start(); }).get();
-    }
 }
 
 /**
@@ -3303,7 +3602,7 @@ void application::load_feature_table_snapshot() {
           "Exception decoding feature table snapshot: {}",
           std::current_exception());
 #ifndef NDEBUG
-        vassert(false, "Snapshot decode failed");
+        vunreachable("Snapshot decode failed");
 #endif
         return;
     }
@@ -3316,16 +3615,9 @@ void application::load_feature_table_snapshot() {
           "indicates that all nodes in cluster were previously >= that version",
           my_version,
           snap.version);
-        // From this point, it is undefined to whether this process will be able
-        // to decode anything it sees on the network or on disk.
-        //
-        // This case will have stricter enforcement in future, to protect the
-        // user from acccidentally getting a cluster into a broken state by
-        // downgrading too far:
-        // https://github.com/redpanda-data/redpanda/issues/7018
-#ifndef NDEBUG
-        vassert(my_version >= snap.version, "Incompatible downgrade detected");
-#endif
+        vassert(
+          config::node().upgrade_override_checks || my_version >= snap.version,
+          "Incompatible downgrade detected");
     } else {
         vlog(
           _log.debug,

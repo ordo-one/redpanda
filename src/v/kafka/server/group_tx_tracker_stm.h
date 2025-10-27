@@ -13,6 +13,7 @@
 
 #include "cluster/state_machine_registry.h"
 #include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "kafka/server/group_data_parser.h"
 #include "raft/persisted_stm.h"
 #include "serde/rw/envelope.h"
@@ -82,7 +83,7 @@ public:
         return storage::stm_type::consumer_offsets_transactional;
     }
 
-    ss::future<fragmented_vector<model::tx_range>>
+    ss::future<chunked_vector<model::tx_range>>
     aborted_tx_ranges(model::offset, model::offset) override {
         // Instead of tracking aborted transactions, group partitions rely on a
         // different approach. When a group transaction is committed, the data
@@ -90,12 +91,12 @@ public:
         // conversion happens atomically along with writing a commit marker.
         // This eliminates the need to track completed transactional batches and
         // they are unconditionally omitted in the compaction pass.
-        return ss::make_ready_future<fragmented_vector<model::tx_range>>();
+        return ss::make_ready_future<chunked_vector<model::tx_range>>();
     }
 
     ss::future<> do_apply(const model::record_batch&) override;
 
-    model::offset max_collectible_offset() override;
+    model::offset max_removable_local_log_offset() override;
 
     ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&& bytes) override;
@@ -104,7 +105,7 @@ public:
       take_local_snapshot(ssx::semaphore_units) override;
 
     ss::future<> apply_raft_snapshot(const iobuf&) final;
-    ss::future<iobuf> take_snapshot(model::offset) final;
+    ss::future<iobuf> take_raft_snapshot(model::offset) final;
 
     ss::future<> handle_raft_data(model::record_batch);
     ss::future<> handle_tx_offsets(
@@ -120,18 +121,27 @@ public:
     ss::future<> handle_commit(
       model::record_batch_header, kafka::group_tx::commit_metadata);
     ss::future<> handle_version_fence(features::feature_table::version_fence);
+    void handle_group_block(kafka::group_block);
+    bool is_group_blocked(kafka::group_id) const;
 
     ss::future<> stop() final;
 
     const all_txs_t& inflight_transactions() const { return _all_txs; }
 
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
+
 private:
     static constexpr int8_t supported_local_snapshot_version = 1;
     struct snapshot
-      : serde::envelope<snapshot, serde::version<0>, serde::compat_version<0>> {
+      : serde::envelope<snapshot, serde::version<1>, serde::compat_version<0>> {
         all_txs_t transactions;
+        chunked_vector<kafka::group_id> blocked_groups;
 
-        auto serde_fields() { return std::tie(transactions); }
+        auto serde_fields() { return std::tie(transactions, blocked_groups); }
+        friend bool operator==(const snapshot&, const snapshot&) = default;
     };
 
     void handle_group_metadata(group_metadata_kv);
@@ -149,9 +159,9 @@ private:
     void maybe_end_tx(kafka::group_id, model::producer_identity, model::offset);
 
     all_txs_t _all_txs;
+    chunked_hash_set<kafka::group_id> _blocked_groups;
 
     ss::sharded<features::feature_table>& _feature_table;
-    group_metadata_serializer _serializer;
     ss::abort_source _as;
     static constexpr ss::lowres_clock::duration tx_fence_gc_frequency{1h};
     ss::timer<ss::lowres_clock> _stale_tx_fence_gc_timer;
@@ -162,7 +172,10 @@ public:
     explicit group_tx_tracker_stm_factory(
       ss::sharded<features::feature_table>&);
     bool is_applicable_for(const storage::ntp_config&) const final;
-    void create(raft::state_machine_manager_builder&, raft::consensus*) final;
+    void create(
+      raft::state_machine_manager_builder&,
+      raft::consensus*,
+      const cluster::stm_instance_config&) final;
 
 private:
     ss::sharded<features::feature_table>& _feature_table;

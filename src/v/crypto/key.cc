@@ -11,6 +11,7 @@
 
 #include "key.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "crypto/crypto.h"
 #include "crypto/exceptions.h"
 #include "crypto/types.h"
@@ -21,8 +22,6 @@
 #include "thirdparty/openssl/evp.h"
 #include "thirdparty/openssl/param_build.h"
 #include "thirdparty/openssl/pem.h"
-
-#include <absl/container/flat_hash_set.h>
 
 namespace crypto {
 
@@ -86,7 +85,7 @@ key_type key::impl::get_key_type() const {
         return key_type::RSA;
     }
 
-    vassert(false, "Unsupported key type {}", key_type);
+    vunreachable("Unsupported key type {}", key_type);
 }
 
 key_type key::get_type() const { return _impl->get_key_type(); }

@@ -183,7 +183,9 @@ struct remote_read_and_write_are_not_supported_for_read_replica {
 struct batch_max_bytes_limits {
     static constexpr error_code ec = error_code::invalid_config;
     static constexpr const char* error_message
-      = "Property max.message.bytes value must be positive";
+      = "Property max.message.bytes value must be positive and less than or "
+        "equal to the `kafka_max_message_size_upper_limit` broker "
+        "configuration";
 
     static bool is_valid(const creatable_topic& c) {
         auto it = std::find_if(
@@ -193,7 +195,11 @@ struct batch_max_bytes_limits {
               return cfg.name == topic_property_max_message_bytes;
           });
         if (it != c.configs.end() && it->value.has_value()) {
-            return boost::lexical_cast<int32_t>(it->value.value()) > 0;
+            auto val = boost::lexical_cast<int32_t>(it->value.value());
+            auto upper_limit = config::shard_local_cfg()
+                                 .kafka_max_message_size_upper_limit_bytes()
+                                 .value_or(std::numeric_limits<int32_t>::max());
+            return val > 0 && val <= upper_limit;
         }
 
         return true;
@@ -380,7 +386,7 @@ struct cloud_topic_config_validator {
         if (it == c.configs.end()) {
             return true;
         }
-        if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+        if (!config::shard_local_cfg().cloud_topics_enabled()) {
             return false;
         }
         try {
@@ -470,41 +476,6 @@ struct write_caching_configs_validator {
     }
 };
 
-struct delete_retention_ms_validator {
-    static constexpr const char* error_message
-      = "Unsupported delete.retention.ms configuration, cannot be enabled "
-        "at the same time as redpanda.remote.read or redpanda.remote.write.";
-    static constexpr const auto config_name
-      = topic_property_delete_retention_ms;
-    static constexpr error_code ec = error_code::invalid_config;
-
-    static bool is_valid(const creatable_topic& c) {
-        const auto config_entries = config_map(c.configs);
-        try {
-            auto delete_retention_ms
-              = get_tristate_value<std::chrono::milliseconds>(
-                config_entries, topic_property_delete_retention_ms);
-
-            auto shadow_indexing_mode = get_shadow_indexing_mode(
-              config_entries);
-            // Cannot set delete_retention_ms at the same time as any tiered
-            // storage properties.
-            if (
-              delete_retention_ms.has_optional_value()
-              && shadow_indexing_mode
-                   != model::shadow_indexing_mode::disabled) {
-                return false;
-            }
-        } catch (const boost::bad_lexical_cast&) {
-            // Caught a bad configuration exception.
-            // Return true for now- this will error out in a later stage.
-            return true;
-        }
-
-        return true;
-    }
-};
-
 struct iceberg_target_lag_ms_validator {
     static constexpr const char* error_message
       = "Unsupported redpanda.iceberg.target.lag.ms config";
@@ -577,6 +548,21 @@ struct vcluster_id_validator {
         } catch (...) {
             return false;
         }
+    }
+};
+
+struct min_max_compaction_lag_ms_validator {
+    static constexpr const char* error_message
+      = "max.compaction.lag.ms must be at least min.compaction.lag.ms";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        const auto entries = config_map(c.configs);
+        const auto min_lag = get_config_value<int64_t>(
+          entries, topic_property_min_compaction_lag_ms);
+        const auto max_lag = get_config_value<int64_t>(
+          entries, topic_property_max_compaction_lag_ms);
+        return !(min_lag && max_lag && (min_lag > max_lag));
     }
 };
 

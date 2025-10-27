@@ -11,6 +11,7 @@
 #pragma once
 
 #include "hashing/combine.h"
+#include "security/acl.h"
 #include "security/audit/schemas/hashing_utils.h"
 #include "security/audit/schemas/schemas.h"
 #include "security/audit/schemas/types.h"
@@ -114,6 +115,22 @@ public:
       const ss::sstring& user,
       const ss::sstring& svc_name);
 
+    static size_t hash(
+      std::string_view svc_name,
+      ss::httpd::const_req req,
+      std::string_view operation_name,
+      const auth_result& auth_result);
+
+    static size_t hash(
+      std::string_view svc_name,
+      ss::httpd::const_req req,
+      std::string_view operation_name,
+      const request_auth_result& auth_result,
+      bool is_authorized,
+      security::acl_operation operation,
+      std::optional<std::string_view> reason,
+      const chunked_vector<resource_detail>& resources);
+
     template<typename T>
     static api_activity construct(
       std::string_view operation_name,
@@ -127,9 +144,10 @@ public:
         auto new_ars = create_resource_details(std::move(additional_resources));
         auto crud = op_to_crud(auth_result.operation);
         auto actor = result_to_actor(auth_result);
-        new_ars.emplace_back(resource_detail{
-          .name = auth_result.resource_name,
-          .type = fmt::format("{}", auth_result.resource_type)});
+        new_ars.emplace_back(
+          resource_detail{
+            .name = auth_result.resource_name,
+            .type = fmt::format("{}", auth_result.resource_type)});
 
         return {
           crud,
@@ -167,6 +185,22 @@ public:
       const ss::sstring& user,
       const ss::sstring& svc_name);
 
+    static api_activity construct(
+      std::string_view svc_name,
+      ss::httpd::const_req req,
+      std::string_view operation_name,
+      const auth_result& auth_result);
+
+    static api_activity construct(
+      std::string_view svc_name,
+      ss::httpd::const_req req,
+      std::string_view operation_name,
+      const request_auth_result& auth_result,
+      bool is_authorized,
+      security::acl_operation operation,
+      std::optional<std::string_view> reason,
+      chunked_vector<resource_detail>&& resources);
+
     static constexpr api_activity::activity_id
     op_to_crud(security::acl_operation op) {
         switch (op) {
@@ -194,7 +228,7 @@ public:
             // The `acl_operation` passed to this function is based off of
             // the ACL check performed by the Kafka handlers.  None of the
             // handlers should be providing `all` to an ACL check.
-            vassert(false, "Cannot convert an ALL acl operation to a CRUD");
+            vunreachable("Cannot convert an ALL acl operation to a CRUD");
         }
     }
 

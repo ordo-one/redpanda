@@ -14,7 +14,7 @@
 #include "bytes/iostream.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "debug_bundle/error.h"
 #include "debug_bundle/metadata.h"
 #include "debug_bundle/probe.h"
@@ -72,11 +72,17 @@ bool contains_sensitive_info(const ss::sstring& arg) {
     }
     return false;
 }
-void print_arguments(const std::vector<ss::sstring>& args) {
+void print_arguments(
+  const std::vector<ss::sstring>& args, const std::vector<ss::sstring>& env) {
     auto msg = boost::algorithm::join_if(args, " ", [](const ss::sstring& arg) {
         return !contains_sensitive_info(arg);
     });
-    vlog(lg.debug, "Starting RPK debug bundle: {}", msg);
+    ss::sstring cmd{};
+    if (!env.empty()) {
+        cmd += ss::format("{} ", fmt::join(env, " "));
+    }
+    cmd += ss::format("{}", msg);
+    vlog(lg.debug, "Starting RPK debug bundle: {}", cmd);
 }
 
 std::string form_debug_bundle_file_name(job_id_t job_id) {
@@ -106,16 +112,6 @@ std::filesystem::path form_debug_bundle_storage_directory() {
     return debug_bundle_dir.value_or(
       config::node().data_directory.value().path
       / service::debug_bundle_dir_name);
-}
-
-ss::future<> write_file(std::string_view path, iobuf buf) {
-    auto file = co_await ss::open_file_dma(
-      path, ss::open_flags::create | ss::open_flags::rw);
-    auto h = ss::defer([file]() mutable { ssx::background = file.close(); });
-    auto istrm = make_iobuf_input_stream(std::move(buf));
-    auto ostrm = co_await ss::make_file_output_stream(file);
-    co_await ss::copy(istrm, ostrm);
-    co_await ostrm.flush();
 }
 
 bool was_run_successful(ss::experimental::process::wait_status wait_status) {
@@ -339,14 +335,17 @@ ss::future<> service::stop() {
 }
 
 ss::future<result<void>> service::initiate_rpk_debug_bundle_collection(
-  job_id_t job_id, debug_bundle_parameters params) {
+  job_id_t job_id,
+  debug_bundle_parameters params,
+  std::vector<ss::sstring> env) {
     auto hold = _gate.hold();
     if (ss::this_shard_id() != service_shard) {
         co_return co_await container().invoke_on(
           service_shard,
-          [job_id, params = std::move(params)](service& s) mutable {
+          [job_id, params = std::move(params), env = std::move(env)](
+            service& s) mutable {
               return s.initiate_rpk_debug_bundle_collection(
-                job_id, std::move(params));
+                job_id, std::move(params), std::move(env));
           });
     }
     auto units = co_await _process_control_mutex.get_units();
@@ -404,14 +403,14 @@ ss::future<result<void>> service::initiate_rpk_debug_bundle_collection(
     }
     auto args = std::move(args_res.assume_value());
     if (lg.is_enabled(ss::log_level::debug)) {
-        print_arguments(args);
+        print_arguments(args, env);
     }
 
     try {
         _rpk_process = std::make_unique<debug_bundle_process>(
           job_id,
           co_await external_process::external_process::create_external_process(
-            std::move(args)),
+            std::move(args), std::move(env)),
           std::move(debug_bundle_file_path),
           std::move(process_output_path));
     } catch (const std::exception& e) {
@@ -600,8 +599,9 @@ result<std::vector<ss::sstring>> service::build_rpk_arguments(
                 ssx::sformat("{}={}", username_variable, creds.username));
               rv.emplace_back(
                 ssx::sformat("{}={}", password_variable, creds.password));
-              rv.emplace_back(ssx::sformat(
-                "{}={}", sasl_mechanism_variable, creds.mechanism));
+              rv.emplace_back(
+                ssx::sformat(
+                  "{}={}", sasl_mechanism_variable, creds.mechanism));
           });
     }
     if (params.controller_logs_size_limit_bytes.has_value()) {
@@ -611,8 +611,9 @@ result<std::vector<ss::sstring>> service::build_rpk_arguments(
     }
     if (params.cpu_profiler_wait_seconds.has_value()) {
         rv.emplace_back(cpu_profiler_wait_variable);
-        rv.emplace_back(ssx::sformat(
-          "{}s", params.cpu_profiler_wait_seconds.value().count()));
+        rv.emplace_back(
+          ssx::sformat(
+            "{}s", params.cpu_profiler_wait_seconds.value().count()));
     }
     if (params.logs_since.has_value()) {
         rv.emplace_back(logs_since_variable);
@@ -648,10 +649,11 @@ result<std::vector<ss::sstring>> service::build_rpk_arguments(
           ssx::sformat("{}={}", tls_enabled_variable, *params.tls_enabled));
     }
     if (params.tls_insecure_skip_verify.has_value()) {
-        rv.emplace_back(ssx::sformat(
-          "{}={}",
-          tls_insecure_skip_verify_variable,
-          *params.tls_insecure_skip_verify));
+        rv.emplace_back(
+          ssx::sformat(
+            "{}={}",
+            tls_insecure_skip_verify_variable,
+            *params.tls_insecure_skip_verify));
     }
     if (params.k8s_namespace.has_value()) {
         rv.emplace_back(k8s_namespace_variable);
@@ -738,17 +740,6 @@ ss::future<> service::set_metadata(job_id_t job_id) {
 
     vlog(lg.debug, "Emplacing metadata into keystore for job {}", job_id);
 
-    co_await _kvstore->put(
-      storage::kvstore::key_space::debug_bundle,
-      bytes::from_string(debug_bundle_metadata_key),
-      std::move(buf));
-
-    auto remove_kvstore_on_err = ss::defer([this] {
-        ssx::background = _kvstore->remove(
-          storage::kvstore::key_space::debug_bundle,
-          bytes::from_string(debug_bundle_metadata_key));
-    });
-
     process_output po{
       .cout = _rpk_process->cout().copy(), .cerr = _rpk_process->cerr().copy()};
     iobuf po_buf;
@@ -761,12 +752,11 @@ ss::future<> service::set_metadata(job_id_t job_id) {
       job_id);
 
     try {
-        co_await write_file(process_output_file.native(), std::move(po_buf));
+        co_await write_fully(process_output_file, std::move(po_buf));
         vlog(
           lg.debug,
           "Successfully wrote process output to file to {}",
           process_output_file.native());
-        remove_kvstore_on_err.cancel();
     } catch (const std::exception& e) {
         vlog(
           lg.warn,
@@ -774,7 +764,13 @@ ss::future<> service::set_metadata(job_id_t job_id) {
           process_output_file,
           job_id,
           e.what());
+        co_return;
     }
+
+    co_await _kvstore->put(
+      storage::kvstore::key_space::debug_bundle,
+      bytes::from_string(debug_bundle_metadata_key),
+      std::move(buf));
 }
 
 std::optional<debug_bundle_status> service::process_status() const {

@@ -49,8 +49,10 @@ const (
 	DiskIRQsAffinityStaticChecker
 	DiskIRQsAffinityChecker
 	FstrimChecker
+	NicRxTxQueueCountChecker
+	NicIRQBalanceChecker
 	NicIRQsAffinitChecker
-	NicIRQsAffinitStaticChecker
+	NetTunerConfigFileChecker
 	NicRfsChecker
 	NicXpsChecker
 	NicRpsChecker
@@ -220,15 +222,18 @@ func RedpandaCheckers(
 	if len(y.Redpanda.KafkaAPI) == 0 {
 		return nil, errors.New("'redpanda.kafka_api' is empty")
 	}
+	addrs := []string{y.Redpanda.RPCServer.Address}
+	for _, address := range y.Redpanda.KafkaAPI {
+		addrs = append(addrs, address.Address)
+	}
 	interfaces, err := net.GetInterfacesByIps(
-		y.Redpanda.KafkaAPI[0].Address,
-		y.Redpanda.RPCServer.Address,
+		addrs...,
 	)
 	if err != nil {
 		return nil, err
 	}
 	netCheckersFactory := NewNetCheckersFactory(
-		fs, irqProcFile, irqDeviceInfo, ethtool, balanceService, cpuMasks)
+		fs, y.Rpk, irqProcFile, irqDeviceInfo, ethtool, balanceService, cpuMasks)
 	checkers := map[CheckerID][]Checker{
 		ConfigFileChecker:             {NewConfigChecker(y)},
 		IoConfigFileChecker:           {NewIOConfigFileExistanceChecker(fs, ioConfigFile)},
@@ -247,10 +252,11 @@ func RedpandaCheckers(
 		SynBacklogChecker:             {netCheckersFactory.NewSynBacklogChecker()},
 		ListenBacklogChecker:          {netCheckersFactory.NewListenBacklogChecker()},
 		RfsTableEntriesChecker:        {netCheckersFactory.NewRfsTableSizeChecker()},
-		NicIRQsAffinitStaticChecker:   {netCheckersFactory.NewNicIRQAffinityStaticChecker(interfaces)},
+		NicRxTxQueueCountChecker:      netCheckersFactory.NewNicRxTxQueueCountCheckers(interfaces, irq.Default, "all"),
+		NicIRQBalanceChecker:          {netCheckersFactory.NewNicIRQBalanceChecker(interfaces)},
 		NicIRQsAffinitChecker:         netCheckersFactory.NewNicIRQAffinityCheckers(interfaces, irq.Default, "all"),
 		NicRpsChecker:                 netCheckersFactory.NewNicRpsSetCheckers(interfaces, irq.Default, "all"),
-		NicRfsChecker:                 netCheckersFactory.NewNicRfsCheckers(interfaces),
+		NicRfsChecker:                 netCheckersFactory.NewNicRfsCheckers(interfaces, irq.Default, "all"),
 		NicXpsChecker:                 netCheckersFactory.NewNicXpsCheckers(interfaces),
 		MaxAIOEvents:                  {NewMaxAIOEventsChecker(fs)},
 		ClockSource:                   {NewClockSourceChecker(fs)},

@@ -10,10 +10,11 @@
  */
 
 #pragma once
+
 #include "base/seastarx.h"
-#include "base/vassert.h"
+#include "base/vassert.h" // IWYU pragma: keep; macro expansion
 #include "model/timeout_clock.h"
-#include "ssx/sformat.h"
+#include "ssx/sformat.h" // IWYU pragma: keep; macro expansion
 #include "test_utils/test_macros.h"
 
 #include <seastar/core/future-util.hh>
@@ -31,9 +32,10 @@ using namespace std::chrono_literals;
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define RPTEST_REQUIRE_EVENTUALLY_CORO(...)                                    \
+    /* NOLINTNEXTLINE(*do-while*) */                                           \
     do {                                                                       \
         try {                                                                  \
-            co_await tests::cooperative_spin_wait_with_timeout(__VA_ARGS__);   \
+            co_await ::tests::cooperative_spin_wait_with_timeout(__VA_ARGS__); \
         } catch (const ss::timed_out_error&) {                                 \
             RPTEST_FAIL_CORO(                                                  \
               ssx::sformat("Timed out at {}:{}", __FILE__, __LINE__));         \
@@ -42,9 +44,10 @@ using namespace std::chrono_literals;
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define RPTEST_REQUIRE_EVENTUALLY(...)                                         \
+    /* NOLINTNEXTLINE(*do-while*) */                                           \
     do {                                                                       \
         try {                                                                  \
-            tests::cooperative_spin_wait_with_timeout(__VA_ARGS__).get();      \
+            ::tests::cooperative_spin_wait_with_timeout(__VA_ARGS__).get();    \
         } catch (const ss::timed_out_error&) {                                 \
             RPTEST_FAIL(                                                       \
               ssx::sformat("Timed out at {}:{}", __FILE__, __LINE__));         \
@@ -55,8 +58,8 @@ namespace tests {
 
 // clang-format off
 template<typename Rep, typename Period, typename Predicate>
-requires ss::ApplyReturns<Predicate, bool> ||
-         ss::ApplyReturns<Predicate, ss::future<bool>>
+requires std::is_invocable_r_v<bool, Predicate> ||
+         std::is_invocable_r_v<ss::future<bool>, Predicate>
 // clang-format on
 /// Used to wait for Prediacate to become true
 ss::future<> cooperative_spin_wait_with_timeout(

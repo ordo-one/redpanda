@@ -12,7 +12,7 @@
 
 #include "cluster/partition_manager.h"
 #include "config/node_config.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
@@ -27,16 +27,16 @@
 
 namespace kafka {
 
-struct partition_data {
+struct log_partition_data {
     describe_log_dirs_partition local;
     std::optional<describe_log_dirs_partition> remote;
 };
 
 using partition_dir_set
-  = chunked_hash_map<model::topic, chunked_vector<partition_data>>;
+  = chunked_hash_map<model::topic, chunked_vector<log_partition_data>>;
 
-static partition_data describe_partition(cluster::partition& p) {
-    auto result = partition_data{
+static log_partition_data describe_partition(cluster::partition& p) {
+    auto result = log_partition_data{
       .local = describe_log_dirs_partition{
         .partition_index = p.ntp().tp.partition(),
         .partition_size = static_cast<int64_t>(p.size_bytes()),
@@ -132,19 +132,21 @@ ss::future<response_ptr> describe_log_dirs_handler::handle(
     describe_log_dirs_response response;
 
     // redpanda only supports a single data directory right now
-    response.data.results.push_back(describe_log_dirs_result{
-      .error_code = error_code::none,
-      .log_dir = config::node().data_directory().as_sstring(),
-    });
+    response.data.results.push_back(
+      describe_log_dirs_result{
+        .error_code = error_code::none,
+        .log_dir = config::node().data_directory().as_sstring(),
+      });
 
     // We don't know until we iterate over topics whether any of them are
     // using cloud storage, so create the result structure speculatively.
     auto bucket_name
       = config::shard_local_cfg().cloud_storage_bucket().value_or("");
-    response.data.results.push_back(describe_log_dirs_result{
-      .error_code = error_code::none,
-      .log_dir = fmt::format("remote://{}", bucket_name),
-    });
+    response.data.results.push_back(
+      describe_log_dirs_result{
+        .error_code = error_code::none,
+        .log_dir = fmt::format("remote://{}", bucket_name),
+      });
 
     auto authz = ctx.authorized(
       security::acl_operation::describe, security::default_cluster_name);
@@ -175,15 +177,17 @@ ss::future<response_ptr> describe_log_dirs_handler::handle(
             }
         }
 
-        local_results.topics.push_back(describe_log_dirs_topic{
-          .name = node.first,
-          .partitions = std::move(local_partitions),
-        });
+        local_results.topics.push_back(
+          describe_log_dirs_topic{
+            .name = node.first,
+            .partitions = std::move(local_partitions),
+          });
         if (!remote_partitions.empty()) {
-            remote_results.topics.push_back(describe_log_dirs_topic{
-              .name = std::move(node.first),
-              .partitions = std::move(remote_partitions),
-            });
+            remote_results.topics.push_back(
+              describe_log_dirs_topic{
+                .name = std::move(node.first),
+                .partitions = std::move(remote_partitions),
+              });
         }
     }
 

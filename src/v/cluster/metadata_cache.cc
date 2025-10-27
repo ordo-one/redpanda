@@ -21,7 +21,7 @@
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timestamp.h"
-#include "storage/types.h"
+#include "storage/disk.h"
 #include "utils/tristate.h"
 
 #include <seastar/core/coroutine.hh>
@@ -169,6 +169,10 @@ bool metadata_cache::contains(
     return _topics_state.local().contains(tp, pid);
 }
 
+bool metadata_cache::contains(const model::kitp& kitp) const {
+    return _topics_state.local().contains(kitp);
+}
+
 bool metadata_cache::contains(model::topic_namespace_view tp) const {
     return _topics_state.local().contains(tp);
 }
@@ -209,7 +213,9 @@ std::optional<model::node_id> metadata_cache::get_controller_leader_id() {
     return _leaders.local().get_leader(model::controller_ntp);
 }
 
-void metadata_cache::reset_leaders() { _leaders.local().reset(); }
+ss::future<> metadata_cache::reset_leaders() {
+    return _leaders.local().reset();
+}
 
 ss::future<> metadata_cache::refresh_health_monitor() {
     co_await _health_monitor.local().refresh_info();
@@ -334,6 +340,26 @@ metadata_cache::get_default_min_cleanable_dirty_ratio() const {
     return config::shard_local_cfg().min_cleanable_dirty_ratio();
 }
 
+std::chrono::milliseconds
+metadata_cache::get_default_min_compaction_lag_ms() const {
+    return config::shard_local_cfg().min_compaction_lag_ms();
+}
+
+std::chrono::milliseconds
+metadata_cache::get_default_max_compaction_lag_ms() const {
+    return config::shard_local_cfg().max_compaction_lag_ms();
+}
+
+std::chrono::milliseconds
+metadata_cache::get_default_message_timestamp_before_max_ms() const {
+    return config::shard_local_cfg().log_message_timestamp_before_max_ms();
+}
+
+std::chrono::milliseconds
+metadata_cache::get_default_message_timestamp_after_max_ms() const {
+    return config::shard_local_cfg().log_message_timestamp_after_max_ms();
+}
+
 topic_properties metadata_cache::get_default_properties() const {
     topic_properties tp;
     tp.compression = {get_default_compression()};
@@ -355,6 +381,12 @@ topic_properties metadata_cache::get_default_properties() const {
       get_default_delete_retention_ms()};
     tp.min_cleanable_dirty_ratio = tristate<double>{
       get_default_min_cleanable_dirty_ratio()};
+    tp.min_compaction_lag_ms = get_default_min_compaction_lag_ms();
+    tp.max_compaction_lag_ms = get_default_max_compaction_lag_ms();
+    tp.message_timestamp_before_max_ms
+      = get_default_message_timestamp_before_max_ms();
+    tp.message_timestamp_after_max_ms
+      = get_default_message_timestamp_after_max_ms();
 
     return tp;
 }

@@ -17,8 +17,6 @@
 #include <seastar/core/shard_id.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/algorithm/container.h>
-
 #include <optional>
 
 namespace kafka {

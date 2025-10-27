@@ -11,7 +11,7 @@ RUN apt update && apt install -y \
     lsb-release
 
 # Install latest versions using backports
-RUN echo "deb http://deb.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/backports.list && \
+RUN echo "deb http://archive.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/backports.list && \
     apt-get update && \
     apt-get install -y -t bullseye-backports \
       cmake \
@@ -31,9 +31,11 @@ RUN wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && /llvm.sh ${STAGE_0_
 # Set working directory
 WORKDIR /src
 
-ARG LLVM_VERSION=18
+ARG LLVM_VERSION=20
 
 # Clone LLVM project (includes Clang, clang-tidy, clangd, and BOLT)
+# We use the latest version of the release branch to pick up fixes quicker rather than waiting for a full
+# release to happen
 RUN git clone --depth 1 --branch release/${LLVM_VERSION}.x https://github.com/llvm/llvm-project.git
 
 # LTO builds take a bunch of RAM, limit them to a low number by default
@@ -48,6 +50,7 @@ set(LLVM_INCLUDE_UTILS OFF CACHE BOOL "")
 set(LLVM_INCLUDE_DOCS OFF CACHE BOOL "")
 set(LLVM_INCLUDE_GO_TESTS OFF CACHE BOOL "")
 set(LLVM_ENABLE_ZLIB ON CACHE BOOL "")
+set(LLVM_ENABLE_LIBXML2 OFF CACHE BOOL "")
 set(LLVM_ENABLE_BACKTRACES OFF CACHE BOOL "")
 set(LLVM_ENABLE_PROJECTS clang bolt lld lldb clang-tools-extra CACHE STRING "")
 set(LLVM_ENABLE_RUNTIMES libcxx libcxxabi compiler-rt CACHE STRING "")
@@ -87,6 +90,8 @@ RUN cmake -G Ninja \
     ../llvm-project/llvm
 
 RUN ninja -j$(nproc) && ninja install
+# This exists as an alias, but it's not in the default installation.
+RUN (cd /opt/install/bin && ln -s llvm-symbolizer llvm-addr2line)
 
 FROM scratch
 

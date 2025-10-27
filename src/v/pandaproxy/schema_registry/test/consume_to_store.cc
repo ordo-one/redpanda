@@ -19,8 +19,10 @@
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "pandaproxy/schema_registry/avro.h"
+#include "pandaproxy/schema_registry/seq_writer.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/storage.h"
+#include "pandaproxy/schema_registry/test/utils.h"
 #include "pandaproxy/schema_registry/util.h"
 
 #include <seastar/testing/thread_test_case.hh>
@@ -42,13 +44,13 @@ constexpr pps::schema_version version1{1};
 constexpr pps::schema_id id0{0};
 constexpr pps::schema_id id1{1};
 
-const pps::canonical_schema_definition string_def0{
+const pps::schema_definition string_def0{
   pps::sanitize_avro_schema_definition(
     {R"({"type":"string"})",
      pps::schema_type::avro,
      {{.name{"ref"}, .sub{subject0}, .version{version0}}}})
     .value()};
-const pps::canonical_schema_definition int_def0{
+const pps::schema_definition int_def0{
   pps::sanitize_avro_schema_definition(
     {R"({"type": "int"})", pps::schema_type::avro})
     .value()};
@@ -58,8 +60,9 @@ inline model::record_batch make_delete_subject_batch(pps::subject sub) {
       model::record_batch_type::raft_data, model::offset{0}};
 
     rb.add_raw_kv(
-      to_json_iobuf(pps::delete_subject_key{
-        .seq{model::offset{0}}, .node{model::node_id{0}}, .sub{sub}}),
+      to_json_iobuf(
+        pps::delete_subject_key{
+          .seq{model::offset{0}}, .node{model::node_id{0}}, .sub{sub}}),
       to_json_iobuf(pps::delete_subject_value{.sub{sub}}));
     return std::move(rb).build();
 }
@@ -71,11 +74,12 @@ inline model::record_batch make_delete_subject_permanently_batch(
 
     std::for_each(versions.cbegin(), versions.cend(), [&](auto version) {
         rb.add_raw_kv(
-          to_json_iobuf(pps::schema_key{
-            .seq{model::offset{0}},
-            .node{model::node_id{0}},
-            .sub{sub},
-            .version{version}}),
+          to_json_iobuf(
+            pps::schema_key{
+              .seq{model::offset{0}},
+              .node{model::node_id{0}},
+              .sub{sub},
+              .version{version}}),
           std::nullopt);
     });
     return std::move(rb).build();
@@ -103,7 +107,9 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
         model::node_id{0},
         ss::default_smp_service_group(),
         std::reference_wrapper(dummy_kafka_client),
-        std::reference_wrapper(s))
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
       .get();
     auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
 
@@ -114,8 +120,7 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
 
     auto good_schema_1 = pps::as_record_batch(
       pps::schema_key{sequence, node_id, subject0, version0, magic1},
-      pps::canonical_schema_value{
-        {subject0, string_def0.share()}, version0, id0});
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
     BOOST_REQUIRE_NO_THROW(c(good_schema_1.copy()).get());
 
     auto s_res = s.get_subject_schema(
@@ -125,8 +130,7 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
 
     auto good_schema_ref_1 = pps::as_record_batch(
       pps::schema_key{sequence, node_id, subject0, version1, magic1},
-      pps::canonical_schema_value{
-        {subject0, string_def0.share()}, version1, id1});
+      pps::schema_value{{subject0, string_def0.share()}, version1, id1});
     BOOST_REQUIRE_NO_THROW(c(good_schema_ref_1.copy()).get());
 
     auto s_ref_res = s.get_subject_schema(
@@ -143,8 +147,7 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
 
     auto bad_schema_magic = pps::as_record_batch(
       pps::schema_key{sequence, node_id, subject0, version0, magic2},
-      pps::canonical_schema_value{
-        {subject0, string_def0.share()}, version0, id0});
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
     BOOST_REQUIRE_THROW(c(bad_schema_magic.copy()).get(), pps::exception);
 
     BOOST_REQUIRE(
@@ -225,7 +228,9 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
         model::node_id{0},
         ss::default_smp_service_group(),
         std::reference_wrapper(dummy_kafka_client),
-        std::reference_wrapper(s))
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
       .get();
     auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
 
@@ -237,8 +242,7 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
     // Insert the schema at seq 0
     auto good_schema_1 = pps::as_record_batch(
       pps::schema_key{sequence, node_id, subject0, version0, magic1},
-      pps::canonical_schema_value{
-        {subject0, string_def0.share()}, version0, id0});
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
     BOOST_REQUIRE_NO_THROW(c(good_schema_1.copy()).get());
     // Roll the segment
     // Soft delete the version (at seq 1)
@@ -255,5 +259,45 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
       pps::exception,
       [](pps::exception e) {
           return e.code() == pps::error_code::subject_not_found;
+      });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_writes_disabled) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    // This kafka client will not be used by the sequencer
+    // (which itself is only instantiated to receive consume_to_store's
+    //  offset updates), is just needed for constructor;
+    ss::sharded<kafka::client::client> dummy_kafka_client;
+    dummy_kafka_client
+      .start(
+        to_yaml(kafka::client::configuration{}, config::redact_secrets::no))
+      .get();
+    auto stop_kafka_client = ss::defer(
+      [&dummy_kafka_client]() { dummy_kafka_client.stop().get(); });
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::reference_wrapper(dummy_kafka_client),
+        std::reference_wrapper(s),
+        ss::sharded_parameter([] {
+            return std::make_unique<sequence_state_checker_test>(
+              pps::sequence_state_checker::writes_disabled_t::yes);
+        }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .write_mode(std::nullopt, pps::mode::read_only, pps::force::no)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code() == pps::error_code::writes_disabled;
       });
 }

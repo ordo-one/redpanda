@@ -8,11 +8,12 @@
 # by the Apache License, Version 2.0
 
 from typing import Any
+
 from ducktape.tests.test import TestContext
-from rptest.clients.rpk import RpkTool
-from rptest.tests.redpanda_cloud_test import RedpandaCloudTest
+
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import RedpandaServiceCloud
+from rptest.tests.redpanda_cloud_test import RedpandaCloudTest
 
 
 class RedpandaCloudSelfTest(RedpandaCloudTest):
@@ -20,12 +21,13 @@ class RedpandaCloudSelfTest(RedpandaCloudTest):
     on the cloud work as expected. For things that are implemented by
     RedpandaMixedTest, they should be tested in RedpandaMixedSelfTest instead.
     """
+
     def __init__(self, test_context: TestContext, *args: Any, **kwargs: Any):
         super().__init__(test_context, *args, **kwargs)
 
-        assert isinstance(
-            self.redpanda,
-            RedpandaServiceCloud), 'test should only run on cloud'
+        assert isinstance(self.redpanda, RedpandaServiceCloud), (
+            "test should only run on cloud"
+        )
 
     @cluster(num_nodes=0)
     def test_healthy(self):

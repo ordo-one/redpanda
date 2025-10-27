@@ -32,6 +32,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/profile"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/registry"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/security"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/shadow"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/topic"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/transform"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version"
@@ -120,9 +121,11 @@ func Execute() {
 		plugincmd.NewCommand(fs),
 		registry.NewCommand(fs, p),
 		security.NewCommand(fs, p),
+		shadow.NewCommand(fs, p),
 		topic.NewCommand(fs, p),
 		transform.NewCommand(fs, p, osExec),
 		versioncmd.NewCommand(fs, p),
+		newOxlaCommand(),
 
 		newStatusCommand(), // deprecated
 	)
@@ -217,6 +220,20 @@ func wrappedGlobalFlagUsages(cmd *cobra.Command) string {
 		width = int(ws.Width)
 	}
 	return cmd.InheritedFlags().FlagUsagesWrapped(width)
+}
+
+func newOxlaCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "oxla",
+		Short: "Redpanda Oxla - Coming Soon",
+		Run: func(_ *cobra.Command, _ []string) {
+			title := color.New(color.FgHiRed, color.Bold).Sprint("🚀 Redpanda Oxla")
+			url := color.New(color.Underline).Sprint("https://www.redpanda.com/oxla-early-access ")
+
+			fmt.Printf("\n%s is coming soon!\n\nRegister for early access here: %s\n\n", title, url)
+		},
+	}
+	return cmd
 }
 
 // This is the same Cobra usage template but using the wrapped flag usages.

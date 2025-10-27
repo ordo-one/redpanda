@@ -8,17 +8,15 @@
 # by the Apache License, Version 2.0
 
 import tempfile
-import time
+
+
 from rptest.clients.default import DefaultClient
 from rptest.clients.rpk import RpkTool
-from rptest.services.admin import Admin
+from rptest.clients.types import TopicSpec
+from rptest.services.cluster import cluster
 from rptest.services.redpanda import SISettings, SchemaRegistryConfig
 from rptest.services.redpanda_connect import RedpandaConnectService
-from rptest.tests.datalake.datalake_services import DatalakeServices
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.cluster import cluster
-from rptest.clients.types import TopicSpec
-from jinja2 import Template
 
 avro_schema = """
 {
@@ -39,40 +37,44 @@ def stream_config(brokers, topic, schema_registry_url, subject):
                 "mapping": """root = {"name": "John","age": 30}""",
                 "interval": "1s",
                 "count": 20,
-                "batch_size": 1
+                "batch_size": 1,
             }
         },
         "pipeline": {
-            "processors": [{
-                "schema_registry_encode": {
-                    "url": schema_registry_url,
-                    "subject": subject,
-                    "refresh_period": "10s"
+            "processors": [
+                {
+                    "schema_registry_encode": {
+                        "url": schema_registry_url,
+                        "subject": subject,
+                        "refresh_period": "10s",
+                    }
                 }
-            }]
+            ]
         },
         "output": {
             "redpanda": {
                 "seed_brokers": brokers,
                 "topic": topic,
             }
-        }
+        },
     }
 
 
 class RedpandaConnectTest(RedpandaTest):
     def __init__(self, test_ctx, *args, **kwargs):
-        super().__init__(test_context=test_ctx,
-                         *args,
-                         **kwargs,
-                         num_brokers=3,
-                         si_settings=SISettings(test_context=test_ctx),
-                         schema_registry_config=SchemaRegistryConfig())
+        super().__init__(
+            test_context=test_ctx,
+            *args,
+            **kwargs,
+            num_brokers=3,
+            si_settings=SISettings(test_context=test_ctx),
+            schema_registry_config=SchemaRegistryConfig(),
+        )
 
     def _create_schema(self, subject: str, schema: str, schema_type="avro"):
         rpk = RpkTool(self.redpanda)
         with tempfile.NamedTemporaryFile(suffix=f".{schema_type}") as tf:
-            tf.write(bytes(schema, 'UTF-8'))
+            tf.write(bytes(schema, "UTF-8"))
             tf.seek(0)
             rpk.create_schema(subject, tf.name)
 
@@ -81,9 +83,9 @@ class RedpandaConnectTest(RedpandaTest):
         """
         Test verifying if Redpanda Connect can work in ducktape
         """
-        topic = TopicSpec(name='connect-test-topic',
-                          partition_count=1,
-                          replication_factor=3)
+        topic = TopicSpec(
+            name="connect-test-topic", partition_count=1, replication_factor=3
+        )
 
         DefaultClient(self.redpanda).create_topic(topic)
 
@@ -93,11 +95,15 @@ class RedpandaConnectTest(RedpandaTest):
         connect.start()
 
         # create a stream
-        connect.start_stream(name="ducky_stream",
-                             config=stream_config(
-                                 self.redpanda.brokers_list(), topic.name,
-                                 self.redpanda.schema_reg().split(",")[0],
-                                 "test"))
+        connect.start_stream(
+            name="ducky_stream",
+            config=stream_config(
+                self.redpanda.brokers_list(),
+                topic.name,
+                self.redpanda.schema_reg().split(",")[0],
+                "test",
+            ),
+        )
 
         # wait for the stream to finish
         connect.stop_stream(name="ducky_stream")
@@ -107,6 +113,6 @@ class RedpandaConnectTest(RedpandaTest):
         rpk = RpkTool(self.redpanda)
         partitions = rpk.describe_topic(topic.name)
 
-        assert all(
-            p.high_watermark > 0 for p in
-            partitions), "Error redpanda connect should produce messages"
+        assert all(p.high_watermark > 0 for p in partitions), (
+            "Error redpanda connect should produce messages"
+        )

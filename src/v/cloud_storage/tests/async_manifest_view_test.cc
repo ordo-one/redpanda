@@ -16,15 +16,12 @@
 #include "cloud_storage/tests/util.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "model/timeout_clock.h"
 #include "model/timestamp.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file-types.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/timed_out_error.hh>
@@ -34,9 +31,9 @@
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <iterator>
-#include <numeric>
 
 using namespace cloud_storage;
 using eof = async_manifest_view_cursor::eof;
@@ -73,9 +70,6 @@ public:
       , ctxlog(test_log, rtc)
       , probe(manifest_ntp)
       , view(api, cache, stm_manifest, bucket, path_provider) {
-        stm_manifest.set_archive_start_offset(
-          model::offset{0}, model::offset_delta{0});
-        stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
         view.start().get();
         base_timestamp = model::timestamp_clock::now() - storage_duration;
         last_timestamp = base_timestamp;
@@ -84,16 +78,19 @@ public:
     ~async_manifest_view_fixture() { view.stop().get(); }
 
     expectation spill_manifest(const spillover_manifest& spm, bool hydrate) {
+        if (stm_manifest.get_archive_start_offset() == model::offset{}) {
+            // Create archive lazily
+            stm_manifest.set_archive_start_offset(
+              model::offset{0}, model::offset_delta{0});
+            stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
+        }
         stm_manifest.spillover(spm.make_manifest_metadata());
         // update cache
         auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
-            cache.local()
-              .put(
-                path, stream.stream, reservation, ss::default_priority_class())
-              .get();
+            cache.local().put(path, stream.stream, reservation).get();
             stream.stream.close().get();
         }
         // upload to the cloud
@@ -134,9 +131,7 @@ public:
         auto path = spm.get_manifest_path(path_provider);
         auto stream = spm.serialize().get();
         auto reservation = cache.local().reserve_space(123, 1).get();
-        cache.local()
-          .put(path, stream.stream, reservation, ss::default_priority_class())
-          .get();
+        cache.local().put(path, stream.stream, reservation).get();
         stream.stream.close().get();
     }
 
@@ -197,6 +192,13 @@ public:
     void trigger_spillover(int num_segments, bool hydrate = true) {
         BOOST_REQUIRE_GT(stm_manifest.size(), num_segments + 1);
 
+        if (stm_manifest.get_archive_start_offset() == model::offset{}) {
+            // Create empty archive
+            stm_manifest.set_archive_start_offset(
+              model::offset{0}, model::offset_delta{0});
+            stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
+        }
+
         const auto so = model::next_offset(stm_manifest.get_last_offset());
         spillover_manifest spm(manifest_ntp, manifest_rev);
         for (const auto& meta : stm_manifest) {
@@ -213,10 +215,7 @@ public:
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
-            cache.local()
-              .put(
-                path, stream.stream, reservation, ss::default_priority_class())
-              .get();
+            cache.local().put(path, stream.stream, reservation).get();
             stream.stream.close().get();
         }
         // upload to the cloud
@@ -716,16 +715,15 @@ FIXTURE_TEST(test_async_manifest_view_retention, async_manifest_view_fixture) {
     }
 
     // Check the case when retention overshoots
-    // auto rr1 = view.compute_retention(total_size * 2,
-    // std::nullopt).get(); BOOST_REQUIRE(rr1.has_value());
-    // BOOST_REQUIRE_EQUAL(rr1.value().offset, model::offset{});
-    // BOOST_REQUIRE_EQUAL(rr1.value().delta, model::offset_delta{});
+    auto rr1 = view.compute_retention(total_size * 2, std::nullopt).get();
+    BOOST_REQUIRE(rr1.has_value());
+    BOOST_REQUIRE_EQUAL(rr1.value().offset, model::offset{});
+    BOOST_REQUIRE_EQUAL(rr1.value().delta, model::offset_delta{});
 
     auto rr2 = view.compute_retention(std::nullopt, storage_duration * 2).get();
     BOOST_REQUIRE(rr2.has_value());
     BOOST_REQUIRE_EQUAL(rr2.value().offset, model::offset{});
     BOOST_REQUIRE_EQUAL(rr2.value().delta, model::offset_delta{});
-    return;
 
     auto rr3
       = view.compute_retention(total_size * 2, storage_duration * 2).get();
@@ -806,10 +804,139 @@ FIXTURE_TEST(test_async_manifest_view_retention, async_manifest_view_fixture) {
       prefix_delta);
 
     auto rr6 = view.compute_retention(total_size, storage_duration).get();
-
     BOOST_REQUIRE(rr6.has_value());
     BOOST_REQUIRE_EQUAL(rr6.value().offset, prefix_base_offset);
     BOOST_REQUIRE_EQUAL(rr6.value().delta, prefix_delta);
+
+    // Check that an offset pinned above the normal retention point will not
+    // change the retention point.
+    auto prefix_kafka_offset = prefix_base_offset - prefix_delta;
+    auto rr7 = view
+                 .compute_retention(
+                   total_size,
+                   storage_duration,
+                   prefix_kafka_offset + kafka::offset{100000})
+                 .get();
+    BOOST_REQUIRE(rr7.has_value());
+    BOOST_CHECK_EQUAL(rr7.value().offset, prefix_base_offset);
+    BOOST_CHECK_EQUAL(rr7.value().delta, prefix_delta);
+
+    // Check that an offset pinned below the normal retention point will cause
+    // retention to return a lower value.
+    auto rr8 = view
+                 .compute_retention(
+                   total_size,
+                   storage_duration,
+                   kafka::prev_offset(prefix_kafka_offset))
+                 .get();
+    BOOST_REQUIRE(rr8.has_value());
+    BOOST_CHECK_LT(rr8.value().offset, prefix_base_offset);
+    BOOST_CHECK_EQUAL(rr8.value().delta, prefix_delta);
+}
+
+FIXTURE_TEST(
+  test_async_manifest_view_retention_with_pin, async_manifest_view_fixture) {
+    std::vector<segment_meta> segments;
+    collect_segments_to(segments);
+    for (int i = 0; i < 10; i++) {
+        generate_manifest_section(100);
+    }
+    listen();
+
+    // Sanity check that aggressive size limits results in removing the entire
+    // spillover region.
+    auto res = view.compute_retention(0, storage_duration).get();
+    BOOST_REQUIRE(res.has_value());
+    auto& stm_manifest = view.stm_manifest();
+    BOOST_CHECK_EQUAL(res.value().offset, stm_manifest.get_start_offset());
+    BOOST_CHECK_EQUAL(
+      res.value().delta,
+      stm_manifest.first_addressable_segment()->delta_offset);
+
+    // Check that pinning inside spillover manifest works as expected.
+    std::vector<kafka::offset> test_pin_offsets;
+    std::optional<kafka::offset> last_offset;
+    for (const auto& spill_m : view.stm_manifest().get_spillover_map()) {
+        test_pin_offsets.push_back(spill_m.base_kafka_offset());
+        auto mid = kafka::offset{
+          (spill_m.base_kafka_offset() + spill_m.last_kafka_offset()) / 2};
+        test_pin_offsets.push_back(mid);
+        test_pin_offsets.push_back(spill_m.last_kafka_offset());
+
+        last_offset = spill_m.last_kafka_offset();
+    }
+
+    BOOST_TEST_REQUIRE(last_offset.has_value());
+
+    for (auto pinned_offset : test_pin_offsets) {
+        auto retention_res
+          = view.compute_retention(0, storage_duration, pinned_offset).get();
+        BOOST_REQUIRE(retention_res.has_value());
+
+        auto computed_kafka_start_offset = retention_res.value().offset
+                                           - retention_res.value().delta;
+
+        // The computed start offset should be less than or equal to the pinned
+        // offset.
+        BOOST_CHECK_LE(computed_kafka_start_offset, pinned_offset);
+    }
+
+    // Check that pinning above the spillover region truncates at the start
+    // of the STM manifest.
+    for (auto increment : {1, 2, 3}) {
+        auto pinned_offset = last_offset.value() + kafka::offset{increment};
+        auto retention_res
+          = view.compute_retention(0, storage_duration, pinned_offset).get();
+        BOOST_REQUIRE(retention_res.has_value());
+
+        auto computed_kafka_start_offset = retention_res.value().offset
+                                           - retention_res.value().delta;
+
+        auto expected_start_offset
+          = stm_manifest.get_start_offset().value()
+            - stm_manifest.first_addressable_segment()->delta_offset;
+
+        // The computed start offset should be less than or equal to the pinned
+        // offset.
+        BOOST_CHECK_LE(computed_kafka_start_offset, pinned_offset);
+
+        // And equal to the start of the STM manifest.
+        BOOST_CHECK_EQUAL(computed_kafka_start_offset, expected_start_offset);
+    }
+
+    std::vector<segment_meta> segments_to_check;
+    std::ranges::sample(
+      segments | std::views::filter([&stm_manifest](const auto& m) {
+          // Only check segments that are in the archive.
+          return m.base_offset < stm_manifest.get_start_offset();
+      }),
+      std::back_inserter(segments_to_check),
+      5,
+      std::mt19937{std::random_device{}()});
+
+    // Test pinning on segment boundaries.
+    for (const auto& segment : segments_to_check) {
+        const std::vector<kafka::offset> offsets_to_probe = {
+          segment.base_offset - segment.delta_offset,
+          segment.committed_offset - segment.delta_offset,
+        };
+
+        for (auto pinned_offset : offsets_to_probe) {
+            auto retention_res
+              = view.compute_retention(0, storage_duration, pinned_offset)
+                  .get();
+            BOOST_REQUIRE(retention_res.has_value());
+
+            auto computed_kafka_start_offset = retention_res.value().offset
+                                               - retention_res.value().delta;
+
+            // The computed start offset should be equal to the start of the
+            // segment containing the pinned offset.
+            BOOST_CHECK_EQUAL(
+              computed_kafka_start_offset,
+              segment.base_offset - segment.delta_offset);
+        }
+    }
 }
 
 FIXTURE_TEST(test_async_manifest_view_after_gc, async_manifest_view_fixture) {
@@ -837,10 +964,13 @@ FIXTURE_TEST(test_async_manifest_view_after_gc, async_manifest_view_fixture) {
     // to the second segment in the second spillover manifest.
     BOOST_REQUIRE(spillover_start_offsets.size() == 3);
     const auto second_spill_start = spillover_start_offsets[0];
-    auto iter = std::next(std::find_if(
-      expected.begin(), expected.end(), [second_spill_start](const auto& meta) {
-          return meta.base_offset == second_spill_start;
-      }));
+    auto iter = std::next(
+      std::find_if(
+        expected.begin(),
+        expected.end(),
+        [second_spill_start](const auto& meta) {
+            return meta.base_offset == second_spill_start;
+        }));
     const auto second_seg_second_spill = *iter;
 
     stm_manifest.set_archive_start_offset(
@@ -1088,8 +1218,9 @@ FIXTURE_TEST(test_async_manifest_view_test_iter2, async_manifest_view_fixture) {
     auto cursor = std::move(maybe_cursor.value());
     cloud_storage::for_each_manifest(
       std::move(cursor),
-      [&actual](ssx::task_local_ptr<const cloud_storage::partition_manifest>
-                  p) mutable {
+      [&actual](
+        ssx::task_local_ptr<const cloud_storage::partition_manifest>
+          p) mutable {
           for (const auto& m : *p) {
               actual.push_back(m);
           }
@@ -1186,4 +1317,45 @@ FIXTURE_TEST(
           })
           .get();
     }
+}
+
+FIXTURE_TEST(
+  test_async_manifest_view_get_term_last_offset_with_spillover_edge_case,
+  async_manifest_view_fixture) {
+    using t = model::term_id;
+    using o = model::offset;
+    int num_segments = 4;
+    std::vector<segment_meta> segs;
+    segs.reserve(num_segments);
+    int ts_step = 10;
+    int o_step = 10;
+    for (int i = 0; i < num_segments; ++i) {
+        segs.push_back(
+          segment_meta{
+            .size_bytes = 4097,
+            .base_offset = o{i * o_step},
+            .committed_offset = o{(i + 1) * o_step - 1},
+            .base_timestamp = model::timestamp{i * ts_step},
+            .max_timestamp = model::timestamp{i * ts_step + 1},
+            .segment_term = t{i}});
+    }
+    auto target_term = model::term_id{1};
+    // Populate 2 spillover manifests in map. The desired term,
+    // model::term_id{1}, is going to be the last entry in the spillover
+    // manifests, i.e there will be no higher term entry in
+    // `get_segment_term_column`, and the main manifest contains no segments
+    // with a lower term than the desired term:
+    // Main manifest: [2, 3]
+    // Spillover map: [[0], [1]]
+    // We should expect that when we fail to find a result in the spillover map
+    // via `get_spillover_upper_bound_by_term()`, we still fall back to
+    // searching the main manifest for the term's last offset.
+    add_segments_to_stm_manifest(segs);
+    trigger_spillover(1);
+    trigger_spillover(1);
+
+    auto offset = view.get_term_last_offset(target_term).get();
+    BOOST_REQUIRE(offset.has_value());
+    BOOST_REQUIRE(offset.value().has_value());
+    BOOST_REQUIRE_EQUAL(offset.value().value(), kafka::offset{19});
 }

@@ -15,8 +15,7 @@
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/async.h"
-
-#include <seastar/core/io_priority_class.hh>
+#include "test_utils/boost_fixture.h"
 
 #include <boost/test/tools/old/interface.hpp>
 
@@ -117,7 +116,7 @@ FIXTURE_TEST(test_tm_stm_eviction, redpanda_thread_fixture) {
     BOOST_REQUIRE_EQUAL(op_code, cluster::tm_stm::op_status::success);
     auto tx_mgr_log = tx_mgr_prt->log();
     tx_mgr_log->flush().get();
-    tx_mgr_log->force_roll(ss::default_priority_class()).get();
+    tx_mgr_log->force_roll().get();
 
     // Start another tx and roll to the next segment.
     op_code = tx_stm
@@ -131,7 +130,7 @@ FIXTURE_TEST(test_tm_stm_eviction, redpanda_thread_fixture) {
     BOOST_REQUIRE_EQUAL(2, tx_mgr_log->segment_count());
 
     tx_mgr_log->flush().get();
-    tx_mgr_log->force_roll(ss::default_priority_class()).get();
+    tx_mgr_log->force_roll().get();
     BOOST_REQUIRE_EQUAL(op_code, cluster::tm_stm::op_status::success);
     BOOST_REQUIRE_EQUAL(3, tx_mgr_log->segment_count());
 

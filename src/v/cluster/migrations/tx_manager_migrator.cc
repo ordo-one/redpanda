@@ -9,6 +9,8 @@
 
 #include "cluster/migrations/tx_manager_migrator.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
 #include "base/vlog.h"
 #include "cluster/controller_api.h"
 #include "cluster/errc.h"
@@ -18,7 +20,7 @@
 #include "cluster/tx_hash_ranges.h"
 #include "cluster/types.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -32,12 +34,9 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
 #include <boost/range/irange.hpp>
 
 #include <chrono>
@@ -214,13 +213,11 @@ ss::future<tx_manager_read_reply> tx_manager_read_handler::do_read(
     if (!partition) {
         co_return tx_manager_read_reply(errc::partition_not_exists);
     }
-    storage::log_reader_config reader_cfg(
-      std::max(offset, partition->raft_start_offset()),
-      model::offset::max(),
-      ss::default_priority_class());
     // read up to 128 KiB
+    auto reader_cfg = storage::local_log_reader_config(
+      std::max(offset, partition->raft_start_offset()), model::offset::max());
     reader_cfg.max_bytes = 128_KiB;
-    auto reader = co_await partition->make_reader(std::move(reader_cfg));
+    auto reader = co_await partition->make_local_reader(std::move(reader_cfg));
 
     auto batches = co_await model::consume_reader_to_chunked_vector(
       std::move(reader), model::no_timeout);

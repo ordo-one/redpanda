@@ -9,17 +9,15 @@
 
 #include "kafka/client/consumer.h"
 
-#include "bytes/iobuf_parser.h"
 #include "kafka/client/assignment_plans.h"
 #include "kafka/client/broker.h"
 #include "kafka/client/configuration.h"
 #include "kafka/client/exceptions.h"
-#include "kafka/client/logger.h"
+#include "kafka/client/types.h"
 #include "kafka/client/utils.h"
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
-#include "kafka/protocol/find_coordinator.h"
 #include "kafka/protocol/heartbeat.h"
 #include "kafka/protocol/join_group.h"
 #include "kafka/protocol/leave_group.h"
@@ -27,7 +25,7 @@
 #include "kafka/protocol/sync_group.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "model/record_utils.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
@@ -76,58 +74,73 @@ fetch_response
 reduce_fetch_response(fetch_response result, fetch_response val) {
     result.data.throttle_time_ms += val.data.throttle_time_ms;
     std::move(
-      val.data.topics.begin(),
-      val.data.topics.end(),
-      std::back_inserter(result.data.topics));
+      val.data.responses.begin(),
+      val.data.responses.end(),
+      std::back_inserter(result.data.responses));
     return result;
 };
 
 } // namespace detail
 
 consumer::consumer(
-  const configuration& config,
+  consumer_configuration config,
+  retries_configuration& retries_cfg,
   topic_cache& topic_cache,
   brokers& brokers,
   shared_broker_t coordinator,
   kafka::group_id group_id,
   kafka::member_id name,
   ss::noncopyable_function<void(const kafka::member_id&)> on_stopped,
-  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater)
-  : _config(config)
+  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater,
+  prefix_logger& logger)
+  : _config(std::move(config))
+  , _retries_cfg(retries_cfg)
   , _topic_cache(topic_cache)
   , _brokers(brokers)
   , _coordinator(std::move(coordinator))
   , _inactive_timer([me{shared_from_this()}]() {
-      vlog(kclog.info, "Consumer: {}: inactive", *me);
+      vlog(me->_logger->info, "Consumer: {}: inactive", *me);
       ssx::background = me->leave().discard_result().finally([me]() {});
   })
   , _group_id(std::move(group_id))
   , _name(std::move(name))
   , _topics()
   , _on_stopped(std::move(on_stopped))
-  , _external_mitigate(std::move(mitigater)) {}
+  , _external_mitigate(std::move(mitigater))
+  , _logger(&logger) {}
 
 void consumer::start() {
-    vlog(kclog.info, "Consumer: {}: start", *this);
+    vlog(_logger->info, "Consumer: {}: start", *this);
     _heartbeat_timer.set_callback([me{shared_from_this()}]() {
-        vlog(kclog.trace, "Consumer: {}: timer cb", *me);
+        vlog(me->_logger->trace, "Consumer: {}: timer cb", *me);
         (void)me->heartbeat()
           .handle_exception_type([me](const exception_base& e) {
               vlog(
-                kclog.info, "Consumer: {}: heartbeat failed: {}", *me, e.error);
+                me->_logger->info,
+                "Consumer: {}: heartbeat failed: {}",
+                *me,
+                e.error);
           })
           .handle_exception_type([me](const ss::gate_closed_exception& e) {
-              vlog(kclog.trace, "Consumer: {}: heartbeat failed: {}", *me, e);
+              vlog(
+                me->_logger->trace,
+                "Consumer: {}: heartbeat failed: {}",
+                *me,
+                e);
           })
           .handle_exception([me](const std::exception_ptr& e) {
-              vlog(kclog.error, "Consumer: {}: heartbeat failed: {}", *me, e);
+              vlog(
+                me->_logger->error,
+                "Consumer: {}: heartbeat failed: {}",
+                *me,
+                e);
           });
     });
-    _heartbeat_timer.rearm_periodic(_config.consumer_heartbeat_interval());
+    _heartbeat_timer.rearm_periodic(_config.heartbeat_interval);
 }
 
 ss::future<> consumer::stop() {
-    vlog(kclog.info, "Consumer: {}: stop", *this);
+    vlog(_logger->info, "Consumer: {}: stop", *this);
     // Clear the timer callbacks as they may hold a shared_from_this().
     _heartbeat_timer.cancel();
     _heartbeat_timer.set_callback([]() {});
@@ -145,7 +158,7 @@ ss::future<> consumer::stop() {
 }
 
 ss::future<> consumer::initialize() {
-    vlog(kclog.info, "Consumer: {}: initialize", *this);
+    vlog(_logger->info, "Consumer: {}: initialize", *this);
     refresh_inactivity_timer();
     return join();
 }
@@ -158,8 +171,8 @@ ss::future<> consumer::join() {
         req.client_id = kafka::client_id("test_client");
         req.data = {
           .group_id = me->_group_id,
-          .session_timeout_ms = cfg.consumer_session_timeout(),
-          .rebalance_timeout_ms = cfg.consumer_rebalance_timeout(),
+          .session_timeout_ms = cfg.session_timeout,
+          .rebalance_timeout_ms = cfg.rebalance_timeout,
           .member_id = me->_member_id,
           .protocol_type = consumer_group_protocol_type,
           .protocols = make_join_group_request_protocols(me->_topics)};
@@ -177,7 +190,7 @@ ss::future<> consumer::join() {
           case error_code::illegal_generation:
               return join();
           case error_code::not_coordinator:
-              return ss::sleep_abortable(_config.retry_base_backoff(), _as)
+              return ss::sleep_abortable(_retries_cfg.retry_base_backoff, _as)
                 .then([this]() { return join(); });
           case error_code::none:
               _generation_id = res.data.generation_id;
@@ -234,7 +247,7 @@ void consumer::on_leader_join(const join_group_response& res) {
       std::unique(_subscribed_topics.begin(), _subscribed_topics.end()));
 
     vlog(
-      kclog.info,
+      _logger->info,
       "Consumer: {}: join: members: {}, topics: {}",
       *this,
       _members,
@@ -345,23 +358,22 @@ ss::future<> consumer::heartbeat() {
 }
 
 void consumer::refresh_inactivity_timer() {
-    _inactive_timer.rearm(
-      ss::timer<>::clock::now() + _config.consumer_session_timeout());
+    _inactive_timer.rearm(ss::timer<>::clock::now() + _config.session_timeout);
 }
 
 ss::future<describe_groups_response> consumer::describe_group() {
     auto req_builder = [this]() {
-        return describe_groups_request{.data{.groups = {{_group_id}}}};
+        return describe_groups_request{.data{.groups = {_group_id}}};
     };
     return req_res(req_builder);
 }
 
 ss::future<offset_fetch_response>
-consumer::offset_fetch(std::vector<offset_fetch_request_topic> topics) {
+consumer::offset_fetch(chunked_vector<offset_fetch_request_topic> topics) {
     refresh_inactivity_timer();
     auto req_builder = [topics{std::move(topics)}, group_id{_group_id}]() {
         return offset_fetch_request{
-          .data{.group_id = group_id, .topics = topics}};
+          .data{.group_id = group_id, .topics = topics.copy()}};
     };
     return req_res(std::move(req_builder))
       .then([this](offset_fetch_response res) {
@@ -375,7 +387,7 @@ consumer::offset_fetch(std::vector<offset_fetch_request_topic> topics) {
 }
 
 ss::future<offset_commit_response>
-consumer::offset_commit(std::vector<offset_commit_request_topic> topics) {
+consumer::offset_commit(chunked_vector<offset_commit_request_topic> topics) {
     refresh_inactivity_timer();
     if (topics.empty()) { // commit all offsets
         for (const auto& s : _fetch_sessions) {
@@ -394,7 +406,7 @@ consumer::offset_commit(std::vector<offset_commit_request_topic> topics) {
           .group_id = me->_group_id,
           .generation_id = me->_generation_id,
           .member_id = me->_member_id,
-          .topics = topics}};
+          .topics = make_copy(topics)}};
     };
 
     co_return co_await req_res(std::move(req_builder));
@@ -403,9 +415,11 @@ consumer::offset_commit(std::vector<offset_commit_request_topic> topics) {
 ss::future<fetch_response>
 consumer::dispatch_fetch(broker_reqs_t::value_type br) {
     auto& [broker, req] = br;
-    vlog(kclog.trace, "Consumer: {}, fetch_req: {}", *this, req);
-    auto res = co_await broker->dispatch(std::move(req));
-    vlog(kclog.trace, "Consumer: {}, fetch_res: {}", *this, res);
+    vlog(_logger->trace, "Consumer: {}, fetch_req: {}", *this, req);
+    auto res_v = co_await broker->dispatch(
+      std::move(req), api_version_for(fetch_api::key), _as);
+    auto res = std::get<fetch_response>(std::move(res_v));
+    vlog(_logger->trace, "Consumer: {}, fetch_res: {}", *this, res);
 
     if (res.data.error_code != error_code::none) {
         throw broker_error(broker->id(), res.data.error_code);
@@ -423,8 +437,12 @@ ss::future<fetch_response> consumer::fetch(
     for (const auto& [t, ps] : _assignment) {
         for (const auto& p : ps) {
             auto tp = model::topic_partition{t, p};
-            auto leader = co_await _topic_cache.leader(tp);
-            auto broker = co_await _brokers.find(leader);
+            auto leader = _topic_cache.leader(tp);
+            if (!leader) {
+                throw partition_error(
+                  tp, error_code::unknown_topic_or_partition);
+            }
+            auto broker = _brokers.find(*leader);
             auto& session = _fetch_sessions[broker];
 
             auto& req = broker_reqs
@@ -434,9 +452,9 @@ ss::future<fetch_response> consumer::fetch(
                               .data = {
                               .replica_id = consumer_replica_id,
                               .max_wait_ms = timeout,
-                              .min_bytes = _config.consumer_request_min_bytes,
+                              .min_bytes = _config.fetch_min_bytes,
                               .max_bytes = max_bytes.value_or(
-                                _config.consumer_request_max_bytes),
+                                _config.fetch_max_bytes),
                               .isolation_level = model::isolation_level::
                                 read_uncommitted, // READ_UNCOMMITTED
                               .session_id = session.id(),
@@ -444,16 +462,16 @@ ss::future<fetch_response> consumer::fetch(
                             }})
                           .first->second;
 
-            if (req.data.topics.empty() || req.data.topics.back().name != t) {
-                req.data.topics.push_back(fetch_request::topic{.name{t}});
+            if (req.data.topics.empty() || req.data.topics.back().topic != t) {
+                req.data.topics.push_back(fetch_request::topic{.topic{t}});
             }
 
-            req.data.topics.back().fetch_partitions.push_back(
+            req.data.topics.back().partitions.push_back(
               fetch_request::partition{
-                .partition_index = p,
+                .partition = p,
                 .fetch_offset = session.offset(tp),
-                .max_bytes = max_bytes.value_or(
-                  _config.consumer_request_max_bytes)});
+                .partition_max_bytes = max_bytes.value_or(
+                  _config.fetch_max_bytes)});
         }
     }
 
@@ -475,17 +493,26 @@ ss::future<
 consumer::reset_coordinator_and_retry_request(request_factory req) {
     return find_coordinator_with_retry_and_mitigation(
              _gate,
-             _config,
+             _retries_cfg.max_retries,
+             _retries_cfg.retry_base_backoff,
              _brokers,
              group_id(),
              name(),
              [this](std::exception_ptr ex) { return _external_mitigate(ex); })
       .then(
         [this, req{std::move(req)}](shared_broker_t new_coordinator) mutable {
-            _coordinator = new_coordinator;
+            auto old_coordinator = std::move(_coordinator);
+            _coordinator = std::move(new_coordinator);
+            auto f = ss::now();
+            if (old_coordinator) {
+                f = old_coordinator->stop().finally([old_coordinator] {});
+            }
+
             // Calling req_res here will re-issue the request on the
             // new coordinator
-            return req_res(std::move(req));
+            return f.then([this, req = std::move(req)]() mutable {
+                return req_res(std::move(req));
+            });
         });
 }
 
@@ -497,7 +524,7 @@ consumer::maybe_process_response_errors(request_factory req, response_t res) {
     switch (res.data.error_code) {
     case error_code::not_coordinator:
         vlog(
-          kclog.debug,
+          _logger->debug,
           "Wrong coordinator on consumer {}, getting new coordinator "
           "before retry",
           *me);
@@ -516,7 +543,7 @@ ss::future<metadata_response> consumer::maybe_process_response_errors(
         switch (topic.error_code) {
         case error_code::not_coordinator:
             vlog(
-              kclog.debug,
+              _logger->debug,
               "Wrong coordinator on consumer {}, topic {}, getting new "
               "coordinator before retry",
               *me,
@@ -539,7 +566,7 @@ ss::future<offset_commit_response> consumer::maybe_process_response_errors(
             switch (partition.error_code) {
             case error_code::not_coordinator:
                 vlog(
-                  kclog.debug,
+                  _logger->debug,
                   "Wrong coordinator on consumer {}, tp {}, getting new "
                   "coordinator before retry",
                   *me,
@@ -564,7 +591,7 @@ ss::future<describe_groups_response> consumer::maybe_process_response_errors(
         switch (group.error_code) {
         case error_code::not_coordinator:
             vlog(
-              kclog.debug,
+              _logger->debug,
               "Wrong coordinator on consumer {}, group {}, getting new "
               "coordinator before retry",
               *me,
@@ -579,23 +606,27 @@ ss::future<describe_groups_response> consumer::maybe_process_response_errors(
 }
 
 ss::future<shared_consumer_t> make_consumer(
-  const configuration& config,
+  const consumer_configuration& config,
+  retries_configuration& retries_config,
   topic_cache& topic_cache,
   brokers& brokers,
   shared_broker_t coordinator,
   group_id group_id,
   member_id name,
   ss::noncopyable_function<void(const member_id&)> on_stopped,
-  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater) {
+  ss::noncopyable_function<ss::future<>(std::exception_ptr)> mitigater,
+  prefix_logger& logger) {
     auto c = ss::make_lw_shared<consumer>(
       config,
+      retries_config,
       topic_cache,
       brokers,
       std::move(coordinator),
       std::move(group_id),
       std::move(name),
       std::move(on_stopped),
-      std::move(mitigater));
+      std::move(mitigater),
+      logger);
     return c->initialize().then([c]() mutable { return std::move(c); });
 }
 

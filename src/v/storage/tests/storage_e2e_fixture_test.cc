@@ -7,16 +7,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "container/chunked_circular_buffer.h"
 #include "kafka/server/tests/produce_consume_utils.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
 #include "storage/disk_log_impl.h"
 #include "storage/segment.h"
 #include "storage/tests/storage_e2e_fixture.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
 
 #include <boost/test/tools/old/interface.hpp>
@@ -29,7 +29,7 @@ using namespace std::chrono_literals;
 namespace {
 ss::future<> force_roll_log(storage::disk_log_impl* log) {
     try {
-        co_await log->force_roll(ss::default_priority_class());
+        co_await log->force_roll();
     } catch (...) {
     }
 }
@@ -98,8 +98,10 @@ FIXTURE_TEST(test_concurrent_log_eviction_and_append, storage_e2e_fixture) {
       /*gc_upper=*/model::timestamp::max(),
       /*max_bytes_in_log=*/1,
       /*max_collect_offset=*/model::offset::min(),
+      /*max_tombstone_remove_offset=*/model::offset::min(),
       /*tombstone_retention_ms=*/std::nullopt,
-      ss::default_priority_class(),
+      /*tx_retention_ms=*/std::nullopt,
+      /*min_lag_ms=*/std::chrono::milliseconds{0},
       as);
 
     const auto num_records = 100;
@@ -107,6 +109,7 @@ FIXTURE_TEST(test_concurrent_log_eviction_and_append, storage_e2e_fixture) {
     model::offset stop_after{num_records * 100};
     tests::kafka_produce_transport producer(make_kafka_client().get());
     producer.start().get();
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
     auto produce = [&] {
         return producer
           .produce_to_partition(
@@ -129,18 +132,18 @@ FIXTURE_TEST(test_concurrent_log_eviction_and_append, storage_e2e_fixture) {
     auto read = [&] {
         auto lstats = log->offsets();
         return log
-          ->make_reader(storage::log_reader_config(
-            lstats.start_offset,
-            model::offset::max(),
-            ss::default_priority_class()))
+          ->make_reader(
+            storage::local_log_reader_config(
+              lstats.start_offset, model::offset::max()))
           .then([](auto reader) {
-              return ss::sleep(std::chrono::milliseconds(
-                                 random_generators::get_int(15, 30)))
+              return ss::sleep(
+                       std::chrono::milliseconds(
+                         random_generators::get_int(15, 30)))
                 .then([r = std::move(reader)]() mutable {
                     return model::consume_reader_to_memory(
                       std::move(r), model::no_timeout);
                 })
-                .then([](ss::circular_buffer<model::record_batch> batches) {
+                .then([](chunked_circular_buffer<model::record_batch> batches) {
                     model::offset prev_base_offset{model::offset::min()};
                     for (const auto& batch : batches) {
                         BOOST_REQUIRE_GT(batch.base_offset(), prev_base_offset);

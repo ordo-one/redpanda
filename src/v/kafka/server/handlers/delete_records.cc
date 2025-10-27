@@ -14,7 +14,7 @@
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/data/partition_proxy.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
@@ -37,10 +37,11 @@ chunked_vector<delete_records_partition_result>
 make_partition_errors(const delete_records_topic& t, error_code ec) {
     chunked_vector<delete_records_partition_result> r;
     for (const auto& p : t.partitions) {
-        r.push_back(delete_records_partition_result{
-          .partition_index = p.partition_index,
-          .low_watermark = invalid_low_watermark,
-          .error_code = ec});
+        r.push_back(
+          delete_records_partition_result{
+            .partition_index = p.partition_index,
+            .low_watermark = invalid_low_watermark,
+            .error_code = ec});
     }
     return r;
 }
@@ -49,7 +50,7 @@ make_partition_errors(const delete_records_topic& t, error_code ec) {
 /// partitions that all contain the identical error codes
 chunked_vector<delete_records_partition_result>
 validate_at_topic_level(request_context& ctx, const delete_records_topic& t) {
-    if (ctx.recovery_mode_enabled()) {
+    if (ctx.recovery_mode_enabled() || !ctx.is_topic_mutable(t.name)) {
         return make_partition_errors(t, error_code::policy_violation);
     }
 
@@ -57,7 +58,7 @@ validate_at_topic_level(request_context& ctx, const delete_records_topic& t) {
         if (cfg.is_read_replica()) {
             return false;
         }
-        /// Immitates the logic in ntp_config::is_collectable
+        /// Immitates the logic in ntp_config::is_*_collectable
         if (
           !cfg.properties.has_overrides()
           || !cfg.properties.cleanup_policy_bitflags) {
@@ -83,7 +84,11 @@ validate_at_topic_level(request_context& ctx, const delete_records_topic& t) {
     } else if (!is_deletable(*cfg)) {
         return make_partition_errors(t, error_code::policy_violation);
     } else if (is_nodelete_topic(t)) {
-        return make_partition_errors(t, error_code::invalid_topic_exception);
+        vlog(
+          klog.warn,
+          "Topic {} is protected by 'kafka_nodelete_topics'",
+          t.name);
+        return make_partition_errors(t, error_code::topic_authorization_failed);
     }
     return {};
 }
@@ -143,7 +148,7 @@ ss::future<result_t> prefix_truncate(
       kafka_truncation_offset, ss::lowres_clock::now() + timeout_ms);
     if (errc != error_code::none) {
         vlog(
-          klog.info,
+          klog.warn,
           "Possible failed attempted to truncate partition: {} error: {}",
           ktp,
           errc);
@@ -154,7 +159,7 @@ ss::future<result_t> prefix_truncate(
     /// until the local start offset was updated
     const auto kafka_start_offset = partition->start_offset();
     vlog(
-      klog.info,
+      klog.debug,
       "Truncated partition: {} to offset: {}",
       ktp,
       kafka_start_offset);
@@ -225,9 +230,10 @@ delete_records_handler::handle(request_context ctx, ss::smp_service_group) {
           /// may happen in the inner for loop below.
           auto topic_level_errors = validate_at_topic_level(ctx, topic);
           if (!topic_level_errors.empty()) {
-              response.data.topics.push_back(delete_records_topic_result{
-                .name = topic.name,
-                .partitions = std::move(topic_level_errors)});
+              response.data.topics.push_back(
+                delete_records_topic_result{
+                  .name = topic.name,
+                  .partitions = std::move(topic_level_errors)});
               return;
           }
 
@@ -283,8 +289,9 @@ delete_records_handler::handle(request_context ctx, ss::smp_service_group) {
 
     /// Map to kafka response type
     for (auto& [topic, partition_results] : group_by_topic) {
-        response.data.topics.push_back(delete_records_topic_result{
-          .name = topic, .partitions = std::move(partition_results)});
+        response.data.topics.push_back(
+          delete_records_topic_result{
+            .name = topic, .partitions = std::move(partition_results)});
     }
     co_return co_await ctx.respond(std::move(response));
 }

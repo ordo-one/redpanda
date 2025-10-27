@@ -11,11 +11,14 @@
 
 #pragma once
 
+#include "cluster/cluster_link/fwd.h"
 #include "cluster/fwd.h"
 #include "config/configuration.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/connection_context.h"
+#include "kafka/server/fetch_memory_units.h"
 #include "kafka/server/fetch_metadata_cache.h"
 #include "kafka/server/fetch_pid_controller.h"
 #include "kafka/server/fetch_session_cache.h"
@@ -79,6 +82,7 @@ public:
       ss::sharded<cluster::controller_api>&,
       ss::sharded<cluster::tx_gateway_frontend>&,
       ss::sharded<datalake_throttle_manager>&,
+      ss::sharded<cluster::cluster_link::frontend>&,
       std::optional<qdc_monitor_config>,
       ssx::singleton_thread_worker&,
       const std::unique_ptr<pandaproxy::schema_registry::api>&) noexcept;
@@ -88,6 +92,8 @@ public:
     server& operator=(const server&) = delete;
     server(server&&) noexcept = delete;
     server& operator=(server&&) noexcept = delete;
+
+    ss::future<> stop();
 
     std::string_view name() const final { return "kafka rpc protocol"; }
     // the lifetime of all references here are guaranteed to live
@@ -226,6 +232,10 @@ public:
 
     ssx::semaphore& memory_fetch_sem() noexcept { return _memory_fetch_sem; }
 
+    fetch_memory_units_manager& fetch_units_manager() noexcept {
+        return _fetch_units_manager;
+    }
+
     ss::future<> revoke_credentials(std::string_view name);
 
     // Returns a default scheduling group that is intended to be used for
@@ -244,6 +254,17 @@ public:
      */
     void
     mark_datalake_producer(const std::optional<std::string_view>& client_id);
+
+    cluster::cluster_link::frontend& cluster_link_frontend() {
+        return _cluster_link_frontend.local();
+    }
+
+    bool is_cluster_link_active() const;
+
+    chunked_vector<ss::lw_shared_ptr<const connection_context>>
+    list_connections() const;
+
+    closed_connections_t list_closed_connections() const;
 
 private:
     void setup_metrics();
@@ -278,12 +299,14 @@ private:
     ss::sharded<cluster::controller_api>& _controller_api;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
     ss::sharded<kafka::datalake_throttle_manager>& _datalake_throttle_manager;
+    ss::sharded<cluster::cluster_link::frontend>& _cluster_link_frontend;
     std::optional<qdc_monitor> _qdc_mon;
     kafka::fetch_metadata_cache _fetch_metadata_cache;
     security::tls::principal_mapper _mtls_principal_mapper;
     security::gssapi_principal_mapper _gssapi_principal_mapper;
     security::krb5::configurator _krb_configurator;
     ssx::semaphore _memory_fetch_sem;
+    fetch_memory_units_manager _fetch_units_manager;
 
     handler_probe_manager _handler_probes;
     metrics::internal_metric_groups _metrics;
@@ -294,6 +317,7 @@ private:
     std::unique_ptr<replica_selector> _replica_selector;
     const std::unique_ptr<pandaproxy::schema_registry::api>& _schema_registry;
     boost::intrusive::list<connection_context> _connections;
+    closed_connections_t _closed_connections{};
 };
 
 } // namespace kafka

@@ -9,7 +9,6 @@
 
 #include "model/timeout_clock.h"
 #include "random/generators.h"
-#include "rpc/backoff_policy.h"
 #include "rpc/connection_cache.h"
 #include "rpc/exceptions.h"
 #include "rpc/logger.h"
@@ -20,8 +19,9 @@
 #include "rpc/test/rpc_integration_fixture.h"
 #include "rpc/types.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/random_bytes.h"
+#include "utils/backoff_policy.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/metrics_api.hh>
@@ -318,7 +318,7 @@ FIXTURE_TEST(echo_from_cache, rpc_integration_fixture) {
           .emplace(
             node_id,
             ccfg,
-            rpc::make_exponential_backoff_policy<rpc::clock_type>(
+            make_exponential_backoff_policy<rpc::clock_type>(
               std::chrono::milliseconds(1), std::chrono::milliseconds(1)))
           .get();
         auto reconnect_transport = cache.get(node_id);
@@ -354,7 +354,7 @@ FIXTURE_TEST(rpc_abort_from_cache, rpc_integration_fixture) {
       .emplace(
         node_id,
         client_config(),
-        rpc::make_exponential_backoff_policy<rpc::clock_type>(
+        make_exponential_backoff_policy<rpc::clock_type>(
           std::chrono::milliseconds(1), std::chrono::milliseconds(1)))
       .get();
     auto reconnect_transport = cache.get(node_id);
@@ -753,7 +753,7 @@ FIXTURE_TEST(missing_method_test, rpc_integration_fixture) {
         std::shuffle(
           request_factory.begin(),
           request_factory.end(),
-          random_generators::internal::gen);
+          random_generators::global().engine());
 
         // dispatch the requests
         std::vector<ss::future<>> requests;
@@ -916,7 +916,7 @@ FIXTURE_TEST(version_not_supported, rpc_integration_fixture) {
     std::shuffle(
       request_factory.begin(),
       request_factory.end(),
-      random_generators::internal::gen);
+      random_generators::global().engine());
 
     // dispatch the requests
     std::vector<ss::future<>> requests;

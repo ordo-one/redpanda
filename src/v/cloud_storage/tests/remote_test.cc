@@ -30,7 +30,6 @@
 #include "model/metadata.h"
 #include "storage/directories.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
 #include "test_utils/tmp_dir.h"
 #include "utils/lazy_abort_source.h"
 #include "utils/retry_chain_node.h"
@@ -38,7 +37,6 @@
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/resource.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -46,6 +44,9 @@
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
+
+#include <boost/range/irange.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -124,7 +125,9 @@ public:
         io.start(
             std::ref(pool),
             ss::sharded_parameter([this] { return conf; }),
-            ss::sharded_parameter([] { return config_file; }))
+            ss::sharded_parameter([] { return config_file; }),
+            ss::sharded_parameter(
+              [] { return ss::default_scheduling_group(); }))
           .get();
         remote
           .start(std::ref(io), ss::sharded_parameter([this] { return conf; }))
@@ -476,10 +479,7 @@ TEST_P(all_types_remote_fixture, test_concat_segment_upload) {
 
     model::ntp test_ntp{"test_ns", "test_tpc", 0};
     disk_log_builder b{log_config{
-      data_path.string(),
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      data_path.string(), 1024, storage::make_sanitized_file_config()}};
     b | start(ntp_config{test_ntp, {data_path}});
 
     auto defer = ss::defer([&b]() { b.stop().get(); });
@@ -506,8 +506,7 @@ TEST_P(all_types_remote_fixture, test_concat_segment_upload) {
             std::vector<ss::lw_shared_ptr<segment>>{
               b.get_log_segments().begin(), b.get_log_segments().end()},
             start_pos,
-            end_pos,
-            ss::default_priority_class()));
+            end_pos));
     };
 
     retry_chain_node fib(never_abort, 100ms, 20ms);
@@ -755,7 +754,7 @@ TEST_P(all_types_remote_fixture, test_list_bucket_with_prefix) {
                       cloud_storage_clients::object_key{url_base() + "x/"})
                     .get();
     ASSERT_TRUE(result.has_value());
-    auto items = result.value().contents;
+    const auto& items = result.value().contents;
     ASSERT_EQ(items.size(), 2);
     ASSERT_EQ(items[0].key, url_base() + "x/a");
     ASSERT_EQ(items[1].key, url_base() + "x/b");
@@ -790,7 +789,7 @@ TEST_P(all_types_remote_fixture, test_list_bucket_with_filter) {
                       })
                     .get();
     ASSERT_TRUE(result.has_value());
-    auto items = result.value().contents;
+    const auto& items = result.value().contents;
     ASSERT_EQ(items.size(), 1);
     ASSERT_EQ(items[0].key, path_with_prefix);
 }
@@ -1164,7 +1163,6 @@ TEST_P(
   all_types_throttle_remote_fixture,
   test_download_segment_throttle) { // NOLINT
     set_expectations_and_listen({});
-    auto subscription = remote.local().subscribe(allow_all);
     auto name = segment_name("1-2-v1.log");
     auto path = remote_segment_path{prefixed_segment_path(
       manifest_ntp, manifest_revision, name, model::term_id{123})};
@@ -1251,7 +1249,6 @@ TEST_P(
   all_types_no_throttle_remote_fixture,
   test_download_segment_no_throttle) { // NOLINT
     set_expectations_and_listen({});
-    auto subscription = remote.local().subscribe(allow_all);
     auto name = segment_name("1-2-v1.log");
     auto path = remote_segment_path{prefixed_segment_path(
       manifest_ntp, manifest_revision, name, model::term_id{123})};
@@ -1411,3 +1408,67 @@ INSTANTIATE_TEST_SUITE_P(
       .url_style = cloud_storage_clients::s3_url_style::virtual_host},
     remote_test_parameters{
       .url_style = cloud_storage_clients::s3_url_style::path}));
+
+TEST(RemoteTest, TestShutdownOnRetry) {
+    ss::sharded<cloud_storage_clients::client_pool> pool;
+    ss::sharded<cloud_io::remote> io;
+    ss::sharded<remote> remote;
+
+    s3_imposter_fixture s3;
+    bool stopped_remote = false;
+    auto shutdown = ss::defer([&] {
+        if (stopped_remote) {
+            pool.local().shutdown_connections();
+            io.local().request_stop();
+            remote.stop().get();
+        }
+        io.stop().get();
+        pool.stop().get();
+    });
+
+    pool.start(10, ss::sharded_parameter([&s3] { return s3.conf; })).get();
+    io.start(
+        std::ref(pool),
+        ss::sharded_parameter([&s3] { return s3.conf; }),
+        ss::sharded_parameter([&] { return config_file; }),
+        ss::sharded_parameter([] { return ss::default_scheduling_group(); }))
+      .get();
+    remote.start(std::ref(io), ss::sharded_parameter([&s3] { return s3.conf; }))
+      .get();
+
+    s3.fail_request_if(
+      [](const auto&) { return true; },
+      {.status = ss::http::reply::status_type::service_unavailable});
+
+    retry_chain_node fib(never_abort, 100ms, 20ms);
+    partition_manifest dummy_dst_manifest(manifest_ntp, manifest_revision);
+    std::vector<ss::future<download_result>> futs;
+    futs.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+        futs.emplace_back(remote.local().download_manifest(
+          s3.bucket_name, json_manifest_format_path, dummy_dst_manifest, fib));
+    }
+
+    // Give some time for the downloads to start.
+    ss::sleep(30ms).get();
+
+    // Now simulate the broker shutting down, but don't get to the point where
+    // cloud_io::remote is shut down.
+    pool.local().shutdown_connections();
+    io.local().request_stop();
+    remote.stop().get();
+    stopped_remote = true;
+
+    // Regression test for CORE-10019. Previously the downloads could result in
+    // a heap-use-after-free.
+    auto results = ss::when_all(futs.begin(), futs.end()).get();
+    for (auto& res_fut : results) {
+        if (res_fut.failed()) {
+            if (ssx::is_shutdown_exception(res_fut.get_exception())) {
+                continue;
+            }
+            FAIL() << "Expected shutdown exception";
+        }
+        EXPECT_EQ(res_fut.get(), download_result::timedout);
+    }
+}

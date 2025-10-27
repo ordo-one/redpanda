@@ -8,12 +8,13 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/schemata/produce_request.h"
 #include "kafka/server/handlers/produce.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
+#include "test_utils/async.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/coroutine/as_future.hh>
@@ -79,13 +80,15 @@ produce_partition_fixture::run_test(size_t data_size, measured_region region) {
     auto batch = std::move(builder).build();
 
     chunked_vector<kafka::produce_request::partition> partitions;
-    partitions.push_back(kafka::produce_request::partition{
-      .partition_index{model::partition_id(0)},
-      .records = kafka::produce_request_record_data(std::move(batch))});
+    partitions.push_back(
+      kafka::produce_request::partition{
+        .partition_index{model::partition_id(0)},
+        .records = kafka::produce_request_record_data(std::move(batch))});
 
     chunked_vector<kafka::produce_request::topic> topics;
-    topics.push_back(kafka::produce_request::topic{
-      .name{std::move(tp.topic)}, .partitions{std::move(partitions)}});
+    topics.push_back(
+      kafka::produce_request::topic{
+        .name{std::move(tp.topic)}, .partitions{std::move(partitions)}});
 
     std::optional<ss::sstring> t_id;
     int16_t acks = -1;

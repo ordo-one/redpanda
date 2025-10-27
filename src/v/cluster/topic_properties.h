@@ -33,7 +33,7 @@ namespace cluster {
  */
 struct topic_properties
   : serde::
-      envelope<topic_properties, serde::version<11>, serde::compat_version<0>> {
+      envelope<topic_properties, serde::version<12>, serde::compat_version<0>> {
     topic_properties() noexcept = default;
     topic_properties(
       std::optional<model::compression> compression,
@@ -82,7 +82,11 @@ struct topic_properties
         iceberg_invalid_record_action,
       std::optional<std::chrono::milliseconds> iceberg_target_lag_ms,
       tristate<double> min_cleanable_dirty_ratio,
-      std::optional<bool> remote_topic_allow_gaps)
+      std::optional<std::chrono::milliseconds> min_compaction_lag_ms,
+      std::optional<std::chrono::milliseconds> max_compaction_lag_ms,
+      std::optional<bool> remote_topic_allow_gaps,
+      std::optional<std::chrono::milliseconds> message_timestamp_before_max_ms,
+      std::optional<std::chrono::milliseconds> message_timestamp_after_max_ms)
       : compression(compression)
       , cleanup_policy_bitflags(cleanup_policy_bitflags)
       , compaction_strategy(compaction_strategy)
@@ -129,7 +133,11 @@ struct topic_properties
       , iceberg_partition_spec(std::move(iceberg_partition_spec))
       , iceberg_invalid_record_action(iceberg_invalid_record_action)
       , iceberg_target_lag_ms(iceberg_target_lag_ms)
-      , min_cleanable_dirty_ratio(min_cleanable_dirty_ratio) {}
+      , min_cleanable_dirty_ratio(min_cleanable_dirty_ratio)
+      , min_compaction_lag_ms(min_compaction_lag_ms)
+      , max_compaction_lag_ms(max_compaction_lag_ms)
+      , message_timestamp_before_max_ms(message_timestamp_before_max_ms)
+      , message_timestamp_after_max_ms(message_timestamp_after_max_ms) {}
 
     std::optional<model::compression> compression;
     std::optional<model::cleanup_policy_bitflags> cleanup_policy_bitflags;
@@ -219,6 +227,11 @@ struct topic_properties
     std::optional<std::chrono::milliseconds> iceberg_target_lag_ms{};
 
     tristate<double> min_cleanable_dirty_ratio{std::nullopt};
+    std::optional<std::chrono::milliseconds> min_compaction_lag_ms{};
+    std::optional<std::chrono::milliseconds> max_compaction_lag_ms{};
+
+    std::optional<std::chrono::milliseconds> message_timestamp_before_max_ms{};
+    std::optional<std::chrono::milliseconds> message_timestamp_after_max_ms{};
 
     bool is_compacted() const;
     bool has_overrides() const;
@@ -271,7 +284,11 @@ struct topic_properties
           iceberg_invalid_record_action,
           iceberg_target_lag_ms,
           min_cleanable_dirty_ratio,
-          remote_topic_allow_gaps);
+          remote_topic_allow_gaps,
+          min_compaction_lag_ms,
+          max_compaction_lag_ms,
+          message_timestamp_before_max_ms,
+          message_timestamp_after_max_ms);
     }
 
     friend bool operator==(const topic_properties&, const topic_properties&)

@@ -39,7 +39,8 @@ SEASTAR_THREAD_TEST_CASE(test_produce_partition_record_count) {
     // configuration under test
     cfg.produce_batch_record_count.set_value(3);
 
-    kc::produce_partition producer(cfg, consumer);
+    kc::produce_partition producer(
+      kc::producer_configuration::from_config_store(cfg), consumer);
 
     auto c_res0_fut = producer.produce(make_batch(model::offset(0), 2));
     auto c_res1_fut = producer.produce(make_batch(model::offset(2), 1));
@@ -48,10 +49,11 @@ SEASTAR_THREAD_TEST_CASE(test_produce_partition_record_count) {
         return consumed_batches.size() > 0;
     }).get();
 
-    producer.handle_response(kafka::produce_response::partition{
-      .partition_index{model::partition_id{42}},
-      .error_code = kafka::error_code::none,
-      .base_offset{model::offset{0}}});
+    producer.handle_response(
+      kafka::produce_response::partition{
+        .partition_index{model::partition_id{42}},
+        .error_code = kafka::error_code::none,
+        .base_offset{model::offset{0}}});
 
     BOOST_REQUIRE_EQUAL(consumed_batches.size(), 1);
     BOOST_REQUIRE_EQUAL(consumed_batches[0].record_count(), 3);
@@ -64,10 +66,11 @@ SEASTAR_THREAD_TEST_CASE(test_produce_partition_record_count) {
     tests::cooperative_spin_wait_with_timeout(5s, [&consumed_batches]() {
         return consumed_batches.size() > 1;
     }).get();
-    producer.handle_response(kafka::produce_response::partition{
-      .partition_index{model::partition_id{42}},
-      .error_code = kafka::error_code::none,
-      .base_offset{model::offset{3}}});
+    producer.handle_response(
+      kafka::produce_response::partition{
+        .partition_index{model::partition_id{42}},
+        .error_code = kafka::error_code::none,
+        .base_offset{model::offset{3}}});
 
     BOOST_REQUIRE_EQUAL(consumed_batches.size(), 2);
     BOOST_REQUIRE_EQUAL(consumed_batches[1].record_count(), 3);

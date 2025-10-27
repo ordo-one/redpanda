@@ -23,6 +23,7 @@
 #include "model/fundamental.h"
 #include "redpanda/tests/fixture.h"
 #include "storage/disk_log_impl.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 
 using tests::kafka_consume_transport;
@@ -39,9 +40,11 @@ FIXTURE_TEST(test_read_replica_basic_sync, read_replica_e2e_fixture) {
     // Produce records to the source.
     auto partition = app.partition_manager.local().get(ntp).get();
     auto& archiver = partition->archiver()->get();
+    archiver.initialize_probe();
     BOOST_REQUIRE(archiver.sync_for_tests().get());
     archiver.upload_topic_manifest().get();
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     BOOST_REQUIRE_EQUAL(
       30, gen.records_per_batch(10).num_segments(3).produce().get());
     BOOST_REQUIRE_EQUAL(3, archiver.manifest().size());
@@ -62,12 +65,14 @@ FIXTURE_TEST(test_read_replica_basic_sync, read_replica_e2e_fixture) {
     auto rr_archiver_ref = rr_partition->archiver();
     BOOST_REQUIRE(rr_archiver_ref.has_value());
     auto& rr_archiver = rr_partition->archiver()->get();
+    rr_archiver.initialize_probe();
     BOOST_REQUIRE(rr_archiver.sync_for_tests().get());
     rr_archiver.sync_manifest().get();
     BOOST_REQUIRE_EQUAL(3, rr_archiver.manifest().size());
 
     kafka_consume_transport consumer(rr_rp->make_kafka_client().get());
     consumer.start().get();
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
     model::offset next(0);
     while (next < model::offset(30)) {
         auto consumed_records = consumer
@@ -94,6 +99,7 @@ FIXTURE_TEST(
 
     auto partition = app.partition_manager.local().get(ntp).get();
     auto& archiver = partition->archiver()->get();
+    archiver.initialize_probe();
     BOOST_REQUIRE(archiver.sync_for_tests().get());
     archiver.upload_topic_manifest().get();
 
@@ -110,6 +116,7 @@ FIXTURE_TEST(
     // Send the delete request to the _read replica_. This is not allowed.
     tests::kafka_delete_records_transport deleter(
       rr_rp->make_kafka_client().get());
+    auto deferred_close = ss::defer([&deleter] { deleter.stop().get(); });
     deleter.start().get();
     BOOST_REQUIRE_EXCEPTION(
       deleter
@@ -135,9 +142,11 @@ FIXTURE_TEST(test_read_replica_delete_records, read_replica_e2e_fixture) {
     // Produce records to the source.
     auto partition = app.partition_manager.local().get(ntp).get();
     auto& archiver = partition->archiver()->get();
+    archiver.initialize_probe();
     BOOST_REQUIRE(archiver.sync_for_tests().get());
     archiver.upload_topic_manifest().get();
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     BOOST_REQUIRE_EQUAL(
       30, gen.batches_per_segment(10).num_segments(3).produce().get());
     BOOST_REQUIRE_EQUAL(3, archiver.manifest().size());
@@ -146,6 +155,7 @@ FIXTURE_TEST(test_read_replica_delete_records, read_replica_e2e_fixture) {
     // fixture because make_kafka_client() uses global configs that will be
     // overwritten by the new fixture.
     tests::kafka_delete_records_transport deleter(make_kafka_client().get());
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
 
     auto rr_rp = start_read_replica_fixture();
     cluster::topic_properties read_replica_props;
@@ -158,6 +168,7 @@ FIXTURE_TEST(test_read_replica_delete_records, read_replica_e2e_fixture) {
     rr_rp->wait_for_leader(ntp).get();
     auto rr_partition = rr_rp->app.partition_manager.local().get(ntp).get();
     auto& rr_archiver = rr_partition->archiver()->get();
+    rr_archiver.initialize_probe();
 
     // Do an initial sync to download the manifest.
     BOOST_REQUIRE(rr_archiver.sync_for_tests().get());
@@ -166,6 +177,7 @@ FIXTURE_TEST(test_read_replica_delete_records, read_replica_e2e_fixture) {
 
     kafka_consume_transport consumer(rr_rp->make_kafka_client().get());
     consumer.start().get();
+    auto deferred_close = ss::defer([&consumer] { consumer.stop().get(); });
     auto consumed_records = consumer
                               .consume_from_partition(
                                 topic_name,
@@ -229,9 +241,11 @@ FIXTURE_TEST(
 
     auto partition = app.partition_manager.local().get(ntp).get();
     auto& archiver = partition->archiver()->get();
+    archiver.initialize_probe();
     BOOST_REQUIRE(archiver.sync_for_tests().get());
     archiver.upload_topic_manifest().get();
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     BOOST_REQUIRE_EQUAL(
       40,
       gen.batches_per_segment(10)
@@ -245,6 +259,7 @@ FIXTURE_TEST(
 
     // DeleteRecords in the region of the log that hasn't yet been uploaded.
     tests::kafka_delete_records_transport deleter(make_kafka_client().get());
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     deleter.start().get();
     auto new_start = model::offset(35);
     BOOST_REQUIRE_EQUAL(
@@ -262,6 +277,7 @@ FIXTURE_TEST(
 
     tests::kafka_list_offsets_transport lister(make_kafka_client().get());
     lister.start().get();
+    auto defered_l_close = ss::defer([&lister] { lister.stop().get(); });
     auto lwm = lister
                  .start_offset_for_partition(topic_name, model::partition_id(0))
                  .get();
@@ -280,11 +296,13 @@ FIXTURE_TEST(
     rr_rp->wait_for_leader(ntp).get();
     auto rr_partition = rr_rp->app.partition_manager.local().get(ntp).get();
     auto& rr_archiver = rr_partition->archiver()->get();
+    rr_archiver.initialize_probe();
     rr_archiver.sync_manifest().get();
 
     tests::kafka_list_offsets_transport rr_lister(
       rr_rp->make_kafka_client().get());
     rr_lister.start().get();
+    auto deferred_close = ss::defer([&rr_lister] { rr_lister.stop().get(); });
     auto rr_hwm = rr_lister
                     .high_watermark_for_partition(
                       topic_name, model::partition_id(0))

@@ -10,10 +10,12 @@
 #include "config/mock_property.h"
 #include "raft/coordinated_recovery_throttle.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
+
+#include <boost/range/irange.hpp>
 
 #include <chrono>
 
@@ -84,10 +86,11 @@ struct test_fixture {
 
     void check_available_all_shards(size_t expected) {
         auto available = all_available().get();
-        BOOST_REQUIRE(std::all_of(
-          available.begin(), available.end(), [expected](auto current) {
-              return current == expected;
-          }));
+        BOOST_REQUIRE(
+          std::all_of(
+            available.begin(), available.end(), [expected](auto current) {
+                return current == expected;
+            }));
     }
 
     void check_available(ss::shard_id shard, size_t expected) {

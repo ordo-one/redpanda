@@ -15,10 +15,9 @@
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/enterprise_feature_messages.h"
 #include "kafka/data/partition_proxy.h"
-#include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
@@ -31,16 +30,15 @@
 #include "kafka/server/kafka_probe.h"
 #include "kafka/server/read_distribution_probe.h"
 #include "model/fundamental.h"
+#include "model/kitp.h"
+#include "model/ktp.h"
+#include "model/limits.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
-#include "model/record_utils.h"
 #include "model/timeout_clock.h"
 #include "net/connection.h"
 #include "random/generators.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/semaphore.h"
-#include "storage/parser_utils.h"
-#include "utils/to_string.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
@@ -57,7 +55,34 @@
 #include <chrono>
 #include <exception>
 #include <ranges>
-#include <string_view>
+
+namespace {
+
+std::optional<kafka::leader_id_and_epoch> get_leader_id_and_epoch(
+  const cluster::metadata_cache& md_cache, const model::ktp& ktp) {
+    auto lt = md_cache.get_leader_term(ktp.as_tn_view(), ktp.get_partition());
+    if (lt && lt->leader) {
+        return kafka::leader_id_and_epoch{
+          .leader_id = *lt->leader,
+          .leader_epoch = kafka::leader_epoch_from_term(lt->term)};
+    }
+    return std::nullopt;
+}
+
+kafka::read_result make_errored_read_result(
+  const cluster::metadata_cache& md_cache,
+  const model::ktp& ktp,
+  kafka::error_code err) {
+    if (auto l = get_leader_id_and_epoch(md_cache, ktp); l.has_value()) {
+        // remap unknown to not_leader as it's in the metadata_cache
+        if (err == kafka::error_code::unknown_topic_or_partition) {
+            err = kafka::error_code::not_leader_for_partition;
+        }
+        return {err, std::move(*l)};
+    }
+    return kafka::read_result(err);
+}
+} // namespace
 
 namespace kafka {
 static constexpr std::chrono::milliseconds default_fetch_timeout = 5s;
@@ -83,7 +108,6 @@ static ss::future<read_result> read_from_partition(
   kafka::partition_proxy part,
   model::offset lso,
   fetch_config config,
-  bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline) {
     auto hw = part.high_watermark();
     auto start_o = part.start_offset();
@@ -94,29 +118,31 @@ static ss::future<read_result> read_from_partition(
         co_return read_result(start_o, hw, lso);
     }
 
-    storage::log_reader_config reader_config(
-      config.start_offset,
-      config.max_offset,
+    kafka::log_reader_config reader_config(
+      model::offset_cast(config.start_offset),
+      model::offset_cast(config.max_offset),
       0,
       config.max_bytes,
-      kafka_read_priority(),
-      std::nullopt,
       std::nullopt,
       config.abort_source.has_value()
         ? config.abort_source.value().get().local()
-        : storage::opt_abort_source_t{},
-      config.client_address);
+        : model::opt_abort_source_t{},
+      config.client_address,
+      config.strict_max_bytes);
 
-    reader_config.strict_max_bytes = config.strict_max_bytes;
     auto rdr = co_await part.make_reader(reader_config);
     std::exception_ptr e;
     std::unique_ptr<iobuf> data;
     std::vector<cluster::tx::tx_range> aborted_transactions;
     std::optional<std::chrono::milliseconds> delta_from_tip_ms;
+    model::offset data_base_offset, data_last_offset;
+
     try {
         auto result = co_await rdr.reader.consume(
           kafka_batch_serializer(), deadline ? *deadline : model::no_timeout);
         data = std::make_unique<iobuf>(std::move(result.data));
+        data_base_offset = result.base_offset;
+        data_last_offset = result.last_offset;
         part.probe().add_records_fetched(result.record_count);
         part.probe().add_bytes_fetched(data->size_bytes());
         if (!part.is_leader() && config.read_from_follower) {
@@ -167,129 +193,15 @@ static ss::future<read_result> read_from_partition(
         std::rethrow_exception(e);
     }
 
-    if (foreign_read) {
-        co_return read_result(
-          ss::make_foreign<read_result::data_t>(std::move(data)),
-          start_o,
-          hw,
-          lso,
-          delta_from_tip_ms,
-          std::move(aborted_transactions));
-    }
-
     co_return read_result(
       std::move(data),
       start_o,
+      data_base_offset,
+      data_last_offset,
       hw,
       lso,
       delta_from_tip_ms,
       std::move(aborted_transactions));
-}
-
-read_result::memory_units_t::memory_units_t(
-  ssx::semaphore& memory_sem, ssx::semaphore& memory_fetch_sem) noexcept
-  : kafka(ss::consume_units(memory_sem, 0))
-  , fetch(ss::consume_units(memory_fetch_sem, 0)) {}
-
-read_result::memory_units_t::~memory_units_t() noexcept {
-    if (shard == ss::this_shard_id() || !has_units()) {
-        return;
-    }
-    auto f = ss::smp::submit_to(
-      shard, [uk = std::move(kafka), uf = std::move(fetch)]() mutable noexcept {
-          uk.return_all();
-          uf.return_all();
-      });
-    if (!f.available()) {
-        ss::engine().run_in_background(std::move(f));
-    }
-}
-
-void read_result::memory_units_t::adopt(memory_units_t&& o) {
-    // Adopts assert internally that the units are from the same semaphore.
-    // So there is no need to assert that they are from the same shard here.
-    kafka.adopt(std::move(o.kafka));
-    fetch.adopt(std::move(o.fetch));
-}
-
-/**
- * Consume proper amounts of units from memory semaphores and return them as
- * semaphore_units. Fetch semaphore units returned are the indication of
- * available resources: if none, there is no memory for the operation;
- * if less than \p max_bytes, the fetch should be capped to that size.
- *
- * \param max_bytes The limit of how much data is going to be fetched
- * \param obligatory_batch_read Set to true for the first ntp in the fetch
- *   fetch request, at least one batch must be fetched for that ntp. Also it
- *   is assumed that a batch size has already been consumed from kafka
- *   memory semaphore for it.
- */
-static read_result::memory_units_t reserve_memory_units(
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem,
-  const size_t max_bytes,
-  const bool obligatory_batch_read) {
-    read_result::memory_units_t memory_units;
-    const size_t memory_kafka_now = memory_sem.current();
-    const size_t memory_fetch = memory_fetch_sem.current();
-    const size_t batch_size_estimate
-      = config::shard_local_cfg().kafka_memory_batch_size_estimate_for_fetch();
-
-    if (obligatory_batch_read) {
-        // cap what we want at what we have, but no further down than a single
-        // batch size - with \ref obligatory_batch_read, it must be fetched
-        // regardless
-        const size_t fetch_size = std::max(
-          batch_size_estimate,
-          std::min({max_bytes, memory_kafka_now, memory_fetch}));
-        memory_units.fetch = ss::consume_units(memory_fetch_sem, fetch_size);
-        memory_units.kafka = ss::consume_units(memory_sem, fetch_size);
-    } else {
-        // max_bytes is how much we prepare to read from this ntp, but no less
-        // than one full batch
-        const size_t requested_fetch_size = std::max(
-          max_bytes, batch_size_estimate);
-        // cap what we want at what we have
-        const size_t fetch_size = std::min(
-          {requested_fetch_size, memory_kafka_now, memory_fetch});
-        // only reserve memory if we have space for at least one batch,
-        // otherwise this ntp will be skipped
-        if (fetch_size >= batch_size_estimate) {
-            memory_units.fetch = ss::consume_units(
-              memory_fetch_sem, fetch_size);
-            memory_units.kafka = ss::consume_units(memory_sem, fetch_size);
-        }
-    }
-
-    return memory_units;
-}
-
-/**
- * Make the \p units hold exactly \p target_bytes, by consuming more units
- * from \p sem or by returning extra units back.
- */
-static void adjust_semaphore_units(
-  ssx::semaphore& sem, ssx::semaphore_units& units, const size_t target_bytes) {
-    if (target_bytes < units.count()) {
-        units.return_units(units.count() - target_bytes);
-    }
-    if (target_bytes > units.count()) {
-        units.adopt(ss::consume_units(sem, target_bytes - units.count()));
-    }
-}
-
-/**
- * Memory units have been reserved before the read op based on an estimation.
- * Now when we know how much data has actually been read, return any extra
- * amount.
- */
-static void adjust_memory_units(
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem,
-  read_result::memory_units_t& memory_units,
-  const size_t read_bytes) {
-    adjust_semaphore_units(memory_sem, memory_units.kafka, read_bytes);
-    adjust_semaphore_units(memory_fetch_sem, memory_units.fetch, read_bytes);
 }
 
 /**
@@ -298,37 +210,41 @@ static void adjust_memory_units(
  */
 static ss::future<read_result> do_read_from_ntp(
   cluster::partition_manager& cluster_pm,
+  const cluster::metadata_cache& md_cache,
   const replica_selector& replica_selector,
   ntp_fetch_config ntp_config,
-  bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
   const bool obligatory_batch_read,
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem) {
+  fetch_memory_units_manager& units_mgr) {
     // control available memory
-    read_result::memory_units_t memory_units(memory_sem, memory_fetch_sem);
-    if (!ntp_config.cfg.skip_read) {
-        memory_units = reserve_memory_units(
-          memory_sem,
-          memory_fetch_sem,
-          ntp_config.cfg.max_bytes,
-          obligatory_batch_read);
-        if (!memory_units.fetch) {
-            ntp_config.cfg.skip_read = true;
-        } else if (ntp_config.cfg.max_bytes > memory_units.fetch.count()) {
-            ntp_config.cfg.max_bytes = memory_units.fetch.count();
+    fetch_memory_units memory_units = [&] {
+        if (!ntp_config.cfg.skip_read) {
+            auto memory_units = units_mgr.allocate_memory_units(
+              ntp_config.cfg.max_bytes,
+              ntp_config.cfg.max_batch_size,
+              obligatory_batch_read);
+            if (!memory_units.has_units()) {
+                ntp_config.cfg.skip_read = true;
+            } else if (ntp_config.cfg.max_bytes > memory_units.num_units()) {
+                ntp_config.cfg.max_bytes = memory_units.num_units();
+            }
+            return memory_units;
+        } else {
+            return units_mgr.allocate_memory_units(0, 0, false);
         }
-    }
+    }();
 
     /*
      * lookup the ntp's partition
      */
     auto kafka_partition = make_partition_proxy(ntp_config.ktp(), cluster_pm);
     if (unlikely(!kafka_partition)) {
-        co_return read_result(error_code::unknown_topic_or_partition);
+        co_return make_errored_read_result(
+          md_cache, ntp_config.ktp(), error_code::unknown_topic_or_partition);
     }
     if (!ntp_config.cfg.read_from_follower && !kafka_partition->is_leader()) {
-        co_return read_result(error_code::not_leader_for_partition);
+        co_return make_errored_read_result(
+          md_cache, ntp_config.ktp(), error_code::not_leader_for_partition);
     }
 
     /**
@@ -337,7 +253,8 @@ static ss::future<read_result> do_read_from_ntp(
     auto leader_epoch_err = details::check_leader_epoch(
       ntp_config.cfg.current_leader_epoch, *kafka_partition);
     if (leader_epoch_err != error_code::none) {
-        co_return read_result(leader_epoch_err);
+        co_return make_errored_read_result(
+          md_cache, ntp_config.ktp(), leader_epoch_err);
     }
     auto offset_ec = co_await kafka_partition->validate_fetch_offset(
       ntp_config.cfg.start_offset,
@@ -394,14 +311,12 @@ static ss::future<read_result> do_read_from_ntp(
         }
     }
     read_result result = co_await read_from_partition(
-      std::move(*kafka_partition),
-      maybe_lso.value(),
-      ntp_config.cfg,
-      foreign_read,
-      deadline);
+      std::move(*kafka_partition), maybe_lso.value(), ntp_config.cfg, deadline);
 
-    adjust_memory_units(
-      memory_sem, memory_fetch_sem, memory_units, result.data_size_bytes());
+    // Note that units can be both increased and decreassed here. Increases
+    // happen because there is no strict limit on read size when reading the
+    // obligatory batch.
+    memory_units.adjust_units(result.data_size_bytes());
     result.memory_units = std::move(memory_units);
     co_return result;
 }
@@ -410,39 +325,28 @@ namespace testing {
 
 ss::future<read_result> read_from_ntp(
   cluster::partition_manager& cluster_pm,
+  const cluster::metadata_cache& md_cache,
   const replica_selector& replica_selector,
   const model::ktp& ktp,
   fetch_config config,
-  bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
   const bool obligatory_batch_read,
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem) {
+  fetch_memory_units_manager& units_mgr) {
     return do_read_from_ntp(
       cluster_pm,
+      md_cache,
       replica_selector,
-      {ktp, std::move(config)},
-      foreign_read,
+      {{ktp.get_topic(), ktp.get_partition()}, std::move(config)},
       deadline,
       obligatory_batch_read,
-      memory_sem,
-      memory_fetch_sem);
-}
-
-read_result::memory_units_t reserve_memory_units(
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem,
-  const size_t max_bytes,
-  const bool obligatory_batch_read) {
-    return kafka::reserve_memory_units(
-      memory_sem, memory_fetch_sem, max_bytes, obligatory_batch_read);
+      units_mgr);
 }
 
 } // namespace testing
 
 static void fill_fetch_responses(
   op_context& octx,
-  std::vector<read_result> results,
+  chunked_vector<read_result> results,
   const chunked_vector<op_context::response_placeholder_ptr>& responses,
   op_context::latency_point start_time,
   bool record_latency = true) {
@@ -460,16 +364,17 @@ static void fill_fetch_responses(
           0, std::min({results.size(), responses.size()}));
     }
 
-    // Used to aggregate semaphore_units from results.
-    std::optional<read_result::memory_units_t> total_memory_units;
-
     for (auto idx : range) {
         auto& res = results[idx];
         const auto& resp_it = responses[idx];
+        const auto& ktp = resp_it->ktp();
 
         fetch_response::partition_response resp;
         resp.partition_index = res.partition;
         resp.error_code = res.error;
+        if (res.current_leader) {
+            resp.current_leader = *res.current_leader;
+        }
 
         // These are set to -1 in the general error case.
         // Set to actual values in the success case or when the error is
@@ -482,7 +387,7 @@ static void fill_fetch_responses(
         // error case
         if (unlikely(resp.error_code != error_code::none)) {
             resp.records = batch_reader();
-            resp_it->set(std::move(resp));
+            resp_it->set(std::move(resp), {});
             continue;
         }
 
@@ -490,10 +395,12 @@ static void fill_fetch_responses(
          * Cache fetch metadata
          */
         octx.rctx.get_fetch_metadata_cache().insert_or_assign(
-          {resp_it->topic(), resp_it->partition_id()},
+          ktp,
           res.start_offset,
           res.high_watermark,
-          res.last_stable_offset);
+          res.last_stable_offset,
+          res.offset_count(),
+          res.data_size_bytes());
         /**
          * Over response budget, we will just waste this read, it will cause
          * data to be stored in the cache so next read is fast
@@ -502,19 +409,9 @@ static void fill_fetch_responses(
             resp.preferred_read_replica = *res.preferred_replica;
         }
 
-        // Aggregate memory_units from all results together to avoid
-        // making more than one cross-shard function call to free them.
-        //
-        // Only aggregate non-empty memory_units.
-        if (res.memory_units.has_units()) {
-            if (unlikely(!total_memory_units)) {
-                // Move the first set of semaphore_units to get a copy of the
-                // semaphore pointer and the shard results originates from.
-                total_memory_units = std::move(res.memory_units);
-            } else {
-                total_memory_units->adopt(std::move(res.memory_units));
-            }
-        }
+        std::optional<fetch_memory_units> resp_units{};
+        auto current_response_size = resp_it->response_size();
+        auto bytes_left = octx.bytes_left - current_response_size;
 
         /**
          * According to KIP-74 we have to return first batch even if it would
@@ -522,7 +419,7 @@ static void fill_fetch_responses(
          */
         if (
           res.has_data()
-          && (octx.bytes_left >= res.data_size_bytes() || octx.response_size == 0)) {
+          && (bytes_left >= res.data_size_bytes() || octx.response_size == 0)) {
             /**
              * set aborted transactions if present
              */
@@ -538,15 +435,16 @@ static void fill_fetch_responses(
                         .producer_id = kafka::producer_id(range.pid.id),
                         .first_offset = range.first};
                   });
-                resp.aborted = std::move(aborted);
+                resp.aborted_transactions = std::move(aborted);
             }
+            resp_units = std::move(res.memory_units);
             resp.records = batch_reader(std::move(res).release_data());
         } else {
             // TODO: add probe to measure how much of read data is discarded
             resp.records = batch_reader();
         }
 
-        resp_it->set(std::move(resp));
+        resp_it->set(std::move(resp), std::move(resp_units));
 
         if (record_latency) {
             std::chrono::microseconds fetch_latency
@@ -557,78 +455,69 @@ static void fill_fetch_responses(
     }
 }
 
-static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
+static ss::future<chunked_vector<read_result>> fetch_ntps(
   cluster::partition_manager& cluster_pm,
+  const cluster::metadata_cache& md_cache,
   const replica_selector& replica_selector,
   chunked_vector<ntp_fetch_config> ntp_fetch_configs,
   read_distribution_probe& read_probe,
-  bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
   const size_t bytes_left,
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem) {
-    size_t total_max_bytes = 0;
-    for (const auto& c : ntp_fetch_configs) {
-        total_max_bytes += c.cfg.max_bytes;
-    }
+  fetch_memory_units_manager& units_mgr) {
+    size_t total_read_size = 0;
 
     // bytes_left comes from the fetch plan and also accounts for the max_bytes
     // field in the fetch request
     const size_t max_bytes_per_fetch = std::min<size_t>(
       config::shard_local_cfg().kafka_max_bytes_per_fetch(), bytes_left);
-    if (total_max_bytes > max_bytes_per_fetch) {
-        auto per_partition = max_bytes_per_fetch / ntp_fetch_configs.size();
-        vlog(
-          klog.debug,
-          "Fetch requested very large response ({}), clamping each partition's "
-          "max_bytes to {} bytes",
-          total_max_bytes,
-          per_partition);
 
-        for (auto& c : ntp_fetch_configs) {
-            c.cfg.max_bytes = per_partition;
+    chunked_vector<read_result> results;
+    results.reserve(ntp_fetch_configs.size());
+
+    for (auto& ntp_cfg : ntp_fetch_configs) {
+        // Strict checking/enforcing of max bytes per fetch occurs in
+        // `fill_fetch_responses`. This check only exists to avoid unneeded
+        // partition reads.
+        if (total_read_size >= max_bytes_per_fetch) {
+            ntp_cfg.cfg.skip_read = true;
         }
-    }
 
-    const auto first_p_id = ntp_fetch_configs.front().ktp().get_partition();
-    auto results = co_await ssx::parallel_transform(
-      std::move(ntp_fetch_configs),
-      [&cluster_pm,
-       &replica_selector,
-       deadline,
-       foreign_read,
-       first_p_id,
-       &memory_sem,
-       &memory_fetch_sem](const ntp_fetch_config& ntp_cfg) {
-          auto p_id = ntp_cfg.ktp().get_partition();
-          return do_read_from_ntp(
-                   cluster_pm,
-                   replica_selector,
-                   ntp_cfg,
-                   foreign_read,
-                   deadline,
-                   first_p_id == p_id,
-                   memory_sem,
-                   memory_fetch_sem)
-            .then([p_id](read_result res) {
-                res.partition = p_id;
-                return res;
-            });
-      });
+        // In Kafka first non-empty partition in a request or session
+        // is considered the `obligatory` batch read.
+        const bool obligatory_batch_read = total_read_size == 0;
 
-    size_t total_size = 0;
-    for (const auto& r : results) {
-        total_size += r.data_size_bytes();
-        if (r.delta_from_tip_ms.has_value()) {
+        // If it's the obligatory batch read then we need to allow for the
+        // configured max bytes to exceeded if the next batch in the partition
+        // is larger. This is needed to conform with KIP-74.
+        ntp_cfg.cfg.strict_max_bytes = !obligatory_batch_read;
+
+        auto&& res = co_await do_read_from_ntp(
+          cluster_pm,
+          md_cache,
+          replica_selector,
+          ntp_cfg,
+          deadline,
+          obligatory_batch_read,
+          units_mgr);
+
+        res.partition = ntp_cfg.ktp().get_partition();
+
+        auto read_size = res.data_size_bytes();
+        total_read_size += read_size;
+
+        if (res.delta_from_tip_ms.has_value()) {
             read_probe.add_read_event_delta_from_tip(
-              r.delta_from_tip_ms.value());
+              res.delta_from_tip_ms.value());
         }
+
+        results.push_back(std::move(res));
     }
+
     vlog(
       klog.trace,
-      "fetch_ntps_in_parallel: for {} partitions returning {} total bytes",
+      "fetch_ntps: for {} partitions returning {} total bytes",
       results.size(),
-      total_size);
+      total_read_size);
     co_return results;
 }
 
@@ -644,82 +533,12 @@ bool shard_fetch::empty() const {
     return requests.empty();
 }
 
-/**
- * Top-level handler for fetching from single shard. The result is
- * unwrapped and any errors from the storage sub-system are translated
- * into kafka specific response codes. On failure or success the
- * partition response is finalized and placed into its position in the
- * response message.
- */
-static ss::future<>
-handle_shard_fetch(ss::shard_id shard, op_context& octx, shard_fetch fetch) {
-    // if over budget skip the fetch.
-    if (octx.bytes_left <= 0) {
-        return ss::now();
-    }
-    // no requests for this shard, do nothing
-    if (fetch.empty()) {
-        return ss::now();
-    }
-
-    const bool foreign_read = shard != ss::this_shard_id();
-
-    // dispatch to remote core
-    return octx.rctx.partition_manager()
-      .invoke_on(
-        shard,
-        octx.ssg,
-        [foreign_read, configs = std::move(fetch.requests), &octx](
-          cluster::partition_manager& mgr) mutable {
-            // &octx is captured only to immediately use its accessors here so
-            // that there is a list of all objects accessed next to `invoke_on`.
-            // This is meant to help avoiding unintended cross shard access
-            return fetch_ntps_in_parallel(
-              mgr,
-              octx.rctx.server().local().get_replica_selector(),
-              std::move(configs),
-              octx.rctx.server().local().read_probe(),
-              foreign_read,
-              octx.deadline,
-              octx.bytes_left,
-              octx.rctx.server().local().memory(),
-              octx.rctx.server().local().memory_fetch_sem());
-        })
-      .then([responses = std::move(fetch.responses),
-             start_time = fetch.start_time,
-             &octx](std::vector<read_result> results) mutable {
-          fill_fetch_responses(octx, std::move(results), responses, start_time);
-      });
-}
-
-class parallel_fetch_plan_executor final : public fetch_plan_executor::impl {
-    ss::future<> execute_plan(op_context& octx, fetch_plan plan) final {
-        std::vector<ss::future<>> fetches;
-        fetches.reserve(ss::smp::count);
-
-        // start fetching from random shard to make sure that we fetch data from
-        // all the partition even if we reach fetch message size limit
-        const ss::shard_id start_shard_idx = random_generators::get_int(
-          ss::smp::count - 1);
-        for (size_t i = 0; i < ss::smp::count; ++i) {
-            auto shard = (start_shard_idx + i) % ss::smp::count;
-
-            fetches.push_back(handle_shard_fetch(
-              shard, octx, std::move(plan.fetches_per_shard[shard])));
-        }
-
-        return ss::when_all_succeed(fetches.begin(), fetches.end());
-    }
-};
-
 class fetch_worker {
 public:
     // Passed from the coordinator shard to fetch workers.
     // Contains either references to objects local to the fetch worker shard or
     // copies of data from the coordinator shard.
     struct shard_local_fetch_context {
-        // True if the results of this fetch will be read on a foreign shard.
-        bool foreign_read;
         size_t bytes_left;
         // Specifies the minimum number of bytes this sub-fetch should read
         // before returning.
@@ -741,10 +560,10 @@ public:
       : _ctx(std::move(ctx)) {}
 
     struct worker_result {
-        std::vector<read_result> read_results;
+        chunked_vector<read_result> read_results;
         // The total amount of bytes read across all results in `read_results`.
         size_t total_size;
-        // The time it took for the first `fetch_ntps_in_parallel` to complete
+        // The time it took for the first `fetch_ntps` to complete
         std::chrono::microseconds first_run_latency_result;
     };
 
@@ -791,7 +610,7 @@ private:
         std::vector<model::offset> last_visible_indexes;
         // Indicates if any `read_result` in `results` has an error.
         bool has_error;
-        std::vector<read_result> results;
+        chunked_vector<read_result> results;
         size_t total_size;
     };
 
@@ -809,20 +628,23 @@ private:
         // are produced to without acks=all. The `last_visible_index` more
         // closely corresponds to the Kafka high watermark as well.
         std::vector<model::offset> last_visible_indexes(requests.size());
-        std::vector<std::tuple<size_t, model::partition_id>> errored_partitions;
+        std::vector<std::pair<size_t, read_result>> errored_partitions;
         size_t total_size{0};
         bool has_error{false};
 
         for (size_t i = 0; i < requests.size(); i++) {
             const auto& req = requests[i];
             auto part = _ctx.mgr.get(req.ktp());
-            if (!part) {
-                errored_partitions.emplace_back(i, req.ktp().get_partition());
-                continue;
-            }
-            auto consensus = part->raft();
+            auto consensus = part ? part->raft() : nullptr;
             if (!consensus) {
-                errored_partitions.emplace_back(i, req.ktp().get_partition());
+                errored_partitions.emplace_back(
+                  i,
+                  make_errored_read_result(
+                    _ctx.srv.metadata_cache(),
+                    req.ktp(),
+                    kafka::error_code::not_leader_for_partition));
+                errored_partitions.back().second.partition
+                  = req.ktp().get_partition();
                 continue;
             }
             last_visible_indexes[i] = consensus->last_visible_index();
@@ -830,24 +652,22 @@ private:
 
         // A read_result needs to be returned for every partition. Hence,
         // the function can't return before calling
-        // `fetch_ntps_in_parallel`.
-        std::vector<read_result> results = co_await fetch_ntps_in_parallel(
+        // `fetch_ntps`.
+        auto results = co_await fetch_ntps(
           _ctx.mgr,
+          _ctx.srv.metadata_cache(),
           _ctx.srv.get_replica_selector(),
           std::move(requests),
           _ctx.srv.read_probe(),
-          _ctx.foreign_read,
           _ctx.deadline,
           _ctx.bytes_left,
-          _ctx.srv.memory(),
-          _ctx.srv.memory_fetch_sem());
+          _ctx.srv.fetch_units_manager());
 
         // If we weren't able to read the last_visible_index for a partition
         // before calling `fetch_ntps_in_parallel` then we need to
         // return with an error for that partition.
-        for (auto [i, partition] : errored_partitions) {
-            results[i] = read_result(error_code::not_leader_for_partition);
-            results[i].partition = partition;
+        for (auto& [i, result] : errored_partitions) {
+            results[i] = std::move(result);
         }
 
         for (const auto& r : results) {
@@ -913,7 +733,7 @@ private:
         // `_ctx.requests`.
         std::vector<size_t> requests_map;
 
-        std::vector<read_result> results;
+        chunked_vector<read_result> results;
         size_t total_size{0};
 
         for (;;) {
@@ -1029,12 +849,11 @@ public:
     ss::future<> execute_plan(op_context& octx, fetch_plan plan) final {
         auto fetch_read_strategy
           = config::shard_local_cfg().fetch_read_strategy();
-        if (
-          fetch_read_strategy
-          == model::fetch_read_strategy::non_polling_with_debounce) {
-            co_await ss::sleep(std::min(
-              config::shard_local_cfg().fetch_reads_debounce_timeout(),
-              octx.request.data.max_wait_ms));
+        if (is_fetch_strategy_with_debounce(fetch_read_strategy)) {
+            co_await ss::sleep(
+              std::min(
+                config::shard_local_cfg().fetch_reads_debounce_timeout(),
+                octx.request.data.max_wait_ms));
         }
         // Ensure both fetch debounce and the fetch scheduling group are enabled
         // before trying to apply any delay.
@@ -1160,6 +979,21 @@ private:
         return true;
     }
 
+    bool is_fetch_strategy_with_debounce(model::fetch_read_strategy s) const {
+        if (s == model::fetch_read_strategy::non_polling_with_debounce) {
+            return true;
+        }
+
+        if (
+          s == model::fetch_read_strategy::polling
+          && !config::shard_local_cfg()
+                .fetch_reads_debounce_timeout.is_default()) {
+            return true;
+        }
+
+        return false;
+    }
+
     /**
      * Waits until the should_stop_fetch() condition should be checked again.
      * The return future is set if;
@@ -1189,18 +1023,15 @@ private:
             co_return;
         }
 
-        const bool foreign_read = fetch.shard != ss::this_shard_id();
-
         fetch_worker::worker_result results
           = co_await octx.rctx.partition_manager().invoke_on(
             fetch.shard,
             [this,
              shard = fetch.shard,
              min_fetch_bytes,
-             foreign_read,
              configs = fetch.requests.copy(),
              &octx](cluster::partition_manager& mgr) mutable
-            -> ss::future<fetch_worker::worker_result> {
+              -> ss::future<fetch_worker::worker_result> {
                 // Although this and octx are captured by reference across
                 // shards it is safe since they are not modified by any shard
                 // for the duration of the capture and they are protected from
@@ -1209,16 +1040,16 @@ private:
                 // that shard. This is meant to help avoiding unintended cross
                 // shard access.
                 return ss::do_with(
-                  fetch_worker(fetch_worker::shard_local_fetch_context{
-                    .foreign_read = foreign_read,
-                    .bytes_left = octx.bytes_left,
-                    .min_bytes = min_fetch_bytes,
-                    .deadline = octx.deadline,
-                    .requests = std::move(configs),
-                    .srv = octx.rctx.server().local(),
-                    .mgr = mgr,
-                    .as = _worker_aborts[shard],
-                  }),
+                  fetch_worker(
+                    fetch_worker::shard_local_fetch_context{
+                      .bytes_left = octx.bytes_left,
+                      .min_bytes = min_fetch_bytes,
+                      .deadline = octx.deadline,
+                      .requests = std::move(configs),
+                      .srv = octx.rctx.server().local(),
+                      .mgr = mgr,
+                      .as = _worker_aborts[shard],
+                    }),
                   [](auto& worker) { return worker.run(); });
             });
 
@@ -1287,8 +1118,13 @@ size_t op_context::fetch_partition_count() const {
     }
 }
 
+namespace {
+
+// Calls f for each topic in the request, passing the associated partitions.
+// This exists to adapt the sessionfull and sessionless fetch cases to a
+// consistent iteration interface.
 template<typename Func>
-void op_context::for_each_fetch_partition(Func&& f) const {
+void for_each_fetch_partition(const op_context& octx, const Func& f) {
     /**
      * Iterate over original request only if it is sessionless or initial
      * full fetch request. For not initial full fetch requests we may
@@ -1296,23 +1132,45 @@ void op_context::for_each_fetch_partition(Func&& f) const {
      * during initial pass. Using session stored partitions will account for
      * the partitions already read and move to the end of iteration order
      */
+    auto& session_ctx = octx.session_ctx;
+
     if (
       session_ctx.is_sessionless()
-      || (session_ctx.is_full_fetch() && initial_fetch)) {
-        std::for_each(
-          request.cbegin(),
-          request.cend(),
-          [f = std::forward<Func>(f)](
-            const fetch_request::const_iterator::value_type& p) {
-              f(fetch_session_partition(p.topic->name, *p.partition));
-          });
+      || (session_ctx.is_full_fetch() && octx.initial_fetch)) {
+        for (auto& topic : octx.request.data.topics) {
+            f(topic.topic,
+              topic.partitions | std::views::transform([&](const auto& p) {
+                  return fetch_session_partition{
+                    topic.topic_id, topic.topic, p};
+              }));
+        }
     } else {
-        std::for_each(
-          session_ctx.session()->partitions().cbegin_insertion_order(),
-          session_ctx.session()->partitions().cend_insertion_order(),
-          std::forward<Func>(f));
+        auto& sparts = session_ctx.session()->partitions();
+        // iterate over partitions, collecting all partitions with the same
+        // topic and passing them to f together
+        auto it = sparts.cbegin_insertion_order();
+        auto end = sparts.cend_insertion_order();
+        while (it != end) {
+            // from the current position, find the range of partitions which
+            // have the same topic, and pass that to the callback
+            const auto& current = it->topic_partition;
+            auto same_topic_end = std::find_if(
+              it, end, [&](const kafka::fetch_session_partition& part) {
+                  const auto no_id = model::topic_id{};
+                  const auto& next = part.topic_partition;
+                  if (
+                    current.get_topic_id() == no_id
+                    || next.get_topic_id() == no_id) {
+                      return current.get_topic() != next.get_topic();
+                  }
+                  return next.get_topic_id() != current.get_topic_id();
+              });
+            f(current.get_topic(), std::ranges::subrange(it, same_topic_end));
+            it = same_topic_end;
+        }
     }
 }
+} // namespace
 
 class simple_fetch_planner final : public fetch_planner::impl {
     fetch_plan create_plan(op_context& octx) final {
@@ -1327,46 +1185,53 @@ class simple_fetch_planner final : public fetch_planner::impl {
         /**
          * group fetch requests by shard
          */
-        octx.for_each_fetch_partition(
+        for_each_fetch_partition(
+          octx,
           [&resp_it, &octx, &plan, &bytes_left_in_plan, &client_address](
-            const fetch_session_partition& fp) {
-              // if this is not an initial fetch we are allowed to skip
-              // partions that aleready have an error or we have enough data
-              if (!octx.initial_fetch) {
-                  bool has_enough_data = !resp_it->empty()
-                                         && octx.over_min_bytes();
+            const model::topic& topic, const auto& partitions) {
+              // First, we check all the failure conditions which depend only on
+              // the topic, and not the partition.
 
-                  if (resp_it->has_error() || has_enough_data) {
+              const bool over_min_bytes = octx.over_min_bytes();
+              const auto& metadata_cache = octx.rctx.metadata_cache();
+              model::topic_namespace_view tn_view{
+                model::kafka_namespace, topic};
+
+              auto fail_all_partitions = [&](error_code ec) {
+                  for (const auto& fp : partitions) {
+                      resp_it->set(
+                        make_partition_response_error(
+                          fp.topic_partition.get_partition(), ec),
+                        {});
                       ++resp_it;
-                      return;
                   }
+              };
+
+              // An empty topic name means that lookup by id failed during
+              // creation of the op_context.
+              if (unlikely(topic().empty())) {
+                  return fail_all_partitions(error_code::unknown_topic_id);
               }
 
-              // We audit successful messages only on the initial fetch
-              audit_on_success audit{octx.initial_fetch};
-
               /**
-               * if not authorized do not include into a plan
+               * If not authorized do not include into a plan.
+               * We audit successful messages only on the initial fetch.
                */
-              if (!octx.rctx.authorized(
+              if (unlikely(!octx.rctx.authorized(
                     security::acl_operation::read,
-                    fp.topic_partition.get_topic(),
-                    audit)) {
-                  resp_it->set(make_partition_response_error(
-                    fp.topic_partition.get_partition(),
-                    error_code::topic_authorization_failed));
-                  ++resp_it;
-                  return;
+                    topic,
+                    audit_on_success{octx.initial_fetch}))) {
+                  return fail_all_partitions(
+                    error_code::topic_authorization_failed);
               }
 
               /**
-               * in sanction mode (without an enterprise license), the audit log
-               * topic is not consumable
+               * in sanction mode (without an enterprise license), the audit
+               * log topic is not consumable
                */
               if (unlikely(
-                    octx.rctx.feature_table().local().should_sanction()
-                    && fp.topic_partition.get_topic()
-                         == model::kafka_audit_logging_topic)) {
+                    topic == model::kafka_audit_logging_topic
+                    && octx.rctx.feature_table().local().should_sanction())) {
                   thread_local static ss::logger::rate_limit rate(1s);
                   vloglr(
                     klog,
@@ -1374,130 +1239,133 @@ class simple_fetch_planner final : public fetch_planner::impl {
                     rate,
                     "{}",
                     features::enterprise_error_message::audit_log_fetch());
-                  resp_it->set(make_partition_response_error(
-                    fp.topic_partition.get_partition(),
-                    error_code::unknown_server_error));
-                  ++resp_it;
-                  return;
-              }
-
-              auto& tp = fp.topic_partition;
-              auto tn_view = tp.as_tn_view();
-              const auto& metadata_cache = octx.rctx.metadata_cache();
-              auto partition_id = tp.get_partition();
-
-              if (unlikely(metadata_cache.is_disabled(tn_view, partition_id))) {
-                  resp_it->set(make_partition_response_error(
-                    partition_id, error_code::replica_not_available));
-                  ++resp_it;
-                  return;
+                  return fail_all_partitions(error_code::unknown_server_error);
               }
 
               if (unlikely(metadata_cache.should_reject_reads(tn_view))) {
-                  resp_it->set(make_partition_response_error(
-                    partition_id, error_code::invalid_topic_exception));
-                  ++resp_it;
-                  return;
+                  return fail_all_partitions(
+                    error_code::invalid_topic_exception);
               }
 
-              auto shard = octx.rctx.shards().shard_for(tp);
-              if (unlikely(!shard)) {
-                  // there is given partition in topic metadata, return
-                  // unknown_topic_or_partition error
+              const auto& topic_md = metadata_cache.get_topic_metadata_ref(
+                model::topic_namespace_view{model::kafka_namespace, topic});
 
+              if (!topic_md) {
+                  return fail_all_partitions(
+                    error_code::unknown_topic_or_partition);
+              }
+
+              const auto& topic_cfg = topic_md->get().get_configuration();
+              // Max batch size or `message.max.bytes` is a user configurable
+              // topic property that defines the max size of a batch that can be
+              // produced to any partition in the topic.
+              //
+              // It is used later in the fetch path to establish the minimum
+              // number of memory semaphore units that need to be allocated
+              // before reading a single batch from any of the topic's
+              // partitions.
+              const auto max_batch_size
+                = topic_cfg.properties.batch_max_bytes.value_or(
+                  metadata_cache.get_default_batch_max_bytes());
+
+              for (const kafka::fetch_session_partition& fp : partitions) {
+                  // if this is not an initial fetch we are allowed to skip
+                  // partitions that already have an error or we have enough
+                  // data
+                  if (!octx.initial_fetch) {
+                      if (
+                        resp_it->has_error()
+                        || (over_min_bytes && !resp_it->empty())) {
+                          ++resp_it;
+                          continue;
+                      }
+                  }
+
+                  const auto& kitp = fp.topic_partition;
+                  const auto partition_id = kitp.get_partition();
+                  model::ktp_with_hash ktp{kitp.get_topic(), partition_id};
+
+                  if (unlikely(
+                        metadata_cache.is_disabled(tn_view, partition_id))) {
+                      resp_it->set(
+                        make_partition_response_error(
+                          partition_id, error_code::replica_not_available),
+                        {});
+                      ++resp_it;
+                      continue;
+                  }
+
+                  auto shard = octx.rctx.shards().shard_for(ktp);
+                  if (unlikely(!shard)) {
+                      // there is given partition in topic metadata, return
+                      // unknown_topic_or_partition error
+
+                      /**
+                       * no shard is found on current node, but topic exists in
+                       * cluster metadata, this mean that the partition was
+                       * moved but consumer has not updated its metadata yet. we
+                       * return not_leader_for_partition error to force metadata
+                       * update.
+                       */
+                      auto ec = metadata_cache.contains(kitp)
+                                  ? error_code::not_leader_for_partition
+                                  : error_code::unknown_topic_or_partition;
+                      resp_it->set(
+                        make_partition_response_error(partition_id, ec), {});
+                      ++resp_it;
+                      continue;
+                  }
+
+                  auto fetch_md = octx.rctx.get_fetch_metadata_cache().get(ktp);
+                  auto max_bytes = std::min(
+                    bytes_left_in_plan, size_t(fp.max_bytes));
                   /**
-                   * no shard is found on current node, but topic exists in
-                   * cluster metadata, this mean that the partition was
-                   * moved but consumer has not updated its metadata yet. we
-                   * return not_leader_for_partition error to force metadata
-                   * update.
+                   * If the fetch offest is less than the hwm for the partition
+                   * then we try to estimate the number of bytes that can be
+                   * read via a moving average in the md cache. If there isn't
+                   * enough information in the md cache to estimate this then we
+                   * assume the `max_bytes` can be read.
                    */
-                  auto ec = metadata_cache.contains(tp.to_ntp())
-                              ? error_code::not_leader_for_partition
-                              : error_code::unknown_topic_or_partition;
-                  resp_it->set(make_partition_response_error(partition_id, ec));
+                  if (fetch_md && fetch_md->high_watermark > fp.fetch_offset) {
+                      const auto offset_count
+                        = (fetch_md->high_watermark - fp.fetch_offset)() + 1;
+                      const auto est_read_size
+                        = offset_count * fetch_md->avg_bytes_per_offset;
+                      if (est_read_size > 0) {
+                          bytes_left_in_plan -= std::min(
+                            est_read_size, max_bytes);
+                      } else {
+                          bytes_left_in_plan -= max_bytes;
+                      }
+                  }
+
+                  plan.fetches_per_shard[*shard].push_back(
+                    std::move(ktp),
+                    fetch_config{
+                      .start_offset = fp.fetch_offset,
+                      .max_offset = model::model_limits<model::offset>::max(),
+                      .max_bytes = max_bytes,
+                      .max_batch_size = max_batch_size,
+                      .timeout = octx.deadline.value_or(model::no_timeout),
+                      .current_leader_epoch = fp.current_leader_epoch,
+                      .isolation_level = octx.request.data.isolation_level,
+                      .strict_max_bytes = true,
+                      .skip_read = bytes_left_in_plan == 0 && max_bytes == 0,
+                      .read_from_follower = octx.request.has_rack_id(),
+                      .consumer_rack_id = octx.request.has_rack_id()
+                                            ? std::make_optional(
+                                                octx.request.data.rack_id)
+                                            : std::nullopt,
+                      .abort_source = octx.rctx.abort_source(),
+                      .client_address = model::client_address_t{client_address},
+                    },
+                    &(*resp_it));
                   ++resp_it;
-                  return;
               }
-
-              auto fetch_md = octx.rctx.get_fetch_metadata_cache().get(tp);
-              auto max_bytes = std::min(
-                bytes_left_in_plan, size_t(fp.max_bytes));
-              /**
-               * If offset is greater, assume that fetch will read max_bytes
-               */
-              if (fetch_md && fetch_md->high_watermark > fp.fetch_offset) {
-                  bytes_left_in_plan -= max_bytes;
-              }
-
-              fetch_config config{
-                .start_offset = fp.fetch_offset,
-                .max_offset = model::model_limits<model::offset>::max(),
-                .max_bytes = max_bytes,
-                .timeout = octx.deadline.value_or(model::no_timeout),
-                .current_leader_epoch = fp.current_leader_epoch,
-                .isolation_level = octx.request.data.isolation_level,
-                .strict_max_bytes = octx.response_size > 0,
-                .skip_read = bytes_left_in_plan == 0 && max_bytes == 0,
-                .read_from_follower = octx.request.has_rack_id(),
-                .consumer_rack_id = octx.request.has_rack_id()
-                                      ? std::make_optional(
-                                          octx.request.data.rack_id)
-                                      : std::nullopt,
-                .abort_source = octx.rctx.abort_source(),
-                .client_address = model::client_address_t{client_address},
-              };
-
-              plan.fetches_per_shard[*shard].push_back(
-                {tp, std::move(config)}, &(*resp_it));
-              ++resp_it;
           });
         return plan;
     }
 };
-
-/**
- * Process partition fetch requests.
- *
- * Each request is handled serially in the order they appear in the request.
- * There are a couple reasons why we are not **yet** processing these in
- * parallel. First, Kafka expects to some extent that the order of the
- * partitions in the request is an implicit priority on which partitions to
- * read from. This is closely related to the request budget limits specified
- * in terms of maximum bytes and maximum time delay.
- *
- * Once we start processing requests in parallel we'll have to work through
- * various challenges. First, once we dispatch in parallel, we'll need to
- * develop heuristics for dealing with the implicit priority order. We'll
- * also need to develop techniques and heuristics for dealing with budgets
- * since global budgets aren't trivially divisible onto each core when
- * partition requests may produce non-uniform amounts of data.
- *
- * w.r.t. what is needed to parallelize this, there are no data dependencies
- * between partition requests within the fetch request, and so they can be
- * run fully in parallel. The only dependency that exists is that the
- * response must be reassembled such that the responses appear in these
- * order as the partitions in the request.
- */
-static ss::future<> fetch_topic_partitions(op_context& octx) {
-    auto planner = make_fetch_planner<simple_fetch_planner>();
-
-    auto fetch_plan = planner.create_plan(octx);
-
-    fetch_plan_executor executor
-      = make_fetch_plan_executor<parallel_fetch_plan_executor>();
-    co_await executor.execute_plan(octx, std::move(fetch_plan));
-
-    if (octx.should_stop_fetch()) {
-        co_return;
-    }
-
-    octx.reset_context();
-    // debounce next read retry
-    co_await ss::sleep(std::min(
-      config::shard_local_cfg().fetch_reads_debounce_timeout(),
-      octx.request.data.max_wait_ms));
-}
 
 namespace testing {
 kafka::fetch_plan make_simple_fetch_plan(op_context& octx) {
@@ -1508,28 +1376,11 @@ kafka::fetch_plan make_simple_fetch_plan(op_context& octx) {
 
 namespace {
 ss::future<> do_fetch(op_context& octx) {
-    switch (config::shard_local_cfg().fetch_read_strategy) {
-    case model::fetch_read_strategy::polling: {
-        // first fetch, do not wait
-        co_await fetch_topic_partitions(octx).then([&octx] {
-            return ss::do_until(
-              [&octx] { return octx.should_stop_fetch(); },
-              [&octx] { return fetch_topic_partitions(octx); });
-        });
-    } break;
-    case model::fetch_read_strategy::non_polling:
-    case model::fetch_read_strategy::non_polling_with_pid:
-    case model::fetch_read_strategy::non_polling_with_debounce: {
-        auto planner = make_fetch_planner<simple_fetch_planner>();
-        auto fetch_plan = planner.create_plan(octx);
+    auto planner = make_fetch_planner<simple_fetch_planner>();
+    auto fetch_plan = planner.create_plan(octx);
 
-        nonpolling_fetch_plan_executor executor;
-        co_await executor.execute_plan(octx, std::move(fetch_plan));
-    } break;
-    default: {
-        vassert(false, "not implemented");
-    } break;
-    }
+    nonpolling_fetch_plan_executor executor;
+    co_await executor.execute_plan(octx, std::move(fetch_plan));
 }
 } // namespace
 
@@ -1556,6 +1407,8 @@ fetch_handler::handle(request_context rctx, ss::smp_service_group ssg) {
           }
           octx.response.data.error_code = error_code::none;
           return do_fetch(octx).then([&octx] {
+              auto resp_units_deleter = octx.response_memory_units_deleter();
+
               // NOTE: Audit call doesn't happen until _after_ the fetch
               // is done. This was done for the sake of simplicity and
               // because fetch doesn't alter the state of the broker
@@ -1563,6 +1416,9 @@ fetch_handler::handle(request_context rctx, ss::smp_service_group ssg) {
                   return std::move(octx).send_error_response(
                     error_code::broker_not_available);
               }
+
+              octx.rctx.add_response_resource_deleter(
+                std::move(resp_units_deleter));
               return std::move(octx).send_response();
           });
       });
@@ -1581,11 +1437,31 @@ op_context::op_context(request_context&& ctx, ss::smp_service_group ssg)
      */
     request.decode(rctx.reader(), rctx.header().version);
     if (likely(!request.data.topics.empty())) {
-        response.data.topics.reserve(request.data.topics.size());
+        response.data.responses.reserve(request.data.topics.size());
     }
 
     if (auto delay = request.debounce_delay(); delay) {
         deadline = model::timeout_clock::now() + delay.value();
+    }
+
+    if (rctx.header().version() >= api_version{13}) {
+        /*
+         * Populate topic names
+         *
+         * Topic names that are not authorized must not be returned, but the
+         * response does not serialize them, so this does not need to be undone.
+         */
+        const auto set_topic = [this](auto& t) {
+            auto tp_ns = rctx.metadata_cache().get_name_by_id(t.topic_id);
+            if (tp_ns.has_value()) {
+                t.topic = std::move(tp_ns->tp);
+            } else {
+                // An empty topic name will be translated to unknown_topic_id
+                // during plan creation
+            }
+        };
+        std::ranges::for_each(request.data.topics, set_topic);
+        std::ranges::for_each(request.data.forgotten_topics_data, set_topic);
     }
 
     /*
@@ -1602,14 +1478,15 @@ op_context::op_context(request_context&& ctx, ss::smp_service_group ssg)
 
 // insert and reserve space for a new topic in the response
 void op_context::start_response_topic(const fetch_request::topic& topic) {
-    response.data.topics.emplace_back(
-      fetchable_topic_response{.name = topic.name});
+    response.data.responses.emplace_back(
+      fetchable_topic_response{
+        .topic = topic.topic, .topic_id = topic.topic_id});
 }
 
 void op_context::start_response_partition(const fetch_request::partition& p) {
-    response.data.topics.back().partitions.push_back(
+    response.data.responses.back().partitions.push_back(
       fetch_response::partition_response{
-        .partition_index = p.partition_index,
+        .partition_index = p.partition,
         .error_code = error_code::none,
         .high_watermark = model::offset(-1),
         .last_stable_offset = model::offset(-1),
@@ -1628,16 +1505,18 @@ void op_context::create_response_placeholders() {
               start_response_partition(*v.partition);
           });
     } else {
-        model::topic last_topic;
+        std::optional<model::kitp_with_hash> last_topic;
         std::for_each(
           session_ctx.session()->partitions().cbegin_insertion_order(),
           session_ctx.session()->partitions().cend_insertion_order(),
           [this, &last_topic](const fetch_session_partition& fp) {
-              auto& topic = fp.topic_partition.get_topic();
-              if (last_topic != topic) {
-                  response.data.topics.emplace_back(
-                    fetchable_topic_response{.name = topic});
-                  last_topic = topic;
+              auto& kitp = fp.topic_partition;
+              if (last_topic != kitp) {
+                  response.data.responses.emplace_back(
+                    fetchable_topic_response{
+                      .topic = kitp.get_topic(),
+                      .topic_id = kitp.get_topic_id()});
+                  last_topic = kitp;
               }
               fetch_response::partition_response p{
                 .partition_index = fp.topic_partition.get_partition(),
@@ -1646,7 +1525,7 @@ void op_context::create_response_placeholders() {
                 .last_stable_offset = fp.last_stable_offset,
                 .records = batch_reader()};
 
-              response.data.topics.back().partitions.push_back(std::move(p));
+              response.data.responses.back().partitions.push_back(std::move(p));
           });
     }
     for (auto it = response.begin(); it != response.end(); ++it) {
@@ -1697,6 +1576,29 @@ bool update_fetch_partition(
 }
 
 ss::future<response_ptr> op_context::send_response() && {
+    auto fetched_data_size = uint64_t{0};
+    for (const auto& topic : response.data.responses) {
+        const bool bytes_to_exclude = std::find(
+                                        usage_excluded_topics.cbegin(),
+                                        usage_excluded_topics.cend(),
+                                        topic.topic)
+                                      != usage_excluded_topics.cend();
+
+        for (const auto& part : topic.partitions) {
+            if (part.records) {
+                auto part_size = part.records->size_bytes();
+                fetched_data_size += part_size;
+
+                /// Account for special internal topic bytes for usage
+                if (bytes_to_exclude) {
+                    response.internal_topic_bytes += part_size;
+                }
+            }
+        }
+    }
+
+    rctx.connection()->attributes().fetch_bytes.record(fetched_data_size);
+
     // Sessionless fetch
     if (session_ctx.is_sessionless()) {
         response.data.session_id = invalid_fetch_session_id;
@@ -1711,28 +1613,14 @@ ss::future<response_ptr> op_context::send_response() && {
     fetch_response final_response;
     final_response.data.error_code = response.data.error_code;
     final_response.data.session_id = response.data.session_id;
-
-    /// Account for special internal topic bytes for usage
-    for (const auto& topic : response.data.topics) {
-        const bool bytes_to_exclude = std::find(
-                                        usage_excluded_topics.cbegin(),
-                                        usage_excluded_topics.cend(),
-                                        topic.name)
-                                      != usage_excluded_topics.cend();
-        if (bytes_to_exclude) {
-            for (const auto& part : topic.partitions) {
-                if (part.records) {
-                    final_response.internal_topic_bytes
-                      += part.records->size_bytes();
-                }
-            }
-        }
-    }
+    final_response.internal_topic_bytes = response.internal_topic_bytes;
 
     for (auto it = response.begin(true); it != response.end(); ++it) {
         if (it->is_new_topic) {
-            final_response.data.topics.emplace_back(
-              fetchable_topic_response{.name = it->partition->name});
+            final_response.data.responses.emplace_back(
+              fetchable_topic_response{
+                .topic = it->partition->topic,
+                .topic_id = it->partition->topic_id});
         }
 
         fetch_response::partition_response r{
@@ -1741,12 +1629,13 @@ ss::future<response_ptr> op_context::send_response() && {
           .high_watermark = it->partition_response->high_watermark,
           .last_stable_offset = it->partition_response->last_stable_offset,
           .log_start_offset = it->partition_response->log_start_offset,
-          .aborted = std::move(it->partition_response->aborted),
+          .aborted_transactions = std::move(
+            it->partition_response->aborted_transactions),
           .preferred_read_replica
           = it->partition_response->preferred_read_replica,
           .records = std::move(it->partition_response->records)};
 
-        final_response.data.topics.back().partitions.push_back(std::move(r));
+        final_response.data.responses.back().partitions.push_back(std::move(r));
     }
 
     return rctx.respond(std::move(final_response));
@@ -1765,19 +1654,46 @@ ss::future<response_ptr> op_context::send_error_response(error_code ec) && {
     return rctx.respond(std::move(resp));
 }
 
+ss::deleter op_context::response_memory_units_deleter() {
+    chunked_vector<fetch_memory_units> mu;
+    for (auto& r : iteration_order) {
+        if (r.has_memory_units()) {
+            mu.push_back(r.release_memory_units().value());
+        }
+    }
+    return ss::make_object_deleter(std::move(mu));
+}
+
+size_t op_context::total_response_memory_units() const {
+    size_t res = 0;
+    for (const auto& r : iteration_order) {
+        res += r.num_memory_units();
+    }
+    return res;
+}
+
 op_context::response_placeholder::response_placeholder(
   fetch_response::iterator it, op_context* ctx)
   : _it(it)
-  , _ctx(ctx) {}
+  , _ctx(ctx)
+  , _ktp(_it->partition->topic, _it->partition_response->partition_index) {}
 
 void op_context::response_placeholder::set(
-  fetch_response::partition_response&& response) {
+  fetch_response::partition_response&& response,
+  std::optional<fetch_memory_units>&& response_memory_units) {
     vassert(
       response.partition_index == _it->partition_response->partition_index,
       "Response and current partition ids have to be the same. Current "
       "response {}, update {}",
       _it->partition_response->partition_index,
       response.partition_index);
+    dassert(
+      (response.records ? response.records->size_bytes() : 0)
+        == (response_memory_units ? response_memory_units->num_units() : 0),
+      "Response units should equal the number of bytes in the response its "
+      "self.");
+
+    replace_or_add_memory_units(std::move(response_memory_units));
 
     if (response.error_code != error_code::none) {
         _ctx->response_error = true;
@@ -1804,8 +1720,10 @@ void op_context::response_placeholder::set(
     // if we are not sessionless update session cache
     if (!_ctx->session_ctx.is_sessionless()) {
         auto& session_partitions = _ctx->session_ctx.session()->partitions();
-        auto key = model::topic_partition_view(
-          _it->partition->name, _it->partition_response->partition_index);
+        auto key = model::kitp_view(
+          _it->partition->topic_id,
+          _it->partition->topic,
+          _it->partition_response->partition_index);
 
         if (auto it = session_partitions.find(key);
             it != session_partitions.end()) {
@@ -1831,7 +1749,11 @@ void op_context::response_placeholder::set(
                 session_partitions.move_to_end(it);
                 move_to_end();
             }
-            _it->partition_response->has_to_be_included = has_to_be_included;
+            // The partition fetch may have been retried, in which case preserve
+            // the original inclusion decision
+            _it->partition_response->has_to_be_included
+              = _it->partition_response->has_to_be_included
+                || has_to_be_included;
         }
     }
 }

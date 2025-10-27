@@ -13,20 +13,21 @@
 #include "base/vlog.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/logger.h"
+#include "cloud_storage/materialized_resources.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/remote_segment_index.h"
 #include "cloud_storage/segment_chunk_data_source.h"
 #include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage/types.h"
 #include "config/configuration.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
 #include "raft/consensus.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/future-util.h"
 #include "ssx/sformat.h"
 #include "ssx/watchdog.h"
@@ -36,10 +37,8 @@
 #include "utils/stream_utils.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/queue.hh>
@@ -98,7 +97,7 @@ generate_log_prefix(const segment_meta& meta, const model::ntp& ntp) {
 
 remote_segment::remote_segment(
   remote& r,
-  cache& c,
+  cloud_io::cache& c,
   cloud_storage_clients::bucket_name bucket,
   const remote_segment_path& path,
   const model::ntp& ntp,
@@ -115,15 +114,16 @@ remote_segment::remote_segment(
   , _chunk_root(fmt::format("{}_chunks", _path().native()))
   , _term(meta.segment_term)
   , _base_rp_offset(meta.base_offset)
-  , _base_offset_delta(std::clamp(
-      meta.delta_offset, model::offset_delta(0), model::offset_delta::max()))
+  , _base_offset_delta(
+      std::clamp(
+        meta.delta_offset, model::offset_delta(0), model::offset_delta::max()))
   , _max_rp_offset(meta.committed_offset)
   , _base_timestamp(meta.base_timestamp)
   , _size(meta.size_bytes)
   , _rtc(&parent)
   , _ctxlog(cst_log, _rtc, generate_log_prefix(meta, ntp))
   , _wait_list(expiry_handler_impl)
-  , _cache_backoff_jitter(cache_thrash_backoff)
+  , _cache_backoff_jitter(cloud_io::cache_thrash_backoff)
   , _compacted(meta.is_compacted)
   , _sname_format(meta.sname_format)
   , _metadata_size_hint(meta.metadata_size_hint)
@@ -178,8 +178,11 @@ remote_segment::remote_segment(
     }
 
     // run hydration loop in the background
+    auto sg = _api.resources().get_scheduling_group();
     _hydration_loop_running = true;
-    ssx::background = run_hydrate_bg();
+
+    ssx::background = ss::with_scheduling_group(
+      sg, [this] { return run_hydrate_bg(); });
 }
 
 const model::ntp& remote_segment::get_ntp() const { return _ntp; }
@@ -235,7 +238,7 @@ ss::future<> remote_segment::stop() {
 }
 
 ss::future<storage::segment_reader_handle>
-remote_segment::data_stream(size_t pos, ss::io_priority_class io_priority) {
+remote_segment::data_stream(size_t pos) {
     vlog(_ctxlog.debug, "remote segment file input stream at {}", pos);
     ss::gate::holder g(_gate);
     co_await hydrate();
@@ -243,7 +246,6 @@ remote_segment::data_stream(size_t pos, ss::io_priority_class io_priority) {
     options.buffer_size = config::shard_local_cfg().storage_read_buffer_size();
     options.read_ahead
       = config::shard_local_cfg().storage_read_readahead_count();
-    options.io_priority_class = io_priority;
     auto data_stream = ss::make_file_input_stream(
       _data_file, pos, std::move(options));
     co_return storage::segment_reader_handle(std::move(data_stream));
@@ -254,8 +256,7 @@ remote_segment::offset_data_stream(
   kafka::offset start,
   kafka::offset end,
   std::optional<model::timestamp> first_timestamp,
-  ss::io_priority_class io_priority,
-  storage::opt_abort_source_t as) {
+  model::opt_abort_source_t as) {
     vlog(_ctxlog.debug, "remote segment file input stream at offset {}", start);
     ss::gate::holder g(_gate);
 
@@ -296,7 +297,6 @@ remote_segment::offset_data_stream(
     options.buffer_size = config::shard_local_cfg().storage_read_buffer_size();
     options.read_ahead
       = config::shard_local_cfg().storage_read_readahead_count();
-    options.io_priority_class = io_priority;
 
     ss::input_stream<char> data_stream;
     if (is_legacy_mode_engaged()) {
@@ -380,7 +380,7 @@ remote_segment::maybe_get_offsets(model::timestamp ts) {
  */
 ss::future<uint64_t> remote_segment::put_segment_in_cache_and_create_index(
   uint64_t size_bytes,
-  space_reservation_guard& reservation,
+  cloud_io::space_reservation_guard& reservation,
   ss::input_stream<char> s) {
     offset_index tmpidx(
       get_base_rp_offset(),
@@ -433,7 +433,7 @@ ss::future<uint64_t> remote_segment::put_segment_in_cache_and_create_index(
 
 ss::future<uint64_t> remote_segment::put_segment_in_cache(
   uint64_t size_bytes,
-  space_reservation_guard& reservation,
+  cloud_io::space_reservation_guard& reservation,
   ss::input_stream<char> s) {
     try {
         co_await _cache.put(_path, s, reservation).finally([&s] {
@@ -452,7 +452,7 @@ ss::future<uint64_t> remote_segment::put_segment_in_cache(
 }
 
 ss::future<> remote_segment::put_chunk_in_cache(
-  space_reservation_guard& reservation,
+  cloud_io::space_reservation_guard& reservation,
   ss::input_stream<char> stream,
   chunk_start_offset_t chunk_start) {
     try {
@@ -471,7 +471,9 @@ ss::future<> remote_segment::put_chunk_in_cache(
 
 ss::future<> remote_segment::do_hydrate_segment() {
     retry_chain_node local_rtc(
-      cache_hydration_timeout, cache_hydration_backoff, &_rtc);
+      config::shard_local_cfg().cloud_storage_segment_upload_timeout_ms(),
+      cloud_io::cache_hydration_backoff,
+      &_rtc);
 
     // RAII reservation object represents the disk space this put will consume
     auto reservation = co_await _cache.reserve_space(
@@ -503,7 +505,9 @@ ss::future<> remote_segment::do_hydrate_segment() {
 
 ss::future<> remote_segment::do_hydrate_index() {
     retry_chain_node local_rtc(
-      cache_hydration_timeout, cache_hydration_backoff, &_rtc);
+      config::shard_local_cfg().cloud_storage_segment_upload_timeout_ms(),
+      cloud_io::cache_hydration_backoff,
+      &_rtc);
 
     offset_index ix(
       _base_rp_offset,
@@ -535,7 +539,9 @@ ss::future<> remote_segment::do_hydrate_index() {
 ss::future<> remote_segment::do_hydrate_txrange() {
     ss::gate::holder guard(_gate);
     retry_chain_node local_rtc(
-      cache_hydration_timeout, cache_hydration_backoff, &_rtc);
+      config::shard_local_cfg().cloud_storage_segment_upload_timeout_ms(),
+      cloud_io::cache_hydration_backoff,
+      &_rtc);
     if (_sname_format == segment_name_format::v3 && _metadata_size_hint == 0) {
         // The tx-manifest is empty, no need to download it, and
         // avoid putting this empty manifest into the cache.
@@ -642,8 +648,6 @@ ss::future<bool> remote_segment::do_materialize_txrange() {
               = config::shard_local_cfg().storage_read_buffer_size;
             options.read_ahead
               = config::shard_local_cfg().storage_read_readahead_count;
-            options.io_priority_class
-              = priority_manager::local().shadow_indexing_priority();
             auto inp_stream = ss::make_file_input_stream(
               cache_item->body, options);
             co_await manifest.update(std::move(inp_stream));
@@ -696,8 +700,6 @@ ss::future<bool> remote_segment::maybe_materialize_index() {
               = config::shard_local_cfg().storage_read_buffer_size;
             options.read_ahead
               = config::shard_local_cfg().storage_read_readahead_count;
-            options.io_priority_class
-              = priority_manager::local().shadow_indexing_priority();
             auto inp_stream = ss::make_file_input_stream(
               cache_item->body, options);
             iobuf state;
@@ -735,7 +737,7 @@ void remote_segment::set_waiter_errors(const std::exception_ptr& err) {
         _wait_list.pop_front();
     }
 
-    fragmented_vector<chunk_request> chunk_waiters;
+    chunked_vector<chunk_request> chunk_waiters;
     chunk_waiters.swap(_chunk_waiters);
     for (auto& w : chunk_waiters) {
         w.promise.set_exception(err);
@@ -763,6 +765,25 @@ bool remote_segment::is_state_materialized() const {
 }
 
 ss::future<> remote_segment::run_hydrate_bg() {
+    // The gate could potentially be closed before the background loop even has
+    // the chance to start.
+    if (_gate.is_closed()) {
+        // If any new download requests got queued up while we were downloading
+        // chunks before the gate closed, cancel them so that the gate close
+        // does not get stuck during segment stop.
+        if (!_chunk_waiters.empty()) {
+            vlog(
+              _ctxlog.debug,
+              "Cancelling {} pending chunk downloads during segment stop",
+              _chunk_waiters.size());
+            for (auto& w : _chunk_waiters) {
+                w.promise.set_exception(ss::gate_closed_exception{});
+            }
+        }
+        _hydration_loop_running = false;
+        co_return;
+    }
+
     ss::gate::holder guard(_gate);
 
     // Track whether we have seen our objects in the cache during the loop
@@ -894,13 +915,13 @@ ss::future<> remote_segment::run_hydrate_bg() {
     _hydration_loop_running = false;
 }
 
-ss::future<fragmented_vector<remote_segment::chunk_request>>
+ss::future<chunked_vector<remote_segment::chunk_request>>
 remote_segment::service_chunk_requests() {
     auto g = _gate.hold();
-    fragmented_vector<ss::future<ss::file>> chunk_op_results;
+    chunked_vector<ss::future<ss::file>> chunk_op_results;
     chunk_op_results.reserve(_chunk_waiters.size());
 
-    fragmented_vector<chunk_request> requests;
+    chunked_vector<chunk_request> requests;
     requests.swap(_chunk_waiters);
 
     std::ranges::transform(
@@ -914,7 +935,7 @@ remote_segment::service_chunk_requests() {
     auto results = co_await ss::when_all(
       chunk_op_results.begin(), chunk_op_results.end());
 
-    fragmented_vector<chunk_request> failed;
+    chunked_vector<chunk_request> failed;
     for (size_t i = 0; i < results.size(); ++i) {
         auto request = std::move(requests[i]);
         auto current_result = std::move(results[i]);
@@ -973,7 +994,7 @@ namespace {
 void log_hydration_abort_cause(
   const retry_chain_logger& logger,
   const ss::lowres_clock::time_point& deadline,
-  storage::opt_abort_source_t as) {
+  model::opt_abort_source_t as) {
     if (ss::lowres_clock::now() > deadline) {
         vlog(logger.warn, "timed out while waiting for hydration");
     } else if (as.has_value() && as->get().abort_requested()) {
@@ -1034,7 +1055,7 @@ ss::future<> remote_segment::do_hydrate(
       .discard_result();
 }
 
-ss::future<> remote_segment::hydrate(storage::opt_abort_source_t as) {
+ss::future<> remote_segment::hydrate(model::opt_abort_source_t as) {
     if (!_hydration_loop_running) {
         vlog(
           _ctxlog.error,
@@ -1066,7 +1087,7 @@ ss::future<> remote_segment::hydrate(storage::opt_abort_source_t as) {
 ss::future<> remote_segment::hydrate_chunk(chunk_start_offset_t start_offset) {
     const auto path_to_start = get_path_to_chunk(start_offset);
     if (const auto status = co_await _cache.is_cached(path_to_start);
-        status == cache_element_status::available) {
+        status == cloud_io::cache_element_status::available) {
         vlog(
           _ctxlog.debug,
           "skipping chunk hydration for chunk path {}, it is already in "
@@ -1076,7 +1097,9 @@ ss::future<> remote_segment::hydrate_chunk(chunk_start_offset_t start_offset) {
     }
 
     retry_chain_node rtc{
-      cache_hydration_timeout, cache_hydration_backoff, &_rtc};
+      config::shard_local_cfg().cloud_storage_segment_upload_timeout_ms(),
+      cloud_io::cache_hydration_backoff,
+      &_rtc};
 
     auto byte_range = _chunks_api->get_byte_range_for_chunk(
       start_offset, _size - 1);
@@ -1210,7 +1233,7 @@ public:
     using stop_parser = storage::batch_consumer::stop_parser;
 
     remote_segment_batch_consumer(
-      storage::log_reader_config& conf,
+      cloud_storage::cloud_log_reader_config& conf,
       remote_segment_batch_reader& parent,
       model::term_id term,
       const model::ntp& ntp,
@@ -1244,8 +1267,8 @@ public:
 
         if (header.type == model::record_batch_type::raft_data) {
             auto next = rp_to_kafka(header.last_offset()) + model::offset(1);
-            if (kafka::offset_cast(next) > _config.start_offset) {
-                _config.start_offset = kafka::offset_cast(next);
+            if (next > _config.start_offset) {
+                _config.start_offset = next;
             }
         }
     }
@@ -1259,9 +1282,7 @@ public:
           header,
           _seg_reader._cur_delta);
 
-        if (
-          rp_to_kafka(header.base_offset)
-          > model::offset_cast(_config.max_offset)) {
+        if (rp_to_kafka(header.base_offset) > _config.max_offset) {
             vlog(
               _ctxlog.debug,
               "[{}] accept_batch_start stop parser because {} > {}(kafka "
@@ -1288,8 +1309,7 @@ public:
         // The segment can be scanned from the begining so we should skip
         // irrelevant batches.
         if (unlikely(
-              rp_to_kafka(header.last_offset())
-              < model::offset_cast(_config.start_offset))) {
+              rp_to_kafka(header.last_offset()) < _config.start_offset)) {
             vlog(
               _ctxlog.debug,
               "[{}] accept_batch_start skip because "
@@ -1418,7 +1438,7 @@ public:
     }
 
 private:
-    storage::log_reader_config& _config;
+    cloud_storage::cloud_log_reader_config& _config;
     remote_segment_batch_reader& _seg_reader;
     model::record_batch_header _header;
     iobuf _records;
@@ -1430,7 +1450,7 @@ private:
 
 remote_segment_batch_reader::remote_segment_batch_reader(
   ss::lw_shared_ptr<remote_segment> s,
-  const storage::log_reader_config& config,
+  const cloud_storage::cloud_log_reader_config& config,
   partition_probe& probe,
   ts_read_path_probe& ts_probe,
   ssx::semaphore_units units) noexcept
@@ -1446,11 +1466,21 @@ remote_segment_batch_reader::remote_segment_batch_reader(
     _ts_probe.segment_reader_created();
 }
 
-ss::future<result<ss::circular_buffer<model::record_batch>>>
+ss::future<result<chunked_circular_buffer<model::record_batch>>>
 remote_segment_batch_reader::read_some(
-  model::timeout_clock::time_point,
+  model::timeout_clock::time_point timeout,
   storage::offset_translator_state& ot_state) {
     ss::gate::holder h(_gate);
+    return _seg
+      ->with_scheduling_group(
+        [this, timeout, &ot_state] { return do_read_some(timeout, ot_state); })
+      .finally([h = std::move(h)] {});
+}
+
+ss::future<result<chunked_circular_buffer<model::record_batch>>>
+remote_segment_batch_reader::do_read_some(
+  model::timeout_clock::time_point,
+  storage::offset_translator_state& ot_state) {
     if (_ringbuf.empty()) {
         if (!_parser) {
             // remote_segment_batch_reader shouldn't be used concurrently
@@ -1491,7 +1521,7 @@ remote_segment_batch_reader::read_some(
                 vlog(_ctxlog.error, "{}", msg);
             }
             _is_unexpected_eof = true;
-            co_return ss::circular_buffer<model::record_batch>{};
+            co_return chunked_circular_buffer<model::record_batch>{};
         }
         _bytes_consumed = new_bytes_consumed.value();
     }
@@ -1510,10 +1540,9 @@ remote_segment_batch_reader::init_parser() {
       _config.client_address);
 
     auto stream_off = co_await _seg->offset_data_stream(
-      model::offset_cast(_config.start_offset),
-      model::offset_cast(_config.max_offset),
+      _config.start_offset,
+      _config.max_offset,
       _config.first_timestamp,
-      priority_manager::local().shadow_indexing_priority(),
       _config.abort_source);
 
     vlog(
@@ -1589,7 +1618,7 @@ std::ostream& operator<<(std::ostream& os, hydration_request::kind kind) {
 }
 
 hydration_loop_state::hydration_loop_state(
-  cache& c, remote_segment_path root, retry_chain_logger& ctxlog)
+  cloud_io::cache& c, remote_segment_path root, retry_chain_logger& ctxlog)
   : _cache{c}
   , _root{std::move(root)}
   , _ctxlog{ctxlog} {}
@@ -1630,7 +1659,7 @@ ss::future<> hydration_loop_state::update_current_path_states() {
 ss::future<bool> hydration_loop_state::is_cache_thrashing() {
     for (auto& path_state : _states) {
         bool available = path_state.current_status
-                         != cache_element_status::not_available;
+                         != cloud_io::cache_element_status::not_available;
         path_state.was_cached |= available;
         if (!available && path_state.was_cached) {
             vlog(
@@ -1653,9 +1682,9 @@ ss::future<> hydration_loop_state::hydrate(size_t wait_list_size) {
 
     for (const auto& state : _states) {
         switch (state.current_status) {
-        case cache_element_status::available:
+        case cloud_io::cache_element_status::available:
             break;
-        case cache_element_status::not_available:
+        case cloud_io::cache_element_status::not_available:
             vlog(
               _ctxlog.info,
               "Hydrating {} {}, {} waiters",
@@ -1664,7 +1693,7 @@ ss::future<> hydration_loop_state::hydrate(size_t wait_list_size) {
               wait_list_size);
             fs.push_back(state.hydrate_action());
             break;
-        case cache_element_status::in_progress:
+        case cloud_io::cache_element_status::in_progress:
             // Ths means that we have two remote_segment instances running
             // in parallel. This is possible in case of extreme contention
             // when the materialized segment gets evicted and then

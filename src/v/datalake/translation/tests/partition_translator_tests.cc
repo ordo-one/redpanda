@@ -173,8 +173,8 @@ public:
         co_return std::nullopt;
     }
 
-    ss::future<std::optional<model::record_batch_reader>> make_log_reader(
-      kafka::offset o, ss::io_priority_class, ss::abort_source&) final {
+    ss::future<std::optional<model::record_batch_reader>>
+    make_log_reader(kafka::offset o, ss::abort_source&) final {
         auto batches = co_await model::test::make_random_batches(
           kafka::offset_cast(o), 500, false);
         auto reader = model::make_generating_record_batch_reader(
@@ -203,9 +203,6 @@ public:
         _test_ctx.update_highest_translated_offset(offset);
         co_return std::make_error_code(std::errc());
     }
-
-    void update_commit_lag(std::optional<kafka::offset>) const final {}
-    void update_translation_lag(kafka::offset) const final {}
 
 private:
     fake_test_ctx& _test_ctx;
@@ -311,8 +308,6 @@ public:
         return ss::make_ready_future();
     }
 
-    void reconcile_properties() final {}
-
     ss::future<
       checked<datalake::coordinator::translated_offset_range, translation_errc>>
     finish(retry_chain_node&, ss::abort_source&) final {
@@ -340,6 +335,10 @@ public:
     }
 
     size_t buffered_bytes() const final { return _buffered_bytes; }
+
+    void report_translation_lag(int64_t) final {}
+
+    void report_commit_lag(int64_t) final {}
 
 private:
     size_t _translated_bytes{0};
@@ -420,9 +419,7 @@ protected:
             std::make_unique<fake_translation_ctx>(ctx),
             std::make_unique<fake_lag_tracker>(ctx),
             simple_time_jitter<ss::lowres_clock, std::chrono::milliseconds>{
-              retry_max_timeout, retry_initial_backoff},
-            retry_max_timeout,
-            retry_initial_backoff));
+              retry_max_timeout, retry_initial_backoff}));
     }
 
     fake_test_ctx& make_test_context() {

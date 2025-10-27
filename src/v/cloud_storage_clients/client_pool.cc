@@ -15,6 +15,7 @@
 #include "cloud_storage_clients/s3_client.h"
 #include "model/timeout_clock.h"
 #include "ssx/future-util.h"
+#include "utils/functional.h"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/timed_out_error.hh>
@@ -249,12 +250,17 @@ std::tuple<unsigned int, unsigned int> pick_two_random_shards() {
 ///       the lifetime of the pointer ends).
 /// \return client pointer (via future that can wait if all clients
 ///         are in use)
-ss::future<client_pool::client_lease>
-client_pool::acquire(ss::abort_source& as) {
+ss::future<client_pool::client_lease> client_pool::acquire(
+  ss::abort_source& as, std::optional<ss::lowres_clock::time_point> deadline) {
     auto guard = _gate.hold();
 
     std::optional<unsigned int> source_sid;
     std::optional<http_client_ptr> client;
+
+    auto deadline_reached = [&deadline] {
+        return deadline.has_value()
+               && ss::lowres_clock::now() >= deadline.value();
+    };
 
     try {
         // If credentials have not yet been acquired, wait for them. It is
@@ -281,7 +287,7 @@ client_pool::acquire(ss::abort_source& as) {
             }
         }
 
-        while (!client.has_value() && !_gate.is_closed()
+        while (!client.has_value() && !deadline_reached() && !_gate.is_closed()
                && !_as.abort_requested()) {
             if (likely(!_pool.empty())) {
                 client = _pool.back();
@@ -294,7 +300,7 @@ client_pool::acquire(ss::abort_source& as) {
                 // client connections then wait util one of the clients is
                 // freed.
                 co_await ssx::with_timeout_abortable(
-                  _cvar.wait(), model::no_timeout, as);
+                  _cvar.wait(), deadline.value_or(model::no_timeout), as);
 
                 vlog(
                   pool_log.debug,
@@ -342,12 +348,18 @@ client_pool::acquire(ss::abort_source& as) {
                     client = make_client();
                 } else {
                     vlog(pool_log.debug, "can't borrow connection, waiting");
-                    co_await ssx::with_timeout_abortable(
-                      _cvar.wait(), model::no_timeout, as);
-                    vlog(
-                      pool_log.debug,
-                      "cvar triggered, pool size: {}",
-                      _pool.size());
+                    // In-between failing to borrow from local pool and failing
+                    // to borrow from a remote pool (co_await/async-operation),
+                    // local pool may have gotten a client back. There is no
+                    // need to wait in such case.
+                    if (_pool.empty()) {
+                        co_await ssx::with_timeout_abortable(
+                          _cvar.wait(), model::no_timeout, as);
+                        vlog(
+                          pool_log.debug,
+                          "cvar triggered, pool size: {}",
+                          _pool.size());
+                    }
                 }
             }
         }
@@ -358,6 +370,8 @@ client_pool::acquire(ss::abort_source& as) {
     }
     if (_gate.is_closed() || _as.abort_requested()) {
         throw ss::gate_closed_exception();
+    } else if (!client.has_value() && deadline_reached()) {
+        throw ss::timed_out_error();
     }
     vassert(client.has_value(), "'acquire' invariant is broken");
 
@@ -426,6 +440,43 @@ client_pool::acquire(ss::abort_source& as) {
     co_return lease;
 }
 
+auto client_pool::acquire_with_timeout(
+  ss::abort_source& as,
+  ss::lowres_clock::duration timeout,
+  std::optional<ss::sstring> ctx) -> ss::future<client_lease> {
+    auto lease = co_await acquire(as);
+    if (timeout < ss::lowres_clock::duration::max()) {
+        // take a copy of the shared_ptr held by the lease to avoid racing with
+        // client_pool teardown
+        lease._wd = std::make_unique<ssx::watchdog>(
+          timeout,
+          [probe = _probe,
+           client = lease.client,
+           timeout,
+           ctx = std::move(ctx)]() mutable {
+              if (ctx.has_value()) {
+                  vlog(
+                    pool_log.warn,
+                    "{} - Lease expired after {}ms. Shutting down client...",
+                    ctx.value(),
+                    timeout / 1ms);
+              } else {
+                  vlog(
+                    pool_log.warn,
+                    "Lease expired after {}ms. Shutting down client...",
+                    timeout / 1ms);
+              }
+              if (probe) {
+                  probe->register_timeout();
+              }
+              if (client) {
+                  client->shutdown();
+              }
+          });
+    }
+    co_return lease;
+}
+
 void client_pool::update_usage_stats() {
     if (_probe) {
         _probe->register_utilization(normalized_num_clients_in_use());
@@ -453,10 +504,10 @@ bool client_pool::borrow_one(unsigned other) {
       other,
       _pool.size(),
       _capacity);
-    // TODO: do not use the topmost element. Find the one
+    // TODO: do not use the bottommost (oldest) element. Find the one
     // with expired connection.
-    auto c = _pool.back();
-    _pool.pop_back();
+    auto c = _pool.front();
+    _pool.pop_front();
     update_usage_stats();
     c->shutdown();
     ssx::spawn_with_gate(_bg_gate, [c] { return c->stop().finally([c] {}); });
@@ -489,7 +540,13 @@ void client_pool::populate_client_pool() {
         _pool.emplace_back(make_client());
     }
 
-    _cvar.signal();
+    // Be defensive in checking that we properly synchronized access to `_pool`
+    // and `_cvar`. Before populate_client_pool() is called, we do not expect
+    // anyone to check the size of the pool or wait on the condition variable.
+    vassert(
+      !_cvar.has_waiters(),
+      "This is a bug: _cvar is not expected to have waiters at this point. "
+      "Missing synchronization?");
 }
 
 client_pool::http_client_ptr client_pool::make_client() const noexcept {

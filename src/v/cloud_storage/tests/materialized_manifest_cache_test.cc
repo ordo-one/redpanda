@@ -17,11 +17,9 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
-#include "test_utils/fixture.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/testing/seastar_test.hh>
 #include <seastar/testing/thread_test_case.hh>

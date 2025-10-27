@@ -14,7 +14,6 @@
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/tmp_dir.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/util/defer.hh>
 
 #include <gtest/gtest.h>
@@ -63,10 +62,7 @@ TEST(replica_state_validator_test, test_happy_path) {
     auto path = tmp_dir.get_path();
 
     auto builder = storage::disk_log_builder{storage::log_config{
-      path.native(),
-      4_KiB,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      path.native(), 4_KiB, storage::make_sanitized_file_config()}};
 
     auto ntp = model::ntp{"kafka", "test", 0};
     auto ntp_config = storage::ntp_config{ntp, {path}};
@@ -84,12 +80,13 @@ TEST(replica_state_validator_test, test_happy_path) {
     // Fake partition manifest
     cloud_storage::partition_manifest manifest(
       ntp, model::initial_revision_id(0));
-    manifest.add(cloud_storage::segment_meta{
-      .base_offset = model::offset{0},
-      .committed_offset = model::offset{20},
-      .delta_offset = model::offset_delta{0},
-      .delta_offset_end = model::offset_delta{2},
-    });
+    manifest.add(
+      cloud_storage::segment_meta{
+        .base_offset = model::offset{0},
+        .committed_offset = model::offset{20},
+        .delta_offset = model::offset_delta{0},
+        .delta_offset_end = model::offset_delta{2},
+      });
 
     archival::replica_state_validator validator(*log, manifest);
     ASSERT_FALSE(validator.has_anomalies());
@@ -101,10 +98,7 @@ TEST(replica_state_validator_test, test_gap_detected) {
     auto path = tmp_dir.get_path();
 
     auto builder = storage::disk_log_builder{storage::log_config{
-      path.native(),
-      4_KiB,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      path.native(), 4_KiB, storage::make_sanitized_file_config()}};
 
     auto ntp = model::ntp{"kafka", "test", 0};
     auto ntp_config = storage::ntp_config{ntp, {path}};
@@ -123,12 +117,13 @@ TEST(replica_state_validator_test, test_gap_detected) {
     // should trigger the anomaly
     cloud_storage::partition_manifest manifest(
       ntp, model::initial_revision_id(0));
-    manifest.add(cloud_storage::segment_meta{
-      .base_offset = model::offset{0},
-      .committed_offset = model::offset{10},
-      .delta_offset = model::offset_delta{0},
-      .delta_offset_end = model::offset_delta{2},
-    });
+    manifest.add(
+      cloud_storage::segment_meta{
+        .base_offset = model::offset{0},
+        .committed_offset = model::offset{10},
+        .delta_offset = model::offset_delta{0},
+        .delta_offset_end = model::offset_delta{2},
+      });
 
     archival::replica_state_validator validator(*log, manifest);
     ASSERT_TRUE(validator.has_anomalies());
@@ -144,10 +139,7 @@ TEST(replica_state_validator_test, test_delta_mismatch) {
     auto path = tmp_dir.get_path();
 
     auto builder = storage::disk_log_builder{storage::log_config{
-      path.native(),
-      4_KiB,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      path.native(), 4_KiB, storage::make_sanitized_file_config()}};
 
     auto ntp = model::ntp{"kafka", "test", 0};
     auto ntp_config = storage::ntp_config{ntp, {path}};
@@ -165,12 +157,13 @@ TEST(replica_state_validator_test, test_delta_mismatch) {
     // The manifest's delta-offset value is wrong
     cloud_storage::partition_manifest manifest(
       ntp, model::initial_revision_id(0));
-    manifest.add(cloud_storage::segment_meta{
-      .base_offset = model::offset{0},
-      .committed_offset = model::offset{20},
-      .delta_offset = model::offset_delta{1},
-      .delta_offset_end = model::offset_delta{2},
-    });
+    manifest.add(
+      cloud_storage::segment_meta{
+        .base_offset = model::offset{0},
+        .committed_offset = model::offset{20},
+        .delta_offset = model::offset_delta{1},
+        .delta_offset_end = model::offset_delta{2},
+      });
 
     archival::replica_state_validator validator(*log, manifest);
     validator.maybe_print_scarry_log_message();
@@ -187,10 +180,7 @@ TEST(replica_state_validator_test, test_log_truncated) {
     auto path = tmp_dir.get_path();
 
     auto builder = storage::disk_log_builder{storage::log_config{
-      path.native(),
-      4_KiB,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      path.native(), 4_KiB, storage::make_sanitized_file_config()}};
 
     auto ntp = model::ntp{"kafka", "test", 0};
     auto ntp_config = storage::ntp_config{ntp, {path}};
@@ -209,21 +199,20 @@ TEST(replica_state_validator_test, test_log_truncated) {
     // validation becomes impossible (this could happen
     // if the data is removed by retention). We need to check if
     // the ntp_archiver can continue uploading new data.
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        model::offset(21), ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(model::offset(21)))
       .get();
 
     // The manifest has correct state
     cloud_storage::partition_manifest manifest(
       ntp, model::initial_revision_id(0));
 
-    manifest.add(cloud_storage::segment_meta{
-      .base_offset = model::offset{12},
-      .committed_offset = model::offset{20},
-      .delta_offset = model::offset_delta{2},
-      .delta_offset_end = model::offset_delta{2},
-    });
+    manifest.add(
+      cloud_storage::segment_meta{
+        .base_offset = model::offset{12},
+        .committed_offset = model::offset{20},
+        .delta_offset = model::offset_delta{2},
+        .delta_offset_end = model::offset_delta{2},
+      });
 
     archival::replica_state_validator validator(*log, manifest);
     validator.maybe_print_scarry_log_message();

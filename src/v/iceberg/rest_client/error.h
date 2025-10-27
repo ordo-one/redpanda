@@ -12,13 +12,14 @@
 
 #include "base/seastarx.h"
 #include "http/request_builder.h"
-#include "thirdparty/ada/ada.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 
 #include <boost/beast/http/status.hpp>
+
+#include <ada.h>
 
 namespace iceberg::rest_client {
 
@@ -63,8 +64,8 @@ template<>
 struct fmt::formatter<iceberg::rest_client::domain_error>
   : fmt::formatter<std::string_view> {
     auto format(
-      const iceberg::rest_client::domain_error&,
-      fmt::format_context& ctx) const -> decltype(ctx.out());
+      const iceberg::rest_client::domain_error&, fmt::format_context& ctx) const
+      -> decltype(ctx.out());
 };
 
 template<>

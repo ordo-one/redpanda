@@ -7,12 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from ducktape.utils.util import wait_until
+
+from rptest.clients.rpk import RpkException
+from rptest.clients.rpk_remote import RpkRemoteTool
 from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import expect_exception
-from ducktape.utils.util import wait_until
-from rptest.clients.rpk_remote import RpkRemoteTool
-from rptest.clients.rpk import RpkException
 
 
 class RpkConnectTest(RedpandaTest):
@@ -35,8 +36,7 @@ class RpkConnectTest(RedpandaTest):
             installed,
             timeout_sec=120,
             backoff_sec=2,
-            err_msg=
-            f"could not find 'redpanda-connect' in plugin list after installing"
+            err_msg=f"could not find 'redpanda-connect' in plugin list after installing",
         )
 
     @cluster(num_nodes=1)
@@ -77,8 +77,8 @@ class RpkConnectTest(RedpandaTest):
         # rpk shouldn't install either if the user runs --version without
         # connect being installed first.
         with expect_exception(
-                RpkException,
-                lambda e: "rpk connect is not installed" in str(e)):
+            RpkException, lambda e: "rpk connect is not installed" in str(e)
+        ):
             rpk_remote.connect_version()
 
         # Now, rpk should download and install on-the-fly Connect when

@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "features/feature_table.h"
 #include "kafka/protocol/types.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/handlers/handlers.h"
@@ -85,6 +86,28 @@ chunked_vector<api_versions_response_key> get_supported_apis() {
       config::shard_local_cfg().enable_transactions.value());
 }
 
+void topic_id_api_version_limiter(api_versions_response& r) {
+    for (auto& api : r.data.api_keys) {
+        auto apply_limit = [&api](int16_t limit) {
+            api.max_version = std::min(api.max_version, limit);
+        };
+        switch (api.api_key) {
+        case fetch_api::key:
+            apply_limit(12);
+            break;
+        case metadata_api::key:
+            apply_limit(11);
+            break;
+        case create_topics_api::key:
+            apply_limit(6);
+            break;
+        case delete_topics_api::key:
+            apply_limit(5);
+            break;
+        };
+    }
+}
+
 api_versions_response api_versions_handler::handle_raw(request_context& ctx) {
     // Unlike other request types, we handle ApiVersion requests
     // with higher versions than supported. We treat such a request
@@ -100,6 +123,13 @@ api_versions_response api_versions_handler::handle_raw(request_context& ctx) {
         api_versions_request request;
         request.decode(ctx.reader(), ctx.header().version);
         r.data.error_code = error_code::none;
+
+        if (ctx.header().version >= api_version(3)) {
+            ctx.connection()->attributes().last_client_software_name.update(
+              request.data.client_software_name);
+            ctx.connection()->attributes().last_client_software_version.update(
+              request.data.client_software_version);
+        }
     }
 
     if (
@@ -111,6 +141,14 @@ api_versions_response api_versions_handler::handle_raw(request_context& ctx) {
             r.data.api_keys = supported_apis.idempotence.copy();
         } else {
             r.data.api_keys = supported_apis.transactions.copy();
+        }
+    }
+
+    {
+        // If feature::topic_ids is not active, limit reported API versions
+        const auto& features = ctx.feature_table().local();
+        if (unlikely(!features.is_active(features::feature::topic_ids_api))) {
+            topic_id_api_version_limiter(r);
         }
     }
     return r;

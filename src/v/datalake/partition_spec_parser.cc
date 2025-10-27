@@ -11,7 +11,7 @@
 #include "datalake/partition_spec_parser.h"
 
 #include "base/vassert.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "iceberg/transform.h"
 #include "iceberg/unresolved_partition_spec.h"
 #include "utils/fixed_string.h"
@@ -292,8 +292,7 @@ private:
 
     template<
       typename Elem,
-      template<typename...>
-      class Container,
+      template<typename...> class Container,
       fixed_string Delim>
     parse_result<Container<Elem>> parse_separated_list(
       parse_result<Elem> (self::*elem_parser)(position), position pos) {
@@ -463,14 +462,14 @@ private:
               [&param1](iceberg::truncate_transform& parametrized_transform) {
                   parametrized_transform.length = param1;
               },
-              [](auto) { vassert(false, "unexpected transform"); });
+              [](auto) { vunreachable("unexpected transform"); });
             return {
               {.source_name = args_res_value.second,
                .transform = std::move(transform)},
               pos};
         }
         default:
-            vassert(false, "parse_transform_name returned unknown option");
+            vunreachable("parse_transform_name returned unknown option");
         }
     }
 

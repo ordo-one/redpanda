@@ -41,7 +41,7 @@ bool fetch_session::apply(fetch_response& res) {
         if (part.partition_response->error_code != error_code::none) {
             continue;
         }
-        const auto& topic = part.partition->name;
+        const auto& topic = part.partition->topic;
         const auto p_id = part.partition_response->partition_index;
         auto& record_set = part.partition_response->records;
         if (!record_set || record_set->empty()) {
@@ -62,18 +62,20 @@ fetch_session::make_offset_commit_request() const {
     if (_offsets.empty()) {
         return res;
     }
-    res.push_back(offset_commit_request_topic{
-      .name{_offsets.begin()->first}, .partitions{}});
+    res.push_back(
+      offset_commit_request_topic{
+        .name{_offsets.begin()->first}, .partitions{}});
     for (const auto& [t, po] : _offsets) {
         for (const auto& [p_id, o] : po) {
             if (res.back().name != t) {
                 res.push_back(
                   offset_commit_request_topic{.name = t, .partitions{}});
             }
-            res.back().partitions.push_back(offset_commit_request_partition{
-              .partition_index = p_id,
-              .committed_offset = o - model::offset(1),
-              .committed_leader_epoch = invalid_leader_epoch});
+            res.back().partitions.push_back(
+              offset_commit_request_partition{
+                .partition_index = p_id,
+                .committed_offset = o - model::offset(1),
+                .committed_leader_epoch = invalid_leader_epoch});
         }
     }
     return res;

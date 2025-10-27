@@ -1,33 +1,59 @@
 #!/usr/bin/env bash
+
+# "tool packages" are generally those which are needed for running ducktape
+# tests, but not for building the early layers of the image themselves. They
+# are installed relatively late in the Dockerfile, after most of the heavy
+# "non mainline" layers have forked off.
 set -e
 apt-get update
 apt-get install -qq \
-  bind9-utils \
   bind9-dnsutils \
+  bind9-utils \
   bsdmainutils \
   dmidecode \
+  faketime \
+  file \
   gnuplot-nox \
+  iproute2 \
+  iptables \
   krb5-admin-server \
   krb5-kdc \
   krb5-user \
-  iproute2 \
-  iptables \
   libatomic1 \
   libyajl-dev \
-  libsasl2-dev \
-  libsasl2-modules-gssapi-mit \
-  libssl-dev \
-  net-tools \
   lsof \
-  pciutils \
+  net-tools \
+  netcat-openbsd \
   nodejs \
   npm \
   openssh-server \
-  netcat-openbsd \
-  sudo \
-  llvm \
-  python3-pip \
-  python3-venv \
-  libzstd-dev \
-  pkg-config \
-  faketime
+  pciutils \
+  software-properties-common \
+  sudo
+
+# install llvm-addr2line-$(version), which is not available in the default ubuntu/debian repos,
+# but is needed to demangle seastar backtraces (much faster than binutils addr2line)
+
+LLVM_VERSION=20
+
+cd "$(mktemp -d)"
+wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+./llvm.sh $LLVM_VERSION
+mkdir -p /opt/llvm
+# make it available in a version-independent way
+ln -s /usr/bin/llvm-addr2line-$LLVM_VERSION /opt/llvm/llvm-addr2line
+
+# Install an llvm-symbolizer shim in the PATH, this allows ASAN, UBSAN, etc
+# symbolization to work out of the box.
+cat <<EOF >/usr/local/bin/llvm-symbolizer
+#!/bin/bash
+
+# This shim unsets LD_LIBRARY_PATH to avoid the issue that
+# redpanda libraries are loaded into the symbolizer, causing
+# it to crash.
+echo "exec llvm-symbolizer shim, cmd: '\$*', ASAN_OPTIONS=\$ASAN_OPTIONS, UBSAN_OPTIONS=\$UBSAN_OPTIONS" >&2
+unset LD_LIBRARY_PATH
+exec /usr/bin/llvm-symbolizer-$LLVM_VERSION "\$@"
+EOF
+chmod +x /usr/local/bin/llvm-symbolizer

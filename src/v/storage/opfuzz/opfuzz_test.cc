@@ -13,10 +13,12 @@
 #include "storage/opfuzz/opfuzz.h"
 #include "storage/tests/storage_test_fixture.h"
 #include "storage/types.h"
-#include "test_utils/fixture.h"
+#include "test_utils/test_macros.h"
 
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <iterator>
@@ -30,14 +32,12 @@ inline model::cleanup_policy_bitflags randcompaction() {
     return c;
 }
 
-FIXTURE_TEST(test_random_workload, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_random_workload) {
     // BLOCK on logging so that we can make sense of the logs
     std::cout.setf(std::ios::unitbuf);
-    storage::log_manager mngr = make_log_manager(storage::log_config(
-      std::move(test_dir),
-      200_MiB,
-      ss::default_priority_class(),
-      storage::with_cache::yes));
+    storage::log_manager mngr = make_log_manager(
+      storage::log_config(
+        std::move(test_dir), 200_MiB, storage::with_cache::yes));
     auto deferred = ss::defer([&mngr]() mutable { mngr.stop().get(); });
 
     // Test parameters
@@ -45,7 +45,8 @@ FIXTURE_TEST(test_random_workload, storage_test_fixture) {
     const size_t ops_per_ntp = 500;
     std::vector<std::unique_ptr<storage::opfuzz>> logs_to_fuzz;
     logs_to_fuzz.reserve(ntp_count);
-    info("generating ntp's {}, with {} ops", ntp_count, ops_per_ntp);
+    SUCCEED() << "generating ntp's " << ntp_count << ", with " << ops_per_ntp
+              << " ops";
     for (size_t i = 0; i < ntp_count; ++i) {
         auto ntp = model::ntp(
           "test.default",
@@ -72,19 +73,17 @@ FIXTURE_TEST(test_random_workload, storage_test_fixture) {
       logs_to_fuzz,
       [](std::unique_ptr<storage::opfuzz>& w) {
           return w->execute().handle_exception([&w](std::exception_ptr e) {
-              vassert(false, "Error:{} fuzzing log: {}", e, w->log());
+              vunreachable("Error:{} fuzzing log: {}", e, w->log());
           });
       })
       .get();
 }
-FIXTURE_TEST(test_random_remove, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_random_remove) {
     // BLOCK on logging so that we can make sense of the logs
     std::cout.setf(std::ios::unitbuf);
-    storage::log_manager mngr = make_log_manager(storage::log_config(
-      std::move(test_dir),
-      200_MiB,
-      ss::default_priority_class(),
-      storage::with_cache::yes));
+    storage::log_manager mngr = make_log_manager(
+      storage::log_config(
+        std::move(test_dir), 200_MiB, storage::with_cache::yes));
     auto deferred = ss::defer([&mngr]() mutable { mngr.stop().get(); });
 
     // Test parameters
@@ -115,7 +114,7 @@ FIXTURE_TEST(test_random_remove, storage_test_fixture) {
       logs_to_fuzz,
       [](std::unique_ptr<storage::opfuzz>& w) {
           return w->execute().handle_exception([&w](std::exception_ptr e) {
-              vassert(false, "Error:{} fuzzing log: {}", e, w->log());
+              vunreachable("Error:{} fuzzing log: {}", e, w->log());
           });
       })
       .get();
@@ -126,16 +125,16 @@ FIXTURE_TEST(test_random_remove, storage_test_fixture) {
           // generate *inclusive* indices
           return random_generators::get_int<size_t>(0, ntp_count - 1);
       });
-    info("Removal sequence: {}", random_ntp_removal_sequence);
+    SUCCEED() << "Removal sequence: " << random_ntp_removal_sequence;
     for (auto i : random_ntp_removal_sequence) {
         const model::ntp& ntp = ntps_to_fuzz[i];
-        info("test... removing: {}", ntp);
+        SUCCEED() << "test... removing: " << ntp;
         mngr.remove(ntp).get();
-        BOOST_REQUIRE(!mngr.get(ntp));
+        ASSERT_FALSE(mngr.get(ntp));
     }
     std::sort(
       random_ntp_removal_sequence.begin(), random_ntp_removal_sequence.end());
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       ntp_count
         - std::distance(
           random_ntp_removal_sequence.begin(),

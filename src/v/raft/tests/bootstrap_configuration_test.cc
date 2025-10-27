@@ -15,21 +15,21 @@
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
 #include "raft/group_configuration.h"
-#include "random/generators.h"
-#include "resource_mgmt/io_priority.h"
 #include "storage/api.h"
 #include "storage/log.h"
 #include "storage/log_manager.h"
 #include "storage/record_batch_builder.h"
-#include "test_utils/randoms.h"
 // testing
 #include "raft/tests/simple_record_fixture.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/core/print.hh>
 #include <seastar/util/log.hh>
 
 using namespace std::chrono_literals; // NOLINT
+
+ss::sstring test_directory() { return test_env::random_dir_path(); }
 
 struct bootstrap_fixture : raft::simple_record_fixture {
     using raft::simple_record_fixture::active_nodes;
@@ -39,14 +39,13 @@ struct bootstrap_fixture : raft::simple_record_fixture {
               return storage::kvstore_config(
                 1_MiB,
                 config::mock_binding(10ms),
-                "test.dir",
+                test_directory(),
                 storage::make_sanitized_file_config());
           },
           []() {
               return storage::log_config(
-                "test.dir",
+                test_directory(),
                 1_GiB,
-                ss::default_priority_class(),
                 storage::with_cache::no,
                 storage::make_sanitized_file_config());
           },
@@ -59,15 +58,13 @@ struct bootstrap_fixture : raft::simple_record_fixture {
         _storage.start().get();
         // ignore the get_log()
         (void)_storage.log_mgr()
-          .manage(storage::ntp_config(_ntp, "test.dir"))
+          .manage(storage::ntp_config(_ntp, test_directory()))
           .get();
     }
 
     std::vector<storage::append_result> write_n(const std::size_t n) {
         const auto cfg = storage::log_append_config{
-          storage::log_append_config::fsync::no,
-          ss::default_priority_class(),
-          model::no_timeout};
+          storage::log_append_config::fsync::no, model::no_timeout};
         std::vector<storage::append_result> res;
         res.push_back(
           datas(n)
@@ -115,9 +112,7 @@ FIXTURE_TEST(write_configs, bootstrap_fixture) {
 }
 FIXTURE_TEST(mixed_config_versions, bootstrap_fixture) {
     const storage::log_append_config append_cfg{
-      storage::log_append_config::fsync::no,
-      ss::default_priority_class(),
-      model::no_timeout};
+      storage::log_append_config::fsync::no, model::no_timeout};
 
     datas(20)
       .for_each_ref(get_log()->make_appender(append_cfg), append_cfg.timeout)

@@ -14,11 +14,16 @@
 #include "crypto/ossl_context_service.h"
 #include "random/generators.h"
 #include "ssx/thread_worker.h"
+#include "test_utils/runfiles.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/testing/perf_tests.hh>
+
+#include <exception>
+#include <filesystem>
+#include <memory>
 
 static constexpr size_t inner_iters = 1000;
 
@@ -43,60 +48,34 @@ public:
         auto fips_mode = crypto::is_fips_mode::no;
 #endif
         _thread_worker->start({.name = "worker"}).get();
-        if (auto module_override = ::getenv("__FIPS_MODULE_PATH");
-            module_override != nullptr) {
-            vassert(
-              std::filesystem::exists(module_override),
-              "Module not found: {}",
-              module_override);
-            auto mod = std::filesystem::path{module_override}.parent_path();
-            ::setenv("MODULE_DIR", mod.c_str(), 1);
-        }
+        auto module_dir = test_utils::get_runfile_path("src/v/crypto/tests");
         _svc
           .start(
             std::ref(*_thread_worker),
             get_config_file_path(),
-            ::getenv("MODULE_DIR"),
+            module_dir,
             fips_mode)
           .get();
         _svc.invoke_on_all(&crypto::ossl_context_service::start).get();
     }
 
-    ss::future<> stop() {
-        co_await _svc.stop();
-        co_await _thread_worker->stop();
-    }
-
-    ~openssl_perf() = default;
+    ~openssl_perf() {
+        _svc.stop().get();
+        _thread_worker->stop().get();
+    };
 
 private:
     std::unique_ptr<ssx::singleton_thread_worker> _thread_worker{nullptr};
     ss::sharded<crypto::ossl_context_service> _svc;
 
     static std::string get_config_file_path() {
-        auto conf_file = ::getenv("OPENSSL_CONF");
-        if (conf_file) {
-            return conf_file;
-        } else {
-            return "";
-        }
+        return test_utils::get_runfile_path(
+          "src/v/crypto/tests/openssl_conf.cnf");
     }
 };
 
-static std::unique_ptr<openssl_perf> global_perf{nullptr};
-
 struct openssl_perf_test {
-    openssl_perf_test() {
-        if (!global_perf) {
-            global_perf = std::make_unique<openssl_perf>();
-            ss::engine().at_exit([]() -> ss::future<> {
-                co_await global_perf->stop();
-                global_perf.reset();
-            });
-        }
-    }
-
-    ~openssl_perf_test() = default;
+    std::unique_ptr<openssl_perf> perf = std::make_unique<openssl_perf>();
 };
 
 PERF_TEST_F(openssl_perf_test, md5_1k) {

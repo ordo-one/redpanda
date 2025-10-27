@@ -73,7 +73,7 @@ public:
       raft::replicate_options) final;
 
     ss::future<storage::translating_reader> make_reader(
-      storage::log_reader_config cfg,
+      kafka::log_reader_config cfg,
       std::optional<model::timeout_clock::time_point>) final;
 
     ss::future<std::vector<model::tx_range>> aborted_transactions(
@@ -103,6 +103,8 @@ public:
 
     result<partition_info> get_partition_info() const final;
 
+    size_t estimate_size_between(kafka::offset, kafka::offset) const final;
+
 private:
     // Returns the Kafka offset corresponding to the lowest offset in the
     // log, including local and cloud storage. Doesn't take into account any
@@ -125,7 +127,7 @@ private:
       cloud_storage::offset_range offsets,
       ss::lw_shared_ptr<const storage::offset_translator_state> ot_state);
 
-    bool may_read_from_cloud(kafka::offset);
+    bool may_read_from_cloud(kafka::offset) const;
 
     ss::lw_shared_ptr<cluster::partition> _partition;
     ss::lw_shared_ptr<const storage::offset_translator_state> _translator;

@@ -13,8 +13,9 @@
 #include "cluster/logger.h"
 #include "cluster/tests/local_monitor_fixture.h"
 #include "config/configuration.h"
+#include "random/generators.h"
 #include "redpanda/tests/fixture.h"
-#include "storage/types.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sstring.hh>
@@ -34,10 +35,7 @@ using storage::disk_space_alert;
 
 local_monitor_fixture::local_monitor_fixture() {
     auto log_conf = storage::log_config{
-      "test.dir",
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()};
+      test_directory(), 1024, storage::make_sanitized_file_config()};
 
     auto kvstore_conf = storage::kvstore_config(
       1_MiB,

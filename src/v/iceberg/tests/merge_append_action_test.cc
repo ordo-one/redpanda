@@ -99,12 +99,13 @@ public:
               .record_count = records_per_file,
               .file_size_bytes = 1_KiB,
             };
-            ret.emplace_back(file_to_append{
-              .file = std::move(file),
-              .schema_id = (schema_id ? *schema_id : md.current_schema_id),
-              .partition_spec_id
-              = (partition_spec_id ? *partition_spec_id : md.default_spec_id),
-            });
+            ret.emplace_back(
+              file_to_append{
+                .file = std::move(file),
+                .schema_id = (schema_id ? *schema_id : md.current_schema_id),
+                .partition_spec_id
+                = (partition_spec_id ? *partition_spec_id : md.default_spec_id),
+              });
         }
         ret[0].file.record_count += leftover_records;
         return ret;
@@ -318,11 +319,11 @@ TEST_F(MergeAppendActionTest, TestMergeAfterTypePromotion) {
           orig_type, new_type, tx.table().partition_specs.back());
         ASSERT_FALSE(compat_res.has_error());
 
-        auto res = tx.set_schema(iceberg::schema{
-                                   .schema_struct = std::move(new_type),
-                                   .schema_id = iceberg::schema::unassigned_id,
-                                   .identifier_field_ids = {},
-                                 })
+        auto res = tx.set_schema(
+                       iceberg::schema{
+                         .schema_struct = std::move(new_type),
+                         .identifier_field_ids = {},
+                       })
                      .get();
         ASSERT_FALSE(res.has_error()) << res.error();
     }
@@ -662,11 +663,12 @@ TEST_F(MergeAppendActionTest, TestMultiplePartitionSpecs) {
     {
         // Add second spec
         auto new_spec = unresolved_partition_spec{};
-        new_spec.fields.push_back(unresolved_partition_spec::field{
-          .source_name = {"baz"},
-          .transform = identity_transform{},
-          .name = "baz",
-        });
+        new_spec.fields.push_back(
+          unresolved_partition_spec::field{
+            .source_name = {"baz"},
+            .transform = identity_transform{},
+            .name = "baz",
+          });
         auto res = tx.set_partition_spec(std::move(new_spec)).get();
         ASSERT_FALSE(res.has_error()) << res.error();
         ASSERT_EQ(tx.table().partition_specs.size(), 2);
@@ -682,11 +684,12 @@ TEST_F(MergeAppendActionTest, TestMultiplePartitionSpecs) {
     {
         // Add third spec
         auto new_spec = unresolved_partition_spec{};
-        new_spec.fields.push_back(unresolved_partition_spec::field{
-          .source_name = {"foo"},
-          .transform = identity_transform{},
-          .name = "foo",
-        });
+        new_spec.fields.push_back(
+          unresolved_partition_spec::field{
+            .source_name = {"foo"},
+            .transform = identity_transform{},
+            .name = "foo",
+          });
         auto res = tx.set_partition_spec(std::move(new_spec)).get();
         ASSERT_FALSE(res.has_error()) << res.error();
         ASSERT_EQ(tx.table().partition_specs.size(), 3);
@@ -746,12 +749,13 @@ TEST_F(MergeAppendActionTest, TestMergeWithMultiplePartitionSpecs) {
         // Add new partition spec and make it default.
         auto table = std::move(tx).release_metadata();
         auto new_spec = partition_spec{.spec_id = partition_spec::id_t{1}};
-        new_spec.fields.push_back(partition_field{
-          .source_id = nested_field::id_t{3}, // baz
-          .field_id = partition_field::id_t{1001},
-          .name = "baz",
-          .transform = identity_transform{},
-        });
+        new_spec.fields.push_back(
+          partition_field{
+            .source_id = nested_field::id_t{3}, // baz
+            .field_id = partition_field::id_t{1001},
+            .name = "baz",
+            .transform = identity_transform{},
+          });
         table.partition_specs.push_back(std::move(new_spec));
         table.default_spec_id = table.partition_specs.back().spec_id;
         tx = transaction(std::move(table));
@@ -769,11 +773,11 @@ TEST_F(MergeAppendActionTest, TestMergeWithMultiplePartitionSpecs) {
           orig_type, new_type, tx.table().partition_specs.back());
         ASSERT_FALSE(compat_res.has_error());
 
-        auto res = tx.set_schema(iceberg::schema{
-                                   .schema_struct = std::move(new_type),
-                                   .schema_id = iceberg::schema::unassigned_id,
-                                   .identifier_field_ids = {},
-                                 })
+        auto res = tx.set_schema(
+                       iceberg::schema{
+                         .schema_struct = std::move(new_type),
+                         .identifier_field_ids = {},
+                       })
                      .get();
         ASSERT_FALSE(res.has_error()) << res.error();
     }
@@ -851,4 +855,134 @@ TEST_F(MergeAppendActionTest, TestMergeWithMultiplePartitionSpecs) {
       merged_mfile->existing_rows_count, num_to_merge_at * rows_per_man);
     ASSERT_EQ(merged_mfile->deleted_files_count, 0);
     ASSERT_EQ(merged_mfile->deleted_rows_count, 0);
+}
+
+TEST_F(MergeAppendActionTest, TestWriteMetadataPathProperty) {
+    // Create a table with a custom metadata path.
+    const auto custom_path = fmt::format(
+      "s3://{}/custom/metadata", bucket_name());
+    auto table = create_table();
+    table_properties_t props;
+    props.emplace("write.metadata.path", custom_path);
+    table.properties = std::move(props);
+
+    // Add some data files to trigger manifest creation.
+    transaction tx(std::move(table));
+    auto files = create_data_files(tx.table(), "test_file", 2, 10);
+    auto res = tx.merge_append(io, std::move(files)).get();
+    ASSERT_FALSE(res.has_error()) << res.error();
+
+    const auto& updated_table = tx.table();
+    ASSERT_TRUE(updated_table.snapshots.has_value());
+    ASSERT_EQ(updated_table.snapshots->size(), 1);
+
+    // Check that the manifest list path uses the custom metadata location
+    const auto& snapshot = updated_table.snapshots->back();
+    const auto& manifest_list_path = snapshot.manifest_list_path;
+    ASSERT_TRUE(manifest_list_path().starts_with(custom_path));
+
+    // Download the manifest list and check manifest paths.
+    auto mlist_res = io.download_manifest_list(manifest_list_path).get();
+    ASSERT_TRUE(mlist_res.has_value());
+    ASSERT_EQ(mlist_res.value().files.size(), 1);
+
+    const auto& manifest_path = mlist_res.value().files[0].manifest_path;
+    ASSERT_TRUE(manifest_path().starts_with(custom_path));
+}
+
+TEST_F(MergeAppendActionTest, TestSnapshotSummaryFirstSnapshot) {
+    transaction tx(create_table());
+    const size_t files_count = 3;
+    const size_t records_count = 150;
+
+    auto files = create_data_files(
+      tx.table(), "test", files_count, records_count);
+    auto res = tx.merge_append(io, std::move(files)).get();
+    ASSERT_FALSE(res.has_error()) << res.error();
+
+    const auto& table = tx.table();
+    ASSERT_TRUE(table.snapshots.has_value());
+    const auto& summary = table.snapshots->back().summary;
+
+    // First snapshot: totals should equal added values
+    const size_t file_size = 1_KiB * files_count;
+    ASSERT_EQ(summary.operation, snapshot_operation::append);
+    ASSERT_EQ(summary.added_data_files, files_count);
+    ASSERT_EQ(summary.added_records, records_count);
+    ASSERT_EQ(summary.added_files_size, file_size);
+    ASSERT_EQ(summary.total_data_files, files_count);
+    ASSERT_EQ(summary.total_records, records_count);
+    ASSERT_EQ(summary.total_files_size, file_size);
+}
+
+TEST_F(MergeAppendActionTest, TestSnapshotSummaryAdds) {
+    transaction tx(create_table());
+
+    // First append.
+    const size_t first_files = 2;
+    const size_t first_records = 100;
+    auto files1 = create_data_files(
+      tx.table(), "test1", first_files, first_records);
+    auto res1 = tx.merge_append(io, std::move(files1)).get();
+    ASSERT_FALSE(res1.has_error());
+
+    // Second append.
+    const size_t second_files = 3;
+    const size_t second_records = 200;
+    auto files2 = create_data_files(
+      tx.table(), "test2", second_files, second_records);
+    auto res2 = tx.merge_append(io, std::move(files2)).get();
+    ASSERT_FALSE(res2.has_error());
+
+    const auto& table = tx.table();
+    const auto& latest_summary = table.snapshots->back().summary;
+
+    // The second snapshot should add onto existing totals.
+    ASSERT_EQ(latest_summary.added_data_files, second_files);
+    ASSERT_EQ(latest_summary.added_records, second_records);
+    ASSERT_EQ(latest_summary.total_data_files, first_files + second_files);
+    ASSERT_EQ(latest_summary.total_records, first_records + second_records);
+    ASSERT_EQ(
+      latest_summary.total_files_size, 1_KiB * (first_files + second_files));
+}
+
+TEST_F(MergeAppendActionTest, TestSnapshotSummaryMissingMetrics) {
+    auto table = create_table();
+    auto initial_mlist_path = uri(
+      fmt::format("s3://{}/manifest1.avro", bucket_name()));
+    snapshot initial_snap{
+        .id = snapshot_id{1},
+        .sequence_number = sequence_number{1},
+        .timestamp_ms = model::timestamp::now(),
+        .summary = snapshot_summary{
+            .operation = snapshot_operation::append,
+            // Only set total_records, leave others unset.
+            .total_records = 100,
+        },
+        .manifest_list_path = initial_mlist_path,
+        .schema_id = table.current_schema_id,
+    };
+    manifest_list initial_mlist;
+    auto up_res
+      = io.upload_manifest_list(initial_mlist_path, initial_mlist).get();
+    ASSERT_TRUE(up_res.has_value());
+
+    table.snapshots = chunked_vector<snapshot>{};
+    table.snapshots->emplace_back(std::move(initial_snap));
+    table.current_snapshot_id = snapshot_id{1};
+    table.last_sequence_number = sequence_number{1};
+
+    transaction tx(std::move(table));
+    auto files = create_data_files(tx.table(), "test", 1, 50);
+    auto res = tx.merge_append(io, std::move(files)).get();
+    ASSERT_FALSE(res.has_error()) << res.error();
+
+    const auto& updated_table = tx.table();
+    const auto& latest_summary = updated_table.snapshots->back().summary;
+
+    // We should only update the total_records metric, since the others were
+    // missing.
+    ASSERT_EQ(latest_summary.total_records, 150);
+    ASSERT_FALSE(latest_summary.total_data_files.has_value());
+    ASSERT_FALSE(latest_summary.total_files_size.has_value());
 }

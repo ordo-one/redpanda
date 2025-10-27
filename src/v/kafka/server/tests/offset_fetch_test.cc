@@ -9,8 +9,8 @@
 
 #include "kafka/protocol/offset_fetch.h"
 #include "redpanda/tests/fixture.h"
-#include "resource_mgmt/io_priority.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/smp.hh>
 
@@ -24,7 +24,7 @@ FIXTURE_TEST(offset_fetch, redpanda_thread_fixture) {
     kafka::offset_fetch_request req;
     req.data.group_id = kafka::group_id("g");
 
-    auto resp = client.dispatch(req, kafka::api_version(2)).get();
+    auto resp = client.dispatch(std::move(req), kafka::api_version(2)).get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
     BOOST_TEST(resp.data.error_code == kafka::error_code::not_coordinator);

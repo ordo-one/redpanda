@@ -19,6 +19,7 @@
 
 #include <boost/range/irange.hpp>
 
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -31,7 +32,7 @@ constexpr size_t NAME_LEN = 32;
 std::vector<role_member> generate_members(size_t N) {
     std::vector<role_member> mems;
     mems.reserve(N);
-    absl::c_for_each(boost::irange(0ul, N), [&mems](auto) {
+    std::ranges::for_each(boost::irange(0ul, N), [&mems](auto) {
         mems.emplace_back(
           role_member_type::user,
           random_generators::gen_alphanum_string(NAME_LEN));
@@ -42,7 +43,7 @@ std::vector<role_member> generate_members(size_t N) {
 std::vector<role_name> generate_role_names(size_t N) {
     std::vector<role_name> roles;
     roles.reserve(N);
-    absl::c_for_each(boost::irange(0ul, N), [&roles](auto) {
+    std::ranges::for_each(boost::irange(0ul, N), [&roles](auto) {
         roles.emplace_back(random_generators::gen_alphanum_string(NAME_LEN));
     });
     return roles;
@@ -159,7 +160,7 @@ PERF_TEST(role_store_bench, put_role) {
     role_name name{random_generators::gen_alphanum_string(NAME_LEN)};
     std::vector<role_member> all_members;
     all_members.reserve(N_MEMBERS);
-    absl::c_copy(members_data, std::back_inserter(all_members));
+    std::ranges::copy(members_data, std::back_inserter(all_members));
     perf_tests::start_measuring_time();
     store.put(std::move(name), std::move(all_members));
     perf_tests::stop_measuring_time();
@@ -238,7 +239,8 @@ void run_authz(
     acl_principal p{principal_type::user, ss::sstring{m.name()}};
 
     perf_tests::start_measuring_time();
-    auto result = auth.authorized(topic1, acl_operation::read, p, host1);
+    auto result = auth.authorized(
+      topic1, acl_operation::read, p, host1, security::superuser_required::no);
     perf_tests::do_not_optimize(result);
     perf_tests::stop_measuring_time();
 }
@@ -312,7 +314,12 @@ PERF_TEST(role_store_bench, role_authz_empty_store) {
     auth.add_bindings(bindings);
 
     perf_tests::start_measuring_time();
-    auto result = auth.authorized(topic1, acl_operation::read, user1, host1);
+    auto result = auth.authorized(
+      topic1,
+      acl_operation::read,
+      user1,
+      host1,
+      security::superuser_required::no);
     perf_tests::do_not_optimize(result);
     perf_tests::stop_measuring_time();
 }

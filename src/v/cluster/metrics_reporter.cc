@@ -11,6 +11,7 @@
 
 #include "cluster/metrics_reporter.h"
 
+#include "absl/container/node_hash_map.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "cluster/config_frontend.h"
@@ -49,8 +50,6 @@
 #include <seastar/net/tls.hh>
 #include <seastar/util/defer.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/container/node_hash_map.h>
 #include <boost/lexical_cast.hpp>
 #include <boost/random/seed_seq.hpp>
 #include <boost/uuid/uuid.hpp>
@@ -59,6 +58,7 @@
 #include <fmt/core.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <climits>
 #include <netdb.h>
 #include <stdexcept>
@@ -298,10 +298,10 @@ metrics_reporter::build_metrics_snapshot() {
             ++snapshot.topics_with_iceberg_kv;
             break;
         case model::iceberg_mode::variant::value_schema_id_prefix:
-            ++snapshot.topics_with_iceberg_sr;
+            ++snapshot.topics_with_iceberg_schema_id;
             break;
         case model::iceberg_mode::variant::value_schema_latest:
-            ++snapshot.topics_with_iceberg_pb;
+            ++snapshot.topics_with_iceberg_schema_latest;
             break;
         }
     }
@@ -379,8 +379,8 @@ ss::future<> metrics_reporter::try_initialize_cluster_info() {
         co_return;
     }
 
-    storage::log_reader_config reader_cfg(
-      model::offset(0), model::offset(2), ss::default_priority_class());
+    storage::local_log_reader_config reader_cfg(
+      model::offset(0), model::offset(2));
     auto reader = co_await _raft0->make_reader(reader_cfg);
 
     auto batches = co_await model::consume_reader_to_memory(
@@ -469,24 +469,13 @@ ss::future<http::client> details::metrics_http_client::make_http_client() {
     client_configuration.disable_metrics = net::metrics_disabled::yes;
 
     if (_conf.addr.protocol == "https") {
-        ss::tls::credentials_builder builder;
-        builder.set_client_auth(ss::tls::client_auth::NONE);
-        builder.set_minimum_tls_version(
-          config::from_config(config::shard_local_cfg().tls_min_version()));
-        auto ca_file = co_await net::find_ca_file();
-        if (ca_file) {
-            vlog(
-              _conf.logger.trace,
-              "using {} as metrics reporter CA store",
-              ca_file);
-            co_await builder.set_x509_trust_file(
-              ca_file.value(), ss::tls::x509_crt_format::PEM);
-        } else {
-            vlog(
-              _conf.logger.trace,
-              "ca file not found, defaulting to system trust store");
-            co_await builder.set_system_trust();
-        }
+        ss::tls::credentials_builder builder
+          = co_await net::get_credentials_builder({
+            .min_tls_version = config::from_config(
+              config::shard_local_cfg().tls_min_version()),
+            .enable_renegotiation = false,
+            .require_client_auth = false,
+          });
 
         client_configuration.credentials
           = co_await net::build_reloadable_credentials_with_probe<
@@ -610,9 +599,9 @@ void rjson_serialize(
     w.Key("topics_with_iceberg_key_value");
     w.Uint64(snapshot.topics_with_iceberg_kv);
     w.Key("topics_with_iceberg_value_schema_id_prefix");
-    w.Uint64(snapshot.topics_with_iceberg_sr);
+    w.Uint64(snapshot.topics_with_iceberg_schema_id);
     w.Key("topics_with_iceberg_latest_protobuf_value");
-    w.Uint64(snapshot.topics_with_iceberg_pb);
+    w.Uint64(snapshot.topics_with_iceberg_schema_latest);
 
     w.Key("partition_count");
     w.Uint64(snapshot.partition_count);

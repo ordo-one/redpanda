@@ -14,7 +14,6 @@
 #include "cluster/controller_snapshot.h"
 #include "cluster/feature_manager.h"
 #include "cluster/security_frontend.h"
-#include "cluster/tests/topic_properties_generator.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
@@ -23,10 +22,9 @@
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
 #include "security/scram_credential.h"
+#include "security/tests/license_utils.h"
 #include "security/types.h"
 #include "test_utils/async.h"
-#include "test_utils/scoped_config.h"
-#include "test_utils/test.h"
 
 #include <gtest/gtest.h>
 
@@ -122,9 +120,13 @@ void validate_actions(
 } // anonymous namespace
 
 TEST_F(controller_snapshot_reconciliation_fixture, test_reocnciler_license) {
-    auto license = get_test_license();
+    auto opt_license = security::testing::get_test_license();
+    if (!opt_license.has_value()) {
+        GTEST_SKIP() << security::testing::skip_no_license_msg;
+        return;
+    }
     cluster::controller_snapshot snap;
-    snap.features.snap.license = license;
+    snap.features.snap.license = opt_license;
 
     auto actions = reconciler.get_actions(snap);
     ASSERT_TRUE(
@@ -134,7 +136,7 @@ TEST_F(controller_snapshot_reconciliation_fixture, test_reocnciler_license) {
     // Once we have a license, we shouldn't need to action it anymore.
     auto err = app.controller->get_feature_manager()
                  .local()
-                 .update_license(std::move(license))
+                 .update_license(std::move(*opt_license))
                  .get();
     ASSERT_TRUE(!err);
     actions = reconciler.get_actions(snap);
@@ -161,6 +163,7 @@ TEST(cluster_recovery_reconciler_test, test_config_ignore_list) {
       "cloud_storage_azure_shared_key",
       "cloud_storage_azure_adls_endpoint",
       "cloud_storage_azure_adls_port",
+      "cloud_storage_cluster_name",
     };
     auto ignore_list = controller_snapshot_reconciler::properties_ignore_list();
     ASSERT_EQ(ignore_list, expected_ignore_list);
@@ -196,8 +199,9 @@ TEST_F(
 TEST_F(controller_snapshot_reconciliation_fixture, test_reconcile_users) {
     cluster::controller_snapshot snap;
     auto& security_snap = snap.security;
-    security_snap.user_credentials.emplace_back(cluster::user_and_credential{
-      security::credential_user{"userguy"}, security::scram_credential{}});
+    security_snap.user_credentials.emplace_back(
+      cluster::user_and_credential{
+        security::credential_user{"userguy"}, security::scram_credential{}});
 
     auto actions = reconciler.get_actions(snap);
     ASSERT_TRUE(

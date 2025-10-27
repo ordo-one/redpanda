@@ -11,6 +11,7 @@
 
 #include "wasm/tests/wasm_fixture.h"
 
+#include "absl/strings/ascii.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
@@ -23,6 +24,7 @@
 #include "schema/tests/fake_registry.h"
 #include "storage/record_batch_builder.h"
 #include "test_utils/random_bytes.h"
+#include "test_utils/runfiles.h"
 #include "wasm/engine.h"
 #include "wasm/tests/wasm_fixture.h"
 #include "wasm/tests/wasm_logger.h"
@@ -32,7 +34,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/util/file.hh>
 
-#include <absl/strings/ascii.h>
 #include <fmt/chrono.h>
 
 #include <chrono>
@@ -112,15 +113,13 @@ void WasmTestFixture::TearDown() {
     _probe = nullptr;
 }
 
-void WasmTestFixture::load_wasm(std::string file) {
-    std::string path = fmt::format("{}.wasm", file);
-    if (!ss::file_exists(path).get()) {
-        auto bazel_env_var = fmt::format(
-          "{}_WASM_BINARY", absl::AsciiStrToUpper(file));
-        const char* path_envvar = std::getenv(bazel_env_var.c_str());
-        vassert(path_envvar != nullptr, "expected {} to exist", bazel_env_var);
-        path = path_envvar;
-    }
+void WasmTestFixture::load_wasm(std::string_view filename) {
+    std::filesystem::path file(filename);
+    auto path = test_utils::get_runfile_path(
+      std::string(
+        std::filesystem::path(
+          "src/transform-sdk/go/transform/internal/testdata")
+        / file.stem() / file.filename()));
     auto wasm_file = ss::util::read_entire_file(path).get();
     auto buf = model::wasm_binary_iobuf(std::make_unique<iobuf>());
     for (auto& chunk : wasm_file) {
@@ -157,11 +156,12 @@ model::record_batch WasmTestFixture::transform(const model::record_batch& b) {
       model::timestamp::now(), std::move(transformed));
 }
 model::record_batch WasmTestFixture::make_tiny_batch() {
-    return model::test::make_random_batch(model::test::record_batch_spec{
-      .allow_compression = false,
-      .count = 1,
-      .timestamp = NOW,
-    });
+    return model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .allow_compression = false,
+        .count = 1,
+        .timestamp = NOW,
+      });
 }
 model::record_batch WasmTestFixture::make_tiny_batch(iobuf record_value) {
     storage::record_batch_builder b(
@@ -169,7 +169,7 @@ model::record_batch WasmTestFixture::make_tiny_batch(iobuf record_value) {
     b.add_raw_kv(tests::random_iobuf(), std::move(record_value));
     return std::move(b).build();
 }
-const std::vector<pandaproxy::schema_registry::subject_schema>&
+const std::vector<pandaproxy::schema_registry::stored_schema>&
 WasmTestFixture::registered_schemas() const {
     return _sr->get_all();
 }

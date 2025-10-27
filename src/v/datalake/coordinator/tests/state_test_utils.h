@@ -9,11 +9,13 @@
  */
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/file_committer.h"
 #include "datalake/coordinator/state.h"
 #include "datalake/coordinator/translated_offset_range.h"
 #include "model/fundamental.h"
+
+#include <seastar/core/coroutine.hh>
 
 #include <gtest/gtest.h>
 
@@ -47,7 +49,8 @@ public:
               state,
               tp,
               t_state.revision,
-              files.pending_entries.back().data.last_offset);
+              files.pending_entries.back().data.last_offset,
+              files.pending_entries.back().data.kafka_bytes_processed);
             EXPECT_FALSE(build_res.has_error());
             ret.emplace_back(std::move(build_res.value()));
         }
@@ -55,7 +58,7 @@ public:
     }
 
     ss::future<checked<std::nullopt_t, errc>>
-    drop_table(const iceberg::table_identifier&) const final {
+    drop_table(const iceberg::table_identifier&, purge_data) const final {
         co_return std::nullopt;
     }
 

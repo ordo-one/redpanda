@@ -24,7 +24,7 @@
 #include "storage/record_batch_builder.h"
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/randoms.h"
 #include "utils/directory_walker.h"
 
@@ -54,14 +54,15 @@ static batches_with_identity make_batches(
       .last_seq = first_seq + count - 1,
       .record_count = count,
       .is_transactional = is_transactional};
-    result.batches.push_back(model::test::make_random_batch(
-      {.offset = model::offset(0),
-       .allow_compression = true,
-       .count = count,
-       .producer_id = pid.id,
-       .producer_epoch = pid.epoch,
-       .base_sequence = first_seq,
-       .is_transactional = is_transactional}));
+    result.batches.push_back(
+      model::test::make_random_batch(
+        {.offset = model::offset(0),
+         .allow_compression = true,
+         .count = count,
+         .producer_id = pid.id,
+         .producer_epoch = pid.epoch,
+         .base_sequence = first_seq,
+         .is_transactional = is_transactional}));
     return result;
 }
 
@@ -372,12 +373,12 @@ FIXTURE_TEST(test_stale_begin_tx_fenced, rm_stm_test_fixture) {
     auto timeout = std::chrono::milliseconds(
       std::numeric_limits<int32_t>::max());
 
-    auto begin_tx = [&](model::tx_seq seq) {
+    auto begin_tx = [&stm, &pid1, timeout](model::tx_seq seq) {
         return stm.begin_tx(pid1, seq, timeout, model::partition_id(0)).get();
     };
 
-    auto commit_tx = [&](model::tx_seq seq) {
-        return stm.commit_tx(pid1, tx_seq, timeout).get();
+    auto commit_tx = [&stm, &pid1, timeout](model::tx_seq seq) {
+        return stm.commit_tx(pid1, seq, timeout).get();
     };
 
     // begin should succeed.
@@ -394,7 +395,7 @@ FIXTURE_TEST(test_stale_begin_tx_fenced, rm_stm_test_fixture) {
       begin_tx(tx_seq_new).error(), cluster::tx::errc::request_rejected);
 
     // seal the transaction.
-    BOOST_REQUIRE_EQUAL(commit_tx(tx_seq_new), cluster::tx::errc::none);
+    BOOST_REQUIRE_EQUAL(commit_tx(tx_seq), cluster::tx::errc::none);
 
     // older sequence numbers are fenced
     BOOST_REQUIRE_EQUAL(
@@ -566,7 +567,7 @@ FIXTURE_TEST(test_aborted_transactions, rm_stm_test_fixture) {
     };
 
     auto roll_log = [&]() {
-        disk_log->force_roll(ss::default_priority_class()).get();
+        disk_log->force_roll().get();
         segment_count++;
         BOOST_REQUIRE_EQUAL(disk_log->segment_count(), segment_count);
     };
@@ -762,8 +763,7 @@ cluster::tx::tx_snapshot_v4 make_tx_snapshot_v4() {
 cluster::tx::tx_snapshot_v5 make_tx_snapshot_v5() {
     auto producers = tests::random_frag_vector(
       tests::random_producer_state, 50, ctx_logger);
-    fragmented_vector<cluster::tx::producer_state_snapshot_deprecated>
-      snapshots;
+    chunked_vector<cluster::tx::producer_state_snapshot_deprecated> snapshots;
     for (const auto& producer : producers) {
         auto snapshot = producer->snapshot(kafka::offset{0});
         cluster::tx::producer_state_snapshot_deprecated old_snapshot;

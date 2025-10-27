@@ -10,35 +10,7 @@
  */
 #include "kafka/protocol/types.h"
 
-#include "utils/base64.h"
-
 namespace kafka {
-
-uuid uuid::from_string(std::string_view encoded) {
-    if (encoded.size() > 24) {
-        details::throw_out_of_range(
-          "Input size of {} too long to be decoded as b64-UUID, expected "
-          "{} bytes or less",
-          encoded.size(),
-          24);
-    }
-    auto decoded = base64_to_bytes(encoded);
-    if (decoded.size() != length) {
-        details::throw_out_of_range(
-          "Expected {} byte value post b64decoding the input: {} bytes",
-          length,
-          decoded.size());
-    }
-    underlying_t ul;
-    std::copy_n(decoded.begin(), length, ul.begin());
-    return uuid(ul);
-}
-
-ss::sstring uuid::to_string() const { return bytes_to_base64(view()); }
-
-std::ostream& operator<<(std::ostream& os, const uuid& u) {
-    return os << u.to_string();
-}
 
 std::ostream& operator<<(std::ostream& os, describe_configs_type t) {
     switch (t) {
@@ -125,6 +97,18 @@ std::ostream& operator<<(std::ostream& os, config_resource_operation t) {
         return os << "subtract";
     }
     return os << "unknown type";
+}
+
+std::ostream& operator<<(std::ostream& os, scram_mechanism m) {
+    switch (m) {
+    case scram_mechanism::scram_sha_256:
+        return os << "SCRAM-SHA-256";
+    case scram_mechanism::scram_sha_512:
+        return os << "SCRAM-SHA-512";
+    case scram_mechanism::unknown:
+        return os << "unknown";
+    }
+    return os << "unsupported type";
 }
 
 } // namespace kafka

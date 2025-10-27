@@ -5,6 +5,8 @@ Bazel functions (e.g. cc_library) because it provides a centralized place for
 making behavior changes across the entire build.
 """
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load(":internal.bzl", "redpanda_copts")
 
 # buildifier: disable=function-docstring-args
@@ -14,18 +16,18 @@ def redpanda_cc_library(
         hdrs = [],
         defines = [],
         local_defines = [],
-        strip_include_prefix = None,
         implementation_deps = [],
-        visibility = None,
         include_prefix = None,
+        visibility = None,
         copts = [],
         deps = [],
         tags = []):
     """
     Define a Redpanda C++ library.
     """
-
-    native.cc_library(
+    if include_prefix == None:
+        include_prefix = native.package_name().removeprefix("src/v/")
+    cc_library(
         name = name,
         srcs = srcs,
         hdrs = hdrs,
@@ -33,7 +35,6 @@ def redpanda_cc_library(
         local_defines = local_defines,
         visibility = visibility,
         include_prefix = include_prefix,
-        strip_include_prefix = strip_include_prefix,
         implementation_deps = implementation_deps,
         deps = deps,
         copts = redpanda_copts() + copts,
@@ -57,8 +58,7 @@ def redpanda_cc_binary(
     """
     Define a Redpanda C++ binary.
     """
-
-    native.cc_binary(
+    cc_binary(
         name = name,
         srcs = srcs,
         defines = defines,

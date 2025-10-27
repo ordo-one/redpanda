@@ -85,15 +85,20 @@ public:
       , _key(std::move(k))
       , _val_size(v_len)
       , _value(std::move(v)) {}
+    record_header(std::optional<iobuf> k, std::optional<iobuf> v)
+      : _key_size(k ? static_cast<int32_t>(k->size_bytes()) : -1)
+      , _key(std::move(k).value_or(iobuf{}))
+      , _val_size(v ? static_cast<int32_t>(v->size_bytes()) : -1)
+      , _value(std::move(v).value_or(iobuf{})) {}
 
     size_t memory_usage() const {
         return sizeof(*this) + _key.size_bytes() + _value.size_bytes();
     }
     record_header share() {
-        return record_header(_key_size, share_key(), _val_size, share_value());
+        return {_key_size, share_key(), _val_size, share_value()};
     }
     record_header copy() const {
-        return record_header(_key_size, _key.copy(), _val_size, _value.copy());
+        return {_key_size, _key.copy(), _val_size, _value.copy()};
     }
 
     int32_t key_size() const { return _key_size; }
@@ -181,16 +186,16 @@ public:
       record_attributes attributes,
       int64_t timestamp_delta,
       int32_t offset_delta,
-      iobuf key,
-      iobuf value,
+      std::optional<iobuf> key,
+      std::optional<iobuf> value,
       std::vector<record_header> hdrs) noexcept
       : _attributes(attributes)
       , _timestamp_delta(timestamp_delta)
       , _offset_delta(offset_delta)
-      , _key_size(static_cast<int32_t>(key.size_bytes()))
-      , _key(std::move(key))
-      , _val_size(static_cast<int32_t>(value.size_bytes()))
-      , _value(std::move(value))
+      , _key_size(key ? static_cast<int32_t>(key->size_bytes()) : -1)
+      , _key(std::move(key).value_or(iobuf{}))
+      , _val_size(value ? static_cast<int32_t>(value->size_bytes()) : -1)
+      , _value(std::move(value).value_or(iobuf{}))
       , _headers(std::move(hdrs)) {
         _size_bytes = static_cast<int32_t>(
           sizeof(model::record_attributes::type)   //
@@ -375,6 +380,17 @@ public:
 
     void set_transactional_type() { _attributes |= transactional_mask; }
 
+    // We remove the transactional type for raft data batches during compaction.
+    // This is part of the first pass of transactional control batch removal in
+    // compaction, in which the `tx_fence` batch is removed, and all the
+    // `raft_data` batches associated with the transaction have their
+    // transactional bit unset. This is done so that after the `commit`
+    // batch is removed in the second pass over the data, there is no
+    // possibility of an unrelated `abort` batch having an effect on the
+    // committed `raft_data` (e.g turning committed data into aborted data when
+    // the log is read sequentially).
+    void remove_transactional_type() { _attributes &= ~transactional_mask; }
+
     bool operator==(const record_batch_attributes& other) const {
         return _attributes == other._attributes;
     }
@@ -554,6 +570,9 @@ struct record_batch_header
         return !(*this == other);
     }
 
+    /// \brief resets the size, header crc and payload crc
+    void reset_size_checksum_metadata(const iobuf& records);
+
     friend std::ostream& operator<<(std::ostream&, const record_batch_header&);
 };
 
@@ -713,7 +732,9 @@ constexpr uint32_t packed_record_batch_header_size
     + sizeof(model::record_batch_header::base_sequence)     // 4
     + sizeof(model::record_batch_header::record_count);     // 4
 static_assert(packed_record_batch_header_size == 61);
-
+namespace test {
+class raw_record_batch_factory;
+}
 class record_batch
   : public serde::envelope<
       model::record_batch,
@@ -958,6 +979,7 @@ private:
     explicit operator bool() const noexcept { return !empty(); }
     friend class ss::optimized_optional<record_batch>;
     friend class record_batch_iterator;
+    friend class test::raw_record_batch_factory;
 
     template<typename Func>
     friend ss::future<>

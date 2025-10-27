@@ -7,10 +7,8 @@
  *
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
-#include "consensus.h"
 #include "datalake/translation/types.h"
 #include "datalake/translation/utils.h"
-#include "fundamental.h"
 #include "gtest/gtest.h"
 #include "model/fundamental.h"
 #include "model/record_batch_types.h"
@@ -44,11 +42,8 @@ TEST(TranslatedLogOffsetTest, TestTranslatedOffsetsGrowingLog) {
 
     model::ntp test_ntp{"kafka", "tapioca", 0};
     auto log_cfg = storage::log_config{
-      data_path.string(),
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()};
-    auto translator_batch_types = raft::offset_translator_batch_types(test_ntp);
+      data_path.string(), 1024, storage::make_sanitized_file_config()};
+    auto translator_batch_types = model::offset_translator_batch_types();
     auto raft_group_id = raft::group_id{0};
     storage::disk_log_builder b{
       std::move(log_cfg), std::move(translator_batch_types), raft_group_id};
@@ -59,7 +54,8 @@ TEST(TranslatedLogOffsetTest, TestTranslatedOffsetsGrowingLog) {
     auto log = b.get_log();
 
     // Must initialize translator state.
-    log->start(std::nullopt).get();
+    ss::abort_source as;
+    log->start(std::nullopt, as).get();
 
     // A good property to check.
     ASSERT_TRUE(
@@ -155,11 +151,8 @@ TEST(TranslatedLogOffsetTest, TestTranslatedOffsetsGrowingLogConfigBatchStart) {
 
     model::ntp test_ntp{"kafka", "tapioca", 0};
     auto log_cfg = storage::log_config{
-      data_path.string(),
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()};
-    auto translator_batch_types = raft::offset_translator_batch_types(test_ntp);
+      data_path.string(), 1024, storage::make_sanitized_file_config()};
+    auto translator_batch_types = model::offset_translator_batch_types();
     auto raft_group_id = raft::group_id{0};
     storage::disk_log_builder b{
       std::move(log_cfg), std::move(translator_batch_types), raft_group_id};
@@ -170,7 +163,8 @@ TEST(TranslatedLogOffsetTest, TestTranslatedOffsetsGrowingLogConfigBatchStart) {
     auto log = b.get_log();
 
     // Must initialize translator state.
-    log->start(std::nullopt).get();
+    ss::abort_source as;
+    log->start(std::nullopt, as).get();
 
     // A good property to check.
     ASSERT_TRUE(
@@ -271,11 +265,8 @@ TEST(
 
     model::ntp test_ntp{"kafka", "tapioca", 0};
     auto log_cfg = storage::log_config{
-      data_path.string(),
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()};
-    auto translator_batch_types = raft::offset_translator_batch_types(test_ntp);
+      data_path.string(), 1024, storage::make_sanitized_file_config()};
+    auto translator_batch_types = model::offset_translator_batch_types();
     auto raft_group_id = raft::group_id{0};
     storage::disk_log_builder b{
       std::move(log_cfg), std::move(translator_batch_types), raft_group_id};
@@ -286,7 +277,8 @@ TEST(
     auto log = b.get_log();
 
     // Must initialize translator state.
-    log->start(std::nullopt).get();
+    ss::abort_source as;
+    log->start(std::nullopt, as).get();
 
     // A good property to check.
     ASSERT_TRUE(

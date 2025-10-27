@@ -13,6 +13,7 @@
 #include "cluster/cloud_metadata/error_outcome.h"
 #include "cluster/cloud_metadata/offsets_recovery_router.h"
 #include "cluster/fwd.h"
+#include "kafka/server/group_initializer.h"
 
 namespace kafka {
 class coordinator_ntp_mapper;
@@ -24,15 +25,9 @@ class offsets_recovery_manager : public offsets_recovery_requestor {
 public:
     offsets_recovery_manager(
       ss::sharded<offsets_recovery_router>& recovery,
-      ss::sharded<kafka::coordinator_ntp_mapper>& mapper,
-      ss::sharded<cluster::members_table>& members,
-      ss::sharded<cluster::controller_api>& controller_api,
-      ss::sharded<topics_frontend>& topics_frontend)
+      kafka::group_initializer& group_initializer)
       : _recovery_router(recovery)
-      , _mapper(mapper)
-      , _members(members)
-      , _controller_api(controller_api)
-      , _topics_frontend(topics_frontend) {}
+      , _group_initializer(group_initializer) {}
 
     ss::future<error_outcome> recover(
       retry_chain_node& parent_retry,
@@ -43,10 +38,7 @@ public:
 
 private:
     ss::sharded<offsets_recovery_router>& _recovery_router;
-    ss::sharded<kafka::coordinator_ntp_mapper>& _mapper;
-    ss::sharded<cluster::members_table>& _members;
-    ss::sharded<cluster::controller_api>& _controller_api;
-    ss::sharded<topics_frontend>& _topics_frontend;
+    kafka::group_initializer& _group_initializer;
 };
 
 } // namespace cluster::cloud_metadata

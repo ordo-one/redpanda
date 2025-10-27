@@ -6,9 +6,9 @@ module(
 bazel_dep(name = "rules_boost", repo_name = "com_github_nelhage_rules_boost")
 archive_override(
     module_name = "rules_boost",
-    integrity = "sha256-ICuTlyfxD3u1tr12YyeT5qPcA/ZkEUvtMDA2ZRzz1zc=",
-    strip_prefix = "rules_boost-e23cc59f87d5049618472d6ce0ca0ed5ef0c23dc",
-    urls = ["https://github.com/nelhage/rules_boost/archive/e23cc59f87d5049618472d6ce0ca0ed5ef0c23dc.tar.gz"],
+    integrity = "sha256-wQsxOxZh1tluc6AXj+ncsYhBSl03uC+hPhBrU6JkupI=",
+    strip_prefix = "rules_boost-f5b0f8c904f2487d8f5a9a956d4388724e627210",
+    urls = ["https://github.com/nelhage/rules_boost/archive/f5b0f8c904f2487d8f5a9a956d4388724e627210.tar.gz"],
 )
 
 non_module_boost_repositories = use_extension("@com_github_nelhage_rules_boost//:boost/repositories.bzl", "non_module_dependencies")
@@ -17,40 +17,42 @@ use_repo(
     "boost",
 )
 
-bazel_dep(name = "gazelle", version = "0.42.0")
-bazel_dep(name = "abseil-cpp", version = "20240722.0")
-bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "gazelle", version = "0.45.0")
+bazel_dep(name = "abseil-cpp", version = "20250814.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
 bazel_dep(name = "crc32c", version = "1.1.0")
 bazel_dep(name = "fmt", version = "9.1.0")
-bazel_dep(name = "googletest", version = "1.15.2")
+bazel_dep(name = "googletest", version = "1.17.0")
+bazel_dep(name = "lexy", version = "2025.05.0")
 bazel_dep(name = "liburing", version = "2.5")
 bazel_dep(name = "lz4", version = "1.9.4")
-bazel_dep(name = "platforms", version = "0.0.11")
-bazel_dep(name = "protobuf", version = "29.1")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "protobuf", version = "31.1")
 single_version_override(
     module_name = "protobuf",
     patch_strip = 1,
-    # this patch is in upstream protobuf, so should be in an upcoming release.
     patches = [
-        "//bazel/thirdparty:protobuf_capture_warning.patch",
         "//bazel/thirdparty:0001-protobuf-handle-map-entry.patch",
     ],
 )
 
-bazel_dep(name = "re2", version = "2024-07-02")
+bazel_dep(name = "re2", version = "2024-07-02.bcr.1")
+bazel_dep(name = "rules_cc", version = "0.2.0")
 bazel_dep(name = "rules_foreign_cc", version = "0.12.0")
-bazel_dep(name = "rules_go", version = "0.53.0")
+bazel_dep(name = "rules_go", version = "0.56.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
-bazel_dep(name = "rules_rust", version = "0.57.1")
+bazel_dep(name = "rules_python", version = "1.5.1")
+bazel_dep(name = "rules_rust", version = "0.60.0")
 bazel_dep(name = "snappy", version = "1.2.1")
 bazel_dep(name = "yaml-cpp", version = "0.8.0")
-bazel_dep(name = "zlib", version = "1.3.1.bcr.3")
+bazel_dep(name = "zlib", version = "1.3.1.bcr.6")
 bazel_dep(name = "zstd", version = "1.5.7")
 bazel_dep(name = "patchelf", version = "0.18.0")
 bazel_dep(name = "bzip2", version = "1.0.8.bcr.2")
+bazel_dep(name = "googleapis", version = "0.0.0-20250703-f9d6fe4a")
 
-bazel_dep(name = "buildifier_prebuilt", version = "7.3.1", dev_dependency = True)
-bazel_dep(name = "rules_python", version = "1.0.0", dev_dependency = True)
+bazel_dep(name = "buildifier_prebuilt", version = "8.2.0.2", dev_dependency = True)
+bazel_dep(name = "rules_shell", version = "0.4.1", dev_dependency = True)
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python", dev_dependency = True)
 python.toolchain(
@@ -77,9 +79,7 @@ use_repo(non_module_dependencies, "hdrhistogram")
 use_repo(non_module_dependencies, "hwloc")
 use_repo(non_module_dependencies, "jsoncons")
 use_repo(non_module_dependencies, "krb5")
-
-# workaround for CORE-9546
-# use_repo(non_module_dependencies, "libpciaccess")
+use_repo(non_module_dependencies, "libpciaccess")
 use_repo(non_module_dependencies, "libprotobuf_mutator")
 use_repo(non_module_dependencies, "libxml2")
 use_repo(non_module_dependencies, "lksctp")
@@ -97,12 +97,12 @@ use_repo(non_module_dependencies, "xxhash")
 use_repo(non_module_dependencies, "x86_64_sysroot")
 use_repo(non_module_dependencies, "aarch64_sysroot")
 
-bazel_dep(name = "toolchains_llvm", version = "1.3.0")
+bazel_dep(name = "toolchains_llvm", version = "1.3.0", dev_dependency = True)
 archive_override(
     module_name = "toolchains_llvm",
-    integrity = "sha256-tiSkUD4G/Zxkdm+TPSclElauijatg7jF9eqs8LvD6hw=",
-    strip_prefix = "toolchains_llvm-e831f94a8b7f3a39391f5822adcab8e4d443c03b",
-    urls = "https://github.com/bazel-contrib/toolchains_llvm/archive/e831f94a8b7f3a39391f5822adcab8e4d443c03b.tar.gz",
+    integrity = "sha256-uX1B8p+idMPln1PCR+Glr+5iXZnvDx6h1h0miiPzWQA=",
+    strip_prefix = "toolchains_llvm-d103be73bce9a804ebc4e57637fbaf9d6f23e682",
+    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/d103be73bce9a804ebc4e57637fbaf9d6f23e682.tar.gz"],
 )
 
 # ====================================
@@ -110,7 +110,7 @@ archive_override(
 # ====================================
 
 # NOTE: We build our toolchains on ubuntu:jammy so you're going to need a distro at least that old.
-llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm", dev_dependency = True)
 
 CXX_STANDARD = "c++23"
 
@@ -138,38 +138,38 @@ COMPILE_FLAGS = {
 }
 
 COMPILERS = {
-    "18": {
+    "previous": {
         "tars": {
             "aarch64": {
-                "build_date": "2025-03-10",
-                "sha": "9f52789c5aee794d6f013249b6e003b50f72e4c3874fd656723a72bf9322eff9",
+                "build_date": "2025-03-15",
+                "sha": "cdba86609d71cfc379bfce9fb5ce97389cc08320fb713c6abab8d698a53e3fa2",
             },
             "x86_64": {
-                "build_date": "2025-03-10",
-                "sha": "51e547308112bc6671f391d03420c315b7c099238d797631e00374f1bd80712e",
-            },
-        },
-        "version": "18.1.8",
-    },
-    "19": {
-        "tars": {
-            "aarch64": {
-                "build_date": "2025-03-11",
-                "sha": "7c1ab3b4981a9e5ec3e3af627a78dea4e9eb4208d362dcb8e4b8f5b521e44bd2",
-            },
-            "x86_64": {
-                "build_date": "2025-03-11",
-                "sha": "808fcade0610167c0c3afbecc7d4f642e4714496ea910ea06c53dd3fee00a0b0",
+                "build_date": "2025-03-15",
+                "sha": "196ae29712c646f3ccc39edea880e8637025bd0aeae5892c48bfb1382fe127db",
             },
         },
         "version": "19.1.7",
+    },
+    "current": {
+        "tars": {
+            "aarch64": {
+                "build_date": "2025-07-22",
+                "sha": "ce0a8d7f4df980dd3aa0deacd390804f887d31065cd79b71827bba6cd4d2e2e8",
+            },
+            "x86_64": {
+                "build_date": "2025-07-22",
+                "sha": "c424df0195e1641b6226dbb380a849d2013975150af40932392361d9893005ac",
+            },
+        },
+        "version": "20.1.8",
     },
 }
 
 [
     (
         llvm.toolchain(
-            name = "llvm_{version}_toolchain".format(version = major_version),
+            name = "{version}_llvm_toolchain".format(version = major_version),
             compile_flags = COMPILE_FLAGS,
             cxx_standard = {"": CXX_STANDARD},
             llvm_version = compiler["version"],
@@ -193,17 +193,21 @@ COMPILERS = {
             },
         ),
         llvm.sysroot(
-            name = "llvm_{version}_toolchain".format(version = major_version),
+            name = "{version}_llvm_toolchain".format(version = major_version),
             label = "@x86_64_sysroot//:sysroot",
             targets = ["linux-x86_64"],
         ),
         llvm.sysroot(
-            name = "llvm_{version}_toolchain".format(version = major_version),
+            name = "{version}_llvm_toolchain".format(version = major_version),
             label = "@aarch64_sysroot//:sysroot",
             targets = ["linux-aarch64"],
         ),
-        use_repo(llvm, "llvm_{version}_toolchain".format(version = major_version)),
-        register_toolchains("@llvm_{version}_toolchain//:all".format(version = major_version)),
+        use_repo(llvm, "{version}_llvm_toolchain".format(version = major_version)),
+        use_repo(llvm, "{version}_llvm_toolchain_llvm".format(version = major_version)),
+        register_toolchains(
+            "@{version}_llvm_toolchain//:all".format(version = major_version),
+            dev_dependency = True,
+        ),
     )
     for (major_version, compiler) in COMPILERS.items()
 ]
@@ -211,21 +215,21 @@ COMPILERS = {
 # ====================================
 # Go Toolchain
 # ====================================
-go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
-go_sdk.download(version = "1.24.1")
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
+go_sdk.download(version = "1.24.3")
 
 # The microsoft compiler versions can be listed at their github release under the `asset.json` file
 go_sdk.download(
     name = "go_sdk_with_systemcrypto",
     experiments = ["systemcrypto"],
     sdks = {
-        "linux_amd64": ("22c15eae18e90a5a995dee497c3486b9/go1.24.1-20250304.4.linux-amd64.tar.gz", "b0ca85ecc435a93e2ddb626dd9ef7fb6689700a0847b0392eb3e146345a8dea0"),
-        "linux_arm64": ("e256ca0c885e677ad7b8fc233798b579/go1.24.1-20250304.4.linux-arm64.tar.gz", "73b1befea457d5967632b2b0b93f8d2c0d899d5b6fbd1396c55d0a015292608b"),
-        "darwin_amd64": ("f139d53d3fce534c6deb63e58e5b7be1/go1.24.1-20250304.4.darwin-amd64.tar.gz", "fa5a2d74488d99d75cd8cbd4fa8f2d892932078e92728b0b580468c95488a7c0"),
-        "darwin_arm64": ("5798ae818c617e0f8bb8b4b221555997/go1.24.1-20250304.4.darwin-arm64.tar.gz", "fe669bea5d0b4a45b135f00ff83e57fb3dc61bc9f96e9d9f001f918d938fbc54"),
+        "linux_amd64": ("dfb7c8bd6b64c9fa9debd6efa724c609/go1.24.3-20250506.3.linux-amd64.tar.gz", "d1e9e4465951816b556f648dfebc1cf20fdef4832d7d3f01f1ef35a259375286"),
+        "linux_arm64": ("e4d43c57efd1a31cf8673bf43aa69412/go1.24.3-20250506.3.linux-arm64.tar.gz", "6d4232da7ca7d2bd19e0b6b69524448de8e5480f49e5d39f7a5507cef682a9ea"),
+        "darwin_amd64": ("a6a4d462a5d8a7be72e3222c112d2101/go1.24.3-20250506.3.darwin-amd64.tar.gz", "1f1d8e1537c4a8049e6f049a861c05d9709f7627178df36cb176872a2546fb7c"),
+        "darwin_arm64": ("02acaf96922416da68a7b15764e56e3c/go1.24.3-20250506.3.darwin-arm64.tar.gz", "330cb681a69cd32465b9e5381e1127eba3184a19d29e9216a9f36383f1bedff0"),
     },
-    urls = ["https://download.visualstudio.microsoft.com/download/pr/f3428561-0ec5-4554-8c3e-f77ccc696490/{}"],
-    version = "1.24.1",
+    urls = ["https://download.visualstudio.microsoft.com/download/pr/18982fcf-1155-40cc-bf0e-4b7564f22251/{}"],
+    version = "1.24.3",
 )
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
@@ -243,6 +247,7 @@ use_repo(
     "build_buf_gen_go_redpandadata_cloud_connectrpc_go",
     "build_buf_gen_go_redpandadata_cloud_protocolbuffers_go",
     "build_buf_gen_go_redpandadata_common_protocolbuffers_go",
+    "build_buf_gen_go_redpandadata_core_protocolbuffers_go",
     "build_buf_gen_go_redpandadata_dataplane_connectrpc_go",
     "build_buf_gen_go_redpandadata_dataplane_protocolbuffers_go",
     "build_buf_gen_go_redpandadata_gatekeeper_connectrpc_go",
@@ -254,13 +259,14 @@ use_repo(
     "com_github_aws_aws_sdk_go",
     "com_github_beevik_ntp",
     "com_github_bufbuild_protocompile",
+    "com_github_cespare_xxhash",
+    "com_github_containerd_errdefs",
     "com_github_coreos_go_systemd_v22",
     "com_github_docker_docker",
     "com_github_docker_go_connections",
     "com_github_docker_go_units",
     "com_github_fatih_color",
     "com_github_google_uuid",
-    "com_github_hamba_avro",
     "com_github_hamba_avro_v2",
     "com_github_hashicorp_go_multierror",
     "com_github_kballard_go_shellquote",
@@ -268,7 +274,9 @@ use_repo(
     "com_github_kr_text",
     "com_github_lestrrat_go_jwx_v2",
     "com_github_linkedin_goavro_v2",
+    "com_github_lithammer_go_jump_consistent_hash",
     "com_github_lorenzosaino_go_sysctl",
+    "com_github_mark3labs_mcp_go",
     "com_github_mattn_go_isatty",
     "com_github_moby_term",
     "com_github_opencontainers_go_digest",
@@ -278,7 +286,11 @@ use_repo(
     "com_github_pkg_errors",
     "com_github_prometheus_client_model",
     "com_github_prometheus_common",
+    "com_github_rcrowley_go_metrics",
+    "com_github_redpanda_data_common_go_proto",
     "com_github_redpanda_data_common_go_rpadmin",
+    "com_github_redpanda_data_common_go_rpsr",
+    "com_github_redpanda_data_protoc_gen_go_mcp",
     "com_github_redpanda_data_redpanda_src_transform_sdk_go_transform",
     "com_github_rs_xid",
     "com_github_safchain_ethtool",
@@ -286,48 +298,56 @@ use_repo(
     "com_github_schollz_progressbar_v3",
     "com_github_segmentio_encoding",
     "com_github_sergi_go_diff",
+    "com_github_sirupsen_logrus",
     "com_github_spf13_afero",
     "com_github_spf13_cobra",
     "com_github_spf13_pflag",
     "com_github_stretchr_testify",
-    "com_github_testcontainers_testcontainers_go",
-    "com_github_testcontainers_testcontainers_go_modules_redpanda",
+    "com_github_tidwall_sjson",
     "com_github_tklauser_go_sysconf",
     "com_github_twmb_franz_go",
     "com_github_twmb_franz_go_pkg_kadm",
+    "com_github_twmb_franz_go_pkg_kfake",
     "com_github_twmb_franz_go_pkg_kmsg",
     "com_github_twmb_franz_go_pkg_sr",
     "com_github_twmb_franz_go_plugin_kzap",
     "com_github_twmb_tlscfg",
     "com_github_twmb_types",
+    "com_github_vectorizedio_redpanda_src_go_rpk",
     "com_google_cloud_go_compute_metadata",
+    "in_gopkg_yaml_v2",
     "in_gopkg_yaml_v3",
     "io_k8s_api",
     "io_k8s_apimachinery",
     "io_k8s_client_go",
+    "org_golang_google_genproto_googleapis_rpc",
     "org_golang_google_protobuf",
     "org_golang_x_exp",
     "org_golang_x_sync",
     "org_golang_x_sys",
     "org_golang_x_term",
+    "org_golang_x_time",
     "org_uber_go_zap",
 )
 
 # ====================================
 # Rust Toolchain
 # ====================================
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
 rust.toolchain(
     edition = "2021",
     extra_target_triples = [
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ],
-    versions = ["1.80.0"],
+    versions = ["1.86.0"],
 )
 use_repo(rust, "rust_toolchains")
 
-register_toolchains("@rust_toolchains//:all")
+register_toolchains(
+    "@rust_toolchains//:all",
+    dev_dependency = True,
+)
 
 crate = use_extension(
     "@rules_rust//crate_universe:extension.bzl",
@@ -344,20 +364,20 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
-use_repo(crate, "crates")
 crate.annotation(
     additive_build_file = "//bazel/thirdparty:wasmtime.BUILD",
     crate = "wasmtime-c-api-impl",
     extra_aliased_targets = {"wasmtime_c": "wasmtime_c"},
     gen_build_script = "off",
 )
+use_repo(crate, "crates")
 
 # ====================================
 # OCI Base Images
 # ====================================
 bazel_dep(name = "rules_oci", version = "2.0.1", dev_dependency = True)
 
-oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci", dev_dependency = True)
 
 # Use a distroless docker image that only comes with the following:
 #
@@ -384,21 +404,30 @@ use_repo(
     "distroless_cc_debian12_linux_arm64_v8",
 )
 
-# ====================================
-# clang-tidy
-# ====================================
-bazel_dep(name = "bazel_clang_tidy", dev_dependency = True)
-git_override(
-    module_name = "bazel_clang_tidy",
-    commit = "db677011c7363509a288a9fb3bf0a50830bbf791",
-    remote = "https://github.com/erenon/bazel_clang_tidy.git",
-)
-
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_file(
     name = "minio",
     executable = True,
-    integrity = "sha256-jsQvcPXbe/5YR5CwavP34rFvSEiOpMluDr2M6kCZDfo=",
-    urls = ["https://dl.min.io/server/minio/release/linux-amd64/minio"],
+    integrity = "sha256-zr1iiuhZtGcN6cBLDL9WAKSYFm2iAxrWNMmHII2JrpQ=",
+    urls = ["https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-04-03T14-56-28Z"],
+)
+
+http_archive(
+    name = "prometheus",
+    add_prefix = "prom",
+    build_file = "//bazel/thirdparty:prometheus.BUILD",
+    integrity = "sha256-ouionAmxSyJ35hUeh/yO0YhYSGy/iTcmVtcfzWZrUdo=",
+    strip_prefix = "prometheus-3.7.1.linux-amd64",
+    urls = ["https://github.com/prometheus/prometheus/releases/download/v3.7.1/prometheus-3.7.1.linux-amd64.tar.gz"],
+)
+
+http_archive(
+    name = "grafana",
+    build_file = "//bazel/thirdparty:grafana.BUILD",
+    integrity = "sha256-L+f4mkpjbAHVS6BQnkLZnrirmH8tEeJcxcVeaAkBa/c=",
+    strip_prefix = "grafana-12.2.1",
+    urls = ["https://dl.grafana.com/grafana/release/12.2.1/grafana_12.2.1_18655849634_linux_amd64.tar.gz"],
 )

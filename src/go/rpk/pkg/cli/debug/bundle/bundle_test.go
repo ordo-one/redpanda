@@ -75,7 +75,13 @@ func TestLimitedWriter(t *testing.T) {
 func TestWalkDirMissingRoot(t *testing.T) {
 	files := make(map[string]*fileInfo)
 	root := "/etc/its_highly_unlikely_that_a_dir_named_like_this_exists_anywhere"
-	err := walkDir(root, files)
+
+	encodeEntry := func(path string, info *fileInfo) error {
+		files[path] = info
+		return nil
+	}
+
+	err := walkDirStreaming(root, encodeEntry)
 
 	require.NoError(t, err)
 
@@ -192,6 +198,10 @@ func TestParseJournalTime(t *testing.T) {
 			name:   "unrecognized relative time",
 			inStr:  "-5trillions",
 			expErr: true,
+		}, {
+			name:  "RFC3339",
+			inStr: "2025-08-10T00:00:00",
+			exp:   time.Date(2025, 8, 10, 0, 0, 0, 0, time.Local),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

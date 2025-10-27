@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
 #include "base/outcome.h"
 #include "base/seastarx.h"
+#include "container/chunked_hash_map.h"
 #include "metrics/metrics.h"
 #include "model/metadata.h"
 #include "net/transport.h"
@@ -29,8 +32,6 @@
 #include <seastar/net/api.hh>
 #include <seastar/net/tls.hh>
 
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_map.h>
 #include <bits/stdint-uintn.h>
 
 #include <concepts>
@@ -262,9 +263,10 @@ private:
      *
      * NOTE: _correlation_idx is unrelated to the sequence type used to define
      * on-wire ordering below.
+     *
+     * TODO(CORE-12902)
      */
-    absl::flat_hash_map<uint32_t, std::unique_ptr<response_entry>>
-      _correlations;
+    chunked_hash_map<uint32_t, std::unique_ptr<response_entry>> _correlations;
     uint32_t _correlation_idx{0};
 
     /**
@@ -381,8 +383,9 @@ ss::future<result<rpc::client_context<T>>> parse_result(
               std::rethrow_exception(ex);
           }
           sctx->signal_body_parse();
-          return ret_t(rpc::client_context<T>(
-            sctx->get_header(), std::move(data_fut.get())));
+          return ret_t(
+            rpc::client_context<T>(
+              sctx->get_header(), std::move(data_fut.get())));
       });
 }
 

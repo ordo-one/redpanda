@@ -11,8 +11,9 @@
 
 #pragma once
 #include "base/seastarx.h"
+#include "base/type_traits.h"
 #include "base/vassert.h"
-#include "utils/functional.h"
+#include "ssx/when_all.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
@@ -31,17 +32,19 @@ namespace ssx {
 
 namespace detail {
 
-template<typename ResultType, typename Iterator, typename Func>
-inline seastar::future<std::vector<ResultType>>
+template<typename ContainerType, typename Iterator, typename Func>
+inline seastar::future<ContainerType>
 async_transform(Iterator begin, Iterator end, Func&& func) {
-    std::vector<ResultType> res;
-    res.reserve(std::distance(begin, end));
+    ContainerType res;
+    if constexpr (CanReserve<ContainerType>) {
+        res.reserve(std::distance(begin, end));
+    }
     return seastar::do_with(
       std::move(res),
       std::move(begin),
       std::move(end),
       [func = std::forward<Func>(func)](
-        std::vector<ResultType>& res, Iterator& begin, Iterator& end) mutable {
+        ContainerType& res, Iterator& begin, Iterator& end) mutable {
           /// Since its not known what type of iterator 'Iterator' is, a
           /// universal ref must be used. For example an rval-ref to a temporary
           /// (when Iterator is a boost::range::iterator_range) or an l-val ref
@@ -75,20 +78,18 @@ async_transform(Iterator begin, Iterator end, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-template<typename Iterator, typename Func>
+template<typename ContainerType, typename Iterator, typename Func>
 requires requires(Func f, Iterator i) {
     *(++i);
     { i != i } -> std::convertible_to<bool>;
     seastar::futurize_invoke(f, *i).get();
 }
 inline auto async_transform(Iterator begin, Iterator end, Func&& func) {
-    using result_type = std::remove_reference_t<
-      decltype(seastar::futurize_invoke(func, *begin).get())>;
-    return detail::async_transform<result_type>(
+    using result_type = ContainerType::value_type;
+    return detail::async_transform<ContainerType>(
       std::move(begin),
       std::move(end),
-      [func = std::forward<Func>(func)](
-        std::vector<result_type>& acc, auto&& x) {
+      [func = std::forward<Func>(func)](ContainerType& acc, auto&& x) {
           return seastar::futurize_invoke(func, std::forward<decltype(x)>(x))
             .then(
               [&acc](result_type result) { acc.push_back(std::move(result)); });
@@ -112,7 +113,7 @@ inline auto async_transform(Iterator begin, Iterator end, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-template<typename Rng, typename Func>
+template<typename ContainerType, typename Rng, typename Func>
 requires requires(Func f, Rng r) {
     r.begin();
     r.end();
@@ -120,7 +121,8 @@ requires requires(Func f, Rng r) {
     seastar::futurize_invoke(f, *r.begin()).get();
 }
 inline auto async_transform(Rng& rng, Func&& func) {
-    return async_transform(rng.begin(), rng.end(), std::forward<Func>(func));
+    return async_transform<ContainerType>(
+      rng.begin(), rng.end(), std::forward<Func>(func));
 }
 
 /// \brief Run tasks synchronously in order and wait for completion only
@@ -197,7 +199,10 @@ inline auto async_flat_transform(Rng& rng, Func&& func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-template<typename Iterator, typename Func>
+template<
+  template<typename...> class Container = std::vector,
+  typename Iterator,
+  typename Func>
 requires requires(Func f, Iterator i) {
     *(++i);
     { i != i } -> std::convertible_to<bool>;
@@ -206,7 +211,7 @@ inline auto parallel_transform(Iterator begin, Iterator end, Func func) {
     using value_type = typename std::iterator_traits<Iterator>::value_type;
     using future = decltype(seastar::futurize_invoke(
       std::move(func), std::move(*begin)));
-    std::vector<future> res;
+    Container<future> res;
     res.reserve(std::distance(begin, end));
     std::transform(
       begin,
@@ -215,11 +220,8 @@ inline auto parallel_transform(Iterator begin, Iterator end, Func func) {
       [func{std::move(func)}](value_type val) mutable {
           return seastar::futurize_invoke(std::move(func), std::move(val));
       });
-    return seastar::do_with(std::move(res), [](std::vector<future>& res) {
-        return seastar::when_all_succeed(
-          std::make_move_iterator(res.begin()),
-          std::make_move_iterator(res.end()));
-    });
+    return ssx::when_all_succeed<Container<typename future::value_type>>(
+      std::move(res));
 }
 
 /// \brief Run tasks in parallel and wait for completion, capturing possible
@@ -239,7 +241,10 @@ inline auto parallel_transform(Iterator begin, Iterator end, Func func) {
 /// function invocations that resolves when all the function invocations
 /// complete.  If one or more return an exception, the return value contains one
 /// of the exceptions.
-template<typename Rng, typename Func>
+template<
+  template<typename...> class Container = std::vector,
+  typename Rng,
+  typename Func>
 requires requires(Func f, Rng r) {
     r.begin();
     r.end();
@@ -248,7 +253,7 @@ requires requires(Func f, Rng r) {
 inline auto parallel_transform(Rng rng, Func func) {
     return seastar::do_with(
       std::move(rng), [func{std::move(func)}](Rng& rng) mutable {
-          return parallel_transform(
+          return parallel_transform<Container>(
             std::make_move_iterator(rng.begin()),
             std::make_move_iterator(rng.end()),
             std::move(func));

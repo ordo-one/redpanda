@@ -17,23 +17,22 @@
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage/types.h"
-#include "cluster/archival/logger.h"
 #include "cluster/errc.h"
 #include "cluster/logger.h"
 #include "cluster/prefix_truncate_record.h"
-#include "cluster/types.h"
+#include "cluster/snapshot.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
 #include "model/record_utils.h"
 #include "model/timeout_clock.h"
 #include "raft/consensus.h"
 #include "raft/persisted_stm.h"
-#include "resource_mgmt/io_priority.h"
 #include "serde/envelope.h"
 #include "serde/rw/envelope.h"
 #include "serde/rw/iobuf.h"
@@ -227,11 +226,11 @@ struct archival_metadata_stm::read_write_fence_cmd
 //
 struct archival_metadata_stm::snapshot
   : public serde::
-      envelope<snapshot, serde::version<5>, serde::compat_version<0>> {
+      envelope<snapshot, serde::version<6>, serde::compat_version<0>> {
     /// List of segments
-    fragmented_vector<segment> segments;
+    chunked_vector<segment> segments;
     /// List of replaced segments
-    fragmented_vector<segment> replaced;
+    chunked_vector<segment> replaced;
     /// Start offset (might be different from the base offset of the first
     /// segment). Default value means that the snapshot was old and didn't
     /// have start_offset. In this case we need to set it to compute it from
@@ -261,7 +260,7 @@ struct archival_metadata_stm::snapshot
     // when DeleteRecords was used to override)
     kafka::offset start_kafka_offset;
     // List of spillover manifests
-    fragmented_vector<segment> spillover_manifests;
+    chunked_vector<segment> spillover_manifests;
     // Timestamp of last completed scrub
     model::timestamp last_partition_scrub;
     // Offest at which the previous scrubbing stopped
@@ -272,6 +271,12 @@ struct archival_metadata_stm::snapshot
     model::producer_id highest_producer_id;
     // Offset of the last applied command
     model::offset applied_offset;
+    // The offset of the last mark_clean_cmd applied;
+    // default (-inf) in v5 and earlier
+    model::offset last_clean_at;
+    // The offset of the last record that modified the stm;
+    // default (-inf) in v5 and earlier
+    model::offset last_dirty_at;
 
     auto serde_fields() {
         return std::tie(
@@ -291,7 +296,9 @@ struct archival_metadata_stm::snapshot
           last_scrubbed_offset,
           detected_anomalies,
           highest_producer_id,
-          applied_offset);
+          applied_offset,
+          last_clean_at,
+          last_dirty_at);
     }
 };
 
@@ -508,10 +515,10 @@ command_batch_builder archival_metadata_stm::batch_start(
     return {*this, deadline, as};
 }
 
-fragmented_vector<archival_metadata_stm::segment>
+chunked_vector<archival_metadata_stm::segment>
 archival_metadata_stm::segments_from_manifest(
   const cloud_storage::partition_manifest& manifest) {
-    fragmented_vector<segment> segments;
+    chunked_vector<segment> segments;
     for (auto meta : manifest) {
         if (meta.ntp_revision == model::initial_revision_id{}) {
             meta.ntp_revision = manifest.get_revision_id();
@@ -532,11 +539,11 @@ archival_metadata_stm::segments_from_manifest(
     return segments;
 }
 
-fragmented_vector<archival_metadata_stm::segment>
+chunked_vector<archival_metadata_stm::segment>
 archival_metadata_stm::replaced_segments_from_manifest(
   const cloud_storage::partition_manifest& manifest) {
     auto replaced = manifest.replaced_segments();
-    fragmented_vector<segment> segments;
+    chunked_vector<segment> segments;
     for (auto meta : replaced) {
         if (meta.ntp_revision == model::initial_revision_id{}) {
             meta.ntp_revision = manifest.get_revision_id();
@@ -547,11 +554,11 @@ archival_metadata_stm::replaced_segments_from_manifest(
     return segments;
 }
 
-fragmented_vector<archival_metadata_stm::segment>
+chunked_vector<archival_metadata_stm::segment>
 archival_metadata_stm::spillover_from_manifest(
   const cloud_storage::partition_manifest& manifest) {
     const auto& sp_list = manifest.get_spillover_map();
-    fragmented_vector<segment> res;
+    chunked_vector<segment> res;
     for (auto meta : sp_list) {
         res.push_back(segment_from_meta(meta));
     }
@@ -642,30 +649,30 @@ ss::future<> archival_metadata_stm::make_snapshot(
     auto segments = segments_from_manifest(m);
     auto replaced = replaced_segments_from_manifest(m);
     auto spillover = spillover_from_manifest(m);
-    iobuf snap_data = serde::to_iobuf(snapshot{
-      .segments = std::move(segments),
-      .replaced = std::move(replaced),
-      .start_offset = m.get_start_offset().value_or(model::offset{}),
-      .last_offset = m.get_last_offset(),
-      .last_uploaded_compacted_offset = m.get_last_uploaded_compacted_offset(),
-      .dirty = state_dirty::clean,
-      .archive_start_offset = m.get_archive_start_offset(),
-      .archive_start_offset_delta = m.get_archive_start_offset_delta(),
-      .archive_clean_offset = m.get_archive_clean_offset(),
-      .archive_size_bytes = m.archive_size_bytes(),
-      .start_kafka_offset = m.get_start_kafka_offset_override(),
-      .spillover_manifests = std::move(spillover),
-      .highest_producer_id = m.highest_producer_id(),
-      .applied_offset = m.get_applied_offset(),
-    });
+    iobuf snap_data = serde::to_iobuf(
+      snapshot{
+        .segments = std::move(segments),
+        .replaced = std::move(replaced),
+        .start_offset = m.get_start_offset().value_or(model::offset{}),
+        .last_offset = m.get_last_offset(),
+        .last_uploaded_compacted_offset
+        = m.get_last_uploaded_compacted_offset(),
+        .dirty = state_dirty::clean,
+        .archive_start_offset = m.get_archive_start_offset(),
+        .archive_start_offset_delta = m.get_archive_start_offset_delta(),
+        .archive_clean_offset = m.get_archive_clean_offset(),
+        .archive_size_bytes = m.archive_size_bytes(),
+        .start_kafka_offset = m.get_start_kafka_offset_override(),
+        .spillover_manifests = std::move(spillover),
+        .highest_producer_id = m.highest_producer_id(),
+        .applied_offset = insync_offset,
+      });
 
     auto snapshot = raft::stm_snapshot::create(
       0, insync_offset, std::move(snap_data));
 
     storage::simple_snapshot_manager tmp_snapshot_mgr(
-      std::filesystem::path(ntp_cfg.work_directory()),
-      archival_stm_snapshot,
-      raft_priority());
+      std::filesystem::path(ntp_cfg.work_directory()), archival_stm_snapshot);
 
     co_await raft::file_backed_stm_snapshot::persist_local_snapshot(
       tmp_snapshot_mgr, std::move(snapshot));
@@ -674,9 +681,7 @@ ss::future<> archival_metadata_stm::make_snapshot(
 ss::future<bool>
 archival_metadata_stm::has_snapshot(const storage::ntp_config& ntp_cfg) {
     storage::simple_snapshot_manager tmp_snapshot_mgr(
-      std::filesystem::path(ntp_cfg.work_directory()),
-      archival_stm_snapshot,
-      raft_priority());
+      std::filesystem::path(ntp_cfg.work_directory()), archival_stm_snapshot);
     co_return co_await tmp_snapshot_mgr.snapshot_exists();
 }
 
@@ -690,11 +695,13 @@ archival_metadata_stm::archival_metadata_stm(
   : raft::persisted_stm<>(archival_stm_snapshot, logger, raft)
   , _logger(logger, ssx::sformat("ntp: {}", raft->ntp()))
   , _mem_tracker(ss::make_shared<util::mem_tracker>(raft->ntp().path()))
-  , _manifest(ss::make_shared<cloud_storage::partition_manifest>(
-      raft->ntp(), raft->log_config().get_remote_revision(), _mem_tracker))
+  , _manifest(
+      ss::make_shared<cloud_storage::partition_manifest>(
+        raft->ntp(), raft->log_config().get_remote_revision(), _mem_tracker))
   , _cloud_storage_api(remote)
   , _feature_table(ft)
-  , _remote_path_provider(remote_label, remote_topic_namespace_override) {}
+  , _remote_path_provider(
+      std::move(remote_label), std::move(remote_topic_namespace_override)) {}
 
 ss::future<std::error_code> archival_metadata_stm::truncate(
   model::offset start_rp_offset,
@@ -891,11 +898,11 @@ ss::future<std::error_code> archival_metadata_stm::do_replicate_commands(
                           .handle_exception_type(broken_promise_to_shutdown);
     auto op_state_reset = ss::defer([&] { _active_operation_res.reset(); });
 
-    auto opts = raft::replicate_options(raft::consistency_level::quorum_ack);
+    auto opts = raft::replicate_options(
+      raft::consistency_level::quorum_ack, current_term);
     opts.set_force_flush();
 
-    auto result = co_await _raft->replicate(
-      current_term, std::move(batch), opts);
+    auto result = co_await _raft->replicate(std::move(batch), opts);
     if (!result) {
         vlog(
           _logger.warn,
@@ -906,8 +913,9 @@ ss::future<std::error_code> archival_metadata_stm::do_replicate_commands(
         // Explicitly step down if we're still leader and force callers to
         // re-sync in a new term with a new leader.
         if (_raft->is_leader() && _raft->term() == current_term) {
-            co_await _raft->step_down(ssx::sformat(
-              "failed to replicate archival batch in term {}", current_term));
+            co_await _raft->step_down(
+              ssx::sformat(
+                "failed to replicate archival batch in term {}", current_term));
         }
         co_return result.error();
     }
@@ -920,8 +928,9 @@ ss::future<std::error_code> archival_metadata_stm::do_replicate_commands(
         }
 
         if (_raft->is_leader() && _raft->term() == current_term) {
-            co_await _raft->step_down(ssx::sformat(
-              "failed to replicate archival batch in term {}", current_term));
+            co_await _raft->step_down(
+              ssx::sformat(
+                "failed to replicate archival batch in term {}", current_term));
         }
         co_return errc::replication_error;
     }
@@ -1047,12 +1056,14 @@ ss::future<> archival_metadata_stm::do_apply(const model::record_batch& b) {
 
                 switch (key) {
                 case add_segment_cmd::key:
-                    apply_add_segment(serde::from_iobuf<add_segment_cmd::value>(
-                      r.release_value()));
+                    apply_add_segment(
+                      serde::from_iobuf<add_segment_cmd::value>(
+                        r.release_value()));
                     break;
                 case truncate_cmd::key:
-                    apply_truncate(serde::from_iobuf<truncate_cmd::value>(
-                      r.release_value()));
+                    apply_truncate(
+                      serde::from_iobuf<truncate_cmd::value>(
+                        r.release_value()));
                     break;
                 case update_start_offset_cmd::key:
                     apply_update_start_offset(
@@ -1063,8 +1074,9 @@ ss::future<> archival_metadata_stm::do_apply(const model::record_batch& b) {
                     apply_cleanup_metadata();
                     break;
                 case mark_clean_cmd::key:
-                    apply_mark_clean(serde::from_iobuf<mark_clean_cmd::value>(
-                      r.release_value()));
+                    apply_mark_clean(
+                      serde::from_iobuf<mark_clean_cmd::value>(
+                        r.release_value()));
                     break;
                 case truncate_archive_init_cmd::key:
                     apply_truncate_archive_init(
@@ -1262,11 +1274,20 @@ archival_metadata_stm::apply_local_snapshot(
     // reset counter, the value depended on the previous _manifest
     _compacted_replaced_bytes = 0;
 
-    if (snap.dirty == state_dirty::dirty) {
-        _last_clean_at = model::offset{0};
+    if (snap.last_clean_at == model::offset{}) {
+        // Handle legacy snapshots which don't have the 'last_clean_at'
+        // field.
+        if (snap.dirty == state_dirty::dirty) {
+            _last_clean_at = model::offset{};
+        } else {
+            _last_clean_at = header.offset;
+        }
     } else {
-        _last_clean_at = header.offset;
+        _last_clean_at = snap.last_clean_at;
     }
+
+    _last_dirty_at = snap.last_dirty_at;
+
     co_return raft::local_snapshot_applied::yes;
 }
 
@@ -1275,25 +1296,29 @@ archival_metadata_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
     auto segments = segments_from_manifest(*_manifest);
     auto replaced = replaced_segments_from_manifest(*_manifest);
     auto spillover = spillover_from_manifest(*_manifest);
-    iobuf snap_data = serde::to_iobuf(snapshot{
-      .segments = std::move(segments),
-      .replaced = std::move(replaced),
-      .start_offset = _manifest->get_start_offset().value_or(model::offset()),
-      .last_offset = _manifest->get_last_offset(),
-      .last_uploaded_compacted_offset
-      = _manifest->get_last_uploaded_compacted_offset(),
-      .dirty = get_dirty(),
-      .archive_start_offset = _manifest->get_archive_start_offset(),
-      .archive_start_offset_delta = _manifest->get_archive_start_offset_delta(),
-      .archive_clean_offset = _manifest->get_archive_clean_offset(),
-      .archive_size_bytes = _manifest->archive_size_bytes(),
-      .start_kafka_offset = _manifest->get_start_kafka_offset_override(),
-      .spillover_manifests = std::move(spillover),
-      .last_partition_scrub = _manifest->last_partition_scrub(),
-      .last_scrubbed_offset = _manifest->last_scrubbed_offset(),
-      .detected_anomalies = _manifest->detected_anomalies(),
-      .highest_producer_id = _manifest->highest_producer_id(),
-      .applied_offset = _manifest->get_applied_offset()});
+    iobuf snap_data = serde::to_iobuf(
+      snapshot{
+        .segments = std::move(segments),
+        .replaced = std::move(replaced),
+        .start_offset = _manifest->get_start_offset().value_or(model::offset()),
+        .last_offset = _manifest->get_last_offset(),
+        .last_uploaded_compacted_offset
+        = _manifest->get_last_uploaded_compacted_offset(),
+        .dirty = get_dirty(),
+        .archive_start_offset = _manifest->get_archive_start_offset(),
+        .archive_start_offset_delta
+        = _manifest->get_archive_start_offset_delta(),
+        .archive_clean_offset = _manifest->get_archive_clean_offset(),
+        .archive_size_bytes = _manifest->archive_size_bytes(),
+        .start_kafka_offset = _manifest->get_start_kafka_offset_override(),
+        .spillover_manifests = std::move(spillover),
+        .last_partition_scrub = _manifest->last_partition_scrub(),
+        .last_scrubbed_offset = _manifest->last_scrubbed_offset(),
+        .detected_anomalies = _manifest->detected_anomalies(),
+        .highest_producer_id = _manifest->highest_producer_id(),
+        .applied_offset = _manifest->get_applied_offset(),
+        .last_clean_at = _last_clean_at,
+        .last_dirty_at = _last_dirty_at});
     auto snapshot_offset = last_applied_offset();
     apply_units.return_all();
 
@@ -1309,7 +1334,22 @@ archival_metadata_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
       0, snapshot_offset, std::move(snap_data));
 }
 
-model::offset archival_metadata_stm::max_collectible_offset() {
+model::offset archival_metadata_stm::cloud_recoverable_offset() {
+    auto lo = get_last_offset();
+    if (_manifest->size() == 0 && lo == model::offset{0}) {
+        lo = model::offset::min();
+    }
+
+    // Do not collect past the offset we last uploaded manifest for: this is
+    // needed for correctness because the remote manifest is used in
+    // handle_eviction() - it is what a remote node doing snapshot-driven
+    // raft recovery will use to start from.
+    lo = std::min(lo, _last_clean_at);
+
+    return lo;
+}
+
+model::offset archival_metadata_stm::max_removable_local_log_offset() {
     // From Redpanda 22.3 up, the ntp_config's impression of whether
     // archival is enabled is authoritative.
     bool collect_all = !_raft->log_config().is_archival_enabled();
@@ -1335,18 +1375,7 @@ model::offset archival_metadata_stm::max_collectible_offset() {
         // need to interact with local retention.
         return model::offset::max();
     }
-    auto lo = get_last_offset();
-    if (_manifest->size() == 0 && lo == model::offset{0}) {
-        lo = model::offset::min();
-    }
-
-    // Do not collect past the offset we last uploaded manifest for: this is
-    // needed for correctness because the remote manifest is used in
-    // handle_eviction() - it is what a remote node doing snapshot-driven
-    // raft recovery will use to start from.
-    lo = std::min(lo, _last_clean_at);
-
-    return lo;
+    return cloud_recoverable_offset();
 }
 
 void archival_metadata_stm::maybe_notify_waiter(cluster::errc err) noexcept {
@@ -1530,6 +1559,10 @@ void archival_metadata_stm::apply_spillover(const spillover_cmd& so) {
           get_last_offset());
     } else {
         vlog(_logger.error, "Can't apply spillover_cmd: {}", so.manifest_meta);
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format,
+          "Spillover command applied with invalid manifest: {}",
+          so.manifest_meta));
     }
 }
 
@@ -1567,7 +1600,7 @@ void archival_metadata_stm::apply_reset_scrubbing_metadata() {
     _manifest->reset_scrubbing_metadata();
 }
 
-fragmented_vector<cloud_storage::partition_manifest::lw_segment_meta>
+chunked_vector<cloud_storage::partition_manifest::lw_segment_meta>
 archival_metadata_stm::get_segments_to_cleanup() const {
     // Include replaced segments to the backlog
     using lw_segment_meta = cloud_storage::partition_manifest::lw_segment_meta;
@@ -1577,14 +1610,14 @@ archival_metadata_stm::get_segments_to_cleanup() const {
     // segments. This is a protection from the data loss. This should not
     // happen, but protects us from data loss in cases where bugs elsewhere.
     const auto backlog_size = source_backlog.size();
-    fragmented_vector<lw_segment_meta> backlog;
+    chunked_vector<lw_segment_meta> backlog;
     std::copy_if(
       source_backlog.begin(),
       source_backlog.end(),
       std::back_inserter(backlog),
-      [this](const lw_segment_meta& m) {
+      [this, end_it = _manifest->end()](const lw_segment_meta& m) {
           auto it = _manifest->find(m.base_offset);
-          if (it == _manifest->end()) {
+          if (it == end_it) {
               return true;
           }
           auto m_name = _manifest->generate_remote_segment_name(
@@ -1683,39 +1716,30 @@ archival_metadata_stm::state_dirty archival_metadata_stm::get_dirty(
 archival_metadata_stm_factory::archival_metadata_stm_factory(
   bool cloud_storage_enabled,
   ss::sharded<cloud_storage::remote>& cloud_storage_api,
-  ss::sharded<features::feature_table>& feature_table,
-  ss::sharded<cluster::topic_table>& topics)
+  ss::sharded<features::feature_table>& feature_table)
   : _cloud_storage_enabled(cloud_storage_enabled)
   , _cloud_storage_api(cloud_storage_api)
-  , _feature_table(feature_table)
-  , _topics(topics) {}
+  , _feature_table(feature_table) {}
 
 bool archival_metadata_stm_factory::is_applicable_for(
   const storage::ntp_config& ntp_cfg) const {
     return _cloud_storage_enabled && _cloud_storage_api.local_is_initialized()
+           && ntp_cfg.ntp().tp.topic != model::kafka_consumer_offsets_topic
            && ntp_cfg.ntp().ns == model::kafka_namespace;
 }
 
 void archival_metadata_stm_factory::create(
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
-    auto topic_md = _topics.local().get_topic_metadata_ref(
-      model::topic_namespace_view(raft->ntp()));
-    auto remote_label
-      = topic_md.has_value()
-          ? topic_md->get().get_configuration().properties.remote_label
-          : std::nullopt;
-    auto remote_topic_namespace_override
-      = topic_md.has_value() ? topic_md->get()
-                                 .get_configuration()
-                                 .properties.remote_topic_namespace_override
-                             : std::nullopt;
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config& cfg) {
+    const auto tcfg = cfg.initial_topic_cfg;
     auto stm = builder.create_stm<cluster::archival_metadata_stm>(
       raft,
       _cloud_storage_api.local(),
       _feature_table.local(),
       clusterlog,
-      remote_label,
-      remote_topic_namespace_override);
+      tcfg ? tcfg->properties.remote_label : std::nullopt,
+      tcfg ? tcfg->properties.remote_topic_namespace_override : std::nullopt);
     raft->log()->stm_manager()->add_stm(stm);
 }
 

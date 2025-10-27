@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "raft/fwd.h"
 #include "raft/logger.h"
@@ -23,17 +25,19 @@
 #include "utils/absl_sstring_hash.h"
 #include "utils/mutex.h"
 
+#include <seastar/core/gate.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
-
-#include <absl/container/flat_hash_map.h>
 
 #include <concepts>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+namespace cluster {
+struct topic_configuration;
+}
 namespace raft {
 
 template<typename T>
@@ -100,8 +104,6 @@ public:
     ss::future<> start();
     ss::future<> stop();
 
-    model::offset last_applied() const { return model::prev_offset(_next); }
-
     snapshot_at_offset_supported supports_snapshot_at_offset() const {
         return _supports_snapshot_at_offset;
     }
@@ -141,11 +143,37 @@ private:
         ss::sstring name;
         stm_ptr stm;
     };
+    /**
+     * Initial recovery snapshot is used by the state machine manager to store
+     * the information about the State Machines initial recovery. This way a
+     * state machine manager can skip to the end the log for the state machines
+     * that require that.
+     */
+    struct initial_recovery_snapshot
+      : serde::checksum_envelope<
+          initial_recovery_snapshot,
+          serde::version<0>,
+          serde::compat_version<0>> {
+        friend bool operator==(
+          const initial_recovery_snapshot&, const initial_recovery_snapshot&)
+          = default;
+
+        auto serde_fields() { return std::tie(initial_recovery_next_offsets); }
+
+        // The initial recovery offset map contains the initial next offset for
+        // each state machine that has been added to the manager.
+        absl::flat_hash_map<ss::sstring, model::offset>
+          initial_recovery_next_offsets;
+    };
+
+    friend std::ostream&
+    operator<<(std::ostream&, const initial_recovery_snapshot&);
 
     state_machine_manager(
       consensus* raft,
       std::vector<named_stm> stms_to_manage,
-      ss::scheduling_group apply_sg);
+      ss::scheduling_group apply_sg,
+      config::binding<std::chrono::milliseconds> stm_shutdown_timeout);
 
     friend class batch_applicator;
     friend class state_machine_manager_builder;
@@ -178,14 +206,30 @@ private:
 
     ss::future<> apply_raft_snapshot();
     ss::future<> do_apply_raft_snapshot(
+      std::vector<entry_ptr> state_machines,
       raft::snapshot_metadata metadata,
       storage::snapshot_reader& reader,
       std::vector<ssx::semaphore_units> background_apply_units);
-    ss::future<> apply();
+    ss::future<> apply() noexcept;
     ss::future<> try_apply_in_foreground();
 
     ss::future<std::vector<ssx::semaphore_units>>
     acquire_background_apply_mutexes();
+
+    std::vector<entry_ptr> all_state_machines() const;
+    model::offset max_next_offset() const;
+    model::offset last_applied() const { return model::prev_offset(_next); }
+
+    ss::future<> apply_initial_recovery_policy();
+    ss::future<> do_stop_stm(entry_ptr entry);
+    /**
+     * Methods to access/write the local state machine manager snapshot. The
+     * snapshot is currently used to maintain the state of initial recovery for
+     * state machines.
+     */
+    ss::future<std::optional<initial_recovery_snapshot>>
+    read_initial_recovery_snapshot();
+    ss::future<> write_initial_recovery_snapshot(initial_recovery_snapshot);
     /**
      * Simple data structure allowing manager to store independent snapshot
      * for each of the STMs
@@ -217,6 +261,8 @@ private:
     ss::abort_source _as;
     ss::scheduling_group _apply_sg;
     snapshot_at_offset_supported _supports_snapshot_at_offset{true};
+    storage::simple_snapshot_manager _initial_recovery_snapshot_mgr;
+    config::binding<std::chrono::milliseconds> _stm_shutdown_timeout;
 };
 
 /**
@@ -235,12 +281,20 @@ public:
     void with_scheduing_group(ss::scheduling_group sg) { _sg = sg; }
 
     state_machine_manager build(raft::consensus* raft) && {
-        return {raft, std::move(_stms), _sg};
+        return {
+          raft,
+          std::move(_stms),
+          _sg,
+          std::move(_stm_shutdown_timeout),
+        };
     }
 
 private:
     std::vector<state_machine_manager::named_stm> _stms;
     ss::scheduling_group _sg = ss::default_scheduling_group();
+    config::binding<std::chrono::milliseconds> _stm_shutdown_timeout
+      = config::shard_local_cfg()
+          .partition_manager_shutdown_watchdog_timeout.bind();
 };
 
 } // namespace raft

@@ -22,8 +22,9 @@
 #include "test_utils/random_bytes.h"
 
 #include <seastar/core/thread.hh>
-#include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
+
+#include <gtest/gtest.h>
 
 using namespace std::chrono_literals; // NOLINT
 using namespace storage;              // NOLINT
@@ -46,22 +47,27 @@ void write_batches(ss::lw_shared_ptr<segment> seg) {
     seg->flush().get();
 }
 
+inline ss::sstring test_directory() {
+    char* tmpdir = std::getenv("TEST_TMPDIR");
+    if (!tmpdir) {
+        return "test.dir";
+    }
+    return {std::filesystem::path(tmpdir) / std::string("test.dir")};
+}
+
 log_config make_config() {
     return log_config{
-      "test.dir",
-      1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()};
+      test_directory(), 1024, storage::make_sanitized_file_config()};
 }
 
 ntp_config config_from_ntp(const model::ntp& ntp) {
-    return ntp_config(ntp, "test.dir");
+    return ntp_config(ntp, test_directory());
 }
 
 constexpr size_t default_segment_readahead_size = 128 * 1024;
 constexpr unsigned default_segment_readahead_count = 10;
 
-SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
+TEST(LogManagerTest, test_can_load_logs) {
     auto conf = make_config();
 
     ss::logger test_logger("test-logger");
@@ -99,7 +105,6 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                   ntps[0],
                   model::offset(10),
                   model::term_id(1),
-                  ss::default_priority_class(),
                   default_segment_readahead_size,
                   default_segment_readahead_count,
                   0)
@@ -112,7 +117,6 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                    ntps[2],
                    model::offset(20),
                    model::term_id(1),
-                   ss::default_priority_class(),
                    default_segment_readahead_size,
                    default_segment_readahead_count,
                    1_MiB)
@@ -124,7 +128,6 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                    ntps[3],
                    model::offset(2),
                    model::term_id(1),
-                   ss::default_priority_class(),
                    default_segment_readahead_size,
                    default_segment_readahead_count,
                    1_MiB)
@@ -136,14 +139,14 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
     m.manage(config_from_ntp(ntps[1].ntp())).get();
     m.manage(config_from_ntp(ntps[2].ntp())).get();
     m.manage(config_from_ntp(ntps[3].ntp())).get();
-    BOOST_CHECK_EQUAL(4, m.size());
-    BOOST_CHECK_EQUAL(m.get(ntps[0].ntp())->segment_count(), 0);
-    BOOST_CHECK_EQUAL(m.get(ntps[1].ntp())->segment_count(), 0);
-    BOOST_CHECK_EQUAL(m.get(ntps[2].ntp())->segment_count(), 1);
-    BOOST_CHECK_EQUAL(m.get(ntps[3].ntp())->segment_count(), 0);
-    BOOST_CHECK(!file_exists(seg->reader().filename()).get());
-    BOOST_CHECK(file_exists(seg3->reader().filename()).get());
-    BOOST_CHECK(!file_exists(seg4->reader().filename()).get());
-    BOOST_CHECK(
+    EXPECT_EQ(4, m.size());
+    EXPECT_EQ(m.get(ntps[0].ntp())->segment_count(), 0);
+    EXPECT_EQ(m.get(ntps[1].ntp())->segment_count(), 0);
+    EXPECT_EQ(m.get(ntps[2].ntp())->segment_count(), 1);
+    EXPECT_EQ(m.get(ntps[3].ntp())->segment_count(), 0);
+    EXPECT_FALSE(file_exists(seg->reader().filename()).get());
+    EXPECT_TRUE(file_exists(seg3->reader().filename()).get());
+    EXPECT_FALSE(file_exists(seg4->reader().filename()).get());
+    EXPECT_TRUE(
       file_exists(seg4->reader().filename() + ".cannotrecover").get());
 }

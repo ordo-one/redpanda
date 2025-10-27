@@ -21,6 +21,7 @@
 #include "pandaproxy/types.h"
 #include "security/request_auth.h"
 #include "utils/adjustable_semaphore.h"
+#include "utils/truncating_logger.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
@@ -121,7 +122,9 @@ public:
       const ss::sstring& header,
       const ss::sstring& definitions,
       context_t& ctx,
-      json::serialization_format exceptional_mime_type);
+      json::serialization_format exceptional_mime_type,
+      ss::logger& log,
+      truncating_logger& req_log);
 
     void route(route_t route);
     void routes(routes_t&& routes);
@@ -141,6 +144,8 @@ private:
     context_t& _ctx;
     json::serialization_format _exceptional_mime_type;
     std::unique_ptr<server_probe> _probe;
+    ss::logger& _log;
+    truncating_logger& _req_log;
 };
 
 template<typename service_t>

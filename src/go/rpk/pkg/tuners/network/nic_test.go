@@ -13,6 +13,7 @@ package network
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/ethtool"
@@ -46,6 +47,9 @@ type ethtoolMock struct {
 }
 
 func (m *ethtoolMock) DriverName(iface string) (string, error) {
+	if m.driverName == nil {
+		return "dummy", nil
+	}
 	return m.driverName(iface)
 }
 
@@ -59,7 +63,7 @@ func Test_nic_IsBondIface(t *testing.T) {
 	procFile := &procFileMock{}
 	deviceInfo := &deviceInfoMock{}
 	nic := NewNic(fs, procFile, deviceInfo, &ethtoolMock{}, "test0")
-	afero.WriteFile(fs, "/sys/class/net/bond_masters", []byte(fmt.Sprintln("test0")), 0o644)
+	afero.WriteFile(fs, "/sys/class/net/test0/lower_ens5", []byte{}, 0o644)
 	// when
 	bond := nic.IsBondIface()
 	// then
@@ -72,8 +76,9 @@ func Test_nic_Slaves_ReturnAllSlavesOfAnInterface(t *testing.T) {
 	procFile := &procFileMock{}
 	deviceInfo := &deviceInfoMock{}
 	nic := NewNic(fs, procFile, deviceInfo, &ethtoolMock{}, "test0")
-	afero.WriteFile(fs, "/sys/class/net/bond_masters", []byte(fmt.Sprintln("test0")), 0o644)
-	afero.WriteFile(fs, "/sys/class/net/test0/bond/slaves", []byte("sl0\nsl1\nsl2"), 0o644)
+	afero.WriteFile(fs, "/sys/class/net/test0/lower_sl0", []byte{}, 0o644)
+	afero.WriteFile(fs, "/sys/class/net/test0/lower_sl1", []byte{}, 0o644)
+	afero.WriteFile(fs, "/sys/class/net/test0/lower_sl2", []byte{}, 0o644)
 	// when
 	slaves, err := nic.Slaves()
 	// then
@@ -90,11 +95,18 @@ func Test_nic_Slaves_ReturnEmptyForNotBondInterface(t *testing.T) {
 	procFile := &procFileMock{}
 	deviceInfo := &deviceInfoMock{}
 	nic := NewNic(fs, procFile, deviceInfo, &ethtoolMock{}, "test0")
+	fs.MkdirAll("/sys/class/net/test0/device", 0o755)
 	// when
 	slaves, err := nic.Slaves()
 	// then
 	require.NoError(t, err)
 	require.Empty(t, slaves)
+}
+
+type IrqInfoRes struct {
+	Num        int
+	ProcLine   string
+	QueueIndex int
 }
 
 func Test_nic_GetIRQs(t *testing.T) {
@@ -104,7 +116,8 @@ func Test_nic_GetIRQs(t *testing.T) {
 		irqDeviceInfo irq.DeviceInfo
 		ethtool       ethtool.EthtoolWrapper
 		nicName       string
-		want          []int
+		want          []IrqInfoRes
+		driverName    string
 	}{
 		{
 			name: "Shall return all device IRQs when there are not fast paths",
@@ -122,7 +135,23 @@ func Test_nic_GetIRQs(t *testing.T) {
 					return []int{54, 56, 58}, nil
 				},
 			},
-			want: []int{54, 56, 58},
+			want: []IrqInfoRes{
+				{
+					Num:        54,
+					ProcLine:   "54:       9076       8545       3081       1372       4662     190816       3865       6709  IR-PCI-MSI 333825-edge      iwlwifi: queue 1",
+					QueueIndex: math.MaxInt64,
+				},
+				{
+					Num:        56,
+					ProcLine:   "56:      24300       3370        681       2725       1511       6627      21983       7056  IR-PCI-MSI 333826-edge      iwlwifi: queue 2",
+					QueueIndex: math.MaxInt64,
+				},
+				{
+					Num:        58,
+					ProcLine:   "58:       8444      10072       3025       2732       5432       5919       7217       3559  IR-PCI-MSI 333827-edge      iwlwifi: queue 3",
+					QueueIndex: math.MaxInt64,
+				},
+			},
 		},
 		{
 			name: "Shall return fast path IRQs only sorted by queue number",
@@ -142,7 +171,28 @@ func Test_nic_GetIRQs(t *testing.T) {
 					return []int{91, 92, 93, 94, 95}, nil
 				},
 			},
-			want: []int{95, 94, 93, 92},
+			want: []IrqInfoRes{
+				{
+					Num:        95,
+					ProcLine:   "95:      40351          0          0          0   PCI-MSI 1572868-edge      eth0-TxRx-0",
+					QueueIndex: 0,
+				},
+				{
+					Num:        94,
+					ProcLine:   "94:      48929          0          0          0   PCI-MSI 1572867-edge      eth0-TxRx-1",
+					QueueIndex: 1,
+				},
+				{
+					Num:        93,
+					ProcLine:   "93:      60344          0          0          0   PCI-MSI 1572866-edge      eth0-TxRx-2",
+					QueueIndex: 2,
+				},
+				{
+					Num:        92,
+					ProcLine:   "92:      79079          0          0          0   PCI-MSI 1572865-edge      eth0-TxRx-3",
+					QueueIndex: 3,
+				},
+			},
 		},
 		{
 			name: "Fdir fast path IRQs should be moved to the end of list",
@@ -163,21 +213,174 @@ func Test_nic_GetIRQs(t *testing.T) {
 					return []int{91, 92, 93, 94, 95, 96}, nil
 				},
 			},
-			want: []int{95, 94, 93, 92, 96},
+			want: []IrqInfoRes{
+				{
+					Num:        95,
+					ProcLine:   "95:      40351          0          0          0   PCI-MSI 1572868-edge      eth0-TxRx-0",
+					QueueIndex: 0,
+				},
+				{
+					Num:        94,
+					ProcLine:   "94:      48929          0          0          0   PCI-MSI 1572867-edge      eth0-TxRx-1",
+					QueueIndex: 1,
+				},
+				{
+					Num:        93,
+					ProcLine:   "93:      60344          0          0          0   PCI-MSI 1572866-edge      eth0-TxRx-2",
+					QueueIndex: 2,
+				},
+				{
+					Num:        92,
+					ProcLine:   "92:      79079          0          0          0   PCI-MSI 1572865-edge      eth0-TxRx-3",
+					QueueIndex: 3,
+				},
+				{
+					Num:        96,
+					ProcLine:   "96:      40351          0          0          0   PCI-MSI 1572868-edge      eth0-fdir-TxRx-0",
+					QueueIndex: math.MaxInt64,
+				},
+			},
+		},
+		{
+			name:       "virtio",
+			driverName: "virtio",
+			irqProcFile: &procFileMock{
+				getIRQProcFileLinesMap: func() (map[int]string, error) {
+					return map[int]string{
+						24: "24:          0          0   PCI-MSI 65536-edge      virtio1-config",
+						25: "25:        135          0   PCI-MSI 65537-edge      virtio1-input.2",
+						26: "26:        221          0   PCI-MSI 65538-edge      virtio1-output.2",
+					}, nil
+				},
+			},
+			irqDeviceInfo: &deviceInfoMock{
+				getIRQs: func(string, string) ([]int, error) {
+					return []int{24, 25, 26}, nil
+				},
+			},
+			want: []IrqInfoRes{
+				{
+					Num:        25,
+					ProcLine:   "25:        135          0   PCI-MSI 65537-edge      virtio1-input.2",
+					QueueIndex: 2,
+				},
+				{
+					Num:        26,
+					ProcLine:   "26:        221          0   PCI-MSI 65538-edge      virtio1-output.2",
+					QueueIndex: 2,
+				},
+			},
+		},
+		{
+			name:       "gvnic legacy",
+			driverName: "gve",
+			irqProcFile: &procFileMock{
+				getIRQProcFileLinesMap: func() (map[int]string, error) {
+					return map[int]string{
+						26: "26:        134          0   ITS-MSI   0 Edge      eth%d-ntfy-block.0",
+						27: "27:          0        201   ITS-MSI   1 Edge      eth%d-ntfy-block.1",
+						58: "58:          0          0   ITS-MSI  32 Edge      eth%d-mgmnt",
+					}, nil
+				},
+			},
+			irqDeviceInfo: &deviceInfoMock{
+				getIRQs: func(string, string) ([]int, error) {
+					return []int{26, 27, 58}, nil
+				},
+			},
+			want: []IrqInfoRes{
+				{
+					Num:        26,
+					ProcLine:   "26:        134          0   ITS-MSI   0 Edge      eth%d-ntfy-block.0",
+					QueueIndex: 0,
+				},
+				{
+					Num:        27,
+					ProcLine:   "27:          0        201   ITS-MSI   1 Edge      eth%d-ntfy-block.1",
+					QueueIndex: 0,
+				},
+			},
+		},
+		{
+			name:       "gvnic",
+			driverName: "gve",
+			irqProcFile: &procFileMock{
+				getIRQProcFileLinesMap: func() (map[int]string, error) {
+					return map[int]string{
+						168: "168:          0          0 PCI-MSIX-0000:00:08.0  30-edge      gve-ntfy-blk0@pci:0000:00:08.0",
+						169: "169:          0          0 PCI-MSIX-0000:00:08.0  31-edge      gve-ntfy-blk1@pci:0000:00:08.0",
+						170: "170:          0          0 PCI-MSIX-0000:00:08.0  32-edge      gve-mgmnt@pci:0000:00:08.0",
+					}, nil
+				},
+			},
+			irqDeviceInfo: &deviceInfoMock{
+				getIRQs: func(string, string) ([]int, error) {
+					return []int{168, 169, 170}, nil
+				},
+			},
+			want: []IrqInfoRes{
+				{
+					Num:        168,
+					ProcLine:   "168:          0          0 PCI-MSIX-0000:00:08.0  30-edge      gve-ntfy-blk0@pci:0000:00:08.0",
+					QueueIndex: 0,
+				},
+				{
+					Num:        169,
+					ProcLine:   "169:          0          0 PCI-MSIX-0000:00:08.0  31-edge      gve-ntfy-blk1@pci:0000:00:08.0",
+					QueueIndex: 0,
+				},
+			},
+		},
+		{
+			name:       "mlx5_core",
+			driverName: "mlx5_core",
+			irqProcFile: &procFileMock{
+				getIRQProcFileLinesMap: func() (map[int]string, error) {
+					return map[int]string{
+						33: "33:       1465        806  Hyper-V PCIe MSI 2701534461952-edge      mlx5_async0@pci:4ea0:00:02.0",
+						34: "34:        154       9690  Hyper-V PCIe MSI 2701534461953-edge      mlx5_comp0@pci:4ea0:00:02.0",
+						35: "35:          0         43  Hyper-V PCIe MSI 2701534461954-edge      mlx5_comp1@pci:4ea0:00:02.0",
+					}, nil
+				},
+			},
+			irqDeviceInfo: &deviceInfoMock{
+				getIRQs: func(string, string) ([]int, error) {
+					return []int{33, 34, 35}, nil
+				},
+			},
+			want: []IrqInfoRes{
+				{
+					Num:        34,
+					ProcLine:   "34:        154       9690  Hyper-V PCIe MSI 2701534461953-edge      mlx5_comp0@pci:4ea0:00:02.0",
+					QueueIndex: 0,
+				},
+				{
+					Num:        35,
+					ProcLine:   "35:          0         43  Hyper-V PCIe MSI 2701534461954-edge      mlx5_comp1@pci:4ea0:00:02.0",
+					QueueIndex: 1,
+				},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			drivernameFunc := func(string) (string, error) { return tt.driverName, nil }
 			n := &nic{
 				fs:            afero.NewMemMapFs(),
 				irqProcFile:   tt.irqProcFile,
 				irqDeviceInfo: tt.irqDeviceInfo,
-				ethtool:       &ethtoolMock{},
+				ethtool:       &ethtoolMock{driverName: drivernameFunc},
 				name:          "test0",
 			}
 			got, err := n.GetIRQs()
 			require.NoError(t, err)
-			require.Exactly(t, tt.want, got)
+			require.Exactly(t, len(tt.want), len(got))
+
+			for i := range got {
+				require.Equal(t, tt.want[i].Num, got[i].Num)
+				require.Equal(t, tt.want[i].ProcLine, got[i].ProcLine)
+				require.Equal(t, tt.want[i].QueueIndex, got[i].QueueIndex())
+			}
 		})
 	}
 }
@@ -365,5 +568,111 @@ func Test_nic_GetNTupleStatus(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tt.want, got)
 		})
+	}
+}
+
+func Test_intelIrqToQueueIdx(t *testing.T) {
+	irq := IrqInfo{
+		Num:       92,
+		ProcLine:  "92:      79079          0          0          0   PCI-MSI 1572865-edge      eth0-TxRx-3",
+		indexFunc: intelIrqToQueueIdx,
+	}
+	require.Equal(t, 3, irq.QueueIndex())
+}
+
+func Test_virtioIrqToQueueIdx(t *testing.T) {
+	{
+		irq := IrqInfo{
+			Num:       27,
+			ProcLine:  "27:          0         68   PCI-MSI 65539-edge      virtio8-input.1",
+			indexFunc: virtioIrqToQueueIdx,
+		}
+		require.Equal(t, 1, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       27,
+			ProcLine:  "27:          0         68   PCI-MSI 65539-edge      virtio77-output.18",
+			indexFunc: virtioIrqToQueueIdx,
+		}
+		require.Equal(t, 18, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       27,
+			ProcLine:  "27:          0         68   PCI-MSI 65539-edge      virtio1-config",
+			indexFunc: virtioIrqToQueueIdx,
+		}
+		require.Equal(t, math.MaxInt64, irq.QueueIndex())
+	}
+}
+
+func Test_gvnicIrqToQueueIdx(t *testing.T) {
+	{
+		irq := IrqInfo{
+			Num:       26,
+			ProcLine:  "26:        134          0   ITS-MSI   0 Edge      eth%d-ntfy-block.1",
+			indexFunc: func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, 4) },
+		}
+		require.Equal(t, 1, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       26,
+			ProcLine:  "26:        134          0   ITS-MSI   0 Edge      eth%d-ntfy-block.18",
+			indexFunc: func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, 16) },
+		}
+		require.Equal(t, 2, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       26,
+			ProcLine:  "26:        134          0   ITS-MSI   0 Edge      gve-ntfy-blk1@pci:0000:00:08.0",
+			indexFunc: func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, 4) },
+		}
+		require.Equal(t, 1, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       26,
+			ProcLine:  "26:        134          0   ITS-MSI   0 Edge      gve-ntfy-blk18@pci:0000:00:08.0",
+			indexFunc: func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, 16) },
+		}
+		require.Equal(t, 2, irq.QueueIndex())
+	}
+
+	{
+
+		irq := IrqInfo{
+			Num:       26,
+			ProcLine:  "26:        134          0   ITS-MSI   0 Edge      eth%d-mgmnt",
+			indexFunc: func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, 4) },
+		}
+		require.Equal(t, math.MaxInt64, irq.QueueIndex())
+	}
+}
+
+func Test_azureHyperVIrqToQueueIdx(t *testing.T) {
+	{
+		irq := IrqInfo{
+			Num:       34,
+			ProcLine:  "34:        154       9690  Hyper-V PCIe MSI 2701534461953-edge      mlx5_comp0@pci:4ea0:00:02.0",
+			indexFunc: azureHyperVIrqToQueueIdx,
+		}
+		require.Equal(t, 0, irq.QueueIndex())
+	}
+
+	{
+		irq := IrqInfo{
+			Num:       33,
+			ProcLine:  "33:       1465        806  Hyper-V PCIe MSI 2701534461952-edge      mlx5_async0@pci:4ea0:00:02.0",
+			indexFunc: azureHyperVIrqToQueueIdx,
+		}
+		require.Equal(t, math.MaxInt64, irq.QueueIndex())
 	}
 }

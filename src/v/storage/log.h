@@ -45,7 +45,8 @@ public:
     log& operator=(const log&) = delete;
     virtual ~log() noexcept = default;
 
-    virtual ss::future<> start(std::optional<truncate_prefix_config>) = 0;
+    virtual ss::future<>
+    start(std::optional<truncate_prefix_config>, ss::abort_source& as) = 0;
 
     // it shouldn't block for a long time as it will block other logs
     // eviction
@@ -87,7 +88,7 @@ public:
     virtual ss::future<> apply_segment_ms() = 0;
 
     virtual ss::future<model::record_batch_reader>
-      make_reader(log_reader_config) = 0;
+      make_reader(local_log_reader_config) = 0;
     virtual log_appender make_appender(log_append_config) = 0;
 
     // final operation. Invalid filesystem state after
@@ -167,6 +168,8 @@ public:
     struct offset_range_size_result_t {
         size_t on_disk_size;
         model::offset last_offset;
+        model::timestamp first_timestamp;
+        model::timestamp last_timestamp;
     };
 
     struct offset_range_size_requirements_t {
@@ -182,7 +185,7 @@ public:
     offset_range_size(
       model::offset first,
       model::offset last,
-      ss::io_priority_class io_priority)
+      ss::semaphore::time_point timeout = ss::semaphore::time_point::max())
       = 0;
 
     /// Find the offset range based on size requirements
@@ -192,12 +195,33 @@ public:
     /// acceptable size.
     virtual ss::future<std::optional<offset_range_size_result_t>>
     offset_range_size(
-      model::offset first,
-      offset_range_size_requirements_t target,
-      ss::io_priority_class io_priority)
+      model::offset first, offset_range_size_requirements_t target)
       = 0;
 
     virtual bool is_compacted(model::offset first, model::offset last) const
+      = 0;
+
+    /// Determine whether an offset range is eligible for compacted reupload by
+    /// the archival system.
+    ///
+    /// The result depends on whether sliding window compaction is enabled and
+    /// on the configured cleanup policy.
+    ///
+    /// Returns 'false' unless all segments covering the offset range are marked
+    /// compacted.
+    ///
+    /// When sliding window compaction is enabled, returns true iff:
+    ///   - delete policy: all segments are marked as having finished windowed
+    ///     compaction
+    ///   - no-delete policy: all segments have a clean compact timestamp
+    /// Otherwise returns true iff all segments have a self compact timestamp
+    virtual bool eligible_for_compacted_reupload(
+      model::offset first, model::offset last) const
+      = 0;
+
+    virtual std::optional<model::offset>
+    max_eligible_for_compacted_reupload_offset(
+      model::offset first = model::offset{0}) const
       = 0;
 
     /// Mutates the ntp_config stored in the log with the new
@@ -208,7 +232,7 @@ public:
     /// Returns true if the log compaction changed.
     virtual bool notify_compaction_update() = 0;
 
-    virtual int64_t compaction_backlog() const = 0;
+    virtual int64_t compaction_backlog() = 0;
 
     virtual ss::future<usage_report> disk_usage(gc_config) = 0;
     virtual ss::future<reclaimable_offsets>
@@ -219,7 +243,7 @@ public:
     virtual segment_set& segments() = 0;
 
     // roll immediately with the current term.
-    virtual ss::future<> force_roll(ss::io_priority_class) = 0;
+    virtual ss::future<> force_roll() = 0;
 
     virtual probe& get_probe() = 0;
 
@@ -239,7 +263,15 @@ public:
     // Returns the dirty ratio of the log. The dirty ratio is the ratio of bytes
     // in closed, dirty segments to the total number of bytes in all closed
     // segments in the log.
-    virtual double dirty_ratio() = 0;
+    virtual double dirty_ratio() const = 0;
+
+    // Return the earliest batch timestamp among all dirty segments.
+    virtual std::optional<model::timestamp>
+    earliest_dirty_segment_ts() const = 0;
+
+    virtual model::offset cleanly_compacted_prefix_offset() const = 0;
+
+    virtual bool needs_compaction() const = 0;
 
 private:
     ntp_config _config;

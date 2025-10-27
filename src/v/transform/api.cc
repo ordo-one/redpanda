@@ -11,6 +11,7 @@
 
 #include "transform/api.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "cluster/errc.h"
 #include "cluster/partition_manager.h"
 #include "cluster/plugin_frontend.h"
@@ -29,7 +30,6 @@
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
 #include "transform/logging/log_manager.h"
@@ -54,7 +54,6 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/optimized_optional.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/range/irange.hpp>
 
 #include <optional>
@@ -83,9 +82,10 @@ public:
         auto ec = co_await _client->produce(
           {_topic, partition}, std::move(batches));
         if (ec != cluster::errc::success) {
-            throw std::runtime_error(ss::format(
-              "failure to produce transform data: {}",
-              cluster::error_category().message(int(ec))));
+            throw std::runtime_error(
+              ss::format(
+                "failure to produce transform data: {}",
+                cluster::error_category().message(int(ec))));
         }
     }
 
@@ -94,8 +94,9 @@ private:
         model::topic_namespace_view ns_tp{model::kafka_namespace, _topic};
         const auto& config = _topic_table->get_topic_cfg(ns_tp);
         if (!config) {
-            throw std::runtime_error(ss::format(
-              "unable to compute output partition for topic: {}", _topic));
+            throw std::runtime_error(
+              ss::format(
+                "unable to compute output partition for topic: {}", _topic));
         }
 
         const auto* disabled_set = _topic_table->get_topic_disabled_set(ns_tp);
@@ -112,10 +113,11 @@ private:
             }
         }
 
-        throw std::runtime_error(ss::format(
-          "unable to compute output partition for topic: {}, all output "
-          "partitions disabled",
-          _topic));
+        throw std::runtime_error(
+          ss::format(
+            "unable to compute output partition for topic: {}, all output "
+            "partitions disabled",
+            _topic));
     }
 
     model::topic _topic;
@@ -149,14 +151,14 @@ public:
 
     ss::future<std::optional<kafka::offset>>
     offset_at_timestamp(model::timestamp ts, ss::abort_source* as) final {
-        auto result = co_await _partition.timequery(storage::timequery_config(
-          _partition.start_offset(),
-          ts,
-          model::offset::max(),
-          /*iop=*/wasm_read_priority(),
-          /*type_filter=*/std::nullopt,
-          /*as=*/*as,
-          /*client_addr=*/std::nullopt));
+        auto result = co_await _partition.timequery(
+          storage::timequery_config(
+            _partition.start_offset(),
+            ts,
+            model::offset::max(),
+            /*type_filter=*/std::nullopt,
+            /*as=*/*as,
+            /*client_addr=*/std::nullopt));
         if (!result.has_value()) {
             co_return std::nullopt;
         }
@@ -186,8 +188,8 @@ public:
         // It's possible to have the local log was truncated due to delete
         // records, retention, etc. In this event, simply resume from the start
         // of the log.
-        model::offset start_offset = std::max(
-          result.value(), kafka::offset_cast(offset));
+        kafka::offset start_offset = std::max(
+          model::offset_cast(result.value()), offset);
         // Clamp reads to only committed transactions.
         auto maybe_lso = _partition.last_stable_offset();
         if (!maybe_lso) {
@@ -196,7 +198,8 @@ public:
         }
         // It's possible for LSO to be 0, which in this case the previous offset
         // is model::offset::min(), this is the same as the kafka fetch path.
-        model::offset max_offset = model::prev_offset(maybe_lso.value());
+        kafka::offset max_offset = model::offset_cast(
+          model::prev_offset(maybe_lso.value()));
         // If the max offset is less than the start, it's always going to be an
         // empty read, short circuit here.
         if (max_offset < start_offset) {
@@ -208,14 +211,12 @@ public:
         // transform subsystem.
         constexpr static size_t max_bytes = 128_KiB;
         auto translater = co_await _partition.make_reader(
-          storage::log_reader_config(
+          kafka::log_reader_config(
             /*start_offset=*/start_offset,
             /*max_offset=*/max_offset,
             /*min_bytes=*/0,
             /*max_bytes=*/max_bytes,
-            /*prio=*/wasm_read_priority(),
-            /*type_filter=*/std::nullopt, // Overridden by partition
-            /*time=*/std::nullopt,        // Not doing a timequery
+            /*time=*/std::nullopt, // Not doing a timequery
             /*as=*/*as));
 
         // NOTE: It's a very important property that the source always outlives
@@ -330,9 +331,10 @@ public:
                 [&offsets, idx](auto result) {
                     if (result.has_error()) {
                         cluster::errc ec = result.error();
-                        throw std::runtime_error(ss::format(
-                          "error loading committed offset: {}",
-                          cluster::error_category().message(int(ec))));
+                        throw std::runtime_error(
+                          ss::format(
+                            "error loading committed offset: {}",
+                            cluster::error_category().message(int(ec))));
                     }
                     auto value = result.value();
                     if (value) {

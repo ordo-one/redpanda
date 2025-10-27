@@ -47,12 +47,13 @@ refresh_credentials::refresh_credentials(
   std::unique_ptr<impl> impl,
   ss::abort_source& as,
   credentials_update_cb_t creds_update,
-  aws_region_name region)
+  aws_region_name region,
+  ss::sstring metrics_tag)
   : _impl(std::move(impl))
   , _as(as)
   , _credentials_update(std::move(creds_update))
   , _region{std::move(region)}
-  , _probe(std::make_unique<auth_refresh_probe>()) {}
+  , _probe(std::make_unique<auth_refresh_probe>(std::move(metrics_tag))) {}
 
 void refresh_credentials::start() {
     _probe->setup_metrics();
@@ -345,42 +346,34 @@ ss::future<http::client> refresh_credentials::impl::make_api_client(
 }
 
 ss::future<> refresh_credentials::impl::init_tls_certs(ss::sstring name) {
-    ss::tls::credentials_builder b;
-    b.set_client_auth(ss::tls::client_auth::NONE);
-    b.set_minimum_tls_version(
-      config::from_config(config::shard_local_cfg().tls_min_version()));
+    auto truststore
+      = config::shard_local_cfg().cloud_storage_trust_file().transform(
+        [](auto& f) { return net::certificate(std::filesystem::path(f)); });
 
-    if (auto trust_file_path
-        = config::shard_local_cfg().cloud_storage_trust_file.value();
-        trust_file_path.has_value()) {
-        vlog(
-          clrl_log.info,
-          "Using non-default trust file {}",
-          trust_file_path.value());
-        co_await b.set_x509_trust_file(
-          trust_file_path.value(), ss::tls::x509_crt_format::PEM);
-    } else if (auto ca_file = co_await net::find_ca_file();
-               ca_file.has_value()) {
-        vlog(clrl_log.info, "Using discovered trust file {}", ca_file.value());
-        co_await b.set_x509_trust_file(
-          ca_file.value(), ss::tls::x509_crt_format::PEM);
-    } else {
-        vlog(clrl_log.info, "Using system default");
-        co_await b.set_system_trust();
-    }
+    auto builder = co_await net::get_credentials_builder({
+      .truststore = std::move(truststore),
+      .k_store = std::nullopt,
+      .crl = std::nullopt,
+      .min_tls_version = config::from_config(
+        config::shard_local_cfg().tls_min_version()),
+      .enable_renegotiation = false,
+      .require_client_auth = false,
+    });
 
     _tls_certs = co_await net::build_reloadable_credentials_with_probe<
       ss::tls::certificate_credentials>(
-      std::move(b), "cloud_provider_client", std::move(name));
+      std::move(builder), "cloud_provider_client", std::move(name));
 }
 
 refresh_credentials make_refresh_credentials(
   model::cloud_credentials_source cloud_credentials_source,
   ss::abort_source& as,
   credentials_update_cb_t creds_update_cb,
+  aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint,
-  retry_params retry_params) {
+  retry_params retry_params,
+  ss::sstring metrics_tag) {
     switch (cloud_credentials_source) {
     case model::cloud_credentials_source::config_file:
         vlog(
@@ -393,37 +386,47 @@ refresh_credentials make_refresh_credentials(
         return make_refresh_credentials<aws_refresh_impl>(
           as,
           std::move(creds_update_cb),
+          std::move(service),
           std::move(region),
           std::move(endpoint),
-          retry_params);
+          retry_params,
+          std::move(metrics_tag));
     case model::cloud_credentials_source::sts:
         return make_refresh_credentials<aws_sts_refresh_impl>(
           as,
           std::move(creds_update_cb),
+          std::move(service),
           std::move(region),
           std::move(endpoint),
-          retry_params);
+          retry_params,
+          std::move(metrics_tag));
     case model::cloud_credentials_source::gcp_instance_metadata:
         return make_refresh_credentials<gcp_refresh_impl>(
           as,
           std::move(creds_update_cb),
+          std::move(service),
           std::move(region),
           std::move(endpoint),
-          retry_params);
+          retry_params,
+          std::move(metrics_tag));
     case model::cloud_credentials_source::azure_aks_oidc_federation:
         return make_refresh_credentials<azure_aks_refresh_impl>(
           as,
           std::move(creds_update_cb),
+          std::move(service),
           std::move(region),
           std::move(endpoint),
-          retry_params);
+          retry_params,
+          std::move(metrics_tag));
     case model::cloud_credentials_source::azure_vm_instance_metadata:
         return make_refresh_credentials<azure_vm_refresh_impl>(
           as,
           std::move(creds_update_cb),
+          std::move(service),
           std::move(region),
           std::move(endpoint),
-          retry_params);
+          retry_params,
+          std::move(metrics_tag));
     }
 }
 

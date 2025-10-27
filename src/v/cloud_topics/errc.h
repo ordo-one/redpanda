@@ -11,18 +11,19 @@
 
 #include <system_error>
 
-namespace experimental::cloud_topics {
+namespace cloud_topics {
 
 enum class errc : int16_t {
     success,
     timeout,
-    upload_failure,     // Generic upload error
-    shutting_down,      // Umbrella shutdown error
-    cache_read_error,   // Failed to read data from cache
-    cache_write_error,  // Failed to write data to the cache
-    download_not_found, // 404 response during the download
-    download_failure,   // Generic download failure
-    slow_down,          // Cloud-storage throttling response
+    upload_failure,      // Generic upload error
+    failed_to_get_epoch, // failed to get cluster_epoch
+    shutting_down,       // Umbrella shutdown error
+    cache_read_error,    // Failed to read data from cache
+    cache_write_error,   // Failed to write data to the cache
+    download_not_found,  // 404 response during the download
+    download_failure,    // Generic download failure
+    slow_down,           // Cloud-storage throttling response
     unexpected_failure,
 };
 
@@ -39,6 +40,8 @@ struct errc_category final : public std::error_category {
             return "upload_failure";
         case errc::shutting_down:
             return "shutting_down";
+        case errc::failed_to_get_epoch:
+            return "failed_to_get_epoch";
         case errc::cache_read_error:
             return "cache_read_error";
         case errc::cache_write_error:
@@ -63,8 +66,8 @@ inline const std::error_category& error_category() noexcept {
 inline std::error_code make_error_code(errc e) noexcept {
     return {static_cast<int>(e), error_category()};
 }
-} // namespace experimental::cloud_topics
+} // namespace cloud_topics
 namespace std {
 template<>
-struct is_error_code_enum<experimental::cloud_topics::errc> : true_type {};
+struct is_error_code_enum<cloud_topics::errc> : true_type {};
 } // namespace std

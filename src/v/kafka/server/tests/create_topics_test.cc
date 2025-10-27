@@ -7,9 +7,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/leaders_preference.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/enterprise_feature_messages.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/errors.h"
@@ -17,6 +18,9 @@
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/tests/topic_properties_helpers.h"
 #include "model/errc.h"
+#include "model/metadata.h"
+#include "model/namespace.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
@@ -88,6 +92,7 @@ public:
       kafka::create_topics_request req,
       kafka::api_version version = kafka::api_version(2)) {
         auto client = make_kafka_client().get();
+        auto deferred_close = ss::defer([&client] { client.stop().get(); });
         client.connect().get();
         auto topics = req.data.topics
                         .copy(); // save a copy because we will move out of req
@@ -121,8 +126,6 @@ public:
             // that the topic creation is correctly propogated to the
             // non-controller broker.
         }
-
-        client.stop().then([&client] { client.shutdown(); }).get();
     }
 
     void verify_response(
@@ -159,8 +162,9 @@ public:
         auto cfg = app.metadata_cache.local().get_topic_cfg(
           model::topic_namespace_view{model::kafka_namespace, topic_res.name});
         BOOST_TEST(cfg, "missing topic config");
-        auto cfg_map = config_map(kafka::report_topic_configs(
-          app.metadata_cache.local(), cfg->properties));
+        auto cfg_map = config_map(
+          kafka::report_topic_configs(
+            app.metadata_cache.local(), cfg->properties));
         BOOST_TEST(cfg_map == resp_cfgs, "configs didn't match");
         BOOST_CHECK_EQUAL(
           topic_res.topic_config_error_code, kafka::error_code::none);
@@ -175,7 +179,7 @@ public:
         metadata_req.data.topics
           = std::make_optional<chunked_vector<kafka::metadata_request_topic>>();
         metadata_req.data.topics->push_back(
-          kafka::metadata_request_topic{request_topic.name});
+          kafka::metadata_request_topic{.name{request_topic.name}});
         auto metadata_resp
           = client.dispatch(std::move(metadata_req), kafka::api_version(1))
               .get();
@@ -303,6 +307,7 @@ FIXTURE_TEST(read_replica_and_remote_write, create_topic_fixture) {
         {"redpanda.remote.write", "true"}});
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp = client.dispatch(make_req({topic}), kafka::api_version(2)).get();
 
@@ -349,6 +354,7 @@ FIXTURE_TEST(create_multiple_topics_mixed_invalid, create_topic_fixture) {
         {"retention.bytes", "this_should_be_an_integer"}});
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp = client
                   .dispatch(make_req({topic_a, topic_b}), kafka::api_version(5))
@@ -386,6 +392,7 @@ FIXTURE_TEST(create_multiple_topics_all_invalid, create_topic_fixture) {
       std::map<ss::sstring, ss::sstring>{{"segment.ms", "0x2A"}});
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp = client
                   .dispatch(
@@ -422,6 +429,7 @@ FIXTURE_TEST(create_multiple_topics_all_invalid_name, create_topic_fixture) {
     auto topic_invalid = make_topic("$nope");
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp
       = client
@@ -464,6 +472,7 @@ FIXTURE_TEST(invalid_boolean_property, create_topic_fixture) {
         {"redpanda.remote.write", "affirmative"}});
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp = client.dispatch(make_req({topic}), kafka::api_version(5)).get();
 
@@ -484,6 +493,7 @@ FIXTURE_TEST(case_insensitive_boolean_property, create_topic_fixture) {
         {"redpanda.remote.write", "tRuE"}, {"redpanda.remote.read", "FALSE"}});
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
     auto resp = client.dispatch(make_req({topic}), kafka::api_version(5)).get();
 
@@ -515,6 +525,7 @@ FIXTURE_TEST(unlicensed_permit_if_config_disabled, create_topic_fixture) {
         kafka::topic_property_record_value_schema_id_validation_compat, true)};
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
 
     for (const auto& [name, props] : enterprise_props) {
@@ -569,6 +580,7 @@ FIXTURE_TEST(unlicensed_rejected, create_topic_fixture) {
           .racks = {model::rack_id{"A"}}})};
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
 
     for (const auto& [name, props] : enterprise_props) {
@@ -601,6 +613,7 @@ FIXTURE_TEST(unlicensed_reject_defaults, create_topic_fixture) {
       lconf().cloud_storage_enable_remote_write.name()};
 
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
 
     for (const auto& config : si_configs) {
@@ -620,6 +633,7 @@ FIXTURE_TEST(unlicensed_reject_defaults, create_topic_fixture) {
 
 FIXTURE_TEST(create_dry_run_rejects_existing, create_topic_fixture) {
     auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
     client.connect().get();
 
     auto topic = make_topic(ssx::sformat("topic_foo"));
@@ -650,4 +664,30 @@ FIXTURE_TEST(create_dry_run_rejects_existing, create_topic_fixture) {
              .get();
     BOOST_REQUIRE_EQUAL(
       resp.data.topics[0].error_code, kafka::error_code::topic_already_exists);
+}
+
+FIXTURE_TEST(create_topic_assigns_topic_id, create_topic_fixture) {
+    auto client = make_kafka_client().get();
+    auto deferred_close = ss::defer([&client] { client.stop().get(); });
+    client.connect().get();
+
+    auto topic = make_topic(ssx::sformat("topic_foo"));
+
+    // create the topic
+    auto resp = client
+                  .dispatch(
+                    make_req({topic}, /*validate_only = */ false),
+                    kafka::api_version(7))
+                  .get();
+    BOOST_REQUIRE_EQUAL(
+      resp.data.topics[0].error_code, kafka::error_code::none);
+
+    auto tpn = model::topic_namespace{
+      model::kafka_namespace, model::topic{"topic_foo"}};
+    auto md = app.controller->get_topics_state().local().get_topic_metadata(
+      tpn);
+    BOOST_REQUIRE(md.has_value());
+    auto tp_id = md->get_configuration().tp_id;
+    BOOST_REQUIRE(tp_id.has_value());
+    BOOST_REQUIRE_EQUAL(resp.data.topics[0].topic_id, *tp_id);
 }

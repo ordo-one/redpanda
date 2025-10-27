@@ -82,6 +82,10 @@ public:
         co_await _in.close();
     }
 
+    bool attached(unsigned index) const {
+        return (_bitmask & (1U << index)) == 0;
+    }
+
     /// Detach client with 'index' from the fanout
     ///
     /// The remaining clients can proceed as usual.
@@ -193,10 +197,11 @@ private:
                     buf = co_await _in.read_up_to(_max_size);
                 }
                 ++_cnt;
-                _buffer.push_back(data_item{
-                  .buf = std::move(buf),
-                  .units = std::move(units),
-                  .mask = _bitmask});
+                _buffer.push_back(
+                  data_item{
+                    .buf = std::move(buf),
+                    .units = std::move(units),
+                    .mask = _bitmask});
                 _pcond.broadcast();
             }
         } catch (...) {
@@ -224,10 +229,20 @@ struct fanout_data_source final : ss::data_source_impl {
       : _isf(std::move(i))
       , _id{source_id} {}
 
+    ~fanout_data_source() final {
+        // Close must have been called before the destructor otherwise we get a
+        // deadlock as the ring buffer is full and we're still expecting
+        // consumption from it.
+        vassert(
+          !_isf->attached(_id),
+          "fanout_data_source destructor called while the source is "
+          "still attached to the fanout");
+    }
+
     ss::future<> close() final { co_await _isf->detach(_id); }
 
     ss::future<ss::temporary_buffer<char>> skip(uint64_t) final {
-        vassert(false, "Not supported");
+        vunreachable("Not supported");
     }
     ss::future<ss::temporary_buffer<char>> get() final {
         co_return co_await _isf->get(_id);

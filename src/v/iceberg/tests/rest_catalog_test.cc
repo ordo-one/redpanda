@@ -8,10 +8,12 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "absl/strings/str_split.h"
 #include "bytes/iobuf_parser.h"
 #include "cloud_io/tests/s3_imposter.h"
 #include "cloud_io/tests/scoped_remote.h"
 #include "config/types.h"
+#include "datalake/credential_manager.h"
 #include "iceberg/json_writer.h"
 #include "iceberg/rest_catalog.h"
 #include "iceberg/rest_client/catalog_client.h"
@@ -20,7 +22,7 @@
 
 #include <seastar/core/sleep.hh>
 
-#include <absl/strings/str_split.h>
+#include <boost/range/irange.hpp>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -66,16 +68,19 @@ struct RestCatalogTest
         return std::make_unique<iceberg::rest_client::catalog_client>(
           std::move(http_client),
           endpoint,
+          mock_credential_manager,
           get_credentials(),
           iceberg::rest_client::base_path{"/catalog"},
           iceberg::rest_client::warehouse{"x"},
           iceberg::rest_client::api_version("v1"),
           std::nullopt,
           nullptr,
-          config::datalake_catalog_auth_mode::oauth2);
+          config::datalake_catalog_auth_mode::oauth2,
+          nullptr);
     }
     std::unique_ptr<cloud_io::scoped_remote> sr;
     iceberg::manifest_io io;
+    datalake::credential_manager mock_credential_manager;
 };
 AssertionResult query_params_equal(
   absl::flat_hash_map<ss::sstring, ss::sstring> expected,
@@ -122,8 +127,7 @@ ss::future<http::downloaded_response> handle_token_request(
       "application/x-www-form-urlencoded");
 
     EXPECT_TRUE(payload.has_value());
-    iobuf_parser parser{std::move(payload.value())};
-    auto received = parser.read_string(parser.bytes_left());
+    auto received = payload.value().linearize_to_string();
 
     EXPECT_TRUE(query_params_equal(
       absl::flat_hash_map<ss::sstring, ss::sstring>{
@@ -165,34 +169,38 @@ static constexpr std::string_view table_metadata = R"J(
 chunked_vector<iceberg::schema> create_test_schemas() {
     iceberg::struct_type schema_struct;
 
-    schema_struct.fields.push_back(iceberg::nested_field::create(
-      iceberg::nested_field::id_t(1),
-      "name",
-      iceberg::field_required::yes,
-      iceberg::string_type{}));
-    schema_struct.fields.push_back(iceberg::nested_field::create(
-      iceberg::nested_field::id_t(2),
-      "age",
-      iceberg::field_required::yes,
-      iceberg::int_type{}));
+    schema_struct.fields.push_back(
+      iceberg::nested_field::create(
+        iceberg::nested_field::id_t(1),
+        "name",
+        iceberg::field_required::yes,
+        iceberg::string_type{}));
+    schema_struct.fields.push_back(
+      iceberg::nested_field::create(
+        iceberg::nested_field::id_t(2),
+        "age",
+        iceberg::field_required::yes,
+        iceberg::int_type{}));
     chunked_vector<iceberg::schema> ret;
-    ret.push_back(iceberg::schema{
-      .schema_struct = std::move(schema_struct),
-      .schema_id = iceberg::schema::id_t{1},
-    });
+    ret.push_back(
+      iceberg::schema{
+        .schema_struct = std::move(schema_struct),
+        .schema_id = iceberg::schema::id_t{1},
+      });
     return ret;
 }
 
 chunked_vector<iceberg::partition_spec> create_test_partition_spec() {
     chunked_vector<iceberg::partition_spec> ret;
-    ret.push_back(iceberg::partition_spec{
-      .spec_id = iceberg::partition_spec::id_t{1},
-      .fields = {iceberg::partition_field{
-        .source_id = iceberg::nested_field::id_t{2},
-        .field_id = iceberg::partition_field::id_t{1000},
-        .name = "partition_by_age",
-        .transform = iceberg::identity_transform{},
-      }}});
+    ret.push_back(
+      iceberg::partition_spec{
+        .spec_id = iceberg::partition_spec::id_t{1},
+        .fields = {iceberg::partition_field{
+          .source_id = iceberg::nested_field::id_t{2},
+          .field_id = iceberg::partition_field::id_t{1000},
+          .name = "partition_by_age",
+          .transform = iceberg::identity_transform{},
+        }}});
     return ret;
 }
 
@@ -202,12 +210,13 @@ chunked_vector<iceberg::sort_order> create_sort_orders() {
       .order_id = iceberg::sort_order::id_t{3},
       .fields = {},
     };
-    so.fields.push_back(iceberg::sort_field{
-      .transform = iceberg::identity_transform{},
-      .source_ids = {iceberg::nested_field::id_t{2}},
-      .direction = iceberg::sort_direction::asc,
-      .null_order = iceberg::null_order::nulls_first,
-    });
+    so.fields.push_back(
+      iceberg::sort_field{
+        .transform = iceberg::identity_transform{},
+        .source_ids = {iceberg::nested_field::id_t{2}},
+        .direction = iceberg::sort_direction::asc,
+        .null_order = iceberg::null_order::nulls_first,
+      });
     ret.push_back(std::move(so));
 
     return ret;
@@ -226,9 +235,8 @@ iceberg::table_metadata create_table_metadata() {
       .partition_specs = create_test_partition_spec(),
       .default_spec_id = iceberg::partition_spec::id_t{1},
       .last_partition_id = iceberg::partition_field::id_t{1},
-      .properties = chunked_hash_map<
-        ss::sstring,
-        ss::sstring>{{"read.split.target.size", "134217728"}},
+      .properties
+      = iceberg::table_properties_t{{"read.split.target.size", "134217728"}},
       .current_snapshot_id = iceberg::snapshot_id(200),
       .snapshots = chunked_vector<iceberg::snapshot>{iceberg::snapshot{
         .id = iceberg::snapshot_id{200},
@@ -329,8 +337,9 @@ TEST_F(RestCatalogTest, CheckLoadTableHappyPath) {
       std::move(client), config::mock_binding<std::chrono::milliseconds>(10s));
 
     auto metadata = catalog
-                      .load_table(iceberg::table_identifier{
-                        .ns = {"foo", "bar", "baz"}, .table = "panda_table"})
+                      .load_table(
+                        iceberg::table_identifier{
+                          .ns = {"foo", "bar", "baz"}, .table = "panda_table"})
                       .get();
 
     ASSERT_TRUE(metadata.has_value());
@@ -412,8 +421,7 @@ ss::future<http::downloaded_response> handle_commit_table_txn(
   std::optional<iobuf> payload,
   [[maybe_unused]] ss::lowres_clock::duration timeout) {
     EXPECT_TRUE(payload.has_value());
-    iobuf_parser parser(std::move(*payload));
-    auto json_str = parser.read_string(parser.bytes_left());
+    auto json_str = payload->linearize_to_string();
     json::Document doc;
     doc.Parse(json_str);
     // validate that the request is a valid json
@@ -438,9 +446,8 @@ iceberg::table_metadata create_empty_table_metadata(const ss::sstring& bucket) {
       .partition_specs = create_test_partition_spec(),
       .default_spec_id = iceberg::partition_spec::id_t{1},
       .last_partition_id = iceberg::partition_field::id_t{1},
-      .properties = chunked_hash_map<
-        ss::sstring,
-        ss::sstring>{{"read.split.target.size", "134217728"}},
+      .properties
+      = iceberg::table_properties_t{{"read.split.target.size", "134217728"}},
       .current_snapshot_id = std::nullopt,
       .snapshots = chunked_vector<iceberg::snapshot>{},
       .sort_orders = create_sort_orders(),
@@ -481,11 +488,12 @@ TEST_F(RestCatalogTest, CommitTxnHappyPath) {
       .file_format = iceberg::data_file_format::parquet,
       .partition = iceberg::partition_key{.val = std::move(partition_key_val)},
     };
-    files.push_back(iceberg::file_to_append{
-      .file = std::move(file),
-      .schema_id = txn.table().current_schema_id,
-      .partition_spec_id = txn.table().default_spec_id,
-    });
+    files.push_back(
+      iceberg::file_to_append{
+        .file = std::move(file),
+        .schema_id = txn.table().current_schema_id,
+        .partition_spec_id = txn.table().default_spec_id,
+      });
 
     auto outcome = txn.merge_append(io, std::move(files)).get();
     ASSERT_FALSE(outcome.has_error());

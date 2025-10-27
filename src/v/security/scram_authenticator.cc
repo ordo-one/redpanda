@@ -11,7 +11,7 @@
 #include "security/scram_authenticator.h"
 
 #include "base/vlog.h"
-#include "random/generators.h"
+#include "random/secure_generators.h"
 #include "security/credential_store.h"
 #include "security/errc.h"
 #include "security/logger.h"
@@ -37,7 +37,17 @@ scram_authenticator<T>::handle_client_first(bytes_view auth_bytes) {
       acl_principal{principal_type::user, authid});
     _credential = std::make_unique<scram_credential>(std::move(*credential));
     _audit_user.name = _principal.name();
-    _audit_user.type_id = audit::user::type::user;
+    const auto principal_type_to_audit_type = [](principal_type type) {
+        switch (type) {
+        case principal_type::user:
+            return audit::user::type::user;
+        case principal_type::ephemeral_user:
+            return audit::user::type::system;
+        case principal_type::role:
+            return audit::user::type::other;
+        }
+    };
+    _audit_user.type_id = principal_type_to_audit_type(_principal.type());
 
     if (
       !_client_first->authzid().empty() && _client_first->authzid() != authid) {
@@ -56,7 +66,7 @@ scram_authenticator<T>::handle_client_first(bytes_view auth_bytes) {
     // build server reply
     _server_first = std::make_unique<server_first_message>(
       _client_first->nonce(),
-      random_generators::gen_alphanum_string(nonce_size, true),
+      random_generators::gen_alphanum_string_secure(nonce_size),
       _credential->salt(),
       _credential->iterations());
 

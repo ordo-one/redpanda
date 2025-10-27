@@ -20,6 +20,8 @@ on:
       - '**.proto'
       - '**.java'
       - '.github/workflows/lint-cpp.yml'
+  merge_group:
+    types: [checks_requested]
 jobs:
   cpp:
     name: Lint files with clang-format
@@ -27,12 +29,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install Baselisk
-        run: |
-          mkdir -v -p $HOME/.local/bin
-          wget -O $HOME/.local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
-          chmod +x $HOME/.local/bin/bazel
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          # Avoid downloading Bazel every time.
+          bazelisk-cache: true
+          # Share repository cache between workflows.
+          repository-cache: true
       - name: Run clang-format
+        env:
+          # Bazel uses this to enforce strict sandboxing - we can't do it in Github Actions,
+          # so set CI=false to disable the check we do in `//tools:bazel`
+          CI: false
         # Don't update the lockfile for this
         run: |
           bazel run --lockfile_mode=off //tools:clang_format

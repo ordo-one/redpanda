@@ -89,7 +89,7 @@ std::optional<adjacent_segment_run> adjacent_segment_merger::scan_manifest(
         so = std::max(
           manifest.get_start_offset().value_or(local_start_offset),
           local_start_offset);
-    } else {
+    } else if (!_is_local) {
         // Remote lookup, start from start offset in the manifest (or 0)
         so = _archiver.manifest().get_start_offset().value_or(model::offset{0});
     }
@@ -105,7 +105,8 @@ std::optional<adjacent_segment_run> adjacent_segment_merger::scan_manifest(
 
     adjacent_segment_run run(_archiver.get_ntp());
 
-    for (auto it = manifest.segment_containing(so); it != manifest.end();
+    for (auto it = manifest.segment_containing(so), end_it = manifest.end();
+         it != end_it;
          ++it) {
         if (!_is_local && it->committed_offset >= local_start_offset) {
             // We're looking for the remote segment
@@ -173,6 +174,15 @@ adjacent_segment_merger::run(run_quota_t quota) {
         co_return result;
     }
 
+    if (_archiver.ntp_config().is_locally_compacted()) {
+        // This should never happen because we should not have been constructed
+        // for a compacted topic: this is a double-check for safety.
+        vlog(
+          _ctxlog.error,
+          "Adjacent segment merging refusing to run on compacted topic");
+        co_return result;
+    }
+
     if (_archiver.ntp_config().is_read_replica_mode_enabled()) {
         // This should never happen because we should not have been constructed
         // for a read replica topic: this is a double-check for safety.
@@ -213,28 +223,31 @@ adjacent_segment_merger::run(run_quota_t quota) {
                          const cloud_storage::partition_manifest& manifest) {
             return scan_manifest(local_start_offset, manifest);
         };
-        auto find_res = co_await _archiver.find_reupload_candidate(scanner);
-        if (!find_res.locks.has_value()) {
+        auto find_res = co_await _archiver.find_reupload_candidate(
+          scanner, _as);
+        if (find_res.skip_to.has_value()) {
+            vlog(
+              _ctxlog.debug,
+              "Scanned invalid run, skip to {}",
+              find_res.skip_to);
+            _last = model::next_offset(find_res.skip_to.value());
+            co_return result;
+        }
+        if (!find_res.upload_stream.has_value()) {
             vlog(_ctxlog.debug, "No more upload candidates");
             co_return result;
         }
         vassert(find_res.units.has_value(), "Must take archiver units");
-        auto next = model::next_offset(find_res.locks->candidate.final_offset);
+        auto next = model::next_offset(
+          find_res.upload_stream.value().end_offset);
         vlog(
           _ctxlog.debug,
-          "Going to upload segment {}, num source segments {}, last offset {}, "
-          "read-write-fence value: {}",
-          find_res.locks->candidate.exposed_name,
-          find_res.locks->candidate.sources.size(),
-          find_res.locks->candidate.final_offset,
+          "Going to upload segment {}, upload size in bytes: {}, "
+          "last offset: {}, read-write-fence value: {}",
+          _archiver.segment_name_for_stream(find_res.upload_stream.value()),
+          find_res.upload_stream.value().size,
+          find_res.upload_stream.value().end_offset,
           find_res.read_write_fence.read_write_fence);
-        for (const auto& src : find_res.locks->candidate.sources) {
-            vlog(
-              _ctxlog.debug,
-              "Local log segment {} found, size {}",
-              src->filename(),
-              src->size_bytes());
-        }
 
         auto uploaded = co_await _archiver.upload(
           std::move(find_res), std::ref(_root_rtc));

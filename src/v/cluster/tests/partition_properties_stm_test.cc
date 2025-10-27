@@ -8,11 +8,13 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
+#include "absl/container/flat_hash_set.h"
 #include "bytes/iobuf.h"
 #include "cluster/logger.h"
 #include "cluster/partition_properties_stm.h"
 #include "cluster/tests/raft_fixture_retry_policy.h"
 #include "config/mock_property.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
@@ -24,11 +26,9 @@
 #include "test_utils/async.h"
 #include "test_utils/test.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/file.hh>
 
-#include <absl/container/flat_hash_set.h>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -115,10 +115,13 @@ struct partition_properties_stm_fixture : raft::raft_fixture {
                          .count = 10,
                          .records = 50,
                        })
-                .then([&](ss::circular_buffer<model::record_batch> batches) {
+                .then([&](
+                        chunked_circular_buffer<model::record_batch> batches) {
                     return leader_node.raft()
                       ->replicate(
-                        chunked_vector<model::record_batch>(std::move(batches)),
+                        chunked_vector<model::record_batch>(
+                          std::from_range,
+                          std::move(batches) | std::views::as_rvalue),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack))
                       .then([](result<raft::replicate_result> res) {
@@ -236,12 +239,12 @@ TEST_F_CORO(partition_properties_stm_fixture, test_snapshot) {
 
     auto snap_before_disabled
       = partition_properties_stm_accessor::snap_from_iobuf(
-        co_await get_leader_stm()->take_snapshot(o));
+        co_await get_leader_stm()->take_raft_snapshot(o));
     ASSERT_EQ_CORO(
       snap_before_disabled.writes_disabled, stm_t::writes_disabled::no);
     // take snapshot at disable command offset
     auto snap_at_disabled = partition_properties_stm_accessor::snap_from_iobuf(
-      co_await get_leader_stm()->take_snapshot(
+      co_await get_leader_stm()->take_raft_snapshot(
         model::next_offset(before_disabled.value())));
     ASSERT_EQ_CORO(
       snap_at_disabled.writes_disabled, stm_t::writes_disabled::yes);
@@ -251,12 +254,12 @@ TEST_F_CORO(partition_properties_stm_fixture, test_snapshot) {
       before_enabled.value(), before_disabled.value() + model::offset(2));
     auto snap_before_enabled
       = partition_properties_stm_accessor::snap_from_iobuf(
-        co_await get_leader_stm()->take_snapshot(o));
+        co_await get_leader_stm()->take_raft_snapshot(o));
     ASSERT_EQ_CORO(
       snap_before_enabled.writes_disabled, stm_t::writes_disabled::yes);
 
     auto snap_at_enabled = partition_properties_stm_accessor::snap_from_iobuf(
-      co_await get_leader_stm()->take_snapshot(
+      co_await get_leader_stm()->take_raft_snapshot(
         model::next_offset(before_enabled.value())));
     ASSERT_EQ_CORO(snap_at_enabled.writes_disabled, stm_t::writes_disabled::no);
 
@@ -265,7 +268,7 @@ TEST_F_CORO(partition_properties_stm_fixture, test_snapshot) {
       before_enabled.value() + model::offset(2));
     auto snap_after_enabled
       = partition_properties_stm_accessor::snap_from_iobuf(
-        co_await get_leader_stm()->take_snapshot(
+        co_await get_leader_stm()->take_raft_snapshot(
           model::next_offset(before_enabled.value())));
     ASSERT_EQ_CORO(
       snap_after_enabled.writes_disabled, stm_t::writes_disabled::no);

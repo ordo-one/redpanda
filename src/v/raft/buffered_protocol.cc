@@ -74,15 +74,14 @@ buffered_protocol::buffered_protocol(
   ss::scheduling_group sg,
   consensus_client_protocol base,
   config::binding<size_t> max_inflight_requests,
-  config::binding<size_t> max_buffered_bytes)
+  config::binding<size_t> max_buffered_bytes,
+  std::chrono::milliseconds gc_interval)
   : _sg(sg)
   , _base_protocol(std::move(base))
   , _max_inflight_requests(std::move(max_inflight_requests))
   , _max_buffered_bytes(std::move(max_buffered_bytes))
   , _gc_timer([this] { garbage_collect_unused_queues(); }) {
-    // the timer interval doesn't have to be configurable, it would be
-    // additional configuration parameter, the queues doesn't change too often
-    _gc_timer.arm_periodic(10s);
+    _gc_timer.arm_periodic(gc_interval);
 }
 
 ss::future<result<vote_reply>> buffered_protocol::vote(
@@ -119,6 +118,9 @@ ss::future<result<append_entries_reply>> buffered_protocol::append_entries(
                   _max_inflight_requests,
                   _max_buffered_bytes));
           }
+          // do not introduce a scheduling point here, the gate has to be held
+          // in the same scheduling point so this group is not considered a
+          // candidate for GC.
           return it->second->append_entries(std::move(req), std::move(opts));
       });
 };
@@ -183,6 +185,48 @@ buffered_protocol::transfer_leadership(
       &consensus_client_protocol::transfer_leadership);
 }
 
+ss::future<result<remake_learner_state_reply>>
+buffered_protocol::remake_learner_state(
+  model::node_id target_node,
+  remake_learner_state_request req,
+  rpc::client_opts opts) {
+    return apply_with_gate(
+      _gate,
+      _base_protocol,
+      target_node,
+      std::move(req),
+      std::move(opts),
+      &consensus_client_protocol::remake_learner_state);
+}
+
+ss::future<result<get_compaction_mcco_reply>>
+buffered_protocol::get_compaction_mcco(
+  model::node_id target_node,
+  get_compaction_mcco_request req,
+  rpc::client_opts opts) {
+    return apply_with_gate(
+      _gate,
+      _base_protocol,
+      target_node,
+      std::move(req),
+      std::move(opts),
+      &consensus_client_protocol::get_compaction_mcco);
+}
+
+ss::future<result<distribute_compaction_mtro_reply>>
+buffered_protocol::distribute_compaction_mtro(
+  model::node_id target_node,
+  distribute_compaction_mtro_request req,
+  rpc::client_opts opts) {
+    return apply_with_gate(
+      _gate,
+      _base_protocol,
+      target_node,
+      std::move(req),
+      std::move(opts),
+      &consensus_client_protocol::distribute_compaction_mtro);
+}
+
 ss::future<bool> buffered_protocol::ensure_disconnect(model::node_id node_id) {
     return _base_protocol.ensure_disconnect(node_id);
 }
@@ -209,7 +253,6 @@ void buffered_protocol::garbage_collect_unused_queues() {
     for (auto it = _append_entries_queues.begin(),
               last = _append_entries_queues.end();
          it != last;) {
-        it->second->log_status();
         if (it->second->is_idle()) {
             std::unique_ptr<internal::append_entries_queue> queue;
             queue.swap(it->second);
@@ -315,7 +358,8 @@ bool append_entries_queue::can_buffer_next_request(size_t size) const {
 }
 bool append_entries_queue::is_idle() const {
     static constexpr auto queue_idle_timeout = 30s;
-    return _requests.empty() && inflight_requests() == 0
+    return _gate.get_count() == 0 && _requests.empty()
+           && inflight_requests() == 0
            && _last_sent_timestamp < clock_type::now() - queue_idle_timeout;
 }
 
@@ -354,15 +398,6 @@ ss::future<> append_entries_queue::stop() {
       [this] { vlog(_logger.debug, "stopped queue"); });
 }
 
-void append_entries_queue::log_status() const {
-    vlog(
-      _logger.info,
-      "inflight requests: {}, buffered requests: {}, buffered_bytes: {}",
-      inflight_requests(),
-      _requests.size(),
-      _buffered_bytes);
-}
-
 void append_entries_queue::setup_internal_metrics() {
     namespace sm = ss::metrics;
 
@@ -375,8 +410,9 @@ void append_entries_queue::setup_internal_metrics() {
       {sm::make_gauge(
          "inflight_requests",
          [this] { return inflight_requests(); },
-         sm::description("Number of append entries requests that were sent to "
-                         "the target node and are awaiting responses."),
+         sm::description(
+           "Number of append entries requests that were sent to "
+           "the target node and are awaiting responses."),
          {target_node_id_label}),
        sm::make_gauge(
          "buffered_bytes",

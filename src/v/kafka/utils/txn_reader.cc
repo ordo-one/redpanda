@@ -11,6 +11,7 @@
 
 #include "txn_reader.h"
 
+#include "absl/container/btree_set.h"
 #include "kafka/data/partition_proxy.h"
 #include "model/fundamental.h"
 #include "model/record.h"
@@ -21,8 +22,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/util/variant_utils.hh>
-
-#include <absl/container/btree_set.h>
 
 #include <functional>
 #include <memory>
@@ -174,8 +173,7 @@ std::unique_ptr<model::record_batch_reader::impl> make_txn_filtered_reader(
         }
         filtered.push_back(std::move(batch));
     }
-    return model::make_fragmented_memory_record_batch_reader(
-             std::move(filtered))
+    return model::make_chunked_memory_record_batch_reader(std::move(filtered))
       .release();
 }
 

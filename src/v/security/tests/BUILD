@@ -3,14 +3,16 @@ load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_
 redpanda_test_cc_library(
     name = "utils",
     hdrs = [
+        "license_utils.h",
         "randoms.h",
     ],
-    include_prefix = "security/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/security",
+        "//src/v/security:license",
         "//src/v/test_utils:random",
         "//src/v/test_utils:random_bytes",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
@@ -64,7 +66,7 @@ redpanda_cc_btest(
     ],
 )
 
-redpanda_cc_btest(
+redpanda_cc_gtest(
     name = "authorizer_test",
     timeout = "short",
     srcs = [
@@ -72,14 +74,16 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/config",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/random:generators",
         "//src/v/security",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "//src/v/utils:base64",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@boost//:algorithm",
-        "@boost//:test",
         "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
         "@seastar//:testing",
     ],
 )
@@ -101,21 +105,6 @@ redpanda_cc_btest(
         "@fmt",
         "@seastar",
         "@seastar//:testing",
-    ],
-)
-
-redpanda_cc_btest(
-    name = "license_test",
-    timeout = "short",
-    srcs = [
-        "license_test.cc",
-    ],
-    deps = [
-        "//src/v/security:license",
-        "//src/v/test_utils:seastar_boost",
-        "@boost//:date_time",
-        "@boost//:filesystem",
-        "@boost//:test",
     ],
 )
 
@@ -227,5 +216,36 @@ redpanda_cc_bench(
         "@boost//:range",
         "@seastar",
         "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "acl_serde_test",
+    timeout = "short",
+    srcs = [
+        "acl_serde_test.cc",
+    ],
+    deps = [
+        ":utils",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/security",
+        "//src/v/serde",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "license_test",
+    timeout = "short",
+    srcs = [
+        "license_test.cc",
+    ],
+    deps = [
+        ":utils",
+        "//src/v/security:license",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
     ],
 )

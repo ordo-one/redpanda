@@ -24,11 +24,10 @@ partition_probe::partition_probe(const model::ntp& ntp) {
     }
 
     namespace sm = ss::metrics;
-    const auto partition_label = sm::label("partition");
     const std::vector<sm::label_instance> partition_labels = {
-      sm::label("namespace")(ntp.ns()),
-      sm::label("topic")(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 
     _metrics.add_group(
@@ -53,7 +52,7 @@ partition_probe::partition_probe(const model::ntp& ntp) {
           partition_labels),
       },
       {sm::shard_label},
-      {sm::shard_label, partition_label});
+      {sm::shard_label, metrics::partition_label});
 }
 
 ts_read_path_probe::ts_read_path_probe() {
@@ -113,8 +112,9 @@ ts_read_path_probe::ts_read_path_probe() {
             sm::make_counter(
               "spillover_manifest_materialized",
               [this] { return _spillover_manifest_materialized; },
-              sm::description("Number of times spillover manifests were loaded "
-                              "from the cache"))
+              sm::description(
+                "Number of times spillover manifests were loaded "
+                "from the cache"))
               .aggregate(aggregate_labels),
 
             sm::make_gauge(

@@ -30,8 +30,12 @@ std::ostream& operator<<(std::ostream& os, const writer_error& ev) {
         return os << "Time limit exceeded";
     case writer_error::shutting_down:
         return os << "Shutting down";
+    case writer_error::out_of_disk:
+        return os << "Disk exhausted";
     case writer_error::unknown_error:
         return os << "Unknown error";
+    case writer_error::retryable_type_resolution_error:
+        return os << "Retryable type resolution error";
     }
 }
 std::string data_writer_error_category::message(int ev) const {
@@ -48,8 +52,28 @@ writer_error map_to_writer_error(reservation_error reservation_err) {
         return writer_error::oom_error;
     case time_quota_exceeded:
         return writer_error::time_limit_exceeded;
+    case out_of_disk:
+        return writer_error::out_of_disk;
     case unknown:
         return writer_error::unknown_error;
+    }
+}
+
+bool is_recoverable_error(writer_error err) {
+    switch (err) {
+    case writer_error::ok:
+    case writer_error::oom_error:
+    case writer_error::time_limit_exceeded:
+    case writer_error::out_of_disk:
+        return true;
+    case writer_error::parquet_conversion_error:
+    case writer_error::retryable_type_resolution_error:
+    case writer_error::file_io_error:
+    case writer_error::no_data:
+    case writer_error::flush_error:
+    case writer_error::shutting_down:
+    case writer_error::unknown_error:
+        return false;
     }
 }
 

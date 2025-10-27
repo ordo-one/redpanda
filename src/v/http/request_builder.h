@@ -11,15 +11,16 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
-#include "thirdparty/ada/ada.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
 #include <boost/beast/http/message.hpp>
+
+#include <ada.h>
 
 namespace http {
 
@@ -78,7 +79,7 @@ public:
 
 private:
     ada::result<ada::url_aggregator> _url{
-      tl::unexpected{ada::errors::generic_error}};
+      tl::unexpected{ada::errors::type_error}};
     std::optional<ss::sstring> _target{std::nullopt};
     boost::beast::http::request_header<> _request;
     absl::flat_hash_map<ss::sstring, ss::sstring> _query_params_kv;

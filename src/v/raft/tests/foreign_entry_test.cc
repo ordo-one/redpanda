@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "container/chunked_circular_buffer.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -20,17 +21,15 @@
 #include "raft/group_configuration.h"
 #include "raft/types.h"
 #include "random/generators.h"
-#include "resource_mgmt/io_priority.h"
 #include "storage/api.h"
 #include "storage/log.h"
 #include "storage/log_manager.h"
 #include "storage/record_batch_builder.h"
-#include "test_utils/randoms.h"
+#include "test_utils/test_env.h"
 #include "utils/copy_range.h"
 // testing
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
 
@@ -40,26 +39,22 @@
 
 using namespace std::chrono_literals; // NOLINT
 
+ss::sstring test_directory() { return test_env::random_dir_path(); }
 struct foreign_entry_fixture {
     static constexpr int active_nodes = 3;
-    ss::sstring test_dir = "test.data."
-                           + random_generators::gen_alphanum_string(10);
 
     foreign_entry_fixture()
       : _storage(
-          [this]() {
+          []() {
               return storage::kvstore_config(
                 1_MiB,
                 config::mock_binding(10ms),
-                test_dir,
+                test_directory(),
                 storage::make_sanitized_file_config());
           },
-          [this]() {
+          []() {
               return storage::log_config(
-                test_dir,
-                1_GiB,
-                ss::default_priority_class(),
-                storage::make_sanitized_file_config());
+                test_directory(), 1_GiB, storage::make_sanitized_file_config());
           },
           _feature_table) {
         _feature_table.start().get();
@@ -69,15 +64,13 @@ struct foreign_entry_fixture {
           .get();
         _storage.start().get();
         (void)_storage.log_mgr()
-          .manage(storage::ntp_config(_ntp, "test.dir"))
+          .manage(storage::ntp_config(_ntp, test_directory()))
           .get();
     }
 
     std::vector<storage::append_result> write_n(const std::size_t n) {
         auto cfg = storage::log_append_config{
-          storage::log_append_config::fsync::no,
-          ss::default_priority_class(),
-          model::no_timeout};
+          storage::log_append_config::fsync::no, model::no_timeout};
         std::vector<storage::append_result> res;
         res.push_back(
           gen_data_record_batch_reader(n)
@@ -92,8 +85,7 @@ struct foreign_entry_fixture {
     }
     template<typename Func>
     model::record_batch_reader reader_gen(std::size_t n, Func&& f) {
-        ss::circular_buffer<model::record_batch> batches;
-        batches.reserve(n);
+        chunked_circular_buffer<model::record_batch> batches;
         while (n-- > 0) {
             batches.push_back(f());
         }
@@ -130,8 +122,9 @@ struct foreign_entry_fixture {
         std::vector<model::broker> learners;
         for (auto i = 0; i < active_nodes; ++i) {
             nodes.push_back(model::random_broker(i, i));
-            learners.push_back(model::random_broker(
-              active_nodes + 1, active_nodes * active_nodes));
+            learners.push_back(
+              model::random_broker(
+                active_nodes + 1, active_nodes * active_nodes));
         }
         return raft::group_configuration(
           std::move(nodes), model::revision_id(1));

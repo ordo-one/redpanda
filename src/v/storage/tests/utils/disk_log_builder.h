@@ -12,16 +12,17 @@
 #pragma once
 #include "base/seastarx.h"
 #include "base/units.h"
-#include "base/vassert.h"
+#include "container/chunked_circular_buffer.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
+#include "model/limits.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/tests/random_batch.h"
 #include "random/generators.h"
-#include "ssx/sformat.h"
 #include "storage/api.h"
 #include "storage/disk_log_impl.h"
+#include "test_utils/test_env.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/sstring.hh>
@@ -32,30 +33,21 @@
 #include <vector>
 namespace storage {
 
-static inline ss::sstring random_dir() {
-    return ssx::sformat(
-      "test.dir_{}", random_generators::gen_alphanum_string(7));
-}
-
 inline log_config log_builder_config() {
     return log_config(
-      random_dir(),
+      test_env::random_dir_path(),
       100_MiB,
-      ss::default_priority_class(),
       storage::make_sanitized_file_config());
 }
 
-inline log_reader_config reader_config() {
-    return log_reader_config{
-      model::offset(0),
-      model::model_limits<model::offset>::max(),
-      ss::default_priority_class()};
+inline local_log_reader_config reader_config() {
+    return local_log_reader_config{
+      model::offset(0), model::model_limits<model::offset>::max()};
 }
 
 inline log_append_config append_config() {
     return log_append_config{
       .should_fsync = storage::log_append_config::fsync::yes,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
 }
 
@@ -312,10 +304,10 @@ public:
       std::optional<size_t> max_partition_retention_size);
     ss::future<std::optional<model::offset>> apply_retention(gc_config cfg);
     ss::future<> apply_adjacent_merge_compaction(
-      compaction_config cfg,
+      compaction::compaction_config cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
     ss::future<bool> apply_sliding_window_compaction(
-      compaction_config cfg,
+      compaction::compaction_config cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
     ss::future<bool> update_start_offset(model::offset start_offset);
     void add_dirty_segment_bytes(ssize_t bytes);
@@ -339,14 +331,12 @@ public:
     segment_index& get_seg_index_ptr(size_t index);
 
     // Create segments
-    ss::future<> add_segment(
-      model::offset offset,
-      model::term_id term = model::term_id(0),
-      ss::io_priority_class pc = ss::default_priority_class());
+    ss::future<>
+    add_segment(model::offset offset, model::term_id term = model::term_id(0));
 
     // Read interface
     // Default consume
-    auto consume(log_reader_config config = reader_config()) {
+    auto consume(local_log_reader_config config = reader_config()) {
         return _log->make_reader(config).then(
           [](model::record_batch_reader reader) {
               return model::consume_reader_to_memory(
@@ -357,14 +347,14 @@ public:
     // Consumer with config
     template<typename Consumer>
     requires model::BatchReaderConsumer<Consumer>
-    auto consume(log_reader_config config = reader_config()) {
+    auto consume(local_log_reader_config config = reader_config()) {
         return consume_impl(Consumer{}, std::move(config));
     }
 
     // Non default constructable Consumer with config
     template<typename Consumer>
     requires model::BatchReaderConsumer<Consumer>
-    auto consume(Consumer c, log_reader_config config = reader_config()) {
+    auto consume(Consumer c, local_log_reader_config config = reader_config()) {
         return consume_impl(std::move(c), std::move(config));
     }
 
@@ -391,7 +381,7 @@ public:
 
 private:
     template<typename Consumer>
-    auto consume_impl(Consumer c, log_reader_config config) {
+    auto consume_impl(Consumer c, local_log_reader_config config) {
         return _log->make_reader(config).then(
           [c = std::move(c)](model::record_batch_reader reader) mutable {
               return std::move(reader).consume(std::move(c), model::no_timeout);
@@ -413,7 +403,7 @@ private:
     }
 
     ss::future<> write(
-      ss::circular_buffer<model::record_batch> buff,
+      chunked_circular_buffer<model::record_batch> buff,
       const log_append_config& config,
       should_flush_after flush);
 
@@ -429,5 +419,21 @@ private:
     ss::abort_source _abort_source;
     std::optional<model::timestamp> _ts_cursor;
 };
+
+/// Specification for the segments and data to go into the log for a test
+struct log_spec {
+    // The base offsets for all segments. The difference in adjacent base
+    // offsets is converted to how many records we will write into each segment
+    // (as a single batch)
+    std::vector<model::offset::type> segment_starts;
+    // The indices of the segments which will be marked as compacted for the
+    // test. The segments are not actually compacted, only marked as such.
+    std::vector<size_t> compacted_segment_indices;
+    // The number of records in the final segment, required separately because
+    // there is no delta to use for the last segment.
+    size_t last_segment_num_records;
+};
+
+void populate_log(storage::disk_log_builder& b, const log_spec& spec);
 
 } // namespace storage

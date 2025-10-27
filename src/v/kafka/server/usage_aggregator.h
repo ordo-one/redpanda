@@ -11,7 +11,8 @@
 
 #pragma once
 #include "base/vlog.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
+#include "kafka/server/datalake_usage_api.h"
 #include "kafka/server/logger.h"
 #include "serde/rw/envelope.h"
 #include "serde/rw/optional.h"
@@ -58,24 +59,28 @@ std::chrono::time_point<clock_type, duration> round_to_interval(
 /// periodically serialized to disk, hence why the struct inherits from the
 /// serde::envelope
 struct usage
-  : serde::envelope<usage, serde::version<0>, serde::compat_version<0>> {
+  : serde::envelope<usage, serde::version<1>, serde::compat_version<0>> {
     uint64_t bytes_sent{0};
     uint64_t bytes_received{0};
     std::optional<uint64_t> bytes_cloud_storage;
+    datalake_usage_api::usage_stats datalake_usage;
     usage operator+(const usage&) const;
     usage& operator+=(const usage&);
     auto serde_fields() {
-        return std::tie(bytes_sent, bytes_received, bytes_cloud_storage);
+        return std::tie(
+          bytes_sent, bytes_received, bytes_cloud_storage, datalake_usage);
     }
     friend bool operator==(const usage&, const usage&) = default;
     friend std::ostream& operator<<(std::ostream& os, const usage& u) {
         fmt::print(
           os,
-          "{{ bytes_sent: {} bytes_received: {} bytes_cloud_storage: {} }}",
+          "{{ bytes_sent: {} bytes_received: {} bytes_cloud_storage: {} "
+          "datalake_usage: {} }}",
           u.bytes_sent,
           u.bytes_received,
           u.bytes_cloud_storage ? std::to_string(*u.bytes_cloud_storage)
-                                : "n/a");
+                                : "n/a",
+          u.datalake_usage);
         return os;
     }
 };
@@ -136,7 +141,7 @@ protected:
     virtual void window_closed() {}
 
 private:
-    void reset_state(fragmented_vector<usage_window> buckets);
+    void reset_state(chunked_vector<usage_window> buckets);
     void close_window();
     void rearm_window_timer();
     bool is_bucket_stale(size_t idx, uint64_t close_ts) const;
@@ -155,7 +160,7 @@ private:
     ss::gate _bg_write_gate;
     ss::gate _gate;
     size_t _current_window{0};
-    fragmented_vector<usage_window> _buckets;
+    chunked_vector<usage_window> _buckets;
     storage::kvstore& _kvstore;
 };
 } // namespace kafka

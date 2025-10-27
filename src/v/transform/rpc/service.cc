@@ -12,7 +12,9 @@
 #include "transform/rpc/service.h"
 
 #include "cluster/types.h"
+#include "kafka/data/log_reader_config.h"
 #include "kafka/data/partition_proxy.h"
+#include "logger.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -21,7 +23,6 @@
 #include "model/timeout_clock.h"
 #include "model/transform.h"
 #include "raft/errc.h"
-#include "resource_mgmt/io_priority.h"
 #include "storage/record_batch_builder.h"
 #include "storage/types.h"
 #include "transform/rpc/deps.h"
@@ -92,7 +93,7 @@ model::record_header make_header(ss::sstring k, ss::sstring v) {
 } // namespace
 
 local_service::local_service(
-  std::unique_ptr<topic_metadata_cache> metadata_cache,
+  std::unique_ptr<kafka::data::rpc::topic_metadata_cache> metadata_cache,
   std::unique_ptr<partition_manager> partition_manager,
   std::unique_ptr<reporter> reporter)
   : _metadata_cache(std::move(metadata_cache))
@@ -159,7 +160,8 @@ ss::future<result<model::offset, cluster::errc>> local_service::produce(
       *shard,
       ntp,
       [timeout,
-       batches = chunked_vector<model::record_batch>(std::move(batches))](
+       batches = chunked_vector<model::record_batch>(
+         std::from_range, std::move(batches) | std::views::as_rvalue)](
         kafka::partition_proxy* partition) mutable {
           return partition
             ->replicate(std::move(batches), make_replicate_options(timeout))
@@ -234,13 +236,11 @@ local_service::load_wasm_binary(
       *shard,
       model::wasm_binaries_internal_ntp,
       [this, offset, timeout](kafka::partition_proxy* partition) mutable {
-          storage::log_reader_config reader_config(
-            /*start_offset=*/offset,
-            /*max_offset=*/offset,
+          kafka::log_reader_config reader_config(
+            /*start_offset=*/model::offset_cast(offset),
+            /*max_offset=*/model::offset_cast(offset),
             /*min_bytes=*/0,
             /*max_bytes=*/1,
-            /*prio=*/wasm_read_priority(),
-            /*type_filter=*/std::nullopt,
             /*time=*/std::nullopt,
             /*as=*/std::nullopt);
           return partition->make_reader(reader_config)

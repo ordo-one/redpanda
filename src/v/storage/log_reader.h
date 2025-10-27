@@ -12,6 +12,7 @@
 #pragma once
 
 #include "bytes/iobuf.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/record_batch_reader.h"
 #include "storage/lock_manager.h"
 #include "storage/offset_translator_state.h"
@@ -21,7 +22,6 @@
 #include "storage/segment_set.h"
 #include "storage/types.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/io_queue.hh>
 #include <seastar/util/optimized_optional.hh>
 
@@ -88,10 +88,11 @@ private:
 
 class log_segment_batch_reader {
 public:
-    static constexpr size_t max_buffer_size = 32 * 1024; // 32KB
+    static constexpr size_t max_buffer_size
+      = local_log_reader_config::segment_reader_max_buffer_size;
 
     log_segment_batch_reader(
-      segment&, log_reader_config& config, probe& p) noexcept;
+      segment&, local_log_reader_config& config, probe& p) noexcept;
     log_segment_batch_reader(log_segment_batch_reader&&) noexcept = default;
     log_segment_batch_reader& operator=(log_segment_batch_reader&&) noexcept
       = delete;
@@ -100,7 +101,7 @@ public:
       = delete;
     ~log_segment_batch_reader() noexcept = default;
 
-    ss::future<result<ss::circular_buffer<model::record_batch>>>
+    ss::future<result<chunked_circular_buffer<model::record_batch>>>
       read_some(model::timeout_clock::time_point);
 
     ss::future<> close();
@@ -114,13 +115,13 @@ private:
 
 private:
     struct tmp_state {
-        ss::circular_buffer<model::record_batch> buffer;
+        chunked_circular_buffer<model::record_batch> buffer;
         size_t buffer_size = 0;
         bool is_full() const { return buffer_size >= max_buffer_size; }
     };
 
     segment& _seg;
-    log_reader_config& _config;
+    local_log_reader_config& _config;
     probe& _probe;
 
     std::unique_ptr<continuous_batch_parser> _iterator;
@@ -135,10 +136,14 @@ public:
     using data_t = model::record_batch_reader::data_t;
     using foreign_data_t = model::record_batch_reader::foreign_data_t;
     using storage_t = model::record_batch_reader::storage_t;
+    static std::vector<model::record_batch> make_ghost_batches(
+      model::offset start_offset,
+      model::offset end_offset,
+      model::term_id term);
 
     log_reader(
       std::unique_ptr<lock_manager::lease>,
-      log_reader_config,
+      local_log_reader_config,
       probe&,
       ss::lw_shared_ptr<const storage::offset_translator_state>) noexcept;
 
@@ -173,7 +178,7 @@ public:
      *
      * Resetting a reader also sets its "was cached" attribute to true.
      */
-    void reset_config(log_reader_config cfg);
+    void reset_config(local_log_reader_config cfg);
 
     /**
      * Return next read request lower bound. i.e. lowest offset that can be read
@@ -245,14 +250,14 @@ private:
     // Reset the internal state of the reader, using the given config and
     // the given segment set iterator. This method is shared between the
     // constructor and the reader cache hit path (which calls reset_config()).
-    void reset(log_reader_config, iterator_pair, bool cache_hit);
+    void reset(local_log_reader_config, iterator_pair, bool cache_hit);
 
     std::unique_ptr<lock_manager::lease> _lease;
     iterator_pair _iterator;
 
     // NOTE: this is not a const config, and is updated to reflect its
     // progression.
-    log_reader_config _config;
+    local_log_reader_config _config;
 
     // The base offset of the previous batch processed.
     model::offset _last_base;
@@ -288,13 +293,13 @@ private:
  * To read more about trim-prefix:
  * https://docs.redpanda.com/current/reference/rpk/rpk-topic/rpk-topic-trim-prefix/
  *
- * \param b The batch to search in.
+ * \param batch The batch to search in.
  * \param min_offset The minimum offset to consider
  * \param t The timestamp to search for
  * \param max_offset The maximum offset to consider
  */
-timequery_result batch_timequery(
-  const model::record_batch& b,
+ss::future<timequery_result> batch_timequery(
+  model::record_batch batch,
   model::offset min_offset,
   model::timestamp t,
   model::offset max_offset);

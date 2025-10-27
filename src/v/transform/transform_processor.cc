@@ -11,6 +11,7 @@
 #include "transform_processor.h"
 
 #include "logger.h"
+#include "model/batch_compression.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/timeout_clock.h"
@@ -18,7 +19,6 @@
 #include "model/transform.h"
 #include "random/simple_time_jitter.h"
 #include "ssx/future-util.h"
-#include "storage/parser_utils.h"
 #include "wasm/engine.h"
 
 #include <seastar/core/abort_source.hh>
@@ -29,6 +29,8 @@
 #include <seastar/core/queue.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/variant_utils.hh>
+
+#include <boost/range/irange.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -142,26 +144,26 @@ ss::future<> processor::start() {
     _task = handle_processor_task(
       _engine->start()
         .then([this] { return load_latest_committed(); })
-        .then(
-          [this](absl::flat_hash_map<model::output_topic_index, kafka::offset>
-                   latest_committed) {
-              // We start reading from the minimum process all producers have
-              // committed too. This means some producers will get transforms
-              // replayed, and in that case they can skip those records until
-              // they start seeing new records past their committed offset.
-              kafka::offset min = kafka::offset::max();
-              for (const auto& [_, offset] : latest_committed) {
-                  // next_offset is used here because we want to start at the
-                  // offset **after** the last one we've processed.
-                  min = std::min(min, kafka::next_offset(offset));
-              }
-              // Mark that we're running now that the start offset is loaded.
-              _state_callback(_id, _ntp, state::running);
-              return when_all_shutdown(
-                run_consumer_loop(min),
-                run_transform_loop(),
-                run_all_producers(std::move(latest_committed)));
-          }));
+        .then([this](
+                absl::flat_hash_map<model::output_topic_index, kafka::offset>
+                  latest_committed) {
+            // We start reading from the minimum process all producers have
+            // committed too. This means some producers will get transforms
+            // replayed, and in that case they can skip those records until
+            // they start seeing new records past their committed offset.
+            kafka::offset min = kafka::offset::max();
+            for (const auto& [_, offset] : latest_committed) {
+                // next_offset is used here because we want to start at the
+                // offset **after** the last one we've processed.
+                min = std::min(min, kafka::next_offset(offset));
+            }
+            // Mark that we're running now that the start offset is loaded.
+            _state_callback(_id, _ntp, state::running);
+            return when_all_shutdown(
+              run_consumer_loop(min),
+              run_transform_loop(),
+              run_all_producers(std::move(latest_committed)));
+        }));
 }
 
 ss::future<> processor::stop() {
@@ -411,7 +413,7 @@ ss::future<> processor::run_producer_loop(
             auto batch = model::transformed_data::make_batch(
               model::timestamp::now(), std::move(batch_records));
             if (_meta.compression_mode != model::compression::none) {
-                batch = co_await storage::internal::compress_batch(
+                batch = co_await model::compress_batch(
                   _meta.compression_mode, std::move(batch));
             }
             _probe->increment_write_bytes(index, batch.size_bytes());

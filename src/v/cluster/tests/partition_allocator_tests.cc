@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/flat_hash_set.h"
 #include "base/units.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/scheduling/allocation_node.h"
@@ -17,14 +18,12 @@
 #include "config/configuration.h"
 #include "model/metadata.h"
 #include "raft/fundamental.h"
-#include "random/fast_prng.h"
 #include "random/generators.h"
 #include "resource_mgmt/memory_groups.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/sharded.hh>
 
-#include <absl/container/flat_hash_set.h>
 #include <boost/test/tools/old/interface.hpp>
 
 ss::logger logger{"allocator_test"};
@@ -33,12 +32,13 @@ static void validate_replica_set_diversity(
   const std::vector<model::broker_shard>& replicas) {
     if (replicas.size() > 1) {
         auto sentinel = replicas.front();
-        BOOST_TEST_REQUIRE(std::all_of(
-          std::next(replicas.begin()),
-          replicas.end(),
-          [sentinel](const model::broker_shard bs) {
-              return sentinel.node_id != bs.node_id;
-          }));
+        BOOST_TEST_REQUIRE(
+          std::all_of(
+            std::next(replicas.begin()),
+            replicas.end(),
+            [sentinel](const model::broker_shard bs) {
+                return sentinel.node_id != bs.node_id;
+            }));
     }
 }
 
@@ -81,11 +81,12 @@ FIXTURE_TEST(unregister_node, partition_allocator_fixture) {
     BOOST_REQUIRE(allocator().contains_node(model::node_id(0)));
     // allocator MUST still contain the node. it has to be marked as removed
     BOOST_REQUIRE(allocator().contains_node(model::node_id(1)));
-    BOOST_REQUIRE(allocator()
-                    .state()
-                    .allocation_nodes()
-                    .find(model::node_id(1))
-                    ->second->is_removed());
+    BOOST_REQUIRE(
+      allocator()
+        .state()
+        .allocation_nodes()
+        .find(model::node_id(1))
+        ->second->is_removed());
     BOOST_REQUIRE(allocator().contains_node(model::node_id(2)));
     BOOST_REQUIRE_EQUAL(allocator().state().available_nodes(), 2);
 }
@@ -455,7 +456,7 @@ FIXTURE_TEST(recovery_test, partition_allocator_fixture) {
                 std::vector<model::broker_shard> replicas;
                 for (int r = 0; r < 3; r++) {
                     ret.push_back(
-                      model::broker_shard{model::node_id(r), prng() % 3});
+                      model::broker_shard{model::node_id(r), prng.get_int(2u)});
                 }
             }
         }
@@ -646,10 +647,11 @@ FIXTURE_TEST(updating_nodes_properties, partition_allocator_fixture) {
     auto it = allocator().state().allocation_nodes().find(model::node_id(1));
     auto allocated = it->second->allocated_partitions();
     auto new_rack = model::rack_id{"rack_A"};
-    allocator().update_allocation_nodes(std::vector<model::broker>{
-      create_broker(0, 2),
-      create_broker(1, 10, new_rack),
-      create_broker(2, 7)});
+    allocator().update_allocation_nodes(
+      std::vector<model::broker>{
+        create_broker(0, 2),
+        create_broker(1, 10, new_rack),
+        create_broker(2, 7)});
     BOOST_REQUIRE_EQUAL(it->second->cpus(), 10);
     // changing core count doesn't change number of allocated partitions
     BOOST_REQUIRE_EQUAL(it->second->allocated_partitions(), allocated);

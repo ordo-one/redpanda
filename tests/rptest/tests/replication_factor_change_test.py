@@ -7,22 +7,23 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.cluster import cluster
 from ducktape.utils.util import wait_until
-from rptest.clients.types import TopicSpec
-from rptest.util import expect_exception
 
-from rptest.tests.redpanda_test import RedpandaTest
-from rptest.clients.rpk import RpkTool, RpkException
+from rptest.clients.rpk import RpkException, RpkTool
+from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
+from rptest.services.cluster import cluster
+from rptest.tests.redpanda_test import RedpandaTest
+from rptest.util import expect_exception
 
 
 class ReplicationFactorChangeTest(RedpandaTest):
-    topics = (TopicSpec(partition_count=3, replication_factor=3), )
+    topics = (TopicSpec(partition_count=3, replication_factor=3),)
 
     def __init__(self, test_context):
-        super(ReplicationFactorChangeTest,
-              self).__init__(test_context=test_context, num_brokers=4)
+        super(ReplicationFactorChangeTest, self).__init__(
+            test_context=test_context, num_brokers=4
+        )
 
         self._rpk = RpkTool(self.redpanda)
         self.admin = Admin(self.redpanda)
@@ -39,21 +40,25 @@ class ReplicationFactorChangeTest(RedpandaTest):
     @cluster(num_nodes=4)
     def simple_test(self):
         self.replication_factor = 3
-        self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                     self.replication_factor)
+        self._rpk.alter_topic_config(
+            self.topic_name, self.rf_property, self.replication_factor
+        )
         self.check_rf(self.replication_factor)
 
         def wait_rec():
             return len(self.admin.list_reconfigurations()) == 0
 
-        wait_until(wait_rec,
-                   timeout_sec=60,
-                   backoff_sec=2,
-                   err_msg="Can not wait end of reconfiguration")
+        wait_until(
+            wait_rec,
+            timeout_sec=60,
+            backoff_sec=2,
+            err_msg="Can not wait end of reconfiguration",
+        )
 
         self.replication_factor = 1
-        self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                     self.replication_factor)
+        self._rpk.alter_topic_config(
+            self.topic_name, self.rf_property, self.replication_factor
+        )
         self.check_rf(self.replication_factor)
 
     @cluster(num_nodes=4)
@@ -62,52 +67,55 @@ class ReplicationFactorChangeTest(RedpandaTest):
         new_rf = -1
 
         with expect_exception(
-                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
-                or "INVALID_CONFIG" in e.msg):
-            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                         new_rf)
+            RpkException,
+            lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+            or "INVALID_CONFIG" in e.msg,
+        ):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property, new_rf)
 
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)
 
         new_rf = 0
         with expect_exception(
-                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
-                or "INVALID_CONFIG" in e.msg):
-            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                         new_rf)
+            RpkException,
+            lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+            or "INVALID_CONFIG" in e.msg,
+        ):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property, new_rf)
 
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)
 
         new_rf = 10000
         with expect_exception(
-                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
-                or "INVALID_CONFIG" in e.msg):
-            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                         new_rf)
+            RpkException,
+            lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+            or "INVALID_CONFIG" in e.msg,
+        ):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property, new_rf)
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)
 
         new_rf = 4
         with expect_exception(
-                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
-                or "INVALID_CONFIG" in e.msg):
-            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                         new_rf)
+            RpkException,
+            lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+            or "INVALID_CONFIG" in e.msg,
+        ):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property, new_rf)
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)
 
-        self.redpanda.set_cluster_config(
-            {'default_topic_replications': str(3)})
-        self.redpanda.set_cluster_config(
-            {'minimum_topic_replications': str(3)})
+        self.redpanda.set_cluster_config({"default_topic_replications": str(3)})
+        self.redpanda.set_cluster_config({"minimum_topic_replications": str(3)})
         new_rf = 1
         with expect_exception(
-                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
-                or "INVALID_CONFIG" in e.msg):
-            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
-                                         new_rf)
+            RpkException,
+            lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+            or "INVALID_CONFIG" in e.msg,
+        ):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property, new_rf)
 
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)

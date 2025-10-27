@@ -13,6 +13,7 @@
 #include "cloud_storage/types.h"
 #include "cluster/partition.h"
 #include "cluster/rm_stm.h"
+#include "kafka/data/log_reader_config.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/server/errors.h"
 #include "logger.h"
@@ -27,6 +28,43 @@
 #include <seastar/core/future.hh>
 
 #include <optional>
+
+namespace {
+
+storage::local_log_reader_config kafka_to_local_log_reader_config(
+  kafka::log_reader_config cfg,
+  ss::lw_shared_ptr<const storage::offset_translator_state> ot_state) {
+    auto start_offset = ot_state->to_log_offset(
+      kafka::offset_cast(cfg.start_offset));
+    auto max_offset = ot_state->to_log_offset(
+      kafka::offset_cast(cfg.max_offset));
+
+    return storage::local_log_reader_config(
+      /*start_offset=*/start_offset,
+      /*max_offset=*/max_offset,
+      /*max_bytes=*/cfg.max_bytes,
+      /*type_filter=*/std::nullopt,
+      /*first_timestamp=*/cfg.first_timestamp,
+      /*abort_source=*/cfg.abort_source,
+      /*client_address=*/cfg.client_address,
+      /*strict_max_bytes=*/cfg.strict_max_bytes);
+}
+
+cloud_storage::cloud_log_reader_config
+kafka_to_cloud_log_reader_config(kafka::log_reader_config cfg) {
+    return cloud_storage::cloud_log_reader_config(
+      /*start_offset=*/cfg.start_offset,
+      /*max_offset=*/cfg.max_offset,
+      /*min_bytes=*/cfg.min_bytes,
+      /*max_bytes=*/cfg.max_bytes,
+      /*type_filter=*/std::nullopt,
+      /*first_timestamp=*/cfg.first_timestamp,
+      /*abort_source=*/cfg.abort_source,
+      /*client_address=*/cfg.client_address,
+      /*strict_max_bytes=*/cfg.strict_max_bytes);
+}
+
+} // namespace
 
 namespace kafka {
 replicated_partition::replicated_partition(
@@ -165,7 +203,7 @@ kafka::leader_epoch replicated_partition::leader_epoch() const {
 
 // TODO: use previous translation speed up lookup
 ss::future<storage::translating_reader> replicated_partition::make_reader(
-  storage::log_reader_config cfg,
+  kafka::log_reader_config cfg,
   std::optional<model::timeout_clock::time_point> debounce_deadline) {
     if (
       _partition->is_read_replica_mode_enabled()
@@ -173,23 +211,26 @@ ss::future<storage::translating_reader> replicated_partition::make_reader(
         // No need to translate the offsets in this case since all fetch
         // requestS in read replica are served via remote_partition which
         // does its own translation.
-        co_return co_await _partition->make_cloud_reader(cfg);
+        auto config = kafka_to_cloud_log_reader_config(cfg);
+        co_return co_await _partition->make_cloud_reader(config);
     }
 
     if (
-      may_read_from_cloud(model::offset_cast(cfg.start_offset))
-      && cfg.start_offset >= _partition->start_cloud_offset()) {
-        cfg.type_filter = {model::record_batch_type::raft_data};
+      may_read_from_cloud(cfg.start_offset)
+      && cfg.start_offset
+           >= model::offset_cast(_partition->start_cloud_offset())) {
+        auto config = kafka_to_cloud_log_reader_config(cfg);
+        config.type_filter = {model::record_batch_type::raft_data};
         co_return co_await _partition->make_cloud_reader(
-          cfg, debounce_deadline);
+          config, debounce_deadline);
     }
 
-    cfg.start_offset = _translator->to_log_offset(cfg.start_offset);
-    cfg.max_offset = _translator->to_log_offset(cfg.max_offset);
-    cfg.type_filter = {model::record_batch_type::raft_data};
+    auto config = kafka_to_local_log_reader_config(cfg, _translator);
+    config.type_filter = {model::record_batch_type::raft_data};
+    config.translate_offsets = model::translate_offsets::yes;
 
-    cfg.translate_offsets = storage::translate_offsets::yes;
-    auto rdr = co_await _partition->make_reader(cfg, debounce_deadline);
+    auto rdr = co_await _partition->make_local_reader(
+      std::move(config), debounce_deadline);
     co_return storage::translating_reader(std::move(rdr), _translator);
 }
 
@@ -254,7 +295,8 @@ replicated_partition::aborted_transactions_remote(
  * Based on the lower offset of an incoming request, decide whether it should
  * be sent to cloud storage (return true), or local raft storage (return false)
  */
-bool replicated_partition::may_read_from_cloud(kafka::offset start_offset) {
+bool replicated_partition::may_read_from_cloud(
+  kafka::offset start_offset) const {
     return _partition->is_remote_fetch_enabled()
            && _partition->cloud_data_available()
            && (start_offset < model::offset_cast(_translator->from_log_offset(_partition->raft_start_offset())));
@@ -645,24 +687,78 @@ result<partition_info> replicated_partition::get_partition_info() const {
     };
 
     for (const auto& follower_metric : followers.value()) {
-        ret.replicas.push_back(replica_info{
-          .id = follower_metric.id,
-          .high_watermark = model::next_offset(
-            clamped_translate(follower_metric.match_index)),
-          .log_end_offset = model::next_offset(
-            clamped_translate(follower_metric.dirty_log_index)),
-          .is_alive = follower_metric.is_live,
-        });
+        ret.replicas.push_back(
+          replica_info{
+            .id = follower_metric.id,
+            .high_watermark = model::next_offset(
+              clamped_translate(follower_metric.match_index)),
+            .log_end_offset = model::next_offset(
+              clamped_translate(follower_metric.dirty_log_index)),
+            .is_alive = follower_metric.is_live,
+          });
     }
 
-    ret.replicas.push_back(replica_info{
-      .id = _partition->raft()->self().id(),
-      .high_watermark = high_watermark(),
-      .log_end_offset = log_end_offset(),
-      .is_alive = true,
-    });
+    ret.replicas.push_back(
+      replica_info{
+        .id = _partition->raft()->self().id(),
+        .high_watermark = high_watermark(),
+        .log_end_offset = log_end_offset(),
+        .is_alive = true,
+      });
 
     return {std::move(ret)};
+}
+
+size_t replicated_partition::estimate_size_between(
+  kafka::offset begin, kafka::offset end) const {
+    if (begin > end) {
+        return 0;
+    }
+    if (
+      _partition->is_read_replica_mode_enabled()
+      && _partition->cloud_data_available()) {
+        auto& m = _partition->archival_meta_stm()->manifest();
+        return m.estimate_size_between(begin, end);
+    }
+    auto ot = _partition->log()->get_offset_translator_state();
+    auto local_log_start = _partition->raft_start_offset();
+    auto local_kafka_start = model::offset_cast(
+      ot->from_log_offset(local_log_start));
+    auto local_kafka_end = kafka::prev_offset(
+      model::offset_cast(ot->from_log_offset(_partition->high_watermark())));
+
+    size_t cloud_sz = 0;
+    if (may_read_from_cloud(begin)) {
+        // There is some data that falls below the local log and should be
+        // served from the cloud.
+
+        // Clamp the target end point to just below the local log so we don't
+        // double account for data that is both in the local log and in cloud.
+        auto cloud_clamped_kafka_end = std::min(
+          end, kafka::prev_offset(local_kafka_start));
+        auto& m = _partition->archival_meta_stm()->manifest();
+        cloud_sz = m.estimate_size_between(begin, cloud_clamped_kafka_end);
+    }
+    size_t local_sz = 0;
+    if (end >= local_kafka_start) {
+        // There is some data that will be served from the local log.
+
+        // Clamp the target offsets with what is actually available in the log.
+        auto local_clamped_kafka_begin = std::max(begin, local_kafka_start);
+        auto local_clamped_kafka_end = std::min(end, local_kafka_end);
+        auto local_clamped_begin = ot->to_log_offset(
+          kafka::offset_cast(local_clamped_kafka_begin));
+        auto local_clamped_end = model::prev_offset(ot->to_log_offset(
+          kafka::offset_cast(kafka::next_offset(local_clamped_kafka_end))));
+
+        auto log = _partition->log();
+        auto local_sz_from_begin = log->size_bytes_after_offset(
+          model::prev_offset(local_clamped_begin));
+        auto local_sz_after_end = log->size_bytes_after_offset(
+          local_clamped_end);
+        local_sz = local_sz_from_begin - local_sz_after_end;
+    }
+    return cloud_sz + local_sz;
 }
 
 } // namespace kafka

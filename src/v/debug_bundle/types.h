@@ -11,8 +11,9 @@
 
 #pragma once
 
+#include "absl/container/btree_set.h"
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/metadata.h"
 #include "security/types.h"
 #include "utils/named_type.h"
@@ -22,7 +23,6 @@
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/sstring.hh>
 
-#include <absl/container/btree_set.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
 
@@ -169,6 +169,7 @@ struct fmt::formatter<debug_bundle::time_variant>
 template<>
 struct fmt::formatter<debug_bundle::partition_selection>
   : formatter<std::string_view> {
-    auto format(const debug_bundle::partition_selection&, format_context& ctx)
-      const -> format_context::iterator;
+    auto
+    format(const debug_bundle::partition_selection&, format_context& ctx) const
+      -> format_context::iterator;
 };

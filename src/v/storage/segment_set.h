@@ -18,7 +18,6 @@
 #include "storage/fwd.h"
 #include "storage/segment.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/sharded.hh>
 
 #include <deque>
@@ -42,19 +41,16 @@ public:
     // for readers and writers taking refs.
     using type = ss::lw_shared_ptr<segment>;
 
-    // NOTE: gcc has an ABI problem and cannot make std::deque noexcept
-    // so we use a circular instead of a dequeue that *is* noexcept ctor
-    // and allow us to truly have an empty container at ctor time
-    // We loose reverse-iterators tho
-    using underlying_t = ss::circular_buffer<type>;
+    using underlying_t = std::deque<type>;
     using const_iterator = underlying_t::const_iterator;
     using iterator = underlying_t::iterator;
+    using reverse_iterator = underlying_t::reverse_iterator;
+    using const_reverse_iterator = underlying_t::const_reverse_iterator;
 
     explicit segment_set(underlying_t);
     ~segment_set() noexcept;
     segment_set(segment_set&&) noexcept = default;
     segment_set& operator=(segment_set&& o) noexcept = default;
-    segment_set(const segment_set&) = delete;
     segment_set& operator=(const segment_set&) = delete;
 
     size_t size() const { return _handles.size(); }
@@ -77,8 +73,6 @@ public:
 
     iterator lower_bound(model::offset o);
     const_iterator lower_bound(model::offset o) const;
-    iterator lower_bound(model::timestamp o);
-    const_iterator lower_bound(model::timestamp o) const;
     iterator upper_bound(model::term_id o);
     const_iterator upper_bound(model::term_id o) const;
 
@@ -89,7 +83,16 @@ public:
     const_iterator begin() const { return _handles.begin(); }
     const_iterator end() const { return _handles.end(); }
 
+    reverse_iterator rbegin() { return _handles.rbegin(); }
+    reverse_iterator rend() { return _handles.rend(); }
+    const_reverse_iterator rbegin() const { return _handles.rbegin(); }
+    const_reverse_iterator rend() const { return _handles.rend(); }
+
+    segment_set copy() const noexcept { return *this; }
+
 private:
+    segment_set(const segment_set&) noexcept = default;
+
     underlying_t _handles;
 
     friend std::ostream& operator<<(std::ostream&, const segment_set&);
@@ -106,5 +109,22 @@ ss::future<segment_set> recover_segments(
   storage_resources&,
   ss::sharded<features::feature_table>& feature_table,
   std::optional<ntp_sanitizer_config> ntp_sanitizer_config);
+
+// Attempts to create a contiguous & non-overlapping `segment_set` from those
+// provided after recovery is performed. `segs` are first sorted in ascending
+// order w/r/t base offset and descending w/r/t dirty offset. I.e, sorting
+// `segment`s `[[0,100],[0,1000],[0,200],[1001,2000],[1001,2001]]` would result
+// in the ordering `[[0,1000],[0,200],[0,100],[1001,2001],[1001,2000]]`. From
+// there, a greedy selection is performed over the set to create a contiguous &
+// non-overlapping `segment_set` by removing redundant `segment`s. If the
+// acquired range is non-contiguous or has altered the offset span,
+// `std::nullopt` is returned, indicating the desired range could not be
+// created. Otherwise, the range is returned.
+// This process deals with the scenario in which redundant `segment`s left over
+// on disk by an adjacent merge compaction (i.e were scheduled for removal, but
+// were not removed due to e.g. a broker crash) will not be included in the
+// `log` post reboot.
+ss::future<std::optional<segment_set>>
+maybe_create_contiguous_segment_set(segment_set::underlying_t segs);
 
 } // namespace storage

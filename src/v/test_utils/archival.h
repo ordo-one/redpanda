@@ -16,8 +16,7 @@
 #include "cluster/archival/archival_policy.h"
 #include "model/tests/random_batch.h"
 #include "storage/tests/utils/disk_log_builder.h"
-
-#include <boost/test/unit_test.hpp>
+#include "test_utils/test_macros.h"
 
 inline ss::input_stream<char> make_manifest_stream(std::string_view json) {
     iobuf i;
@@ -29,7 +28,6 @@ inline storage::disk_log_builder make_log_builder(std::string_view data_path) {
     return storage::disk_log_builder{storage::log_config{
       {data_path.data(), data_path.size()},
       4_KiB,
-      ss::default_priority_class(),
       storage::make_sanitized_file_config()}};
 }
 
@@ -74,12 +72,13 @@ struct segment_spec {
 inline void populate_local_log(
   storage::disk_log_builder& b, const std::vector<segment_spec>& segs) {
     for (const auto& spec : segs) {
-        auto record_batch = make_random_batch(model::test::record_batch_spec{
-          .offset = spec.start_offset,
-          .allow_compression = false,
-          .count = 1,
-          .record_sizes = std::vector<size_t>{spec.size_bytes},
-          .timestamp = spec.timestamp});
+        auto record_batch = make_random_batch(
+          model::test::record_batch_spec{
+            .offset = spec.start_offset,
+            .allow_compression = false,
+            .count = 1,
+            .record_sizes = std::vector<size_t>{spec.size_bytes},
+            .timestamp = spec.timestamp});
 
         b | storage::add_segment(spec.start_offset)
           | storage::add_batch(std::move(record_batch));
@@ -107,13 +106,14 @@ require_upload_candidate(archival::candidate_creation_result&& r) {
     ss::visit(
       r,
       [](std::monostate) {
-          BOOST_FAIL("unexpected default candidate creation result");
+          RPTEST_FAIL("unexpected default candidate creation result");
       },
       [](const archival::candidate_creation_error& err) {
-          BOOST_FAIL(fmt::format("unexpected creation error: {}", err));
+          RPTEST_FAIL(fmt::format("unexpected creation error: {}", err));
       },
       [](const archival::skip_offset_range& r) {
-          BOOST_FAIL(fmt::format("unexpected skip offset range: {}", r.reason));
+          RPTEST_FAIL(
+            fmt::format("unexpected skip offset range: {}", r.reason));
       },
       [](const archival::upload_candidate_with_locks&) {});
     return std::move(std::get<archival::upload_candidate_with_locks>(r));
@@ -125,16 +125,16 @@ inline void require_candidate_creation_error(
     ss::visit(
       r,
       [](std::monostate) {
-          BOOST_FAIL("unexpected default candidate creation result");
+          RPTEST_FAIL("unexpected default candidate creation result");
       },
       [expected](const archival::candidate_creation_error& actual) {
-          BOOST_REQUIRE_EQUAL(actual, expected);
+          RPTEST_REQUIRE_EQ(actual, expected);
       },
       [](const archival::skip_offset_range& r) {
-          BOOST_FAIL(fmt::format("unexpected skip offset range: {}", r));
+          RPTEST_FAIL(fmt::format("unexpected skip offset range: {}", r));
       },
       [](const archival::upload_candidate_with_locks&) {
-          BOOST_FAIL("unexpected candidate created");
+          RPTEST_FAIL("unexpected candidate created");
       });
 }
 
@@ -145,16 +145,16 @@ inline void require_skip_offset(
     ss::visit(
       r,
       [](std::monostate) {
-          BOOST_FAIL("unexpected default candidate creation result");
+          RPTEST_FAIL("unexpected default candidate creation result");
       },
       [](const archival::candidate_creation_error& err) {
-          BOOST_FAIL(fmt::format("unexpected creation error: {}", err));
+          RPTEST_FAIL(fmt::format("unexpected creation error: {}", err));
       },
       [expected, final](const archival::skip_offset_range& r) {
-          BOOST_REQUIRE_EQUAL(r.reason, expected);
-          BOOST_REQUIRE_EQUAL(r.end_offset, final);
+          RPTEST_REQUIRE_EQ(r.reason, expected);
+          RPTEST_REQUIRE_EQ(r.end_offset, final);
       },
       [](const archival::upload_candidate_with_locks&) {
-          BOOST_FAIL("unexpected candidate created");
+          RPTEST_FAIL("unexpected candidate created");
       });
 }

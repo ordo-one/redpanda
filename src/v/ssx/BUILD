@@ -1,11 +1,22 @@
 load("//bazel:build.bzl", "redpanda_cc_library")
 
 redpanda_cc_library(
+    name = "condition_variable",
+    srcs = ["condition_variable.cc"],
+    hdrs = ["condition_variable.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/container:intrusive",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "thread_worker",
     hdrs = [
         "thread_worker.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -19,10 +30,22 @@ redpanda_cc_library(
     hdrs = [
         "sformat.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "@fmt",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "sharded_service_container",
+    hdrs = [
+        "sharded_service_container.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":watchdog",
+        "//src/v/base",
         "@seastar",
     ],
 )
@@ -32,10 +55,10 @@ redpanda_cc_library(
     hdrs = [
         "future-util.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "//src/v/ssx:when_all",
         "//src/v/utils:functional",
     ],
 )
@@ -45,7 +68,6 @@ redpanda_cc_library(
     hdrs = [
         "semaphore.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "@seastar",
@@ -57,7 +79,6 @@ redpanda_cc_library(
     hdrs = [
         "abort_source.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -70,10 +91,23 @@ redpanda_cc_library(
     hdrs = [
         "async_algorithm.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "async_merge_top_k",
+    hdrs = [
+        "async_merge_top_k.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":async_algorithm",
+        "//src/v/base",
+        "//src/v/container:priority_queue",
         "@seastar",
     ],
 )
@@ -83,7 +117,6 @@ redpanda_cc_library(
     hdrs = [
         "async-clear.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -97,10 +130,22 @@ redpanda_cc_library(
     hdrs = [
         "watchdog.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         ":future_util",
+        "//src/v/base",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "checkpoint_mutex",
+    hdrs = [
+        "checkpoint_mutex.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":sformat",
         "//src/v/base",
         "@seastar",
     ],
@@ -111,7 +156,6 @@ redpanda_cc_library(
     hdrs = [
         "task_local_ptr.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -124,7 +168,6 @@ redpanda_cc_library(
     hdrs = [
         "single_sharded.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -137,7 +180,6 @@ redpanda_cc_library(
     hdrs = [
         "event.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         ":semaphore",
@@ -150,7 +192,6 @@ redpanda_cc_library(
     hdrs = [
         "sleep_abortable.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "@seastar",
@@ -162,7 +203,6 @@ redpanda_cc_library(
     hdrs = [
         "sharded_ptr.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -176,7 +216,6 @@ redpanda_cc_library(
     hdrs = [
         "aligned.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -189,7 +228,6 @@ redpanda_cc_library(
     hdrs = [
         "sharded_value.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         ":aligned",
@@ -206,7 +244,6 @@ redpanda_cc_library(
     hdrs = [
         "work_queue.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         ":future_util",
@@ -220,10 +257,33 @@ redpanda_cc_library(
     hdrs = [
         "when_all.h",
     ],
-    include_prefix = "ssx",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/serde",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "rate_limited_function",
+    hdrs = [
+        "rate_limited_function.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "single_fiber_executor",
+    hdrs = [
+        "single_fiber_executor.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":future_util",
+        "//src/v/utils:retry_chain_node",
         "@seastar",
     ],
 )

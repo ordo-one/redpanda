@@ -21,15 +21,6 @@
 
 namespace cluster::cloud_metadata {
 
-inline security::license get_test_license() {
-    const char* sample_valid_license = std::getenv("REDPANDA_SAMPLE_LICENSE");
-    vassert(
-      sample_valid_license != nullptr,
-      "Expected REDPANDA_SAMPLE_LICENSE to be set");
-    const ss::sstring license_str{sample_valid_license};
-    return security::make_license(license_str);
-}
-
 inline security::acl_binding binding_for_user(const ss::sstring& user) {
     const security::acl_principal principal{
       security::principal_type::ephemeral_user, user};
@@ -75,17 +66,15 @@ inline topic_properties non_remote_topic_properties() {
 // recorded in its log.
 inline ss::future<std::vector<cluster::recovery_stage>>
 read_recovery_stages(cluster::partition& controller_prt) {
-    storage::log_reader_config reader_config(
+    storage::local_log_reader_config reader_config(
       model::offset(0),
       controller_prt.raft()->committed_offset(),
-      0,
       std::numeric_limits<size_t>::max(),
-      ss::default_priority_class(),
       model::record_batch_type::cluster_recovery_cmd,
       std::nullopt,
       std::nullopt,
       std::nullopt);
-    auto reader = controller_prt.make_reader(reader_config).get();
+    auto reader = controller_prt.make_local_reader(reader_config).get();
     auto batches = co_await model::consume_reader_to_memory(
       std::move(reader), model::timeout_clock::time_point::max());
     std::vector<cluster::recovery_stage> stages;

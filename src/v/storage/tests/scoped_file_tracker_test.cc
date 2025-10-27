@@ -7,9 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/btree_set.h"
 #include "storage/scoped_file_tracker.h"
 
-#include <absl/container/btree_set.h>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -27,7 +27,9 @@ TEST(ScopedFileTrackerTest, TestBasic) {
     ASSERT_EQ(0, tracked.size());
 
     // If we leave scope without clearing, we leave behind some files.
-    { scoped_file_tracker t(&tracked, {"foo"}); }
+    {
+        scoped_file_tracker t(&tracked, {"foo"});
+    }
     ASSERT_EQ(1, tracked.size());
 
     // Even if we clear from a new tracker, we don't affect the already tracked

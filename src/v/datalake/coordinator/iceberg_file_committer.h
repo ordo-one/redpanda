@@ -11,7 +11,7 @@
 
 #include "base/seastarx.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/file_committer.h"
 #include "datalake/coordinator/state_update.h"
 #include "iceberg/catalog.h"
@@ -59,7 +59,7 @@ public:
       model::topic, const topics_state&) const final;
 
     ss::future<checked<std::nullopt_t, errc>>
-    drop_table(const iceberg::table_identifier&) const final;
+    drop_table(const iceberg::table_identifier&, purge_data) const final;
 
 private:
     // Must outlive this committer.

@@ -31,6 +31,7 @@ public:
     using server = auth_ctx_server<proxy>;
     proxy(
       const YAML::Node& config,
+      const YAML::Node& client_cfg,
       ss::smp_service_group smp_sg,
       size_t max_memory,
       ss::sharded<kafka::client::client>& client,
@@ -41,7 +42,7 @@ public:
     ss::future<> stop();
 
     configuration& config();
-    kafka::client::configuration& client_config();
+    const configuration& config() const;
     ss::sharded<kafka::client::client>& client() { return _client; }
     ss::sharded<kafka_client_cache>& client_cache() { return _client_cache; }
     ss::future<> mitigate_error(std::exception_ptr);
@@ -49,10 +50,9 @@ public:
 private:
     ss::future<> do_start();
     ss::future<> configure();
-    ss::future<> inform(model::node_id);
-    ss::future<> do_inform(model::node_id);
 
     configuration _config;
+    kafka::client::configuration _client_cfg;
     ssx::semaphore _mem_sem;
     adjustable_semaphore _inflight_sem;
     config::binding<size_t> _inflight_config_binding;
@@ -62,8 +62,6 @@ private:
     server::context_t _ctx;
     server _server;
     one_shot _ensure_started;
-    cluster::controller* _controller;
-    bool _has_ephemeral_credentials{false};
     bool _is_started{false};
 };
 

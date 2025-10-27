@@ -9,6 +9,7 @@
 // by the Apache License, Version 2.0
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
 #include "cluster/errc.h"
 #include "model/timeout_clock.h"
@@ -16,8 +17,6 @@
 #include "serde/envelope.h"
 #include "serde/rw/variant.h"
 #include "strings/string_switch.h"
-
-#include <absl/container/flat_hash_set.h>
 
 #include <concepts>
 #include <cstdint>
@@ -295,8 +294,6 @@ struct alter_quotas_request
       alter_quotas_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     alter_delta_cmd_data cmd_data;
     model::timeout_clock::duration timeout{};
 
@@ -312,8 +309,6 @@ struct alter_quotas_response
       alter_quotas_response,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     cluster::errc ec;
     auto serde_fields() { return std::tie(ec); }
 

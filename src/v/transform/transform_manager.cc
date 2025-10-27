@@ -10,14 +10,16 @@
  */
 #include "transform_manager.h"
 
+#include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
 #include "logger.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/transform.h"
-#include "rpc/backoff_policy.h"
 #include "transform_processor.h"
+#include "utils/backoff_policy.h"
 #include "utils/human.h"
 
 #include <seastar/core/future.hh>
@@ -30,10 +32,6 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/log.hh>
-
-#include <absl/algorithm/container.h>
-#include <absl/container/btree_map.h>
-#include <absl/container/btree_set.h>
 
 #include <algorithm>
 #include <chrono>
@@ -74,9 +72,8 @@ private:
     // the backoff policy for this processor for when we attempt to restart
     // the processor. If it's been enough time since our last restart of the
     // processor we will reset this.
-    ::rpc::backoff_policy _backoff
-      = ::rpc::make_exponential_backoff_policy<ClockType>(
-        base_duration, max_duration);
+    ::backoff_policy _backoff = ::make_exponential_backoff_policy<ClockType>(
+      base_duration, max_duration);
 };
 
 // The lexicographically smallest ntp
@@ -307,7 +304,7 @@ void manager<ClockType>::on_transform_state_change(
             // become inactive on their own, but only as apart of the startup
             // sequence.
         case processor::state::unknown:
-            vassert(false, "unexpected transform state change: {}", state);
+            vunreachable("unexpected transform state change: {}", state);
         }
     });
 }

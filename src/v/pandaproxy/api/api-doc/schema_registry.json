@@ -30,7 +30,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -73,7 +73,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -104,13 +104,13 @@
             }
           },
           "404": {
-            "description": "Subject not found",
+            "description": "Not Found: Subject not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -136,7 +136,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -173,7 +173,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -199,7 +199,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -221,6 +221,13 @@
             "schema": {
               "$ref": "#/definitions/mode"
             }
+          },
+          {
+            "name": "force",
+            "description": "If true, override the emptiness check when setting the global mode to IMPORT",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
           }
         ],
         "produces": [
@@ -242,7 +249,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -289,7 +296,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -318,6 +325,13 @@
             "schema": {
               "$ref": "#/definitions/mode"
             }
+          },
+          {
+            "name": "force",
+            "description": "If true, override the emptiness check when setting a subject's mode to IMPORT",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
           }
         ],
         "produces": [
@@ -345,7 +359,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -383,7 +397,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -412,7 +426,7 @@
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -430,6 +444,13 @@
             "in": "path",
             "required": true,
             "type": "integer"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "description": "Redpanda version 25.2 or later. For Avro and Protobuf schemas only. Supported values: an empty string `''` returns the schema in its current format (default), and `serialized` (Protobuf only) returns the schema in its Base64-encoded wire binary format. Unsupported values return a 501 error."
           }
         ],
         "produces": [
@@ -441,25 +462,23 @@
           "200": {
             "description": "OK",
             "schema": {
-              "type": "object",
-              "properties": {
-                "schemaType": {
-                  "type": "string"
-                },
-                "schema": {
-                  "type": "string"
-                }
-              }
+              "$ref": "#/definitions/schema_def"
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "501": {
+            "description": "Not Implemented: The specified format parameter value is not supported",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -503,13 +522,13 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -551,13 +570,13 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
           },
           "500": {
-            "description": "Internal Server error",
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -574,7 +593,7 @@
             "name": "deleted",
             "in": "query",
             "required": false,
-            "type": "string"
+            "type": "boolean"
           },
           {
             "name": "subjectPrefix",
@@ -636,6 +655,13 @@
             "type": "boolean"
           },
           {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "description": "Redpanda version 25.2 or later. For Avro and Protobuf schemas only. Supported values: an empty string `''` returns the schema in its current format (default), and `serialized` (Protobuf only) returns the schema in its Base64-encoded wire binary format. Unsupported values return a 501 error."
+          },
+          {
             "name": "schema_def",
             "in": "body",
             "schema": {
@@ -652,11 +678,11 @@
           "200": {
             "description": "OK",
             "schema": {
-              "$ref": "#/definitions/subject_schema"
+              "$ref": "#/definitions/stored_schema"
             }
           },
           "404": {
-            "description": "Not found",
+            "description": "Not Found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -675,6 +701,12 @@
           },
           "500": {
             "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "501": {
+            "description": "Not Implemented: The specified format parameter value is not supported",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -714,7 +746,7 @@
             }
           },
           "404": {
-            "description": "Subject not found",
+            "description": "Not Found: Subject not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -743,7 +775,7 @@
             "name": "deleted",
             "in": "query",
             "required": false,
-            "type": "string"
+            "type": "boolean"
           }
         ],
         "produces": [
@@ -762,7 +794,7 @@
             }
           },
           "404": {
-            "description": "Subject not found",
+            "description": "Not Found: Subject not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -800,7 +832,7 @@
             "name": "schema_def",
             "in": "body",
             "schema": {
-              "$ref": "#/definitions/schema_def"
+              "$ref": "#/definitions/stored_schema"
             }
           }
         ],
@@ -863,7 +895,14 @@
             "name": "deleted",
             "in": "query",
             "required": false,
-            "type": "string"
+            "type": "boolean"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "description": "Redpanda version 25.2 or later. For Avro and Protobuf schemas only. Supported values: an empty string `''` returns the schema in its current format (default), and `serialized` (Protobuf only) returns the schema in its Base64-encoded wire binary format. Unsupported values return a 501 error."
           }
         ],
         "produces": [
@@ -875,11 +914,11 @@
           "200": {
             "description": "OK",
             "schema": {
-              "$ref": "#/definitions/subject_schema"
+              "$ref": "#/definitions/stored_schema"
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -892,6 +931,12 @@
           },
           "500": {
             "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "501": {
+            "description": "Not Implemented: The specified format parameter value is not supported",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -934,7 +979,7 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -956,8 +1001,9 @@
     },
     "/subjects/{subject}/versions/{version}/schema": {
       "get": {
-        "summary": "Retrieve a schema for the subject and version.",
+        "summary": "Retrieve the raw schema for the subject.",
         "operationId": "get_subject_versions_version_schema",
+        "description": "Returns the specified version of the schema in its original format, without backslashes.",
         "parameters": [
           {
             "name": "subject",
@@ -975,7 +1021,14 @@
             "name": "deleted",
             "in": "query",
             "required": false,
-            "type": "string"
+            "type": "boolean"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "description": "Redpanda version 25.2 or later. For Avro and Protobuf schemas only. Supported values: an empty string `''` returns the schema in its current format (default), and `serialized` (Protobuf only) returns the schema in its Base64-encoded wire binary format. Unsupported values return a 501 error."
           }
         ],
         "produces": [
@@ -991,7 +1044,7 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -1004,6 +1057,12 @@
           },
           "500": {
             "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "501": {
+            "description": "Not Implemented: The specified format parameter value is not supported",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -1045,7 +1104,7 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -1100,7 +1159,7 @@
             }
           },
           "404": {
-            "description": "Schema not found",
+            "description": "Not Found: Schema not found",
             "schema": {
               "$ref": "#/definitions/error_body"
             }
@@ -1152,6 +1211,7 @@
           {
             "name": "verbose",
             "in": "query",
+            "description": "If true, includes more verbose information about the compatibility check, for example the reason the check failed.",
             "required": false,
             "type": "boolean"
           }
@@ -1202,5 +1262,213 @@
           }
         }
       }
+    },
+    "/security/acls": {
+      "get": {
+        "summary": "List ACLs",
+        "description": "Returns a list of ACL rules that match the specified filters.",
+        "operationId": "get_security_acls",
+        "produces": [
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "principal",
+            "in": "query",
+            "type": "string",
+            "description": "The name of the principal, for example, User:alice or RedpandaRole:admin. Use \"*\" to represent a wildcard."
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "type": "string",
+            "description": "The name of the resource. Use \"*\" to represent a wildcard."
+          },
+          {
+            "name": "resource_type",
+            "in": "query",
+            "type": "string",
+            "enum": ["REGISTRY", "SUBJECT"],
+            "description": "The type of resource being secured. The REGISTRY type maps to top-level operations such as `GET /mode` and `GET /config`. The SUBJECT type maps to operations on the subject level, such as `GET /subjects` and `GET /config/{subject}`."
+          },
+          {
+            "name": "pattern_type",
+            "in": "query",
+            "type": "string",
+            "enum": ["LITERAL", "PREFIXED"],
+            "description": "Pattern match type for the resource. Only applies when `resource_type` is SUBJECT."
+          },
+          {
+            "name": "host",
+            "in": "query",
+            "type": "string",
+            "description": "Originating host for which this rule applies. Use \"*\" to represent a wildcard."
+          },
+          {
+            "name": "operation",
+            "in": "query",
+            "type": "string",
+            "enum": ["ALL", "READ", "WRITE", "DELETE", "DESCRIBE", "DESCRIBE_CONFIGS", "ALTER_CONFIGS"],
+            "description": "The operation to allow or deny."
+          },
+          {
+            "name": "permission",
+            "in": "query",
+            "type": "string",
+            "enum": ["ALLOW", "DENY"],
+            "description": "Specifies whether the operation is allowed or denied."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List ACLs",
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/security_acl"
+              }
+            },
+            "examples": {
+              "application/json": [
+                {
+                  "principal": "User:alice",
+                  "resource": "model-",
+                  "resource_type": "SUBJECT",
+                  "pattern_type": "PREFIXED",
+                  "operation": "READ",
+                  "permission": "ALLOW",
+                  "host": "*"
+                }
+              ]
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create ACLs",
+        "description": "Create new ACL rules.",
+        "operationId": "post_security_acls",
+        "parameters": [
+          {
+            "name": "acls",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/security_acl"
+              }
+            }
+          }
+        ],
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json"
+        ],
+        "responses": {
+          "201": {
+            "description": "ACLs created"
+          },
+          "400": {
+            "description": "Bad request",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete ACLs",
+        "description": "Delete ACL rules that match the specified definitions exactly.",
+        "operationId": "delete_security_acls",
+        "consumes": [
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "acls",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/security_acl"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ACLs deleted",
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/security_acl"
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/error_body"
+            }
+          }
+        }
+      }
     }
-  

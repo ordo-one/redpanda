@@ -9,13 +9,13 @@
  */
 
 #include "bytes/iostream.h"
+#include "cloud_io/cache_service.h"
+#include "cloud_io/tests/cache_test_fixture.h"
 #include "cloud_io/tests/s3_imposter.h"
-#include "cloud_storage/cache_service.h"
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_file.h"
-#include "cloud_storage/tests/cache_test_fixture.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/lazy_abort_source.h"
 
 #include <seastar/core/seastar.hh>
@@ -42,7 +42,7 @@ using namespace cloud_storage;
 
 class remote_file_fixture
   : public s3_imposter_fixture
-  , public cache_test_fixture {
+  , public cloud_io::cache_test_fixture {
 public:
     remote_file_fixture()
       : data_dir("data_dir") {
@@ -55,7 +55,9 @@ public:
         io.start(
             std::ref(pool),
             ss::sharded_parameter([this] { return get_configuration(); }),
-            ss::sharded_parameter([] { return config_file; }))
+            ss::sharded_parameter([] { return config_file; }),
+            ss::sharded_parameter(
+              [] { return ss::default_scheduling_group(); }))
           .get();
         remote
           .start(std::ref(io), ss::sharded_parameter([this] {

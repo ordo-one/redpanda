@@ -11,6 +11,9 @@
 
 #include "pandaproxy/schema_registry/protobuf.h"
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
 #include "base/vlog.h"
 #include "bytes/streambuf.h"
 #include "kafka/protocol/errors.h"
@@ -23,12 +26,10 @@
 #include "utils/base64.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/flat_hash_set.h>
-#include <absl/strings/ascii.h>
-#include <absl/strings/escaping.h>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/range/combine.hpp>
 #include <confluent/meta.pb.h>
@@ -45,7 +46,7 @@
 #include <google/protobuf/empty.pb.h>
 #include <google/protobuf/field_mask.pb.h>
 #include <google/protobuf/io/tokenizer.h>
-#include <google/protobuf/io/zero_copy_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/source_context.pb.h>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/timestamp.pb.h>
@@ -92,7 +93,7 @@ struct descriptor_hasher {
     using is_transparent = void;
 
     std::size_t operator()(const pb::FileDescriptor* s) const {
-        return absl::Hash<std::string>()(s->name());
+        return absl::Hash<std::string_view>()(s->name());
     }
     std::size_t operator()(const ss::sstring& s) const {
         return absl::Hash<ss::sstring>()(s);
@@ -186,13 +187,14 @@ public:
       const pb::Message* descriptor,
       ErrorLocation location,
       std::string_view message) final {
-        _errors.emplace_back(err{
-          level::error,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring{message}});
+        _errors.emplace_back(
+          err{
+            level::error,
+            ss::sstring{filename},
+            ss::sstring{element_name},
+            descriptor,
+            location,
+            ss::sstring{message}});
     }
 
     void RecordWarning(
@@ -201,13 +203,14 @@ public:
       const pb::Message* descriptor,
       ErrorLocation location,
       std::string_view message) final {
-        _errors.emplace_back(err{
-          level::warn,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring{message}});
+        _errors.emplace_back(
+          err{
+            level::warn,
+            ss::sstring{filename},
+            ss::sstring{element_name},
+            descriptor,
+            location,
+            ss::sstring{message}});
     }
 
     error_info error(std::string_view sub) const;
@@ -233,7 +236,7 @@ private:
 ///\brief Implements ZeroCopyInputStream with a copy of the definition
 class schema_def_input_stream : public pb::io::ZeroCopyInputStream {
 public:
-    explicit schema_def_input_stream(const canonical_schema_definition& def)
+    explicit schema_def_input_stream(const schema_definition& def)
       : _is{def.shared_raw()}
       , _impl{&_is.istream()} {}
 
@@ -255,7 +258,7 @@ public:
       : _parser{}
       , _fdp{} {}
 
-    const pb::FileDescriptorProto& parse(const canonical_schema& schema) {
+    const pb::FileDescriptorProto& parse(const subject_schema& schema) {
         schema_def_input_stream is{schema.def()};
         io_error_collector error_collector;
         pb::io::Tokenizer t{&is, &error_collector};
@@ -431,21 +434,30 @@ build_file(pb::DescriptorPool& dp, const pb::FileDescriptorProto& fdp) {
 ss::future<pb::FileDescriptorProto> build_file_with_refs(
   pb::DescriptorPool& dp,
   schema_getter& store,
-  canonical_schema schema,
+  subject_schema schema,
   normalize norm) {
     for (const auto& ref : schema.def().refs()) {
         if (dp.FindFileByName(ref.name)) {
             continue;
         }
-        auto dep = co_await store.get_subject_schema(
-          ref.sub, ref.version, include_deleted::no);
-        co_await build_file_with_refs(
-          dp,
-          store,
-          canonical_schema{subject{ref.name}, std::move(dep.schema).def()},
-          normalize::no);
+        try {
+            auto dep = co_await store.get_subject_schema(
+              ref.sub, ref.version, include_deleted::yes);
+            co_await build_file_with_refs(
+              dp,
+              store,
+              subject_schema{subject{ref.name}, std::move(dep.schema).def()},
+              normalize::no);
+        } catch (const exception& e) {
+            if (failed_subject_schema_lookup(e.code())) {
+                throw as_exception(
+                  no_reference_found_for(schema, ref.sub, ref.version));
+            }
+            throw;
+        }
     }
 
+    ss::memory::scoped_system_alloc_fallback fb;
     parser p;
     auto new_fdp = p.parse(schema);
     normalize_imports(new_fdp, norm);
@@ -461,14 +473,23 @@ ss::future<pb::FileDescriptorProto> build_file_with_refs(
 ss::future<pb::FileDescriptorProto> import_schema(
   pb::DescriptorPool& dp,
   schema_getter& store,
-  canonical_schema schema,
+  subject_schema schema,
   normalize norm) {
     try {
         co_return co_await build_file_with_refs(
           dp, store, schema.share(), norm);
     } catch (const exception& e) {
+        // Rethrow if the schema is missing references
+        if (e.code() == error_code::schema_missing_reference) {
+            throw;
+        }
+        // Otherwise log the error details and throw an appropriate error for
+        // the response
         vlog(
-          plog.warn, "Failed to decode schema {}: {}", schema.sub(), e.what());
+          srlog.warn,
+          "Failed to decode schema {}: {:?}",
+          schema.sub(),
+          e.what());
         throw as_exception(invalid_schema(schema));
     }
 }
@@ -496,7 +517,7 @@ struct protobuf_schema_definition::impl {
      * messages
      */
     ss::sstring debug_string() const {
-        // TODO BP: Prevent this linearization
+        ss::memory::scoped_system_alloc_fallback fb;
         auto s = fd->DebugString();
 
         // reordering not required if no package or no dependencies
@@ -529,14 +550,21 @@ struct protobuf_schema_definition::impl {
           "{}\n{}\n\n{}\n\n{}\n", header, package, imports, footer);
     }
 
-    canonical_schema_definition::raw_string raw() const {
-        return canonical_schema_definition::raw_string{debug_string()};
+    schema_definition::raw_string raw(output_format format) const {
+        if (format == output_format::serialized) {
+            iobuf_ostream ios;
+            fdp.SerializeToOstream(&ios.ostream());
+
+            return schema_definition::raw_string{
+              iobuf_to_base64(std::move(ios).buf())};
+        }
+        return schema_definition::raw_string{debug_string()};
     }
 };
 
-canonical_schema_definition::raw_string
-protobuf_schema_definition::raw() const {
-    return _impl->raw();
+schema_definition::raw_string
+protobuf_schema_definition::raw(output_format format) const {
+    return _impl->raw(format);
 }
 
 ::result<ss::sstring, kafka::error_code>
@@ -545,7 +573,7 @@ protobuf_schema_definition::name(const std::vector<int>& fields) const {
     if (d.has_error()) {
         return d.error();
     }
-    return d.value().get().full_name();
+    return ss::sstring(d.value().get().full_name());
 }
 
 ::result<
@@ -602,7 +630,7 @@ operator<<(std::ostream& os, const protobuf_schema_definition& def) {
 }
 
 ss::future<protobuf_schema_definition> make_protobuf_schema_definition(
-  schema_getter& store, canonical_schema schema, normalize norm) {
+  schema_getter& store, subject_schema schema, normalize norm) {
     auto refs = schema.def().refs();
     auto impl = ss::make_shared<protobuf_schema_definition::impl>();
     impl->fdp = co_await import_schema(
@@ -617,26 +645,41 @@ ss::future<protobuf_schema_definition> make_protobuf_schema_definition(
     co_return protobuf_schema_definition{std::move(impl), std::move(refs)};
 }
 
-ss::future<canonical_schema_definition> validate_protobuf_schema(
-  sharded_store& store, canonical_schema schema, normalize norm) {
+ss::future<schema_definition> validate_protobuf_schema(
+  sharded_store& store,
+  subject_schema schema,
+  normalize norm,
+  output_format format) {
     auto res = co_await make_protobuf_schema_definition(
       store, std::move(schema), norm);
-    co_return canonical_schema_definition{std::move(res)};
+    co_return schema_definition{res.raw(format), res.type(), res.refs()};
 }
 
-ss::future<canonical_schema> make_canonical_protobuf_schema(
-  sharded_store& store, unparsed_schema schema, normalize norm) {
-    auto [sub, unparsed] = std::move(schema).destructure();
-    auto [def, type, refs] = std::move(unparsed).destructure();
-    canonical_schema temp{
-      sub,
-      {canonical_schema_definition::raw_string{std::move(def)()},
-       type,
-       std::move(refs)}};
-
-    co_return canonical_schema{
+ss::future<subject_schema> make_canonical_protobuf_schema(
+  sharded_store& store,
+  subject_schema schema,
+  normalize norm,
+  output_format format) {
+    subject sub = schema.sub();
+    co_return subject_schema{
       std::move(sub),
-      co_await validate_protobuf_schema(store, std::move(temp), norm)};
+      co_await validate_protobuf_schema(
+        store, std::move(schema), norm, format)};
+}
+
+ss::future<schema_definition> format_protobuf_schema_definition(
+  sharded_store& store, schema_definition schema, output_format format) {
+    switch (format) {
+    case output_format::ignore_extensions:
+        throw as_exception(format_not_supported(format));
+    case output_format::serialized: {
+        auto serialized = co_await make_canonical_protobuf_schema(
+          store, {{}, std::move(schema)}, normalize::no, format);
+        co_return std::move(serialized).def();
+    }
+    default:
+        co_return std::move(schema);
+    }
 }
 
 namespace {

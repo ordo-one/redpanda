@@ -7,7 +7,6 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
     ],
-    include_prefix = "kafka/server/tests",
     deps = [
         "//src/v/kafka/protocol:describe_configs",
         "//src/v/kafka/server",
@@ -21,7 +20,6 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
     ],
-    include_prefix = "kafka/server/tests",
     deps = [
         "//src/v/cluster",
         "//src/v/redpanda/tests:fixture",
@@ -44,15 +42,15 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
     ],
-    include_prefix = "kafka/server/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "//src/v/bytes:iobuf",
-        "//src/v/container:fragmented_vector",
-        "//src/v/kafka/client",
+        "//src/v/container:chunked_vector",
+        "//src/v/kafka/client:transport",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:delete_records",
+        "//src/v/kafka/protocol:fetch",
         "//src/v/kafka/protocol:list_offset",
         "//src/v/kafka/protocol:offset_for_leader_epoch",
         "//src/v/kafka/protocol:produce",
@@ -121,6 +119,7 @@ redpanda_cc_btest(
         "//src/v/cluster",
         "//src/v/kafka/protocol/schemata:create_topics_request",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/model",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -137,6 +136,7 @@ redpanda_cc_btest(
     deps = [
         "//src/v/kafka/protocol/schemata:create_topics_response",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/model",
         "//src/v/test_utils:seastar_boost",
         "@boost//:range",
@@ -168,23 +168,8 @@ redpanda_cc_btest(
     deps = [
         "//src/v/kafka/protocol/schemata:create_topics_request",
         "//src/v/kafka/server",
-        "//src/v/pandaproxy:subject_name_strategy",
-        "//src/v/test_utils:seastar_boost",
-        "@boost//:test",
-        "@seastar//:testing",
-    ],
-)
-
-redpanda_cc_btest(
-    name = "fetch_unit_test",
-    timeout = "short",
-    srcs = [
-        "fetch_unit_test.cc",
-    ],
-    deps = [
-        "//src/v/base",
-        "//src/v/kafka/server",
-        "//src/v/ssx:semaphore",
+        "//src/v/kafka/server:topic_config_utils",
+        "//src/v/pandaproxy/schema_registry:subject_name_strategy",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar//:testing",
@@ -201,6 +186,7 @@ redpanda_cc_btest(
         "//src/v/cluster",
         "//src/v/config",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/model",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -225,12 +211,30 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_gtest(
+    name = "fetch_memory_units_test",
+    timeout = "short",
+    srcs = [
+        "fetch_memory_units_test.cc",
+    ],
+    cpu = 2,
+    deps = [
+        "//src/v/base",
+        "//src/v/kafka/server",
+        "//src/v/ssx:semaphore",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "consumer_group_recovery_test",
     timeout = "short",
     srcs = [
         "consumer_group_recovery_test.cc",
     ],
     deps = [
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/container:chunked_hash_map",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server",
@@ -251,9 +255,8 @@ redpanda_cc_btest(
     srcs = [
         "member_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server",
         "//src/v/test_utils:seastar_boost",
@@ -272,10 +275,9 @@ redpanda_cc_btest(
         "consumer_groups_test.cc",
     ],
     cpu = 1,
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
-        "//src/v/kafka/client",
+        "//src/v/kafka/client:transport",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:describe_groups",
         "//src/v/kafka/protocol:find_coordinator",
@@ -286,6 +288,7 @@ redpanda_cc_btest(
         "//src/v/model",
         "//src/v/model:timeout_clock",
         "//src/v/redpanda/tests:fixture",
+        "//src/v/security",
         "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:base64",
@@ -303,11 +306,10 @@ redpanda_cc_btest(
     srcs = [
         "group_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server",
         "//src/v/test_utils:seastar_boost",
@@ -325,7 +327,6 @@ redpanda_cc_btest(
     srcs = [
         "read_write_roundtrip_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/kafka/protocol",
         "//src/v/random:generators",
@@ -343,15 +344,16 @@ redpanda_cc_btest(
     srcs = [
         "delete_topics_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/cluster",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:create_topics",
         "//src/v/kafka/protocol:delete_topics",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/protocol/schemata:create_topics_request",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/redpanda:application",
         "//src/v/redpanda/tests:fixture",
         "//src/v/test_utils:seastar_boost",
@@ -368,11 +370,10 @@ redpanda_cc_btest(
     srcs = [
         "offset_fetch_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/kafka/protocol:offset_fetch",
+        "//src/v/kafka/server",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -386,11 +387,9 @@ redpanda_cc_btest(
     srcs = [
         "api_versions_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/kafka/server",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -398,21 +397,19 @@ redpanda_cc_btest(
     ],
 )
 
-redpanda_cc_btest(
+redpanda_cc_gtest(
     name = "usage_manager_test",
     timeout = "short",
     srcs = [
         "usage_manager_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/kafka/server",
         "//src/v/storage/tests:kvstore_fixture",
-        "//src/v/test_utils:seastar_boost",
-        "@boost//:test",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -422,15 +419,16 @@ redpanda_cc_btest(
     srcs = [
         "create_topics_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
+        "//src/v/cluster",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/features:enterprise_feature_messages",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:create_topics",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/kafka/server/tests:topic_properties_helpers",
         "//src/v/model",
         "//src/v/test_utils:seastar_boost",
@@ -446,11 +444,9 @@ redpanda_cc_btest(
     srcs = [
         "find_coordinator_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/kafka/protocol:find_coordinator",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -464,16 +460,14 @@ redpanda_cc_btest(
     srcs = [
         "list_offsets_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:list_offset",
         "//src/v/kafka/protocol:produce",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -487,15 +481,15 @@ redpanda_cc_btest(
     srcs = [
         "topic_recreate_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:create_topics",
         "//src/v/kafka/protocol:delete_topics",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/protocol:produce",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/redpanda:application",
@@ -514,7 +508,6 @@ redpanda_cc_btest(
     srcs = [
         "fetch_session_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/kafka/protocol:fetch",
         "//src/v/kafka/protocol/schemata:fetch_request",
@@ -535,11 +528,11 @@ redpanda_cc_btest(
     srcs = [
         "create_partition_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/config",
         "//src/v/features:enterprise_feature_messages",
         "//src/v/kafka/protocol",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/kafka/server/tests:topic_properties_helpers",
         "//src/v/model",
         "//src/v/test_utils:seastar_boost",
@@ -556,7 +549,6 @@ redpanda_cc_btest(
     srcs = [
         "group_metadata_serialization_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/bytes",
         "//src/v/kafka/protocol",
@@ -580,16 +572,16 @@ redpanda_cc_btest(
     srcs = [
         "partition_reassignments_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol:alter_partition_reassignments",
         "//src/v/kafka/protocol:list_partition_reassignments",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/protocol/schemata:alter_partition_reassignments_request",
         "//src/v/kafka/protocol/schemata:list_partition_reassignments_request",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/model",
         "//src/v/redpanda/tests:fixture",
         "//src/v/test_utils:seastar_boost",
@@ -606,7 +598,6 @@ redpanda_cc_btest(
     srcs = [
         "replicated_partition_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
         "//src/v/kafka/data:partition_proxy",
@@ -626,22 +617,22 @@ redpanda_cc_btest(
     srcs = [
         "metadata_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
-        "//src/v/kafka/client",
+        "//src/v/kafka/client:transport",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:create_topics",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/protocol:sasl_authenticate",
         "//src/v/kafka/protocol:sasl_handshake",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:security",
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
         "//src/v/security",
+        "//src/v/test_utils:random_bytes",
         "//src/v/test_utils:seastar_boost",
-        "@abseil-cpp//absl/algorithm:container",
         "@boost//:test",
         "@seastar//:testing",
     ],
@@ -653,7 +644,6 @@ redpanda_cc_btest(
     srcs = [
         "quota_manager_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
         "//src/v/config",
@@ -671,7 +661,6 @@ redpanda_cc_btest(
     srcs = [
         "client_quota_translator_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
         "//src/v/cluster",
@@ -691,10 +680,9 @@ redpanda_cc_btest(
         "alter_config_test.cc",
     ],
     cpu = "1",
-    tags = ["exclusive"],
     deps = [
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/features:enterprise_feature_messages",
         "//src/v/kafka/client",
         "//src/v/kafka/protocol",
@@ -704,6 +692,7 @@ redpanda_cc_btest(
         "//src/v/kafka/protocol:incremental_alter_configs",
         "//src/v/kafka/protocol:metadata",
         "//src/v/kafka/server",
+        "//src/v/kafka/server:topic_config_utils",
         "//src/v/kafka/server/tests:topic_properties_helpers",
         "//src/v/model",
         "//src/v/test_utils:scoped_config",
@@ -722,19 +711,20 @@ redpanda_cc_btest(
         "produce_consume_test.cc",
     ],
     cpu = "1",
-    tags = ["exclusive"],
     deps = [
         ":kafka_test_utils",
-        "//src/v/container:fragmented_vector",
-        "//src/v/kafka/client",
+        "//src/v/container:chunked_vector",
+        "//src/v/kafka/client:transport",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:fetch",
+        "//src/v/kafka/protocol:offset_for_leader_epoch",
         "//src/v/kafka/protocol:produce",
         "//src/v/kafka/server",
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
         "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -752,9 +742,11 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/config",
         "//src/v/kafka/server",
+        "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/raft",
         "//src/v/redpanda/tests:fixture",
+        "//src/v/storage",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:scoped_config",
         "@googletest//:gtest",
@@ -762,6 +754,24 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "fetch_metadata_cache_test",
+    timeout = "short",
+    srcs = [
+        "fetch_metadata_cache_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/base",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_btest(
     name = "fetch_test",
     timeout = "short",
     srcs = [
@@ -769,12 +779,15 @@ redpanda_cc_gtest(
     ],
     cpu = 1,
     deps = [
+        "//src/v/base",
+        "//src/v/cluster/tests:cluster_test_fixture",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server",
         "//src/v/model",
+        "//src/v/raft",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/resource_mgmt:io_priority",
-        "//src/v/test_utils:gtest",
+        "//src/v/storage/tests:disk_log_builder",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@fmt",
@@ -803,30 +816,45 @@ redpanda_cc_gtest(
     ],
 )
 
+redpanda_cc_gtest(
+    name = "write_at_offset_stm_test",
+    timeout = "moderate",
+    srcs = [
+        "write_at_offset_stm_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/config",
+        "//src/v/kafka/data:log_reader_config",
+        "//src/v/kafka/server:write_at_offset_stm",
+        "//src/v/model/tests:random",
+        "//src/v/raft",
+        "//src/v/raft/tests:stm_test_fixture",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:scoped_config",
+        "@googletest//:gtest",
+    ],
+)
+
 redpanda_cc_bench(
     name = "kafka_fetch_rpbench",
-    timeout = "moderate",
     srcs = [
         "fetch_bench.cc",
     ],
     cpu = 2,
-    duration = 1,
     memory = "4GiB",
-    runs = 1,
-    tags = ["exclusive"],
-    target_compatible_with = select({
-        "//bazel:optimized_build": [],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
     deps = [
         ":kafka_test_utils",
         "//src/v/base",
         "//src/v/cluster",
         "//src/v/kafka/server",
         "//src/v/model",
+        "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
-        "//src/v/test_utils:fixture",
+        "//src/v/test_utils:async",
         "//src/v/test_utils:scoped_config",
+        "@seastar",
         "@seastar//:benchmark",
     ],
 )
@@ -836,13 +864,10 @@ redpanda_cc_bench(
     srcs = [
         "fetch_plan_bench.cc",
     ],
-    duration = 1,
     memory = "4GiB",
-    runs = 1,
-    tags = ["exclusive"],
     deps = [
         "//src/v/base",
-        "//src/v/kafka/client",
+        "//src/v/kafka/client:types",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:fetch",
         "//src/v/kafka/protocol/schemata:fetch_request",
@@ -850,7 +875,8 @@ redpanda_cc_bench(
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
-        "@boost//:test",
+        "//src/v/security",
+        "@fmt",
         "@seastar//:benchmark",
     ],
 )
@@ -862,15 +888,16 @@ redpanda_cc_bench(
     ],
     duration = 1,
     memory = "4GiB",
+    redirect_stderr = True,
     runs = 1,
-    tags = ["exclusive"],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol/schemata:produce_request",
         "//src/v/kafka/server",
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
+        "//src/v/test_utils:async",
         "@boost//:test",
         "@seastar",
         "@seastar//:benchmark",
@@ -893,5 +920,110 @@ redpanda_cc_bench(
         "@fmt",
         "@seastar",
         "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "describe_user_scram_credentials_test",
+    timeout = "short",
+    srcs = [
+        "describe_user_scram_credentials_test.cc",
+    ],
+    env = {"RP_FIXTURE_ENV": "1"},
+    deps = [
+        "//src/v/cluster",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_user_scram_credentials",
+        "//src/v/kafka/server",
+        "//src/v/kafka/server:security",
+        "//src/v/model",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "alter_user_scram_credentials_test",
+    timeout = "short",
+    srcs = [
+        "alter_user_scram_credentials_test.cc",
+    ],
+    env = {"RP_FIXTURE_ENV": "1"},
+    deps = [
+        "//src/v/cluster",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:alter_user_scram_credentials",
+        "//src/v/kafka/server",
+        "//src/v/kafka/server:security",
+        "//src/v/model",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "describe_acls_test",
+    timeout = "short",
+    srcs = [
+        "describe_acls_test.cc",
+    ],
+    env = {"RP_FIXTURE_ENV": "1"},
+    deps = [
+        "//src/v/cluster",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_acls",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "produce_invalid_batch_test",
+    timeout = "short",
+    srcs = [
+        "produce_invalid_batch_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/config",
+        "//src/v/container:chunked_vector",
+        "//src/v/kafka/client:transport",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:metadata",
+        "//src/v/kafka/protocol:produce",
+        "//src/v/model",
+        "//src/v/model/tests:raw_record_batch_factory",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "in_flight_requests_test",
+    timeout = "short",
+    srcs = [
+        "in_flight_requests_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/kafka/server",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
     ],
 )

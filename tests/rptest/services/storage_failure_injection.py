@@ -8,12 +8,10 @@
 # by the Apache License, Version 2.0
 
 import json
-
-from collections import ChainMap
-from enum import Enum
 from dataclasses import dataclass
-from typing import Optional
+from enum import Enum
 from functools import reduce
+from typing import Optional
 
 
 class BatchType(str, Enum):
@@ -91,17 +89,12 @@ class NTPFailureInjectionConfig:
 
     def to_dict(self):
         return {
-            "namespace":
-            self.ntp.namespace,
-            "topic":
-            self.ntp.topic,
-            "partition":
-            self.ntp.partition,
-            "failure_configs":
-            reduce(lambda a, b: {
-                **a,
-                **b
-            }, [cfg.to_dict() for cfg in self.failure_configs])
+            "namespace": self.ntp.namespace,
+            "topic": self.ntp.topic,
+            "partition": self.ntp.partition,
+            "failure_configs": reduce(
+                lambda a, b: {**a, **b}, [cfg.to_dict() for cfg in self.failure_configs]
+            ),
         }
 
 
@@ -113,8 +106,7 @@ class FailureInjectionConfig:
     def to_dict(self):
         return {
             "seed": self.seed,
-            "ntps":
-            [ntp_cfg.to_dict() for ntp_cfg in self.ntp_failure_configs]
+            "ntps": [ntp_cfg.to_dict() for ntp_cfg in self.ntp_failure_configs],
         }
 
     def write_to_file(self, path):

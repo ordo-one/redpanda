@@ -7,11 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build linux
+
 package bundle
 
 import (
-	"context"
-	"encoding/xml"
 	"fmt"
 	"os"
 	"strings"
@@ -20,7 +20,6 @@ import (
 	"github.com/docker/go-units"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug/common"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/httpapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
 	"github.com/spf13/afero"
@@ -143,7 +142,7 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			}
 			out.MaybeDie(err, "unable to create bundle: %v", err)
 			if uploadURL != "" {
-				err = uploadBundle(cmd.Context(), path, uploadURL)
+				err = common.UploadBundle(cmd.Context(), path, uploadURL)
 				out.MaybeDie(err, "unable to upload bundle: %v", err)
 				fmt.Println("Successfully uploaded the bundle")
 			}
@@ -155,30 +154,12 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVarP(&outFile, outputFlag, "o", "", "The file path where the debug file will be written (default ./<timestamp>-bundle.zip)")
-	f.DurationVar(&timeout, "timeout", 31*time.Second, "How long to wait for child commands to execute. For example: 30s, 1.5m")
+	f.DurationVar(&timeout, "timeout", 60*time.Second, "How long to wait for child commands to execute. For example: 30s, 1.5m")
 	f.StringVar(&uploadURL, "upload-url", "", "If provided, where to upload the bundle in addition to creating a copy on disk")
 	// Debug bundle options.
 	opts.InstallFlags(f)
 
 	return cmd
-}
-
-// uploadBundle will send the file located in 'filepath' by issuing a PUT
-// request to the 'uploadURL'.
-func uploadBundle(ctx context.Context, filepath, uploadURL string) error {
-	uploadFile, err := os.Open(filepath)
-	if err != nil {
-		return fmt.Errorf("unable to open the file %q: %v", filepath, err)
-	}
-	defer uploadFile.Close()
-
-	cl := httpapi.NewClient(
-		httpapi.Err4xx(func(code int) error { return &S3EndpointError{HTTPCode: code} }),
-		httpapi.Headers(
-			"Content-Type", "application/zip",
-		))
-
-	return cl.Put(ctx, uploadURL, nil, uploadFile, nil)
 }
 
 func parsePartitionFlag(flags []string) (filters []topicPartitionFilter, rerr error) {
@@ -197,19 +178,6 @@ func parsePartitionFlag(flags []string) (filters []topicPartitionFilter, rerr er
 		})
 	}
 	return
-}
-
-// S3EndpointError is the error that we get when calling an S3 url.
-type S3EndpointError struct {
-	XMLName xml.Name `xml:"Error"`
-	Code    string   `xml:"Code"`
-	Message string   `xml:"Message"`
-
-	HTTPCode int
-}
-
-func (e *S3EndpointError) Error() string {
-	return fmt.Sprintf("unexpected error code %v - %v : %v", e.HTTPCode, e.Code, e.Message)
 }
 
 const bundleHelpText = `'rpk debug bundle' collects environment data that can help debug and diagnose

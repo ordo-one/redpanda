@@ -10,6 +10,7 @@
 #include "storage/segment_index.h"
 
 #include "base/vassert.h"
+#include "compaction/utils.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
 #include "storage/index_state.h"
@@ -37,17 +38,22 @@ segment_index::segment_index(
   std::optional<ntp_sanitizer_config> sanitizer_config,
   std::optional<model::timestamp> broker_timestamp,
   std::optional<model::timestamp> clean_compact_timestamp,
-  bool may_have_tombstone_records)
+  bool may_have_tombstone_records,
+  std::optional<model::timestamp> self_compact_timestamp,
+  bool may_have_transaction_batches)
   : _path(std::move(path))
   , _step(step)
   , _feature_table(std::ref(feature_table))
-  , _state(index_state::make_empty_index(
-      storage::internal::should_apply_delta_time_offset(_feature_table)))
+  , _state(
+      index_state::make_empty_index(
+        base,
+        storage::internal::should_apply_delta_time_offset(_feature_table)))
   , _sanitizer_config(std::move(sanitizer_config)) {
-    _state.base_offset = base;
     _state.broker_timestamp = broker_timestamp;
     _state.clean_compact_timestamp = clean_compact_timestamp;
     _state.may_have_tombstone_records = may_have_tombstone_records;
+    _state.self_compact_timestamp = self_compact_timestamp;
+    _state.may_have_transaction_batches = may_have_transaction_batches;
 }
 
 segment_index::segment_index(
@@ -59,11 +65,11 @@ segment_index::segment_index(
   : _path(std::move(path))
   , _step(step)
   , _feature_table(std::ref(feature_table))
-  , _state(index_state::make_empty_index(
-      storage::internal::should_apply_delta_time_offset(_feature_table)))
-  , _mock_file(mock_file) {
-    _state.base_offset = base;
-}
+  , _state(
+      index_state::make_empty_index(
+        base,
+        storage::internal::should_apply_delta_time_offset(_feature_table)))
+  , _mock_file(mock_file) {}
 
 ss::future<ss::file> segment_index::open() {
     if (_mock_file) {
@@ -82,15 +88,18 @@ void segment_index::reset() {
     // Persist the base offset, clean compaction timestamp, and tombstones
     // identifier through a reset.
     auto base = _state.base_offset;
+    auto self_compact_timestamp = _state.self_compact_timestamp;
     auto clean_compact_timestamp = _state.clean_compact_timestamp;
     auto may_have_tombstone_records = _state.may_have_tombstone_records;
+    auto may_have_transaction_batches = _state.may_have_transaction_batches;
 
     _state = index_state::make_empty_index(
-      storage::internal::should_apply_delta_time_offset(_feature_table));
+      base, storage::internal::should_apply_delta_time_offset(_feature_table));
 
-    _state.base_offset = base;
+    _state.self_compact_timestamp = self_compact_timestamp;
     _state.clean_compact_timestamp = clean_compact_timestamp;
     _state.may_have_tombstone_records = may_have_tombstone_records;
+    _state.may_have_transaction_batches = may_have_transaction_batches;
 
     _acc = 0;
 }
@@ -136,7 +145,7 @@ void segment_index::maybe_track(
           to_optional_model_timestamp(new_broker_ts),
           path().is_internal_topic()
             || hdr.type == model::record_batch_type::raft_data,
-          internal::is_compactible(hdr) ? hdr.record_count : 0)) {
+          compaction::is_filterable(hdr.type) ? hdr.record_count : 0)) {
         _acc = 0;
     }
     _needs_persistence = true;
@@ -184,6 +193,7 @@ ss::future<bool> segment_index::materialize_index() {
 ss::future<bool> segment_index::materialize_index_from_file(ss::file f) {
     auto size = co_await f.size();
     auto buf = co_await f.dma_read_bulk<char>(0, size);
+    _disk_usage_size = size;
     if (buf.empty()) {
         co_return false;
     }
@@ -232,6 +242,9 @@ ss::future<> segment_index::flush_to_file(ss::file backing_file) {
     for (const auto& f : b) {
         co_await out.write(f.get(), f.size());
     }
+
+    _disk_usage_size = b.size_bytes();
+
     co_await out.flush();
 }
 

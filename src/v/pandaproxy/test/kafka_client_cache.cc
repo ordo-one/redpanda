@@ -20,6 +20,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/defer.hh>
 
 #include <boost/test/unit_test.hpp>
 
@@ -31,7 +32,12 @@ using namespace std::chrono_literals;
 static constexpr auto clean_timer_period = 10s;
 
 namespace pandaproxy {
-using cache_item = std::pair<client_ptr, client_mu_ptr>;
+using cache_item = std::pair<client_ptr, client_lock_ptr>;
+
+struct stop_client {
+    client_ptr client;
+    void operator()() { client->stop().get(); }
+};
 
 struct test_client_cache : public kafka_client_cache {
     explicit test_client_cache(size_t max_size)
@@ -52,6 +58,15 @@ struct test_client_cache : public kafka_client_cache {
 
     ~test_client_cache() { stop().get(); }
 
+    std::pair<client_ptr, ss::deferred_action<stop_client>>
+    make_client_with_guard(
+      credential_t user, config::rest_authn_method authn_method) {
+        auto client = kafka_client_cache::make_client(
+          std::move(user), std::move(authn_method));
+        auto guard = ss::defer(stop_client{client});
+        return std::make_pair(std::move(client), std::move(guard));
+    }
+
     cache_item
     get_client(credential_t user, config::rest_authn_method authn_method) {
         return fetch_or_insert(user, authn_method);
@@ -69,23 +84,20 @@ SEASTAR_THREAD_TEST_CASE(cache_make_client_scram_sha_256) {
     {
         // Creating a client with no authn methods results in a kafka
         // client without a principal
-        pp::client_ptr client = client_cache.make_client(
+        auto [client, guard] = client_cache.make_client_with_guard(
           user, config::rest_authn_method::none);
-        BOOST_TEST(client->config().sasl_mechanism.value() == "");
-        BOOST_TEST(client->config().scram_username.value() == "");
-        BOOST_TEST(client->config().scram_password.value() == "");
+        BOOST_TEST(!client->get_credentials().has_value());
     }
 
     {
         // Creating a client with http_basic authn type results
         // in a kafka client with a principal
-        pp::client_ptr client = client_cache.make_client(
+        auto [client, guard] = client_cache.make_client_with_guard(
           user, config::rest_authn_method::http_basic);
         BOOST_TEST(
-          client->config().sasl_mechanism.value()
-          == ss::sstring{"SCRAM-SHA-256"});
-        BOOST_TEST(client->config().scram_username.value() == user.name);
-        BOOST_TEST(client->config().scram_password.value() == user.pass);
+          client->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+        BOOST_TEST(client->get_credentials()->username == user.name);
+        BOOST_TEST(client->get_credentials()->password == user.pass);
     }
 }
 
@@ -97,23 +109,20 @@ SEASTAR_THREAD_TEST_CASE(cache_make_client_scram_sha_512) {
     {
         // Creating a client with no authn methods results in a kafka
         // client without a principal
-        pp::client_ptr client = client_cache.make_client(
+        auto [client, guard] = client_cache.make_client_with_guard(
           user, config::rest_authn_method::none);
-        BOOST_TEST(client->config().sasl_mechanism.value() == "");
-        BOOST_TEST(client->config().scram_username.value() == "");
-        BOOST_TEST(client->config().scram_password.value() == "");
+        BOOST_TEST(!client->get_credentials().has_value());
     }
 
     {
         // Creating a client with http_basic authn type results
         // in a kafka client with a principal
-        pp::client_ptr client = client_cache.make_client(
+        auto [client, guard] = client_cache.make_client_with_guard(
           user, config::rest_authn_method::http_basic);
         BOOST_TEST(
-          client->config().sasl_mechanism.value()
-          == ss::sstring{"SCRAM-SHA-512"});
-        BOOST_TEST(client->config().scram_username.value() == user.name);
-        BOOST_TEST(client->config().scram_password.value() == user.pass);
+          client->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-512"});
+        BOOST_TEST(client->get_credentials()->username == user.name);
+        BOOST_TEST(client->get_credentials()->password == user.pass);
     }
 }
 
@@ -131,17 +140,17 @@ SEASTAR_THREAD_TEST_CASE(cache_fetch_or_insert) {
       user, config::rest_authn_method::http_basic);
     pp::client_ptr client = item.first;
     BOOST_TEST(
-      client->config().sasl_mechanism.value() == ss::sstring{"SCRAM-SHA-256"});
-    BOOST_TEST(client->config().scram_username.value() == user.name);
-    BOOST_TEST(client->config().scram_password.value() == user.pass);
+      client->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+    BOOST_TEST(client->get_credentials()->username == user.name);
+    BOOST_TEST(client->get_credentials()->password == user.pass);
 
     // Second fetch tests found path: user password did not change
     item = client_cache.get_client(user, config::rest_authn_method::http_basic);
     client = item.first;
     BOOST_TEST(
-      client->config().sasl_mechanism.value() == ss::sstring{"SCRAM-SHA-256"});
-    BOOST_TEST(client->config().scram_username.value() == user.name);
-    BOOST_TEST(client->config().scram_password.value() == user.pass);
+      client->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+    BOOST_TEST(client->get_credentials()->username == user.name);
+    BOOST_TEST(client->get_credentials()->password == user.pass);
 
     pp::credential_t user2{user};
     user2.pass = "parrot";
@@ -151,13 +160,13 @@ SEASTAR_THREAD_TEST_CASE(cache_fetch_or_insert) {
       user2, config::rest_authn_method::http_basic);
     pp::client_ptr client2 = item.first;
     BOOST_TEST(
-      client2->config().sasl_mechanism.value() == ss::sstring{"SCRAM-SHA-256"});
-    BOOST_TEST(client2->config().scram_username.value() == user.name);
-    BOOST_TEST(client2->config().scram_password.value() == user2.pass);
+      client2->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+    BOOST_TEST(client2->get_credentials()->username == user.name);
+    BOOST_TEST(client2->get_credentials()->password == user2.pass);
     BOOST_TEST(
-      client->config().sasl_mechanism.value() == ss::sstring{"SCRAM-SHA-256"});
-    BOOST_TEST(client->config().scram_username.value() == user.name);
-    BOOST_TEST(client->config().scram_password.value() == user2.pass);
+      client->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+    BOOST_TEST(client->get_credentials()->username == user.name);
+    BOOST_TEST(client->get_credentials()->password == user2.pass);
 
     user2.name = "party";
     // Fourth fetch tests not-found path: cache.size == cache.max_size and cache
@@ -167,9 +176,9 @@ SEASTAR_THREAD_TEST_CASE(cache_fetch_or_insert) {
       user2, config::rest_authn_method::http_basic);
     client2 = item.first;
     BOOST_TEST(
-      client2->config().sasl_mechanism.value() == ss::sstring{"SCRAM-SHA-256"});
-    BOOST_TEST(client2->config().scram_username.value() == user2.name);
-    BOOST_TEST(client2->config().scram_password.value() == user2.pass);
+      client2->get_credentials()->mechanism == ss::sstring{"SCRAM-SHA-256"});
+    BOOST_TEST(client2->get_credentials()->username == user2.name);
+    BOOST_TEST(client2->get_credentials()->password == user2.pass);
     BOOST_TEST(client_cache.size() == s);
     BOOST_TEST(client_cache.max_size() == max_s);
 }

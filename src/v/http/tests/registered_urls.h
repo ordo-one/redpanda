@@ -10,12 +10,12 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "base/seastarx.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/http/httpd.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/beast/http/field.hpp>
 
 #include <iosfwd>
@@ -94,6 +94,11 @@ struct registered_urls {
 
             void then_reply_with(
               ss::sstring content, ss::http::reply::status_type status);
+
+            void then_reply_with(
+              ss::sstring content,
+              std::vector<std::pair<ss::sstring, ss::sstring>> headers,
+              ss::http::reply::status_type status);
 
             void then_reply_with(
               std::vector<std::pair<ss::sstring, ss::sstring>> headers,

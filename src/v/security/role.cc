@@ -12,6 +12,7 @@
 
 #include "security/role_store.h"
 
+#include <algorithm>
 #include <ranges>
 
 namespace security {
@@ -23,7 +24,7 @@ role_member_type member_type_for_principal_type(security::principal_type p) {
         return role_member_type::user;
     case security::principal_type::ephemeral_user:
     case security::principal_type::role:
-        vassert(false, "Invalid principal_type {{{}}} for role membership", p);
+        vunreachable("Invalid principal_type {{{}}} for role membership", p);
     }
     __builtin_unreachable();
 }
@@ -88,7 +89,7 @@ std::optional<role> role_store::get(const role_name& name) const {
 }
 
 bool role_store::remove(const role_name& name) {
-    absl::c_for_each(
+    std::ranges::for_each(
       _members_store, [&name](members_store_type::value_type& e) {
           e.second.erase(role_name_view{name});
       });

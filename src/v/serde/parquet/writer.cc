@@ -11,14 +11,13 @@
 
 #include "serde/parquet/writer.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "container/contiguous_range_map.h"
 #include "serde/parquet/column_writer.h"
 #include "serde/parquet/metadata.h"
 #include "serde/parquet/shredder.h"
-
-#include <absl/container/flat_hash_set.h>
 
 #include <algorithm>
 
@@ -78,7 +77,7 @@ public:
             if (usage > _opts.page_buffer_size) {
                 co_await col.writer.next_page();
             }
-            stats.buffered_size += col.writer.current_page_memory_usage();
+            stats.buffered_size += col.writer.memory_usage();
         }
         stats.flushed_size = _flushed_bytes;
         co_return stats;
@@ -165,16 +164,17 @@ public:
                 orders.push_back(column_order::type_defined);
             }
         });
-        auto encoded_footer = encode(file_metadata{
-          .version = 2,
-          .schema = flatten(_opts.schema),
-          .num_rows = num_rows,
-          .row_groups = std::move(_row_groups),
-          .key_value_metadata = std::move(_opts.metadata),
-          .created_by = fmt::format(
-            "Redpanda version {} (build {})", _opts.version, _opts.build),
-          .column_orders = std::move(orders),
-        });
+        auto encoded_footer = encode(
+          file_metadata{
+            .version = 2,
+            .schema = flatten(_opts.schema),
+            .num_rows = num_rows,
+            .row_groups = std::move(_row_groups),
+            .key_value_metadata = std::move(_opts.metadata),
+            .created_by = fmt::format(
+              "Redpanda version {} (build {})", _opts.version, _opts.build),
+            .column_orders = std::move(orders),
+          });
         size_t footer_size = encoded_footer.size_bytes();
         co_await write_iobuf(std::move(encoded_footer));
         co_await write_iobuf(encode_footer_size(footer_size));

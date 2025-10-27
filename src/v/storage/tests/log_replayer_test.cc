@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0
 
 #include "base/seastarx.h"
+#include "container/chunked_circular_buffer.h"
 #include "features/feature_table.h"
 #include "model/record_utils.h"
 #include "model/tests/random_batch.h"
@@ -25,6 +26,8 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/testing/thread_test_case.hh>
+
+#include <gtest/gtest.h>
 
 #include <memory>
 
@@ -54,19 +57,19 @@ public:
                       base_name + ".index",
                       ss::open_flags::create | ss::open_flags::rw)
                       .get();
-        fd = ss::file(ss::make_shared(file_io_sanitizer(
-          std::move(fd),
-          std::filesystem::path{base_name},
-          ntp_sanitizer_config{.sanitize_only = true})));
-        fidx = ss::file(ss::make_shared(file_io_sanitizer(
-          std::move(fidx),
-          std::filesystem::path{base_name + ".index"},
-          ntp_sanitizer_config{.sanitize_only = true})));
+        fd = ss::file(
+          ss::make_shared(file_io_sanitizer(
+            std::move(fd),
+            std::filesystem::path{base_name},
+            ntp_sanitizer_config{.sanitize_only = true})));
+        fidx = ss::file(
+          ss::make_shared(file_io_sanitizer(
+            std::move(fidx),
+            std::filesystem::path{base_name + ".index"},
+            ntp_sanitizer_config{.sanitize_only = true})));
 
         auto appender = std::make_unique<segment_appender>(
-          fd,
-          segment_appender::options(
-            ss::default_priority_class(), 1, std::nullopt, resources));
+          fd, segment_appender::options(1, std::nullopt, resources));
         auto indexer = segment_index(
           segment_full_path::mock(base_name + ".index"),
           std::move(fidx),
@@ -100,17 +103,18 @@ public:
         auto fd = ss::open_file_dma(
                     name, ss::open_flags::create | ss::open_flags::rw)
                     .get();
-        fd = ss::file(ss::make_shared(file_io_sanitizer(
-          std::move(fd),
-          std::filesystem::path{name},
-          ntp_sanitizer_config{.sanitize_only = true})));
+        fd = ss::file(
+          ss::make_shared(file_io_sanitizer(
+            std::move(fd),
+            std::filesystem::path{name},
+            ntp_sanitizer_config{.sanitize_only = true})));
         auto out = ss::make_file_output_stream(std::move(fd)).get();
         const auto b = random_generators::gen_alphanum_string(100);
         out.write(b.data(), b.size()).get();
         out.flush().get();
         out.close().get();
     }
-    void write(ss::circular_buffer<model::record_batch>& batches) {
+    void write(chunked_circular_buffer<model::record_batch>& batches) {
         do_write(
           [&batches](segment_appender& appender) {
               for (auto& b : batches) {
@@ -134,27 +138,26 @@ public:
 };
 } // namespace storage
 
-SEASTAR_THREAD_TEST_CASE(test_can_recover_single_batch) {
+TEST(log_replayer_test, test_can_recover_single_batch) {
     log_replayer_fixture ctx;
     auto batches = model::test::make_random_batches(model::offset(1), 1).get();
     auto last_offset = batches.back().last_offset();
     ctx.write(batches);
     storage::log_replayer::checkpoint recovered
-      = ctx.replayer().recover_in_thread(ss::default_priority_class());
-    BOOST_REQUIRE(bool(recovered));
-    BOOST_CHECK_EQUAL(recovered.last_offset.value(), last_offset);
+      = ctx.replayer().recover_in_thread();
+    ASSERT_TRUE(bool(recovered));
+    EXPECT_EQ(recovered.last_offset.value(), last_offset);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_unrecovered_single_batch) {
+TEST(log_replayer_test, test_unrecovered_single_batch) {
     {
         log_replayer_fixture ctx;
         auto batches
           = model::test::make_random_batches(model::offset(1), 1).get();
         batches.back().header().crc = 10;
         ctx.write(batches);
-        auto recovered = ctx.replayer().recover_in_thread(
-          ss::default_priority_class());
-        BOOST_CHECK(!bool(recovered));
+        auto recovered = ctx.replayer().recover_in_thread();
+        EXPECT_FALSE(bool(recovered));
     }
     {
         log_replayer_fixture ctx;
@@ -162,33 +165,30 @@ SEASTAR_THREAD_TEST_CASE(test_unrecovered_single_batch) {
           = model::test::make_random_batches(model::offset(1), 1).get();
         batches.back().header().first_timestamp = model::timestamp(10);
         ctx.write(batches);
-        auto recovered = ctx.replayer().recover_in_thread(
-          ss::default_priority_class());
-        BOOST_CHECK(!bool(recovered));
+        auto recovered = ctx.replayer().recover_in_thread();
+        EXPECT_FALSE(bool(recovered));
     }
 }
 
-SEASTAR_THREAD_TEST_CASE(test_malformed_segment) {
+TEST(log_replayer_test, test_malformed_segment) {
     log_replayer_fixture ctx;
     ctx.write_garbage();
     ctx.initialize(model::offset(0));
-    auto recovered = ctx.replayer().recover_in_thread(
-      ss::default_priority_class());
-    BOOST_CHECK(!bool(recovered));
+    auto recovered = ctx.replayer().recover_in_thread();
+    EXPECT_FALSE(bool(recovered));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_can_recover_multiple_batches) {
+TEST(log_replayer_test, test_can_recover_multiple_batches) {
     log_replayer_fixture ctx;
     auto batches = model::test::make_random_batches(model::offset(1), 10).get();
     auto last_offset = batches.back().last_offset();
     ctx.write(batches);
-    auto recovered = ctx.replayer().recover_in_thread(
-      ss::default_priority_class());
-    BOOST_CHECK(bool(recovered));
-    BOOST_CHECK_EQUAL(recovered.last_offset.value(), last_offset);
+    auto recovered = ctx.replayer().recover_in_thread();
+    EXPECT_TRUE(bool(recovered));
+    EXPECT_EQ(recovered.last_offset.value(), last_offset);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_unrecovered_multiple_batches) {
+TEST(log_replayer_test, test_unrecovered_multiple_batches) {
     {
         // bad crc test
         log_replayer_fixture ctx;
@@ -197,10 +197,9 @@ SEASTAR_THREAD_TEST_CASE(test_unrecovered_multiple_batches) {
         batches.back().header().crc = 10;
         auto last_offset = (batches.end() - 2)->last_offset();
         ctx.write(batches);
-        auto recovered = ctx.replayer().recover_in_thread(
-          ss::default_priority_class());
-        BOOST_CHECK(bool(recovered));
-        BOOST_CHECK_EQUAL(recovered.last_offset.value(), last_offset);
+        auto recovered = ctx.replayer().recover_in_thread();
+        EXPECT_TRUE(bool(recovered));
+        EXPECT_EQ(recovered.last_offset.value(), last_offset);
     }
     {
         // timestamp test
@@ -210,23 +209,21 @@ SEASTAR_THREAD_TEST_CASE(test_unrecovered_multiple_batches) {
         batches.back().header().first_timestamp = model::timestamp(10);
         auto last_offset = (batches.end() - 2)->last_offset();
         ctx.write(batches);
-        auto recovered = ctx.replayer().recover_in_thread(
-          ss::default_priority_class());
-        BOOST_CHECK(bool(recovered));
-        BOOST_CHECK_EQUAL(recovered.last_offset.value(), last_offset);
+        auto recovered = ctx.replayer().recover_in_thread();
+        EXPECT_TRUE(bool(recovered));
+        EXPECT_EQ(recovered.last_offset.value(), last_offset);
     }
 }
-SEASTAR_THREAD_TEST_CASE(test_reset_index) {
+TEST(log_replayer_test, test_reset_index) {
     // bad crc test
     log_replayer_fixture ctx;
     ctx.write_garbage_index(); // key
     auto batches = model::test::make_random_batches(model::offset(1), 10).get();
     auto last_offset = batches.back().last_offset();
     ctx.write(batches);
-    auto recovered = ctx.replayer().recover_in_thread(
-      ss::default_priority_class());
-    BOOST_CHECK(bool(recovered));
-    BOOST_CHECK_EQUAL(recovered.last_offset.value(), last_offset);
+    auto recovered = ctx.replayer().recover_in_thread();
+    EXPECT_TRUE(bool(recovered));
+    EXPECT_EQ(recovered.last_offset.value(), last_offset);
     storage::stlog.info("Recovered segment:{}", ctx._seg);
-    BOOST_CHECK(ctx._seg->index().needs_persistence());
+    EXPECT_TRUE(ctx._seg->index().needs_persistence());
 }

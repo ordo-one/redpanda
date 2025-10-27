@@ -3,6 +3,9 @@
 #
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "int_flag")
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@rules_python//python:defs.bzl", "py_binary")
 
@@ -65,13 +68,13 @@ bool_flag(
 
 int_flag(
     name = "api_level",
-    build_setting_default = 6,
+    build_setting_default = 7,
     make_variable = "API_LEVEL",
 )
 
 int_flag(
     name = "scheduling_groups",
-    build_setting_default = 16,
+    build_setting_default = 18,
     make_variable = "SCHEDULING_GROUPS",
 )
 
@@ -201,6 +204,7 @@ cc_library(
         "src/core/cgroup.hh",
         "src/core/condition-variable.cc",
         "src/core/cpu_profiler.cc",
+        "src/core/disk_params.cc",
         "src/core/dpdk_rte.cc",
         "src/core/exception_hacks.cc",
         "src/core/execution_stage.cc",
@@ -231,6 +235,7 @@ cc_library(
         "src/core/semaphore.cc",
         "src/core/sharded.cc",
         "src/core/signal.cc",
+        "src/core/signal_mutex.cc",
         "src/core/smp.cc",
         "src/core/sstring.cc",
         "src/core/syscall_result.hh",
@@ -294,6 +299,8 @@ cc_library(
         "src/util/read_first_line.cc",
         "src/util/short_streams.cc",
         "src/util/tmp_file.cc",
+        "src/websocket/common.cc",
+        "src/websocket/parser.cc",
         "src/websocket/server.cc",
     ],
     hdrs = [
@@ -317,6 +324,7 @@ cc_library(
         "include/seastar/core/condition-variable.hh",
         "include/seastar/core/coroutine.hh",
         "include/seastar/core/deleter.hh",
+        "include/seastar/core/disk_params.hh",
         "include/seastar/core/distributed.hh",
         "include/seastar/core/do_with.hh",
         "include/seastar/core/dpdk_rte.hh",
@@ -327,6 +335,7 @@ cc_library(
         "include/seastar/core/fair_queue.hh",
         "include/seastar/core/file.hh",
         "include/seastar/core/file-types.hh",
+        "include/seastar/core/format.hh",
         "include/seastar/core/fsnotify.hh",
         "include/seastar/core/fsqual.hh",
         "include/seastar/core/fstream.hh",
@@ -347,6 +356,7 @@ cc_library(
         "include/seastar/core/internal/pollable_fd.hh",
         "include/seastar/core/internal/read_state.hh",
         "include/seastar/core/internal/run_in_background.hh",
+        "include/seastar/core/internal/signal_mutex.hh",
         "include/seastar/core/internal/stall_detector.hh",
         "include/seastar/core/internal/timers.hh",
         "include/seastar/core/internal/uname.hh",
@@ -435,6 +445,7 @@ cc_library(
         "include/seastar/http/chunk_parsers.hh",
         "include/seastar/http/client.hh",
         "include/seastar/http/common.hh",
+        "include/seastar/http/connection_factory.hh",
         "include/seastar/http/exception.hh",
         "include/seastar/http/file_handler.hh",
         "include/seastar/http/function_handlers.hh",
@@ -493,10 +504,10 @@ cc_library(
         "include/seastar/rpc/rpc_impl.hh",
         "include/seastar/rpc/rpc_types.hh",
         "include/seastar/util/alloc_failure_injector.hh",
+        "include/seastar/util/assert.hh",
         "include/seastar/util/backtrace.hh",
         "include/seastar/util/bool_class.hh",
         "include/seastar/util/closeable.hh",
-        "include/seastar/util/concepts.hh",
         "include/seastar/util/conversions.hh",
         "include/seastar/util/critical_alloc_section.hh",
         "include/seastar/util/defer.hh",
@@ -507,6 +518,7 @@ cc_library(
         "include/seastar/util/indirect.hh",
         "include/seastar/util/internal/iovec_utils.hh",
         "include/seastar/util/internal/magic.hh",
+        "include/seastar/util/iostream.hh",
         "include/seastar/util/is_smart_ptr.hh",
         "include/seastar/util/later.hh",
         "include/seastar/util/lazy.hh",
@@ -534,6 +546,8 @@ cc_library(
         "include/seastar/util/tuple_utils.hh",
         "include/seastar/util/used_size.hh",
         "include/seastar/util/variant_utils.hh",
+        "include/seastar/websocket/common.hh",
+        "include/seastar/websocket/parser.hh",
         "include/seastar/websocket/server.hh",
     ],
     copts = [
@@ -548,8 +562,9 @@ cc_library(
         "BOOST_TEST_DYN_LINK",
         "BOOST_TEST_NO_LIB",
         "SEASTAR_API_LEVEL=$(API_LEVEL)",
+        "SEASTAR_HAS_MEMBARRIER",
         "SEASTAR_SCHEDULING_GROUPS_COUNT=$(SCHEDULING_GROUPS)",
-        "SEASTAR_WITH_TLS_OSSL",
+        "SEASTAR_USE_OPENSSL",
         "SEASTAR_DEPRECATED_OSTREAM_FORMATTERS",
     ] + select({
         ":use_task_backtrace": ["SEASTAR_TASK_BACKTRACE"],

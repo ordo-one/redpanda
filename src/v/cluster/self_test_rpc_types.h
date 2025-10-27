@@ -25,7 +25,6 @@
 #include "serde/rw/vector.h"
 #include "utils/uuid.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/scheduling.hh>
 
 namespace cluster {
@@ -66,8 +65,8 @@ struct diskcheck_opts
     /// Scheduling group that the benchmark will operate under
     ss::scheduling_group sg;
 
-    /// Total size a single shard will write/read to disk
-    uint64_t file_size() const { return data_size / ss::smp::count; }
+    /// Total size a single shard will write/read to a single file on disk
+    uint64_t file_size() const { return data_size / parallelism; }
     /// Address where allocated memory is placed will be a multiple of this
     uint64_t alignment() const { return request_size >= 4096 ? 4096ULL : 512; }
 
@@ -200,7 +199,7 @@ struct cloudcheck_opts
     ss::sstring name{"Cloud credentials check"};
 
     // Timeout duration for cloud storage requests.
-    ss::lowres_clock::duration timeout{std::chrono::milliseconds(5000)};
+    ss::lowres_clock::duration timeout{std::chrono::milliseconds(10000)};
 
     // Backoff duration for cloud storage requests.
     ss::lowres_clock::duration backoff{std::chrono::milliseconds(10)};
@@ -334,8 +333,6 @@ struct self_test_result
 struct empty_request
   : serde::
       envelope<empty_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     auto serde_fields() { return std::tie(); }
 };
 
@@ -344,8 +341,6 @@ struct start_test_request
       start_test_request,
       serde::version<2>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     uuid_t id;
     std::vector<diskcheck_opts> dtos;
     std::vector<netcheck_opts> ntos;
@@ -381,8 +376,6 @@ struct get_status_response
       get_status_response,
       serde::version<1>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     uuid_t id{};
     self_test_status status{};
     std::vector<self_test_result> results;
@@ -406,7 +399,6 @@ struct get_status_response
 struct netcheck_request
   : serde::
       envelope<netcheck_request, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     model::node_id source;
     iobuf buf;
     auto serde_fields() { return std::tie(source, buf); }
@@ -420,7 +412,6 @@ struct netcheck_request
 struct netcheck_response
   : serde::
       envelope<netcheck_response, serde::version<0>, serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     size_t bytes_read{0};
 
     auto serde_fields() { return std::tie(bytes_read); }

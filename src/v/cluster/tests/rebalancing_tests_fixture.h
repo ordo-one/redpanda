@@ -15,8 +15,10 @@
 #include "cluster/tests/cluster_test_fixture.h"
 #include "cluster/tests/utils.h"
 #include "cluster/types.h"
+#include "container/chunked_circular_buffer.h"
+#include "model/tests/random_batch.h"
+#include "storage/types.h"
 
-using batches_t = ss::circular_buffer<model::record_batch>;
 using batches_ptr_t = ss::lw_shared_ptr<batches_t>;
 using foreign_batches_t = ss::foreign_ptr<batches_ptr_t>;
 
@@ -39,9 +41,9 @@ public:
 
     application* node_application(int id) { return apps[model::node_id(id)]; }
 
-    void start_cluster(int node_count) {
+    void start_cluster(size_t node_count) {
         // start nodes
-        for (auto i = 0; i < node_count; ++i) {
+        for (size_t i = 0; i < node_count; ++i) {
             auto nid = model::node_id(i);
             apps.emplace(nid, create_node_application(nid));
         }
@@ -135,18 +137,19 @@ public:
               .then([&pm, ntp](auto batches) {
                   // replicate
                   auto f = pm.get(ntp)->raft()->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
 
                   return ss::with_timeout(
                            model::timeout_clock::now() + 2s, std::move(f))
-                    .then([&pm, ntp](result<raft::replicate_result> res) {
+                    .then([&pm, ntp](result<raft::replicate_result>) {
                         auto p = pm.get(ntp);
-                        return p->make_reader(storage::log_reader_config(
-                          model::offset(0),
-                          p->committed_offset(),
-                          ss::default_priority_class()));
+                        return p->make_local_reader(
+                          storage::local_log_reader_config(
+                            model::offset(0), p->committed_offset()));
                     })
                     .then([](model::record_batch_reader r) {
                         return model::consume_reader_to_memory(

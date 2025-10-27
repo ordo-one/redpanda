@@ -21,15 +21,17 @@ cluster::topic_status make_topic_status(size_t id, size_t num_partitions) {
         part_status.id = model::partition_id(i);
         part_status.leader_id = model::node_id(1);
         part_status.reclaimable_size_bytes = 100;
+        part_status.cloud_topic_max_gc_eligible_epoch = 101;
         part_status.revision_id = model::revision_id(1);
         part_status.term = model::term_id(1);
         if (i % 3 == 0) { // leaders
             if (i % 30) { // 10% of leaders to have faulty partitions
                 part_status.under_replicated_replicas.emplace(2);
-                part_status.followers_stats.emplace(cluster::followers_stats{
-                  .in_sync = 2,
-                  .out_of_sync = {model::node_id(1), model::node_id(2)},
-                  .down = {model::node_id(3), model::node_id(4)}});
+                part_status.followers_stats.emplace(
+                  cluster::followers_stats{
+                    .in_sync = 2,
+                    .out_of_sync = {model::node_id(1), model::node_id(2)},
+                    .down = {model::node_id(3), model::node_id(4)}});
             } else {
                 part_status.under_replicated_replicas.emplace(0);
                 part_status.followers_stats.emplace();

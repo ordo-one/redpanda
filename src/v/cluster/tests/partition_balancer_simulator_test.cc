@@ -13,7 +13,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "random/generators.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/testing/thread_test_case.hh>
 
@@ -106,7 +106,7 @@ public:
             model::ntp ntp{tp_ns.ns, tp_ns.tp, as.id};
             auto jitter = std::max(
               -int64_t(mean_partition_size),
-              int64_t(*stddev * dist(random_generators::internal::gen)));
+              int64_t(*stddev * dist(random_generators::global().engine())));
             auto size = mean_partition_size + jitter;
             auto partition = ss::make_lw_shared<partition_state>(ntp, size);
             _partitions.emplace(ntp, partition);
@@ -206,7 +206,7 @@ public:
             std::shuffle(
               recovery_streams.begin(),
               recovery_streams.end(),
-              random_generators::internal::gen);
+              random_generators::global().engine());
 
             for (const auto& rs : recovery_streams) {
                 if (node.bandwidth_left >= recovery_batch_size) {
@@ -451,9 +451,10 @@ private:
                                / (node_count * (node_count - 1));
 
         // Generous boundaries to allow for fluctuations. But they will catch
-        // pathological cases.
+        // pathological cases. Set empirically to avoid flakes (i.e., if the
+        // upper bound is * 3, we get ~1% flakes in the pair test).
         double expected_min = expected_freq - sqrt(expected_freq) * 3;
-        double expected_max = expected_freq + sqrt(expected_freq) * 3;
+        double expected_max = expected_freq + sqrt(expected_freq) * 4;
 
         logger.info(
           "validating replica pair frequencies, topic filter: {}, "
@@ -475,10 +476,14 @@ private:
                 }
             }
         }
-        BOOST_REQUIRE_MESSAGE(
-          !offending_pair,
-          "validation failed, offending pair: " << offending_pair->first << ", "
-                                                << offending_pair->second);
+
+        auto failure_msg = offending_pair.has_value()
+                             ? fmt::format(
+                                 "validation failed, offending pair: {}, {}",
+                                 offending_pair->first,
+                                 offending_pair->second)
+                             : "";
+        BOOST_REQUIRE_MESSAGE(!offending_pair, failure_msg);
     }
 
     cluster::cluster_health_report create_health_report() const {
@@ -494,10 +499,11 @@ private:
         for (const auto& [id, state] : _nodes) {
             auto last_seen = raft::clock_type::now();
             // TODO: add ability to add unavailable nodes
-            status_updates.push_back(cluster::node_status{
-              .node_id = id,
-              .last_seen = last_seen,
-            });
+            status_updates.push_back(
+              cluster::node_status{
+                .node_id = id,
+                .last_seen = last_seen,
+              });
         }
 
         _workers.node_status_table
@@ -513,8 +519,7 @@ private:
         return cluster::partition_balancer_planner(
           cluster::planner_config{
             .mode = mode,
-            .soft_max_disk_usage_ratio = 0.8,
-            .hard_max_disk_usage_ratio = 0.95,
+            .max_disk_usage_ratio = 0.8,
             .max_concurrent_actions = 50,
             .node_availability_timeout_sec = std::chrono::minutes(1),
             .segment_fallocation_step = 16_MiB,
@@ -714,8 +719,9 @@ private:
               topic2partitions;
             for (const auto& [ntp, repl] : replicas) {
                 topic2partitions[model::topic_namespace(ntp.ns, ntp.tp.topic)]
-                  .push_back(cluster::partition_status{
-                    .id = ntp.tp.partition, .size_bytes = repl.local_size});
+                  .push_back(
+                    cluster::partition_status{
+                      .id = ntp.tp.partition, .size_bytes = repl.local_size});
             }
 
             chunked_vector<cluster::topic_status> topics;

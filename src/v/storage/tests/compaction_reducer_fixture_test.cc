@@ -8,28 +8,27 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
-#include "gtest/gtest.h"
+#include "compaction/key_offset_map.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
 #include "storage/compaction_reducers.h"
-#include "storage/key_offset_map.h"
 #include "storage/lock_manager.h"
 #include "storage/log_reader.h"
 #include "storage/probe.h"
 #include "storage/segment_deduplication_utils.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
+#include "storage/tests/batch_generators.h"
 #include "storage/tests/storage_test_fixture.h"
 #include "storage/types.h"
 #include "test_utils/test.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/defer.hh>
 
-class MapBuildingReducerFixtureTest
-  : public storage_test_fixture
-  , public seastar_test {};
+#include <gtest/gtest.h>
+
+class MapBuildingReducerFixtureTest : public storage_test_fixture {};
 
 TEST_F(MapBuildingReducerFixtureTest, TestMapIndexing) {
     auto cfg = default_log_config(test_dir);
@@ -52,16 +51,20 @@ TEST_F(MapBuildingReducerFixtureTest, TestMapIndexing) {
     int num_appends = 5;
     append_random_batches<linear_int_kv_batch_generator>(log, num_appends);
     log->flush().get();
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 2);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 2);
 
     auto& segments = disk_log->segments();
     auto& seg = segments.front();
 
     static constexpr int64_t max_keys = 4;
-    storage::simple_key_offset_map map(max_keys);
-    storage::compaction_config compact_cfg(
-      model::offset::max(), std::nullopt, ss::default_priority_class(), as);
+    compaction::simple_key_offset_map map(max_keys);
+    compaction::compaction_config compact_cfg(
+      model::offset::max(),
+      model::offset::max(),
+      std::nullopt,
+      std::nullopt,
+      as);
     auto pb = storage::probe{};
 
     auto last_indexed_offset = model::offset{-1};

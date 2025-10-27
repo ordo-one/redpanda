@@ -10,8 +10,12 @@
 
 #include "iceberg/rest_client/catalog_client.h"
 
+#include "absl/strings/str_join.h"
+#include "absl/strings/strip.h"
+#include "bytes/iobuf_parser.h"
 #include "bytes/streambuf.h"
 #include "config/types.h"
+#include "datalake/credential_manager.h"
 #include "http/request_builder.h"
 #include "http/rest_client/rest_entity.h"
 #include "http/utils.h"
@@ -23,12 +27,11 @@
 #include "iceberg/table_requests_json.h"
 #include "json/istreamwrapper.h"
 #include "ssx/future-util.h"
+#include "utils/to_string.h"
 
 #include <seastar/core/sleep.hh>
 #include <seastar/coroutine/as_future.hh>
 
-#include <absl/strings/str_join.h>
-#include <absl/strings/strip.h>
 #include <rapidjson/error/en.h>
 
 namespace {
@@ -49,9 +52,23 @@ iobuf serialize_payload_as_json(const T& payload) {
 
     return std::move(buf).as_iobuf();
 }
+
+template<typename T>
+void maybe_log_payload_as_json(
+  ss::logger& l, ss::log_level lvl, std::string_view msg, const T& payload) {
+    if (!l.is_enabled(lvl)) {
+        return;
+    }
+    auto buf = serialize_payload_as_json(payload);
+    iobuf_parser p(std::move(buf));
+    const auto logged_size = std::min(p.bytes_left(), 4_KiB);
+    vlogl(l, lvl, "{}: {}", msg, p.read_string_safe(logged_size));
+}
+
 static constexpr std::string_view json_content_type = "application/json";
 static constexpr std::string_view oauth_token_endpoint = "oauth/tokens";
 static constexpr std::string_view config_endpoint = "config";
+
 } // namespace
 
 namespace iceberg::rest_client {
@@ -83,9 +100,10 @@ expected<json::Document> parse_json(iobuf&& raw_response) {
     doc.ParseStream(wrapper);
 
     if (doc.HasParseError()) {
-        return tl::unexpected(json_parse_error{
-          .context = "parse_json",
-          .error = parse_error_msg{GetParseError_En(doc.GetParseError())}});
+        return tl::unexpected(
+          json_parse_error{
+            .context = "parse_json",
+            .error = parse_error_msg{GetParseError_En(doc.GetParseError())}});
     }
 
     return doc;
@@ -94,6 +112,7 @@ expected<json::Document> parse_json(iobuf&& raw_response) {
 catalog_client::catalog_client(
   std::unique_ptr<http::abstract_client> http_client,
   ss::sstring endpoint,
+  datalake::credential_manager& credential_mgr,
   std::optional<credentials> credentials,
   std::optional<base_path> base_path,
   std::optional<warehouse> warehouse,
@@ -110,13 +129,17 @@ catalog_client::catalog_client(
   , _oauth_token{std::move(token)}
   , _retry_policy{retry_policy ? std::move(retry_policy) : std::make_unique<default_retry_policy>()}
   , _auth_mode(auth_mode)
-  , _probe(std::move(probe)) {}
+  , _probe(std::move(probe))
+  , _credential_manager(credential_mgr) {}
 
 ss::future<expected<std::monostate>>
 catalog_client::maybe_configure(retry_chain_node& rtc) {
     auto gh = maybe_gate();
     if (!gh.has_value()) {
         co_return tl::unexpected(gh.error());
+    }
+    if (_configured) {
+        co_return std::monostate{};
     }
     vlog(log.debug, "Configuring Iceberg REST catalog client");
     auto http_request = http::request_builder{}
@@ -208,12 +231,23 @@ catalog_client::acquire_token(retry_chain_node& rtc) {
       {"client_secret", creds.client_secret},
       {"scope", creds.oauth2_scope},
     });
-    co_return (co_await perform_request(
-                 rtc,
-                 token_request,
-                 custom_oauth2_server ? *creds.oauth2_server_uri : _endpoint,
-                 client_probe::endpoint::oauth_token,
-                 std::move(payload)))
+    auto req_res = co_await perform_request(
+      rtc,
+      token_request,
+      custom_oauth2_server ? *creds.oauth2_server_uri : _endpoint,
+      client_probe::endpoint::oauth_token,
+      std::move(payload));
+    if (!req_res.has_value()) {
+        vlogl(
+          log,
+          ss::log_level::trace,
+          "Failed to perform oauth_token request with payload: client_id={}, "
+          "scope={}",
+          creds.client_id,
+          creds.oauth2_scope);
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res)
       .and_then(parse_json)
       .and_then(parse_as_expected("oauth_token", parse_oauth_token));
 }
@@ -265,6 +299,16 @@ ss::future<expected<std::monostate>> catalog_client::maybe_add_bearer_auth(
         }
 
         request.with_bearer_auth(token.value());
+        break;
+    }
+    case config::datalake_catalog_auth_mode::aws_sigv4: {
+        // AWS SigV4 signing will be handled after build() is called
+        break;
+    }
+    case config::datalake_catalog_auth_mode::gcp: {
+        // GCP credentials are handled by the credential manager and will be
+        // applied after build() is called
+        break;
     }
     }
     co_return std::monostate{};
@@ -315,6 +359,16 @@ ss::future<expected<iobuf>> catalog_client::perform_request(
         if (!request.has_value()) {
             co_return tl::unexpected(request.error());
         }
+
+        auto auth_result = co_await _credential_manager.maybe_sign(
+          payload, request.value());
+        if (auth_result.has_error()) {
+            co_return tl::unexpected(
+              domain_error{http_call_error{fmt::format(
+                "Failed to sign request with credential manager: {}",
+                auth_result.error().message())}});
+        }
+
         auto request_target = ss::sstring{
           request->target().begin(), request->target().end()};
 
@@ -384,12 +438,21 @@ catalog_client::create_namespace(
         co_return tl::unexpected(auth_result.error());
     }
 
-    co_return (co_await perform_request(
-                 rtc,
-                 http_request,
-                 _endpoint,
-                 client_probe::endpoint::create_namespace,
-                 serialize_payload_as_json(req)))
+    auto req_res = co_await perform_request(
+      rtc,
+      http_request,
+      _endpoint,
+      client_probe::endpoint::create_namespace,
+      serialize_payload_as_json(req));
+    if (!req_res.has_value()) {
+        maybe_log_payload_as_json(
+          log,
+          ss::log_level::trace,
+          "Failed to perform create_namespace request",
+          req);
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res)
       .and_then(parse_json)
       .and_then(
         parse_as_expected("create_namespace", parse_create_namespace_response));
@@ -415,12 +478,21 @@ ss::future<expected<load_table_result>> catalog_client::create_table(
         co_return tl::unexpected(auth_result.error());
     }
 
-    co_return (co_await perform_request(
-                 rtc,
-                 http_request,
-                 _endpoint,
-                 client_probe::endpoint::create_table,
-                 serialize_payload_as_json(req)))
+    auto req_res = co_await perform_request(
+      rtc,
+      http_request,
+      _endpoint,
+      client_probe::endpoint::create_table,
+      serialize_payload_as_json(req));
+    if (!req_res.has_value()) {
+        maybe_log_payload_as_json(
+          log,
+          ss::log_level::trace,
+          "Failed to perform create_table request",
+          req);
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res)
       .and_then(parse_json)
       .and_then(parse_as_expected("create_table", parse_load_table_result));
 }
@@ -444,9 +516,18 @@ ss::future<expected<load_table_result>> catalog_client::load_table(
         co_return tl::unexpected(auth_result.error());
     }
 
-    co_return (
-      co_await perform_request(
-        rtc, http_request, _endpoint, client_probe::endpoint::load_table))
+    auto req_res = co_await perform_request(
+      rtc, http_request, _endpoint, client_probe::endpoint::load_table);
+    if (!req_res.has_value()) {
+        vlog(
+          log.trace,
+          "Failed to perform load_table request for table '{}' in namespace "
+          "'{}'",
+          table_name,
+          absl::StrJoin(ns, "."));
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res)
       .and_then(parse_json)
       .and_then(parse_as_expected("load_table", parse_load_table_result));
 }
@@ -478,13 +559,21 @@ ss::future<expected<std::monostate>> catalog_client::drop_table(
         co_return tl::unexpected(auth_result.error());
     }
 
-    co_return (
-      co_await perform_request(
-        rtc, http_request, _endpoint, client_probe::endpoint::drop_table))
-      .map([](iobuf&&) {
-          // we expect empty response, discard it
-          return std::monostate{};
-      });
+    auto req_res = co_await perform_request(
+      rtc, http_request, _endpoint, client_probe::endpoint::drop_table);
+    if (!req_res.has_value()) {
+        vlog(
+          log.trace,
+          "Failed to perform drop_table request for table '{}' in namespace "
+          "'{}'",
+          table_name,
+          absl::StrJoin(ns, "."));
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res).map([](iobuf&&) {
+        // we expect empty response, discard it
+        return std::monostate{};
+    });
 }
 
 ss::future<expected<commit_table_response>> catalog_client::commit_table_update(
@@ -506,12 +595,21 @@ ss::future<expected<commit_table_response>> catalog_client::commit_table_update(
         co_return tl::unexpected(auth_result.error());
     }
 
-    co_return (co_await perform_request(
-                 rtc,
-                 http_request,
-                 _endpoint,
-                 client_probe::endpoint::commit_table_update,
-                 serialize_payload_as_json(commit_request)))
+    auto req_res = co_await perform_request(
+      rtc,
+      http_request,
+      _endpoint,
+      client_probe::endpoint::commit_table_update,
+      serialize_payload_as_json(commit_request));
+    if (!req_res.has_value()) {
+        maybe_log_payload_as_json(
+          log,
+          ss::log_level::trace,
+          "Failed to perform commit_table_update request",
+          commit_request);
+        co_return tl::unexpected(req_res.error());
+    }
+    co_return std::move(req_res)
       .and_then(parse_json)
       .and_then(
         parse_as_expected("commit_table_update", parse_commit_table_response));

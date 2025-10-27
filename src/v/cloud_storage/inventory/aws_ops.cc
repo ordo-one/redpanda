@@ -14,6 +14,7 @@
 #include "cloud_storage/logger.h"
 #include "cloud_storage/remote.h"
 #include "json/istreamwrapper.h"
+#include "re2/re2.h"
 #include "ssx/future-util.h"
 
 #include <seastar/util/log.hh>
@@ -24,7 +25,6 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 #include <rapidjson/error/en.h>
-#include <re2/re2.h>
 
 #include <exception>
 #include <ranges>
@@ -144,8 +144,9 @@ aws_ops::aws_ops(
   ss::sstring inventory_prefix)
   : _bucket(std::move(bucket))
   , _inventory_config_id(std::move(inventory_config_id))
-  , _inventory_key(cloud_storage_clients::object_key{
-      fmt::format("?inventory&id={}", _inventory_config_id())})
+  , _inventory_key(
+      cloud_storage_clients::object_key{
+        fmt::format("?inventory&id={}", _inventory_config_id())})
   , _prefix(std::move(inventory_prefix)) {}
 
 ss::future<op_result<void>> aws_ops::create_inventory_configuration(

@@ -16,6 +16,8 @@
 #include "ssx/semaphore.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/http/request.hh>
+#include <seastar/net/inet_address.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 namespace pandaproxy {

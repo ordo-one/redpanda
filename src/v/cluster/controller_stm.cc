@@ -19,6 +19,7 @@
 #include "cluster/members_manager.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/coroutine/switch_to.hh>
 
 namespace cluster {
 
@@ -97,11 +98,12 @@ ss::future<std::optional<iobuf>> controller_stm::maybe_make_join_snapshot() {
     co_await std::get<config_manager&>(_state).fill_snapshot(snapshot);
     apply_mtx_holder.return_all();
 
-    co_return serde::to_iobuf(controller_join_snapshot{
-      .last_applied = last_applied,
-      .bootstrap = std::move(snapshot.bootstrap),
-      .features = std::move(snapshot.features),
-      .config = std::move(snapshot.config)});
+    co_return serde::to_iobuf(
+      controller_join_snapshot{
+        .last_applied = last_applied,
+        .bootstrap = std::move(snapshot.bootstrap),
+        .features = std::move(snapshot.features),
+        .config = std::move(snapshot.config)});
 }
 
 ss::future<std::optional<iobuf>>
@@ -186,6 +188,8 @@ ss::future<> controller_stm::apply_snapshot(
           std::get<client_quota::backend&>(_state).apply_snapshot(
             offset, snapshot),
           std::get<data_migrations::migrations_table&>(_state).apply_snapshot(
+            offset, snapshot),
+          std::get<cluster_link::table&>(_state).apply_snapshot(
             offset, snapshot));
 
     } catch (const seastar::abort_requested_exception&) {
@@ -211,6 +215,28 @@ ss::future<> controller_stm::apply_snapshot(
 
 ss::future<ssx::semaphore_units> controller_stm::lock_apply() {
     return _apply_mtx.get_units();
+}
+
+ss::future<result<raft::replicate_result>> controller_stm::replicate(
+  model::record_batch&& b, std::optional<model::term_id> term) {
+    return ss::with_scheduling_group(
+      _scheduling_group, [this, b = std::move(b), term]() mutable {
+          return base_t::replicate(std::move(b), term);
+      });
+}
+
+/// Replicates record batch and waits until state will be applied to the
+/// state machine
+ss::future<std::error_code> controller_stm::replicate_and_wait(
+  model::record_batch&& b,
+  model::timeout_clock::time_point timeout,
+  ss::abort_source& as,
+  std::optional<model::term_id> term) {
+    return ss::with_scheduling_group(
+      _scheduling_group,
+      [this, b = std::move(b), term, timeout, &as]() mutable {
+          return base_t::replicate_and_wait(std::move(b), timeout, as, term);
+      });
 }
 
 } // namespace cluster

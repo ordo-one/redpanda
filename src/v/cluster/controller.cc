@@ -23,11 +23,14 @@
 #include "cluster/cloud_metadata/producer_id_recovery_manager.h"
 #include "cluster/cloud_metadata/uploader.h"
 #include "cluster/cluster_discovery.h"
+#include "cluster/cluster_link/frontend.h"
+#include "cluster/cluster_link/table.h"
 #include "cluster/cluster_recovery_table.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller_api.h"
 #include "cluster/controller_backend.h"
+#include "cluster/controller_forced_reconfiguration_manager.h"
 #include "cluster/controller_log_limiter.h"
 #include "cluster/controller_service.h"
 #include "cluster/controller_stm.h"
@@ -35,6 +38,7 @@
 #include "cluster/data_migration_backend.h"
 #include "cluster/data_migration_frontend.h"
 #include "cluster/data_migration_irpc_frontend.h"
+#include "cluster/data_migration_router.h"
 #include "cluster/data_migration_table.h"
 #include "cluster/data_migration_types.h"
 #include "cluster/data_migration_worker.h"
@@ -71,9 +75,11 @@
 #include "config/configuration.h"
 #include "config/node_config.h"
 #include "features/feature_table.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
+#include "raft/fundamental.h"
 #include "raft/fwd.h"
 #include "security/acl.h"
 #include "security/authorizer.h"
@@ -88,10 +94,14 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/coroutine/switch_to.hh>
 #include <seastar/util/later.hh>
 
+#include <algorithm>
 #include <chrono>
+#include <memory>
 #include <optional>
+#include <system_error>
 namespace cluster {
 
 bytes controller::invariants_key() {
@@ -108,9 +118,10 @@ controller::controller(
   ss::sharded<raft::group_manager>& raft_manager,
   ss::sharded<features::feature_table>& feature_table,
   ss::sharded<cloud_storage::remote>& cloud_storage_api,
-  ss::sharded<cloud_storage::cache>& cloud_cache,
+  ss::sharded<cloud_io::cache>& cloud_cache,
   ss::sharded<node_status_table>& node_status_table,
-  ss::sharded<cluster::metadata_cache>& metadata_cache)
+  ss::sharded<cluster::metadata_cache>& metadata_cache,
+  ss::scheduling_group scheduling_group)
   : _config_preload(std::move(config_preload))
   , _connections(ccache)
   , _partition_manager(pm)
@@ -118,10 +129,7 @@ controller::controller(
   , _storage(storage)
   , _local_monitor(local_monitor)
   , _tp_updates_dispatcher(
-      _partition_allocator,
-      _tp_state,
-      _partition_leaders,
-      _partition_balancer_state)
+      _partition_allocator, _tp_state, _partition_balancer_state)
   , _security_manager(_credentials, _authorizer, _roles)
   , _raft_manager(raft_manager)
   , _feature_table(feature_table)
@@ -129,7 +137,9 @@ controller::controller(
   , _cloud_cache(cloud_cache)
   , _node_status_table(node_status_table)
   , _metadata_cache(metadata_cache)
-  , _probe(*this) {}
+  , _probe(*this)
+  , _cfr_m(std::make_unique<controller_forced_reconfiguration_manager>(this))
+  , _scheduling_group(scheduling_group) {}
 
 // Explicit destructor in the .cc file just to avoid bloating the header with
 // includes for destructors of all its members (e.g. the metadata uploader).
@@ -183,6 +193,10 @@ ss::future<> controller::wire_up() {
             ss::sharded_parameter(
               [] { return config::shard_local_cfg().sasl_mechanisms.bind(); }),
             ss::sharded_parameter([] {
+                return config::shard_local_cfg()
+                  .sasl_mechanisms_overrides.bind();
+            }),
+            ss::sharded_parameter([] {
                 return config::shard_local_cfg().http_authentication.bind();
             }),
             ss::sharded_parameter([] {
@@ -204,8 +218,9 @@ ss::future<> controller::wire_up() {
             }));
       })
       .then([this] {
-          return _tp_state.start(ss::sharded_parameter(
-            [this] { return std::ref(_data_migrated_resources.local()); }));
+          return _tp_state.start(ss::sharded_parameter([this] {
+              return std::ref(_data_migrated_resources.local());
+          }));
       })
       .then([this] {
           return _partition_balancer_state.start_single(
@@ -232,7 +247,19 @@ ss::future<> controller::start(
     producer_id_recovery,
   ss::shared_ptr<cluster::cloud_metadata::offsets_recovery_requestor>
     offsets_recovery,
-  std::chrono::milliseconds application_start_time) {
+  std::chrono::milliseconds application_start_time,
+  ss::sharded<std::unique_ptr<cluster::data_migrations::group_proxy>>&
+    data_migrations_group_proxy) {
+    // Abort all background activity if start() is asked to abort mid-way.
+    auto shard0_as_sub = shard0_as.subscribe([this](const auto&) noexcept {
+        return _as.invoke_on_all(&ss::abort_source::request_abort);
+    });
+
+    /**
+     * Switch to cluster scheduling group to ensure that all the controller
+     * services are started within that scheduling group.
+     */
+    co_await ss::coroutine::switch_to(_scheduling_group);
     auto initial_raft0_brokers = discovery.founding_brokers();
     std::vector<model::node_id> seed_nodes;
     seed_nodes.reserve(initial_raft0_brokers.size());
@@ -250,7 +277,7 @@ ss::future<> controller::start(
       config::node().data_directory().as_sstring(),
       seed_nodes);
 
-    co_await _partition_leaders.start(std::ref(_tp_state));
+    co_await _partition_leaders.start(std::ref(_tp_state), std::ref(_as));
     co_await _drain_manager.start(std::ref(_partition_manager));
     co_await _members_manager.start_single(
       _raft0,
@@ -278,7 +305,6 @@ ss::future<> controller::start(
     co_await _recovery_manager.start_single(
       std::ref(_as),
       std::ref(_stm),
-      std::ref(_feature_table),
       std::ref(_cloud_storage_api),
       std::ref(_recovery_table),
       std::ref(_storage),
@@ -290,18 +316,18 @@ ss::future<> controller::start(
     co_await _quota_store.start();
     co_await _quota_backend.start_single(std::ref(_quota_store));
 
+    co_await _cluster_link_table.start();
+
     co_await _config_frontend.start(
       std::ref(_stm),
       std::ref(_connections),
       std::ref(_partition_leaders),
-      std::ref(_feature_table),
       std::ref(_as));
     co_await _config_manager.start_single(
       std::ref(_config_preload),
       std::ref(_config_frontend),
       std::ref(_connections),
       std::ref(_partition_leaders),
-      std::ref(_feature_table),
       std::ref(_members_table),
       std::ref(_as));
 
@@ -319,6 +345,9 @@ ss::future<> controller::start(
       std::ref(_feature_table),
       std::ref(_stm),
       std::ref(_partition_leaders),
+      ss::sharded_parameter([&data_migrations_group_proxy] {
+          return std::ref(*data_migrations_group_proxy.local());
+      }),
       std::ref(_connections),
       ss::sharded_parameter(
         [this]() -> std::optional<
@@ -331,12 +360,24 @@ ss::future<> controller::start(
         }),
       std::ref(_as));
 
+    co_await _data_migration_router.start(
+      _raft0->self().id(),
+      ss::sharded_parameter([&data_migrations_group_proxy] {
+          return std::ref(*data_migrations_group_proxy.local());
+      }),
+      std::ref(_shard_table),
+      std::ref(_metadata_cache),
+      std::ref(_connections),
+      std::ref(_partition_leaders));
     co_await _data_migration_worker.start(
       _raft0->self().id(),
       ss::sharded_parameter(
         [this] { return std::ref(_partition_leaders.local()); }),
       ss::sharded_parameter(
         [this] { return std::ref(_partition_manager.local()); }),
+      ss::sharded_parameter([&data_migrations_group_proxy] {
+          return std::ref(*data_migrations_group_proxy.local());
+      }),
       ss::sharded_parameter([this] { return std::ref(_as.local()); }));
     {
         limiter_configuration limiter_conf{
@@ -364,6 +405,7 @@ ss::future<> controller::start(
           std::move(limiter_conf),
           std::ref(_feature_table),
           config::shard_local_cfg().controller_snapshot_max_age_sec.bind(),
+          _scheduling_group,
           std::ref(clusterlog),
           _raft0.get(),
           raft::persistent_last_applied::yes,
@@ -380,14 +422,17 @@ ss::future<> controller::start(
           std::ref(_plugin_backend),
           std::ref(_recovery_manager),
           std::ref(_quota_backend),
-          std::ref(_data_migration_table.local()));
+          std::ref(_data_migration_table.local()),
+          std::ref(_cluster_link_table.local()));
     }
+    co_await _epoch_service.start(_raft0->self().id(), &_connections);
+    co_await _epoch_service.invoke_on_all(&cluster_epoch_service<>::start);
+    _epoch_service.local().set_raft0(_raft0, _stm, _raft_manager);
 
     co_await _members_frontend.start(
       std::ref(_stm),
       std::ref(_connections),
       std::ref(_partition_leaders),
-      std::ref(_feature_table),
       std::ref(_as));
 
     co_await _security_frontend.start(
@@ -403,7 +448,6 @@ ss::future<> controller::start(
       self(),
       std::ref(_credentials),
       std::ref(_ephemeral_credentials),
-      std::ref(_feature_table),
       std::ref(_connections));
 
     co_await _tp_frontend.start(
@@ -437,7 +481,9 @@ ss::future<> controller::start(
       ss::sharded_parameter([] {
           return config::shard_local_cfg()
             .partition_autobalancing_topic_aware.bind();
-      }));
+      }),
+      ss::sharded_parameter(
+        [] { return config::shard_local_cfg().kafka_topics_max.bind(); }));
 
     co_await _plugin_frontend.start(
       _raft0->self().id(),
@@ -457,6 +503,17 @@ ss::future<> controller::start(
       std::ref(_partition_leaders),
       std::ref(_as));
 
+    co_await _cluster_link_frontend.start(
+      _raft0->self().id(),
+      ss::sharded_parameter([this] { return &_partition_leaders.local(); }),
+      ss::sharded_parameter([this] { return &_cluster_link_table.local(); }),
+      ss::sharded_parameter([this] {
+          return _stm.local_is_initialized() ? &_stm.local() : nullptr;
+      }),
+      ss::sharded_parameter([this] { return &_connections.local(); }),
+      ss::sharded_parameter([this] { return &_feature_table.local(); }),
+      ss::sharded_parameter([this] { return &_as.local(); }));
+
     co_await _members_backend.start_single(
       std::ref(_tp_frontend),
       std::ref(_tp_state),
@@ -465,7 +522,6 @@ ss::future<> controller::start(
       std::ref(_api),
       std::ref(_members_manager),
       std::ref(_members_frontend),
-      std::ref(_feature_table),
       _raft0,
       std::ref(_as));
 
@@ -500,6 +556,11 @@ ss::future<> controller::start(
       }),
       ss::sharded_parameter(
         [] { return config::shard_local_cfg().retention_local_strict.bind(); }),
+      ss::sharded_parameter([] {
+          return config::shard_local_cfg()
+            .controller_backend_reconciliation_concurrency.bind();
+      }),
+      _scheduling_group,
       std::ref(_as));
 
     co_await _shard_balancer.start_single(
@@ -586,7 +647,7 @@ ss::future<> controller::start(
 
     co_await cluster_creation_hook(discovery);
     {
-        auto u = _stm.local().lock_apply();
+        auto u = co_await _stm.local().lock_apply();
         // start shard_balancer before controller_backend so that it bootstraps
         // shard_placement_table and controller_backend can start with already
         // initialized table.
@@ -622,11 +683,12 @@ ss::future<> controller::start(
       std::ref(_tp_state),
       std::ref(_shard_table),
       std::ref(_connections),
-      std::ref(_hm_frontend),
       std::ref(_members_table),
       std::ref(_partition_balancer),
       std::ref(_partition_manager),
       std::ref(_as));
+
+    co_await set_raft_manager_remake_cb();
 
     co_await _members_backend.invoke_on(
       members_manager::shard, &members_backend::start);
@@ -652,7 +714,6 @@ ss::future<> controller::start(
       config::shard_local_cfg().partition_autobalancing_concurrent_moves.bind(),
       std::ref(_tp_state),
       std::ref(_tp_frontend),
-      std::ref(_partition_allocator),
       std::ref(_partition_leaders),
       std::ref(_members_table),
       std::ref(_as));
@@ -742,8 +803,6 @@ ss::future<> controller::start(
         .partition_autobalancing_node_availability_timeout_sec.bind(),
       config::shard_local_cfg()
         .partition_autobalancing_max_disk_usage_percent.bind(),
-      config::shard_local_cfg()
-        .storage_space_alert_free_threshold_percent.bind(),
       config::shard_local_cfg().partition_autobalancing_tick_interval_ms.bind(),
       config::shard_local_cfg().partition_autobalancing_concurrent_moves.bind(),
       config::shard_local_cfg()
@@ -803,11 +862,13 @@ ss::future<> controller::start(
       data_migrations::data_migrations_shard,
       std::ref(_data_migration_table.local()),
       std::ref(_data_migration_frontend.local()),
+      std::ref(_data_migration_router.local()),
       std::ref(_data_migration_worker),
       std::ref(_partition_leaders.local()),
       std::ref(_tp_frontend.local()),
       std::ref(_tp_state.local()),
       std::ref(_shard_table.local()),
+      std::ref(*data_migrations_group_proxy.local()),
       _cloud_storage_api.local_is_initialized()
         ? std::make_optional(std::ref(_cloud_storage_api.local()))
         : std::nullopt,
@@ -819,6 +880,14 @@ ss::future<> controller::start(
       &data_migrations::backend::start);
     co_await _data_migration_irpc_frontend.start(
       std::ref(_feature_table), std::ref(_data_migration_backend));
+
+    co_await _topic_metrics_watcher.start(
+      ss::sharded_parameter([this] { return std::ref(_tp_state.local()); }),
+      ss::sharded_parameter([] {
+          return config::shard_local_cfg().topic_label_aggregation_limit.bind();
+      }));
+
+    co_await _cfr_m->start(shard0_as);
 }
 
 ss::future<> controller::set_ready() {
@@ -855,6 +924,8 @@ ss::future<> controller::stop() {
         co_await shutdown_input();
     }
 
+    co_await _cfr_m->stop();
+
     co_await ss::smp::submit_to(controller_stm_shard, [&stm = _stm] {
         return stm.local_is_initialized() ? stm.local().shutdown() : ss::now();
     });
@@ -871,6 +942,7 @@ ss::future<> controller::stop() {
     if (_recovery_backend) {
         co_await _recovery_backend->stop_and_wait();
     }
+    co_await _topic_metrics_watcher.stop();
     co_await _recovery_manager.stop();
     co_await _recovery_table.stop();
     co_await _partition_balancer.stop();
@@ -881,15 +953,18 @@ ss::future<> controller::stop() {
     co_await _hm_backend.stop();
     co_await _health_manager.stop();
     co_await _members_backend.stop();
+    co_await _data_migration_router.stop();
     co_await _data_migration_worker.stop();
     co_await _data_migration_frontend.stop();
     co_await _topic_mount_handler.stop();
     co_await _config_manager.stop();
+    co_await clear_raft_manager_remake_cb();
     co_await _api.stop();
     co_await _shard_balancer.stop();
     co_await _backend.stop();
     co_await _tp_frontend.stop();
     co_await _plugin_frontend.stop();
+    co_await _cluster_link_frontend.stop();
     co_await _quota_frontend.stop();
     co_await _ephemeral_credential_frontend.stop();
     co_await _security_frontend.stop();
@@ -906,7 +981,9 @@ ss::future<> controller::stop() {
     co_await _credentials.stop();
     co_await _tp_state.stop();
     co_await _members_manager.stop();
+    co_await _epoch_service.stop();
     co_await _stm.stop();
+    co_await _cluster_link_table.stop();
     co_await _quota_backend.stop();
     co_await _quota_store.stop();
     co_await _plugin_backend.stop();
@@ -958,7 +1035,10 @@ ss::future<> controller::create_cluster(bootstrap_cluster_cmd_data cmd_data) {
             retry_chain_node retry_node(_as.local(), 300s, 5s);
             auto res
               = co_await cloud_metadata::download_highest_manifest_in_bucket(
-                _cloud_storage_api.local(), bucket_opt.value(), retry_node);
+                _cloud_storage_api.local(),
+                bucket_opt.value(),
+                retry_node,
+                config::shard_local_cfg().cloud_storage_cluster_name());
             if (res.has_value()) {
                 vlog(
                   clusterlog.info,
@@ -1224,6 +1304,40 @@ controller::validate_configuration_invariants() {
         // configuration_invariants in kvstore later.
     }
     co_return invariants;
+}
+
+ss::future<std::error_code> controller::trigger_remake_cb(raft::group_id g) {
+    auto ec = co_await _api.local().remake_partition(g);
+    if (ec) {
+        vlog(clusterlog.warn, "Unable to remake group {}, {}", g, ec);
+    }
+    co_return ec;
+}
+
+ss::future<> controller::set_raft_manager_remake_cb() {
+    co_await _raft_manager.invoke_on_all([this](raft::group_manager& gm) {
+        gm.set_remake_cb(
+          [this](raft::group_id g) -> ss::future<std::error_code> {
+              return trigger_remake_cb(g);
+          });
+    });
+}
+
+ss::future<> controller::clear_raft_manager_remake_cb() {
+    co_await _raft_manager.invoke_on_all(&raft::group_manager::clear_remake_cb);
+}
+
+ss::future<cluster::error_info>
+controller::initialize_controller_forced_reconfiguration(
+  std::vector<model::node_id> dead_nodes, uint16_t surviving_node_count) {
+    vassert(
+      ss::this_shard_id() == controller_stm_shard,
+      "programmer error, controller_force_recovery should only be called on "
+      "shard {}",
+      controller_stm_shard);
+
+    co_return co_await _cfr_m->initialize_controller_forced_reconfiguration(
+      std::move(dead_nodes), surviving_node_count);
 }
 
 } // namespace cluster

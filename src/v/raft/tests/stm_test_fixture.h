@@ -31,7 +31,6 @@
 #include "test_utils/test.h"
 
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
@@ -124,7 +123,7 @@ public:
       : simple_kv_base<>(rn) {}
 
     ss::future<iobuf>
-    take_snapshot(model::offset last_included_offset) override {
+    take_raft_snapshot(model::offset last_included_offset) override {
         state_t inc_state;
         // build incremental snapshot
         auto snap = co_await raft_node.raft()->open_snapshot();
@@ -136,8 +135,7 @@ public:
         }
 
         auto rdr = co_await raft_node.raft()->make_reader(
-          storage::log_reader_config(
-            start_offset, last_included_offset, ss::default_priority_class()));
+          storage::local_log_reader_config(start_offset, last_included_offset));
 
         auto batches = co_await model::consume_reader_to_memory(
           std::move(rdr), default_timeout());
@@ -151,6 +149,10 @@ public:
 
         co_return serde::to_iobuf(std::move(inc_state));
     };
+
+    stm_initial_recovery_policy get_initial_recovery_policy() const override {
+        return stm_initial_recovery_policy::read_everything;
+    }
 };
 using wait_for_each_batch = ss::bool_class<struct wait_for_each_tag>;
 

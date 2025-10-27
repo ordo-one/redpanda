@@ -23,6 +23,7 @@
 #include "security/sasl_authentication.h"
 #include "security/scram_authenticator.h"
 #include "security/types.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/util/defer.hh>
 
@@ -80,13 +81,13 @@ FIXTURE_TEST(test_config_utils, redpanda_thread_fixture) {
 
     const auto create_credentials = [&, this]() {
         return kafka::client::create_client_credentials(
-          *app.controller, cluster_cfg, client_cfg, principal);
+          *app.controller, client_cfg, principal);
     };
 
     // Default configuration, no authz - expect no changes
     {
-        auto config = create_credentials().get();
-        BOOST_REQUIRE_EQUAL(*config, client_cfg);
+        auto sasl_cfg = create_credentials().get();
+        BOOST_REQUIRE(!sasl_cfg.has_value());
         BOOST_REQUIRE(!ec_store.has(ec_store.find(principal)));
     }
 
@@ -104,8 +105,8 @@ FIXTURE_TEST(test_config_utils, redpanda_thread_fixture) {
 
     // Expect no changes as authz isn't enabled:
     {
-        auto config = create_credentials().get();
-        BOOST_REQUIRE_EQUAL(*config, client_cfg);
+        auto sasl_cfg = create_credentials().get();
+        BOOST_REQUIRE(!sasl_cfg.has_value());
         BOOST_REQUIRE(!ec_store.has(ec_store.find(principal)));
     }
 
@@ -116,8 +117,14 @@ FIXTURE_TEST(test_config_utils, redpanda_thread_fixture) {
         client_cfg.sasl_mechanism.set_value(
           ss::sstring{security::scram_sha512_authenticator::name});
 
-        auto config = create_credentials().get();
-        BOOST_REQUIRE_EQUAL(*config, client_cfg);
+        auto sasl_cfg = create_credentials().get();
+        BOOST_REQUIRE(sasl_cfg.has_value());
+        BOOST_REQUIRE_EQUAL(
+          sasl_cfg->mechanism, client_cfg.sasl_mechanism.value());
+        BOOST_REQUIRE_EQUAL(
+          sasl_cfg->username, client_cfg.scram_username.value());
+        BOOST_REQUIRE_EQUAL(
+          sasl_cfg->password, client_cfg.scram_password.value());
         BOOST_REQUIRE(!ec_store.has(ec_store.find(principal)));
 
         // reset the credentials
@@ -131,11 +138,12 @@ FIXTURE_TEST(test_config_utils, redpanda_thread_fixture) {
 
     // Expect credentials are created.
     {
-        auto config = create_credentials().get();
+        auto sasl_cfg = create_credentials().get();
+        BOOST_REQUIRE(sasl_cfg.has_value());
         BOOST_REQUIRE_EQUAL(
-          config->sasl_mechanism(), security::scram_sha512_authenticator::name);
-        BOOST_REQUIRE(config->scram_username.is_overriden());
-        BOOST_REQUIRE(config->scram_password.is_overriden());
+          sasl_cfg->mechanism, security::scram_sha512_authenticator::name);
+        BOOST_REQUIRE_NE(sasl_cfg->username, "");
+        BOOST_REQUIRE_NE(sasl_cfg->password, "");
         BOOST_REQUIRE(ec_store.has(ec_store.find(principal)));
     }
 }

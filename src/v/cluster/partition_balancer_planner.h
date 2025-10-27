@@ -10,14 +10,14 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "cluster/fwd.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/partition_balancer_types.h"
 #include "cluster/scheduling/types.h"
 #include "cluster/types.h"
+#include "container/chunked_vector.h"
 #include "model/metadata.h"
-
-#include <absl/container/flat_hash_map.h>
 
 #include <chrono>
 
@@ -34,12 +34,12 @@ struct ntp_reassignment {
 
 struct planner_config {
     model::partition_autobalancing_mode mode;
-    // If node disk usage goes over this ratio planner will actively move
+    // Used in two places:
+    // - If node disk usage goes over this ratio planner will actively move
     // partitions away from the node.
-    double soft_max_disk_usage_ratio;
-    // Planner won't plan a move that will result in destination node(s) going
+    // - Planner won't plan a move that will result in destination node(s) going
     // over this ratio.
-    double hard_max_disk_usage_ratio;
+    double max_disk_usage_ratio;
     // Max number of actions that can be scheduled in one planning iteration
     size_t max_concurrent_actions;
     std::chrono::seconds node_availability_timeout_sec;
@@ -60,6 +60,10 @@ struct planner_config {
     // partitions on each node, as opposed to balancing the total number of
     // partitions.
     bool topic_aware = false;
+
+    // If true, expects nodes to report their space management statistics in the
+    // health report.
+    bool space_management_enabled = false;
 };
 
 class partition_balancer_planner {
@@ -75,26 +79,18 @@ public:
         waiting_for_reports,
         missing_sizes,
     };
-    /**
-     * class describing a reason underlying partition replica set change
-     */
-    enum class change_reason {
-        rack_constraint_repair,
-        partition_count_rebalancing,
-        node_decommissioning,
-        node_unavailable,
-        disk_full,
-    };
 
     struct plan_data {
         partition_balancer_violations violations;
-        std::vector<ntp_reassignment> reassignments;
-        std::vector<model::ntp> cancellations;
-        absl::flat_hash_map<model::node_id, absl::btree_set<model::ntp>>
-          decommission_realloc_failures;
+        chunked_vector<ntp_reassignment> reassignments;
+        chunked_vector<model::ntp> cancellations;
+        chunked_hash_map<model::ntp, reallocation_failure_details>
+          reallocation_failures;
         bool counts_rebalancing_finished = false;
         size_t failed_actions_count = 0;
         status status = status::empty;
+
+        void maybe_add_reallocation_failure();
     };
 
     ss::future<plan_data>
@@ -134,8 +130,6 @@ private:
     planner_config _config;
     partition_balancer_state& _state;
     partition_allocator& _partition_allocator;
-
-    friend std::ostream& operator<<(std::ostream&, change_reason);
 };
 
 } // namespace cluster

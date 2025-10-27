@@ -7,29 +7,26 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.cluster import cluster
+from confluent_kafka.admin import NewTopic
+from confluent_kafka.error import KafkaError, KafkaException
 from ducktape.utils.util import wait_until
+
 from rptest.clients.python_librdkafka import PythonLibrdkafka
 from rptest.clients.rpk import RpkTool
+from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
-from confluent_kafka.admin import NewTopic
-from confluent_kafka.error import KafkaException, KafkaError
-
-from rptest.clients.kafka_cli_tools import KafkaCliTools
 
 
 class CustomTopicAssignmentTest(RedpandaTest):
     def __init__(self, test_context):
         # Disable balancer so replicas are not shuffled around after creation
         rp_conf = {"partition_autobalancing_mode": "off"}
-        super(CustomTopicAssignmentTest,
-              self).__init__(test_context=test_context,
-                             num_brokers=5,
-                             extra_rp_conf=rp_conf)
+        super(CustomTopicAssignmentTest, self).__init__(
+            test_context=test_context, num_brokers=5, extra_rp_conf=rp_conf
+        )
 
     def create_and_validate(self, name, custom_assignment):
-        self.redpanda.logger.info(
-            f"creating topic {name} with {custom_assignment}")
+        self.redpanda.logger.info(f"creating topic {name} with {custom_assignment}")
         rpk = RpkTool(self.redpanda)
 
         self.client().create_topic_with_assignment(name, custom_assignment)
@@ -67,12 +64,13 @@ class CustomTopicAssignmentTest(RedpandaTest):
     def test_custom_assignment_validation(self):
         client = PythonLibrdkafka(self.redpanda).get_client()
 
-        def expect_failed_create_topic(name, custom_assignment,
-                                       expected_error):
+        def expect_failed_create_topic(name, custom_assignment, expected_error):
             topics = [
-                NewTopic(name,
-                         num_partitions=len(custom_assignment),
-                         replica_assignment=custom_assignment)
+                NewTopic(
+                    name,
+                    num_partitions=len(custom_assignment),
+                    replica_assignment=custom_assignment,
+                )
             ]
             res = client.create_topics(topics, request_timeout=10)
             assert len(res) == 1
@@ -88,12 +86,13 @@ class CustomTopicAssignmentTest(RedpandaTest):
                 assert kafka_error.code() == expected_error
 
         # not unique replicas
-        expect_failed_create_topic("invalid-1", [[1, 1, 2]],
-                                   KafkaError.INVALID_REQUEST)
+        expect_failed_create_topic("invalid-1", [[1, 1, 2]], KafkaError.INVALID_REQUEST)
         # not existing broker
-        expect_failed_create_topic("invalid-1", [[1, 10, 2]],
-                                   KafkaError.BROKER_NOT_AVAILABLE)
+        expect_failed_create_topic(
+            "invalid-1", [[1, 10, 2]], KafkaError.BROKER_NOT_AVAILABLE
+        )
 
         # different replication factors
-        expect_failed_create_topic("invalid-1", [[1, 2, 3], [4]],
-                                   KafkaError.INVALID_REPLICATION_FACTOR)
+        expect_failed_create_topic(
+            "invalid-1", [[1, 2, 3], [4]], KafkaError.INVALID_REPLICATION_FACTOR
+        )

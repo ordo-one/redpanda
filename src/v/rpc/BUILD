@@ -24,7 +24,6 @@ redpanda_cc_library(
         "types.cc",
     ],
     hdrs = [
-        "backoff_policy.h",
         "connection_cache.h",
         "connection_set.h",
         "errc.h",
@@ -40,7 +39,6 @@ redpanda_cc_library(
         "transport.h",
         "types.h",
     ],
-    include_prefix = "rpc",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -49,6 +47,7 @@ redpanda_cc_library(
         "//src/v/bytes:scattered_message",
         "//src/v/compression",
         "//src/v/config",
+        "//src/v/container:chunked_hash_map",
         "//src/v/hashing:crc32c",
         "//src/v/hashing:xx",
         "//src/v/metrics",
@@ -59,6 +58,7 @@ redpanda_cc_library(
         "//src/v/ssx:future_util",
         "//src/v/ssx:semaphore",
         "//src/v/ssx:sformat",
+        "//src/v/utils:backoff_policy",
         "//src/v/utils:log_hist",
         "//src/v/utils:mutex",
         "//src/v/utils:named_type",

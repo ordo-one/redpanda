@@ -19,9 +19,8 @@
 #include "security/role.h"
 #include "security/role_store.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
-#include <absl/algorithm/container.h>
 #include <boost/range/irange.hpp>
 
 #include <algorithm>
@@ -195,10 +194,11 @@ FIXTURE_TEST(test_role_management, cluster_test_fixture) {
             auto ec
               = app_0->controller->get_feature_manager()
                   .local()
-                  .write_action(cluster::feature_update_action{
-                    .feature_name = ss::sstring("role_based_access_control"),
-                    .action
-                    = cluster::feature_update_action::action_t::deactivate})
+                  .write_action(
+                    cluster::feature_update_action{
+                      .feature_name = ss::sstring("role_based_access_control"),
+                      .action
+                      = cluster::feature_update_action::action_t::deactivate})
                   .get();
             success = ec == cluster::errc::success;
         }

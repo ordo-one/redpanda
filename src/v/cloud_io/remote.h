@@ -150,7 +150,8 @@ public:
     remote(
       ss::sharded<cloud_storage_clients::client_pool>& clients,
       const cloud_storage_clients::client_configuration& conf,
-      model::cloud_credentials_source cloud_credentials_source);
+      model::cloud_credentials_source cloud_credentials_source,
+      ss::scheduling_group sg);
 
     ~remote() override;
 
@@ -234,6 +235,10 @@ public:
     /// requests. It is also important to note that the value for max_keys will
     /// be capped by the cloud provider default (which may vary between
     /// providers, e.g AWS has a limit of 1000 keys per ListObjects request).
+    /// The result may also contain less than max_keys (or even no results) even
+    /// though there is data if the continuation_token is followed. Use the
+    /// is_truncated field in the result to see if there is more data to be
+    /// fetched.
     /// \param continuation_token The token hopefully passed back to the user
     /// from a prior list_objects() request, in the case that they are handling
     /// a truncated result manually.
@@ -312,6 +317,7 @@ private:
 
     model::cloud_storage_backend _cloud_storage_backend;
     cloud_io::provider _provider;
+    config::binding<std::chrono::milliseconds> _lease_timeout;
 };
 
 } // namespace cloud_io

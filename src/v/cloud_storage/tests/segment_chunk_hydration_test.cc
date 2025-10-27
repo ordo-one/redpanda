@@ -15,7 +15,10 @@
 #include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage/remote_segment.h"
 #include "cloud_storage/tests/cloud_storage_fixture.h"
+#include "cloud_storage/types.h"
+#include "container/chunked_circular_buffer.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 #include "utils/lazy_abort_source.h"
 #include "utils/stream_provider.h"
@@ -199,7 +202,6 @@ FIXTURE_TEST(test_remote_segment_chunk_read, cloud_storage_fixture) {
                             // iterate over the entire segment in chunks.
                             kafka::offset{100000000},
                             std::nullopt,
-                            ss::default_priority_class(),
                             as)
                           .get()
                           .stream;
@@ -247,7 +249,6 @@ FIXTURE_TEST(test_remote_segment_chunk_read_fallback, cloud_storage_fixture) {
                             segment.get_base_kafka_offset(),
                             kafka::offset{100000000},
                             std::nullopt,
-                            ss::default_priority_class(),
                             as)
                           .get()
                           .stream;
@@ -272,8 +273,9 @@ FIXTURE_TEST(test_remote_segment_chunk_read_fallback, cloud_storage_fixture) {
               return req.header("Range") == "";
           };
 
-          BOOST_REQUIRE(ranges::all_of(
-            get_requests(is_segment_dl_req), does_not_have_range_header));
+          BOOST_REQUIRE(
+            ranges::all_of(
+              get_requests(is_segment_dl_req), does_not_have_range_header));
 
           const auto is_chunk_path = [](std::string_view v) {
               return v.find("_chunks") != v.npos;
@@ -285,10 +287,11 @@ FIXTURE_TEST(test_remote_segment_chunk_read_fallback, cloud_storage_fixture) {
               return std::regex_match(path.begin(), path.end(), log_file_expr);
           };
 
-          BOOST_REQUIRE(ranges::any_of(
-            std::filesystem::recursive_directory_iterator{
-              tmp_directory.get_path()},
-            is_log_path));
+          BOOST_REQUIRE(
+            ranges::any_of(
+              std::filesystem::recursive_directory_iterator{
+                tmp_directory.get_path()},
+              is_log_path));
           BOOST_REQUIRE(downloaded == segment_bytes);
       };
     test_wrapper(*this, test, upload_index_t::no);
@@ -435,14 +438,15 @@ FIXTURE_TEST(test_chunk_multiple_readers, cloud_storage_fixture) {
 
     storage::offset_translator_state ot_state(m.get_ntp());
 
-    storage::log_reader_config reader_config(
-      model::offset{1}, model::offset{1000000}, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      kafka::offset{1}, kafka::offset{1000000});
     reader_config.max_bytes = std::numeric_limits<size_t>::max();
 
     std::vector<std::unique_ptr<remote_segment_batch_reader>> readers{};
     for (auto i = 0; i < 1000; ++i) {
-        readers.push_back(std::make_unique<remote_segment_batch_reader>(
-          segment, reader_config, probe, ts_probe, ssx::semaphore_units()));
+        readers.push_back(
+          std::make_unique<remote_segment_batch_reader>(
+            segment, reader_config, probe, ts_probe, ssx::semaphore_units()));
     }
 
     auto all_readers_done = [&readers] {
@@ -452,7 +456,7 @@ FIXTURE_TEST(test_chunk_multiple_readers, cloud_storage_fixture) {
 
     while (!all_readers_done()) {
         std::vector<
-          ss::future<result<ss::circular_buffer<model::record_batch>>>>
+          ss::future<result<chunked_circular_buffer<model::record_batch>>>>
           reads;
         reads.reserve(readers.size());
         ranges::transform(
@@ -461,8 +465,9 @@ FIXTURE_TEST(test_chunk_multiple_readers, cloud_storage_fixture) {
           });
 
         auto results = ss::when_all_succeed(reads.begin(), reads.end()).get();
-        BOOST_REQUIRE(ranges::all_of(
-          results, [](const auto& result) { return !result.has_error(); }));
+        BOOST_REQUIRE(ranges::all_of(results, [](const auto& result) {
+            return !result.has_error();
+        }));
     }
 
     for (const auto& reader : readers) {
@@ -494,10 +499,11 @@ FIXTURE_TEST(test_chunk_prefetch, cloud_storage_fixture) {
                   fmt::format("_chunks/{}", start));
             };
 
-            BOOST_REQUIRE(ranges::any_of(
-              std::filesystem::recursive_directory_iterator{
-                tmp_directory.get_path()},
-              is_path_to_chunk));
+            BOOST_REQUIRE(
+              ranges::any_of(
+                std::filesystem::recursive_directory_iterator{
+                  tmp_directory.get_path()},
+                is_path_to_chunk));
 
             const auto does_match_byte_range = [&](const auto& req) {
                 const auto header = req.header("Range");
@@ -529,7 +535,6 @@ FIXTURE_TEST(test_abort_hydration_timeout, cloud_storage_fixture) {
               segment.get_base_kafka_offset(),
               kafka::offset{100000000},
               std::nullopt,
-              ss::default_priority_class(),
               as)
             .get(),
           ss::timed_out_error);
@@ -547,7 +552,6 @@ FIXTURE_TEST(test_abort_hydration_triggered_externally, cloud_storage_fixture) {
               segment.get_base_kafka_offset(),
               kafka::offset{100000000},
               std::nullopt,
-              ss::default_priority_class(),
               as)
             .get(),
           ss::abort_requested_exception);

@@ -15,13 +15,13 @@
 #include "json/writer.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
+#include "model/batch_compression.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "pandaproxy/json/exceptions.h"
 #include "pandaproxy/json/iobuf.h"
 #include "pandaproxy/json/rjson_util.h"
 #include "pandaproxy/json/types.h"
-#include "storage/parser_utils.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -106,7 +106,7 @@ public:
         for (auto& v : res) {
             auto r = std::move(*v.partition_response);
             model::topic_partition_view tpv(
-              v.partition->name, r.partition_index);
+              v.partition->topic, r.partition_index);
             while (r.records && !r.records->empty()) {
                 auto adapter = r.records->consume_batch();
                 if (
@@ -121,8 +121,7 @@ public:
                 auto batch = std::move(*adapter.batch);
 
                 if (batch.compressed()) {
-                    batch = storage::internal::maybe_decompress_batch_sync(
-                      batch);
+                    batch = model::decompress_batch_sync(batch);
                 }
 
                 batch.for_each_record([&rjs, &w](model::record record) {

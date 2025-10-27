@@ -24,6 +24,7 @@ go_library(
     deps = [
         "//src/go/rpk/pkg/adminapi",
         "//src/go/rpk/pkg/cli/container/common",
+        "//src/go/rpk/pkg/cobraext",
         "//src/go/rpk/pkg/config",
         "//src/go/rpk/pkg/oauth",
         "//src/go/rpk/pkg/oauth/providers/auth0",
@@ -44,12 +45,19 @@ go_test(
     size = "small",
     srcs = [
         "create_test.go",
+        "print_test.go",
         "prompt_test.go",
     ],
     embed = [":profile"],
+    env = {
+        # We use a fake fs in tests, but we still need to configure a valid config path
+        "XDG_CONFIG_HOME": "/.test-config",
+    },
     deps = [
+        "//src/go/rpk/pkg/config",
         "@build_buf_gen_go_redpandadata_cloud_protocolbuffers_go//redpanda/api/controlplane/v1:controlplane",
         "@com_github_fatih_color//:color",
+        "@com_github_spf13_afero//:afero",
         "@com_github_stretchr_testify//require",
     ],
 )

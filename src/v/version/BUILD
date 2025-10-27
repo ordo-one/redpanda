@@ -1,5 +1,6 @@
 load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_python//python:defs.bzl", "py_binary")
 load("//bazel:build.bzl", "redpanda_cc_library")
 load(":expand_with_stamp_vars.bzl", "expand_with_stamp_vars")
 
@@ -15,7 +16,7 @@ write_file(
     name = "nostamp_variables",
     out = "nostamp_variables.txt",
     content = [
-        "STABLE_GIT_LATEST_TAG 0.0.0-dev",
+        "STABLE_GIT_LATEST_TAG v0.0.0-dev",
         "STABLE_GIT_COMMIT 0000000000000000000000000000000000000000",
         "STABLE_GIT_TREE_DIRTY ",
     ],
@@ -50,6 +51,5 @@ redpanda_cc_library(
     hdrs = [
         "version.h",
     ],
-    include_prefix = "version",
     visibility = ["//visibility:public"],
 )

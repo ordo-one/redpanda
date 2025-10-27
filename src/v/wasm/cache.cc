@@ -11,8 +11,10 @@
 
 #include "wasm/cache.h"
 
+#include "absl/container/btree_set.h"
 #include "logger.h"
 #include "model/transform.h"
+#include "ssx/future-util.h"
 #include "wasm/wasi_logger.h"
 
 #include <seastar/core/lowres_clock.hh>
@@ -22,8 +24,6 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/optimized_optional.hh>
-
-#include <absl/container/btree_set.h>
 
 namespace wasm {
 

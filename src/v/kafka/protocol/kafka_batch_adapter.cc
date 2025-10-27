@@ -18,7 +18,7 @@
 #include "kafka/protocol/wire.h"
 #include "model/fundamental.h"
 #include "model/record.h"
-#include "storage/parser_utils.h"
+#include "model/timestamp.h"
 
 #include <seastar/core/smp.hh>
 
@@ -85,11 +85,12 @@ model::record_batch_header kafka_batch_adapter::read_header(iobuf_parser& in) {
     const size_t total_bytes_consumed = in.bytes_consumed()
                                         - initial_bytes_consumed;
     if (unlikely(total_bytes_consumed != internal::kafka_header_size)) {
-        throw std::runtime_error(fmt::format(
-          "Invalid kafka header parsing. Must consume exactly:{}, but "
-          "consumed:{}",
-          internal::kafka_header_size,
-          total_bytes_consumed));
+        throw std::runtime_error(
+          fmt::format(
+            "Invalid kafka header parsing. Must consume exactly:{}, but "
+            "consumed:{}",
+            internal::kafka_header_size,
+            total_bytes_consumed));
     }
     header.ctx.owner_shard = ss::this_shard_id();
     return header;
@@ -143,15 +144,31 @@ iobuf kafka_batch_adapter::adapt(iobuf&& kbatch) {
         + sizeof(model::record_batch_header::size_bytes);
 
     if (unlikely(kbatch.size_bytes() < kafka_length_diff)) {
-        vlog(klog.error, "kbatch is unexpectedly small");
+        vlog(
+          klog.warn,
+          "unable to parse kafka batch, size of the buffer is smaller than the "
+          "size of a header preamble (base offset and size_bytes), (current "
+          "buffer size: {})",
+          kbatch.size_bytes());
+        short_read = true;
         return iobuf{};
     }
-
     auto batch_length =
       [peeker{iobuf_parser(kbatch.share(0, kafka_length_diff))}]() mutable {
           peeker.skip(sizeof(model::record_batch_header::base_offset));
           return peeker.consume_be_type<int32_t>() + kafka_length_diff;
       }();
+
+    if (batch_length > kbatch.size_bytes()) {
+        short_read = true;
+        vlog(
+          klog.debug,
+          "batch is unexpectedly small for the indicated batch length: {} > "
+          "{}",
+          batch_length,
+          kbatch.size_bytes());
+        return iobuf{};
+    }
 
     auto remainder = kbatch.share(
       batch_length, kbatch.size_bytes() - batch_length);
@@ -187,23 +204,29 @@ iobuf kafka_batch_adapter::adapt(iobuf&& kbatch) {
     auto new_batch = model::record_batch(
       header, std::move(records), model::record_batch::tag_ctor_ng{});
 
-    /**
-     * Perform some type of validation on the uncompressed input. In this case
-     * we make sure that the records can be materialized but we avoid
-     * re-encoding them using the lazy-record optimization.
-     */
-    if (!new_batch.compressed()) {
-        try {
-            new_batch.for_each_record([](model::record r) { (void)r; });
-        } catch (const std::exception& e) {
-            vlog(klog.error, "Parsing uncompressed records: {}", e.what());
-            return remainder;
-        }
-    }
-
     batch = std::move(new_batch);
     return remainder;
 }
+
+namespace {
+::compression::type to_compression_type(model::compression c) {
+    switch (c) {
+    case model::compression::gzip:
+        return ::compression::type::gzip;
+    case model::compression::snappy:
+        return ::compression::type::java_snappy;
+    case model::compression::lz4:
+        return ::compression::type::lz4;
+    case model::compression::zstd:
+        return ::compression::type::zstd;
+    case model::compression::none:
+    case model::compression::count:
+    case model::compression::producer:
+        break;
+    }
+    throw std::runtime_error(fmt::format("Unknown compression type: {}", c));
+}
+} // namespace
 
 /*
  * Handle a MessageSet. For each uncompressed message the message data is
@@ -275,7 +298,7 @@ void kafka_batch_adapter::convert_message_set(
         }
 
         auto batch_data = compression::compressor::uncompress(
-          *batch->value, batch->compression());
+          *batch->value, to_compression_type(batch->compression()));
 
         convert_message_set(builder, std::move(batch_data), true);
     }

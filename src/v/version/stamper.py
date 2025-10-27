@@ -9,8 +9,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from string import Template
 from pathlib import Path
+from string import Template
 
 
 def substitute(args):
@@ -37,5 +37,5 @@ def main():
     substitute(parser.parse_args())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

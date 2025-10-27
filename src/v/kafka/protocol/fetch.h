@@ -13,7 +13,7 @@
 
 #include "base/likely.h"
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/batch_reader.h"
 #include "kafka/protocol/schemata/fetch_request.h"
 #include "kafka/protocol/schemata/fetch_response.h"
@@ -61,7 +61,7 @@ struct fetch_request final {
         return data.topics.empty()
                || std::all_of(
                  data.topics.cbegin(), data.topics.cend(), [](const topic& t) {
-                     return t.fetch_partitions.empty();
+                     return t.partitions.empty();
                  });
     }
 
@@ -111,7 +111,7 @@ struct fetch_request final {
           : state_({.new_topic = true, .topic = begin})
           , t_end_(end) {
             if (likely(state_.topic != t_end_)) {
-                state_.partition = state_.topic->fetch_partitions.cbegin();
+                state_.partition = state_.topic->partitions.cbegin();
                 normalize();
             }
         }
@@ -149,11 +149,11 @@ struct fetch_request final {
 
     private:
         void normalize() {
-            while (state_.partition == state_.topic->fetch_partitions.cend()) {
+            while (state_.partition == state_.topic->partitions.cend()) {
                 state_.topic++;
                 state_.new_topic = true;
                 if (state_.topic != t_end_) {
-                    state_.partition = state_.topic->fetch_partitions.cbegin();
+                    state_.partition = state_.topic->partitions.cbegin();
                 } else {
                     break;
                 }
@@ -180,7 +180,7 @@ struct fetch_request final {
 struct fetch_response final {
     using api_type = fetch_api;
     using aborted_transaction = kafka::aborted_transaction;
-    using partition_response = fetchable_partition_response;
+    using partition_response = partition_data;
     using partition = fetchable_topic_response;
 
     fetch_response_data data;
@@ -214,7 +214,7 @@ struct fetch_response final {
     public:
         using partition_iterator = chunked_vector<partition>::iterator;
         using partition_response_iterator
-          = small_fragment_vector<partition_response>::iterator;
+          = chunked_vector<partition_response>::iterator;
 
         struct value_type {
             partition_iterator partition;
@@ -224,7 +224,9 @@ struct fetch_response final {
 
         using difference_type = void;
         using pointer = value_type*;
+        using const_pointer = const value_type*;
         using reference = value_type&;
+        using const_reference = const value_type&;
         using iterator_category = std::forward_iterator_tag;
 
         iterator(
@@ -243,8 +245,10 @@ struct fetch_response final {
         }
 
         reference operator*() noexcept { return state_; }
+        const_reference operator*() const noexcept { return state_; }
 
         pointer operator->() noexcept { return &state_; }
+        const_pointer operator->() const noexcept { return &state_; }
 
         iterator& operator++() {
             state_.is_new_topic = false;
@@ -303,11 +307,10 @@ struct fetch_response final {
     };
 
     iterator begin(bool enable_filtering = false) {
-        return iterator(
-          data.topics.begin(), data.topics.end(), enable_filtering);
+        return {data.responses.begin(), data.responses.end(), enable_filtering};
     }
 
-    iterator end() { return iterator(data.topics.end(), data.topics.end()); }
+    iterator end() { return {data.responses.end(), data.responses.end()}; }
 
     friend std::ostream& operator<<(std::ostream& os, const fetch_response& r) {
         return os << r.data;

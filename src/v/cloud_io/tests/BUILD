@@ -1,4 +1,4 @@
-load("//bazel:test.bzl", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
     name = "scoped_remote",
@@ -8,7 +8,6 @@ redpanda_test_cc_library(
     hdrs = [
         "scoped_remote.h",
     ],
-    include_prefix = "cloud_io/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/cloud_io:remote",
@@ -26,23 +25,92 @@ redpanda_test_cc_library(
         "s3_imposter.h",
     ],
     implementation_deps = [
-        "//src/v/base",
-        "//src/v/bytes:iobuf",
-        "//src/v/bytes:iobuf_parser",
         "@boost//:algorithm",
         "@boost//:core",
         "@boost//:property_tree",
     ],
-    include_prefix = "cloud_io/tests",
     visibility = ["//visibility:public"],
     deps = [
+        "//src/v/base",
         "//src/v/cloud_storage_clients",
         "//src/v/config",
         "//src/v/http/tests:utils",
-        "//src/v/model/tests:random",
-        "//src/v/test_utils:fixture",
         "//src/v/utils:uuid",
         "@abseil-cpp//absl/container:flat_hash_set",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "cloud_io_cache_fixture",
+    hdrs = [
+        "cache_test_fixture.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cloud_io:cache",
+        "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:tmp_dir",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "cache_test",
+    timeout = "short",
+    srcs = [
+        "cache_test.cc",
+        "cache_test_fixture.h",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_io:cache",
+        "//src/v/config",
+        "//src/v/random:generators",
+        "//src/v/storage:disk",
+        "//src/v/test_utils:iostream",
+        "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:directory_walker",
+        "//src/v/utils:file_io",
+        "//src/v/utils:human",
+        "@boost//:filesystem",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "cache_rpbench",
+    srcs = [
+        "cache_bench.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/cloud_io:cache",
+        "//src/v/config",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/ssx:sformat",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "directory_walker_test",
+    timeout = "short",
+    srcs = [
+        "directory_walker_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iostream",
+        "//src/v/cloud_io:cache",
+        "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",

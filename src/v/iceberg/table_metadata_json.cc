@@ -80,8 +80,9 @@ sort_field parse_sort_field(const json::Value& v) {
     chunked_vector<nested_field::id_t> source_ids;
     for (const auto& id_json : parse_required_array(v, "source-ids")) {
         if (!id_json.IsInt()) {
-            throw std::invalid_argument(fmt::format(
-              "Expected source-ids to be ints: {}", id_json.GetType()));
+            throw std::invalid_argument(
+              fmt::format(
+                "Expected source-ids to be ints: {}", id_json.GetType()));
         }
         source_ids.emplace_back(nested_field::id_t{id_json.GetInt()});
     }
@@ -130,15 +131,16 @@ table_metadata parse_table_meta(const json::Value& v) {
     auto last_partition_id = parse_required_i32(v, "last-partition-id");
 
     auto properties_json = parse_optional_object(v, "properties");
-    std::optional<chunked_hash_map<ss::sstring, ss::sstring>> properties;
+    std::optional<table_properties_t> properties;
     if (properties_json.has_value()) {
         properties.emplace();
         for (const auto& m : properties_json.value()) {
             if (!m.name.IsString() || !m.value.IsString()) {
-                throw std::invalid_argument(fmt::format(
-                  "Expected 'properties' field to be a string map: {} => {}",
-                  m.name.GetType(),
-                  m.value.GetType()));
+                throw std::invalid_argument(
+                  fmt::format(
+                    "Expected 'properties' field to be a string map: {} => {}",
+                    m.name.GetType(),
+                    m.value.GetType()));
             }
             const auto& val_str = m.value.GetString();
             properties->emplace(m.name.GetString(), val_str);
@@ -170,10 +172,11 @@ table_metadata parse_table_meta(const json::Value& v) {
         refs.emplace();
         for (const auto& r : refs_json.value()) {
             if (!r.name.IsString()) {
-                throw std::invalid_argument(fmt::format(
-                  "Expected 'refs' field to be string-object map: {} => {}",
-                  r.name.GetType(),
-                  r.value.GetType()));
+                throw std::invalid_argument(
+                  fmt::format(
+                    "Expected 'refs' field to be string-object map: {} => {}",
+                    r.name.GetType(),
+                    r.value.GetType()));
             }
             auto ref = parse_snapshot_ref(r.value);
             refs->emplace(r.name.GetString(), ref);

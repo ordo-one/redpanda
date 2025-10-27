@@ -10,10 +10,11 @@
  */
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "absl/hash/hash.h"
+#include "container/chunked_vector.h"
 
-#include <absl/hash/hash.h>
 #include <ankerl/unordered_dense.h>
+#include <fmt/format.h>
 
 #include <type_traits>
 
@@ -104,4 +105,44 @@ std::ostream& operator<<(std::ostream& o, const chunked_hash_map<K, V>& r) {
     }
     o << "}";
     return o;
+}
+template<typename K, typename V>
+struct fmt::formatter<chunked_hash_map<K, V>> {
+    using type = chunked_hash_map<K, V>;
+
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+    template<typename FormatContext>
+    typename FormatContext::iterator
+    format(const type& map, FormatContext& ctx) const {
+        // Map formatting is broken until version 11:
+        // https://github.com/fmtlib/fmt/issues/3685
+        auto out = ctx.out();
+        out = fmt::format_to(out, "[");
+        auto it = map.begin();
+        if (it != map.end()) {
+            out = fmt::format_to(out, "{{{} -> {}}}", it->first, it->second);
+            for (++it; it != map.end(); ++it) {
+                out = fmt::format_to(
+                  out, ", {{{} -> {}}}", it->first, it->second);
+            }
+        }
+        return fmt::format_to(out, "]");
+    }
+};
+
+/// Returns a lower bound on the memory currently being held by `m`.
+template<
+  typename K,
+  typename V,
+  typename Hash = std::conditional_t<
+    detail::has_absl_hash<K>,
+    detail::avalanching_absl_hash<K>,
+    ankerl::unordered_dense::hash<K>>,
+  typename EqualTo = std::equal_to<K>>
+size_t
+memory_usage_lower_bound(const chunked_hash_map<K, V, Hash, EqualTo>& m) {
+    return m.bucket_count()
+             * sizeof(typename chunked_hash_map<K, V>::bucket_type)
+           + m.values().capacity() * sizeof(m.values()[0]);
 }

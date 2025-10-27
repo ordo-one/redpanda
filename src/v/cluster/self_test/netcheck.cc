@@ -11,13 +11,13 @@
 
 #include "cluster/self_test/netcheck.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
 #include "cluster/logger.h"
 
 #include <seastar/core/coroutine.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/range/irange.hpp>
 
 namespace cluster::self_test {
@@ -91,7 +91,7 @@ ss::future<std::vector<self_test_result>> netcheck::run(netcheck_opts opts) {
           "Starting redpanda self-test network benchmark, with options: {}",
           opts);
         co_return co_await ss::with_scheduling_group(opts.sg, [this]() {
-            return ssx::async_transform(
+            return ssx::async_transform<std::vector<self_test_result>>(
               _opts.peers, [this](model::node_id peer) {
                   return run_individual_benchmark(peer);
               });

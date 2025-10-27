@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/offset_interval.h"
 #include "model/record.h"
 #include "storage/mvlog/file.h"
@@ -18,7 +18,6 @@
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
 
 namespace storage::experimental::mvlog {

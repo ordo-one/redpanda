@@ -2,9 +2,11 @@
 
 #include "base/vlog.h"
 #include "datalake/logger.h"
-#include "datalake/schema_parquet.h"
-#include "datalake/values_parquet.h"
+#include "iceberg/conversion/schema_parquet.h"
+#include "iceberg/conversion/values_parquet.h"
 #include "version/version.h"
+
+#include <seastar/util/defer.hh>
 
 namespace datalake {
 
@@ -13,6 +15,10 @@ ss::future<writer_error> serde_parquet_writer::add_data_struct(
     auto conversion_result = co_await to_parquet_value(
       std::make_unique<iceberg::struct_value>(std::move(value)));
     if (conversion_result.has_error()) {
+        vlog(
+          datalake_log.warn,
+          "Error converting iceberg struct to parquet value - {}",
+          conversion_result.error());
         co_return writer_error::parquet_conversion_error;
     }
 
@@ -20,6 +26,31 @@ ss::future<writer_error> serde_parquet_writer::add_data_struct(
       std::move(conversion_result.value()));
     try {
         auto stats = co_await _writer.write_row(std::move(group));
+        auto stats_updater = ss::defer([this, stats] {
+            _buffered_bytes = stats.buffered_size;
+            _flushed_bytes = stats.flushed_size;
+        });
+
+        /*
+         * handle disk reservation. see writer_disk_tracker for more info.
+         */
+        const auto total_bytes = _buffered_bytes + _flushed_bytes;
+        const auto new_total_bytes = stats.buffered_size + stats.flushed_size;
+        if (new_total_bytes > total_bytes) {
+            auto& disk = _mem_tracker.disk();
+            auto result = co_await disk.reserve_bytes(
+              new_total_bytes - total_bytes, as);
+            if (result != reservation_error::ok) {
+                co_return map_to_writer_error(result);
+            }
+        } else if (new_total_bytes < total_bytes) {
+            auto& disk = _mem_tracker.disk();
+            co_await disk.free_bytes(total_bytes - new_total_bytes, as);
+        }
+
+        /*
+         * handle memory reservation
+         */
         auto new_buffered_bytes = stats.buffered_size;
         if (new_buffered_bytes > _buffered_bytes) {
             auto reservation_result = co_await _mem_tracker.reserve_bytes(
@@ -35,8 +66,6 @@ ss::future<writer_error> serde_parquet_writer::add_data_struct(
             co_await _mem_tracker.free_bytes(
               _buffered_bytes - new_buffered_bytes, as);
         }
-        _buffered_bytes = new_buffered_bytes;
-        _flushed_bytes = stats.flushed_size;
     } catch (...) {
         vlog(
           datalake_log.warn,

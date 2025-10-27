@@ -13,12 +13,14 @@
 #include "base/seastarx.h"
 #include "base/vlog.h"
 #include "bytes/iobuf.h"
+#include "cluster/cluster_link/frontend.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/protocol/types.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/connection_context.h"
 #include "kafka/server/fetch_session_cache.h"
+#include "kafka/server/group_router.h"
 #include "kafka/server/handlers/handler_interface.h"
 #include "kafka/server/logger.h"
 #include "kafka/server/response.h"
@@ -48,12 +50,9 @@
 namespace kafka {
 
 /// Checks to see if the event is auditable.
-/// Current check will exclude any produce messages by the audit principal
-inline bool
-skip_auditing(api_key key, const security::acl_principal& principal) {
-    return security::audit::kafka_api_to_event_type(key)
-             == security::audit::event_type::produce
-           && principal == security::audit_principal;
+/// Skips auditing ephemeral users
+inline bool skip_auditing(const security::acl_principal& principal) {
+    return principal.type() == security::principal_type::ephemeral_user;
 }
 
 inline constexpr auto request_header_size = sizeof(int16_t) + sizeof(int16_t)
@@ -88,10 +87,12 @@ class request_context {
 public:
     request_context(
       ss::lw_shared_ptr<connection_context> conn,
+      ss::lw_shared_ptr<request_resources> rres,
       request_header&& header,
       iobuf&& request,
       ss::lowres_clock::duration throttle_delay) noexcept
       : _conn(std::move(conn))
+      , _request_resources(std::move(rres))
       , _request_size(request.size_bytes())
       , _header(std::move(header))
       , _reader(std::move(request))
@@ -203,6 +204,12 @@ public:
         return _conn->server().get_fetch_metadata_cache();
     }
 
+    bool is_topic_mutable(const model::topic& topic) const {
+        return _conn->server()
+          .cluster_link_frontend()
+          .is_topic_mutable_for_kafka_api(topic);
+    }
+
     template<typename ResponseType>
     requires requires(
       ResponseType r, protocol::encoder& writer, api_version version) {
@@ -264,6 +271,10 @@ public:
         return ss::make_ready_future<response_ptr>(std::move(resp));
     }
 
+    group_initializer& group_initializer() {
+        return _conn->server().group_router().group_initializer();
+    }
+
     coordinator_ntp_mapper& coordinator_mapper() {
         return _conn->server().coordinator_mapper();
     }
@@ -274,7 +285,7 @@ public:
         return _conn->server().credentials();
     }
 
-    bool audit() { return _audit_successful; }
+    bool audit() const { return _audit_successful; }
 
     bool audit_authn_failure(ss::sstring reason) {
         return audit_authn_failure(std::move(reason), "");
@@ -342,8 +353,9 @@ public:
       security::acl_operation operation,
       const T& name,
       authz_quiet quiet = authz_quiet{false},
-      audit_authz_check audit_authz = audit_authz_check::yes) {
-        auto result = do_authorized(operation, name, quiet);
+      audit_authz_check audit_authz = audit_authz_check::yes,
+      superuser_required superuser_required = superuser_required::no) {
+        auto result = do_authorized(operation, name, quiet, superuser_required);
         auto resp = bool(result);
 
         auto key = _header.key;
@@ -362,14 +374,15 @@ public:
       security::acl_operation operation,
       const T& name,
       Func&& f,
-      authz_quiet quiet = authz_quiet{false}) {
-        auto result = do_authorized(operation, name, quiet);
+      authz_quiet quiet = authz_quiet{false},
+      superuser_required superuser_required = superuser_required::no) {
+        auto result = do_authorized(operation, name, quiet, superuser_required);
         auto resp = bool(result);
 
         auto key = _header.key;
 
         // Not auditing produce authz attempts from audit principal
-        if (skip_auditing(key, result.principal)) [[unlikely]] {
+        if (skip_auditing(result.principal)) [[unlikely]] {
             return resp;
         }
 
@@ -410,18 +423,29 @@ public:
 
     ss::sharded<server>& server() { return _conn->server().container(); }
 
+    bool is_cluster_link_active() const {
+        return _conn->server().container().local().is_cluster_link_active();
+    }
+
+    void add_response_resource_deleter(ss::deleter&& res) {
+        _request_resources->response_resource_deleter = ss::make_object_deleter(
+          std::move(_request_resources->response_resource_deleter),
+          std::move(res));
+    }
+
 private:
     template<typename T>
     security::auth_result do_authorized(
       security::acl_operation operation,
       const T& name,
-      authz_quiet quiet = authz_quiet{false}) {
+      authz_quiet quiet = authz_quiet{false},
+      superuser_required superuser_required = superuser_required::no) {
         if constexpr (std::is_same_v<T, model::topic>) {
             if (name == model::kafka_audit_logging_topic) [[unlikely]] {
                 _request_contains_audit_topic = true;
             }
         }
-        return _conn->authorized(operation, name, quiet);
+        return _conn->authorized(operation, name, quiet, superuser_required);
     }
     template<typename T>
     void do_audit(
@@ -429,7 +453,7 @@ private:
       const T& name,
       api_key key,
       std::optional<std::string_view> client_id) {
-        if (skip_auditing(key, auth_result.principal)) [[unlikely]] {
+        if (skip_auditing(auth_result.principal)) [[unlikely]] {
             return;
         }
 
@@ -493,6 +517,7 @@ private:
 
 private:
     ss::lw_shared_ptr<connection_context> _conn;
+    ss::lw_shared_ptr<request_resources> _request_resources;
     size_t _request_size;
     request_header _header;
     protocol::decoder _reader;
@@ -503,7 +528,7 @@ private:
 
 // Executes the API call identified by the specified request_context.
 process_result_stages process_request(
-  request_context&&, ss::smp_service_group, const session_resources&);
+  request_context&&, ss::smp_service_group, const request_resources&);
 
 bool track_latency(api_key);
 

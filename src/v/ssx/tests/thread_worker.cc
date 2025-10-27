@@ -16,8 +16,9 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/later.hh>
 
-#include <absl/algorithm/container.h>
 #include <boost/test/unit_test_log.hpp>
+
+#include <algorithm>
 
 struct move_only {
     explicit move_only(size_t v)
@@ -47,8 +48,9 @@ auto thread_worker_test() {
         }
     }).get();
 
-    BOOST_REQUIRE(absl::c_all_of(
-      all_results, [](const auto& c) { return c.size() == tries; }));
+    BOOST_REQUIRE(std::ranges::all_of(all_results, [](const auto& c) {
+        return c.size() == tries;
+    }));
 
     ss::smp::invoke_on_all([&w, &all_results]() {
         return [](auto& w, auto& all_results) -> ss::future<> {

@@ -9,6 +9,7 @@
 
 #include "cluster/rm_stm_types.h"
 
+#include "model/record_batch_types.h"
 #include "storage/record_batch_builder.h"
 
 namespace cluster::tx {
@@ -233,7 +234,8 @@ fence_batch_data read_fence_batch(model::record_batch&& b) {
 model::control_record_type parse_control_batch(const model::record_batch& b) {
     const auto& hdr = b.header();
     vassert(
-      hdr.type == model::record_batch_type::raft_data,
+      hdr.type == model::record_batch_type::raft_data
+        || hdr.type == model::record_batch_type::ctp_placeholder,
       "expect data batch type got {}",
       hdr.type);
     vassert(hdr.attrs.is_control(), "expect control attrs got {}", hdr.attrs);
@@ -315,7 +317,8 @@ tx_snapshot_v6::tx_snapshot_v6(tx_snapshot_v5 snap_v5, raft::group_id group)
             v6.finished_requests.emplace_back(
               request.first_sequence,
               request.last_sequence,
-              request.last_offset);
+              request.last_offset,
+              producer_state_snapshot::finished_request::unset_term);
         }
         producer_states.emplace(v6.id.get_id(), std::move(v6));
     }
@@ -325,7 +328,7 @@ tx_snapshot_v6::tx_snapshot_v6(tx_snapshot_v5 snap_v5, raft::group_id group)
         auto& state = producer_states[pid.get_id()];
         state.id = pid;
         state.group = group;
-        state.transaction_state = {};
+        state.transaction_state = producer_partition_transaction_state{};
         state.transaction_state->first = data.first;
         state.transaction_state->last = data.last;
         state.transaction_state->sequence = model::tx_seq{-1};
@@ -399,11 +402,10 @@ namespace reflection {
 using namespace cluster::tx;
 
 template<class T>
-using fvec = fragmented_vector<T>;
+using fvec = chunked_vector<T>;
 
 ss::future<> async_adl<tx_snapshot_v4>::to(iobuf& out, tx_snapshot_v4 snap) {
-    co_await detail::async_adl_list<
-      fragmented_vector<model::producer_identity>>{}
+    co_await detail::async_adl_list<chunked_vector<model::producer_identity>>{}
       .to(out, std::move(snap.fenced));
     co_await detail::async_adl_list<fvec<tx_range>>{}.to(
       out, std::move(snap.ongoing));
@@ -456,8 +458,7 @@ ss::future<> async_adl<tx_snapshot_v5>::to(iobuf& out, tx_snapshot_v5 snap) {
     reflection::serialize(out, snap.offset);
     co_await detail::async_adl_list<fvec<producer_state_snapshot_deprecated>>{}
       .to(out, std::move(snap.producers));
-    co_await detail::async_adl_list<
-      fragmented_vector<model::producer_identity>>{}
+    co_await detail::async_adl_list<chunked_vector<model::producer_identity>>{}
       .to(out, std::move(snap.fenced));
     co_await detail::async_adl_list<fvec<tx_range>>{}.to(
       out, std::move(snap.ongoing));

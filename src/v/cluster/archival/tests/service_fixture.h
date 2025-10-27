@@ -14,6 +14,7 @@
 #include "cloud_storage/types.h"
 #include "cloud_storage_clients/client_pool.h"
 #include "cluster/archival/ntp_archiver_service.h"
+#include "cluster/archival/probe.h"
 #include "http/tests/http_imposter.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -27,6 +28,11 @@
 
 #include <vector>
 
+#if defined(IS_GTEST)
+#error                                                                         \
+  "archival service fixture uses boost assertions so can't be used with gtest"
+#endif
+
 namespace archival {
 
 struct segment_desc {
@@ -35,7 +41,7 @@ struct segment_desc {
     model::term_id term;
     std::optional<size_t> num_records;
     std::optional<size_t> records_per_batch;
-    std::optional<model::timestamp> timestamp;
+    std::optional<model::timestamp> timestamp = model::timestamp::min();
 };
 
 struct offset_range {
@@ -139,8 +145,6 @@ public:
       ss::lw_shared_ptr<archival::configuration>,
       cloud_storage::configuration>
     get_configurations();
-    std::unique_ptr<storage::disk_log_builder> get_started_log_builder(
-      model::ntp ntp, model::revision_id rev = model::revision_id(0));
     /// Wait unill all information will be replicated and the local node
     /// will become a leader for 'ntp'.
     void wait_for_partition_leadership(const model::ntp& ntp);
@@ -171,9 +175,14 @@ public:
       archival::ntp_archiver::batch_result,
       std::optional<model::offset> lso = std::nullopt);
 
+    std::optional<ntp_level_probe>& get_probe(ntp_archiver& archiver) const {
+        return archiver._probe;
+    }
+
     ss::future<> upload_until_term_change(archival::ntp_archiver& archiver) {
         auto sync_timeout = config::shard_local_cfg()
                               .cloud_storage_metadata_sync_timeout_ms.value();
+        archiver.initialize_probe();
         return archiver._parent.archival_meta_stm()
           ->sync(sync_timeout)
           .then([&](const auto& sync_result) {
@@ -190,6 +199,12 @@ public:
 
     void broadcast_flush_condition_variable(archival::ntp_archiver& archiver) {
         archiver._flush_cond.broadcast();
+    }
+
+    void requests_size_eventually(
+      size_t expected, ss::lowres_clock::duration to = 3s) {
+        RPTEST_REQUIRE_EVENTUALLY(
+          to, [&] { return get_requests().size() == expected; });
     }
 
     ss::sharded<cloud_storage_clients::client_pool> pool;
@@ -213,22 +228,6 @@ archival::remote_segment_path get_segment_path(
 
 archival::remote_segment_path get_segment_index_path(
   const cloud_storage::partition_manifest&, const archival::segment_name&);
-
-/// Specification for the segments and data to go into the log for a test
-struct log_spec {
-    // The base offsets for all segments. The difference in adjacent base
-    // offsets is converted to how many records we will write into each segment
-    // (as a single batch)
-    std::vector<model::offset::type> segment_starts;
-    // The indices of the segments which will be marked as compacted for the
-    // test. The segments are not actually compacted, only marked as such.
-    std::vector<size_t> compacted_segment_indices;
-    // The number of records in the final segment, required separately because
-    // there is no delta to use for the last segment.
-    size_t last_segment_num_records;
-};
-
-void populate_log(storage::disk_log_builder& b, const log_spec& spec);
 
 segment_layout write_random_batches(
   ss::lw_shared_ptr<storage::segment> seg,

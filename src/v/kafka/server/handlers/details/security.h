@@ -8,56 +8,36 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
+
+#pragma once
 #include "kafka/protocol/schemata/create_acls_request.h"
 #include "kafka/protocol/schemata/delete_acls_request.h"
 #include "kafka/protocol/schemata/describe_acls_request.h"
-#include "kafka/server/request_context.h"
+#include "kafka/protocol/schemata/describe_acls_response.h"
+#include "kafka/protocol/types.h"
 #include "model/validation.h"
 #include "security/acl.h"
-namespace kafka::details {
+#include "security/scram_credential.h"
+namespace kafka {
 
 /*
- * Conversions throw acl_conversion_error and the exception message via (what())
- * is generally what should be returned as the error message in kafka responses.
- *
- * Using an exception here eliminates the need to write c/go-style error
- * handling for the large number of fields that need to be converted.
+ * authz failures should be quiet or logged at a reduced severity level.
  */
-struct acl_conversion_error : std::exception {
-    explicit acl_conversion_error(ss::sstring msg)
-      : msg{std::move(msg)} {}
-    const char* what() const noexcept final { return msg.c_str(); }
-    ss::sstring msg;
-};
+using authz_quiet = ss::bool_class<struct authz_quiet_tag>;
+
+using audit_authz_check = ss::bool_class<struct audit_authz_check_tag>;
+
+using superuser_required = ss::bool_class<struct superuser_required_tag>;
+
+namespace details {
+
+constexpr auto sr_subject_wire_value = 100;
+constexpr auto sr_registry_wire_value = 101;
+
+using acl_conversion_error = security::acl_conversion_error;
 
 inline security::acl_principal to_acl_principal(const ss::sstring& principal) {
-    std::string_view view(principal);
-    constexpr std::string_view user_prefix{"User:"};
-    constexpr std::string_view role_prefix{"RedpandaRole:"};
-    auto usr = view.starts_with(user_prefix);
-    auto rol = !usr && view.starts_with(role_prefix);
-
-    if (unlikely(!usr && !rol)) {
-        throw acl_conversion_error(
-          fmt::format("Invalid principal name: {{{}}}", principal));
-    }
-
-    auto name = principal.substr(usr ? user_prefix.size() : role_prefix.size());
-    if (unlikely(name.empty())) {
-        throw acl_conversion_error(
-          fmt::format("Principal name cannot be empty"));
-    }
-    if (name == "*") {
-        if (usr) {
-            return security::acl_wildcard_user;
-        } else {
-            throw acl_conversion_error(
-              fmt::format("Illegal wildcard role: {{{}}}", principal));
-        }
-    }
-    return security::acl_principal(
-      usr ? security::principal_type::user : security::principal_type::role,
-      std::move(name));
+    return security::acl_principal::from_string(principal);
 }
 
 inline security::acl_host to_acl_host(const ss::sstring& host) {
@@ -85,6 +65,18 @@ inline security::resource_type to_resource_type(int8_t type) {
     default:
         throw acl_conversion_error(
           fmt::format("Invalid resource type: {}", type));
+    }
+}
+
+inline security::resource_type to_registry_resource_type(int8_t type) {
+    switch (type) {
+    case sr_subject_wire_value:
+        return security::resource_type::sr_subject;
+    case sr_registry_wire_value:
+        return security::resource_type::sr_registry;
+    default:
+        throw acl_conversion_error(
+          fmt::format("Invalid registry resource type: {}", type));
     }
 }
 
@@ -164,10 +156,11 @@ inline security::acl_binding to_acl_binding(const creatable_acl& acl) {
         auto errc = model::validate_kafka_topic_name(
           model::topic_view(pattern.name()));
         if (pattern.name() != "*" && errc) {
-            throw acl_conversion_error(fmt::format(
-              "ACL topic {} does not conform to kafka topic schema: {}",
-              pattern.name(),
-              errc.message()));
+            throw acl_conversion_error(
+              fmt::format(
+                "ACL topic {} does not conform to kafka topic schema: {}",
+                pattern.name(),
+                errc.message()));
         }
     }
 
@@ -191,7 +184,9 @@ to_resource_pattern_filter(const describe_acls_request_data& request) {
         // wildcard
         break;
     default:
-        resource_type = to_resource_type(request.resource_type);
+        resource_type = request.describe_registry_acls
+                          ? to_registry_resource_type(request.resource_type)
+                          : to_resource_type(request.resource_type);
     }
 
     std::optional<security::resource_pattern_filter::pattern_filter_type>
@@ -209,7 +204,12 @@ to_resource_pattern_filter(const describe_acls_request_data& request) {
     }
 
     return security::resource_pattern_filter(
-      resource_type, request.resource_name_filter, pattern_filter);
+      resource_type,
+      request.resource_name_filter,
+      pattern_filter,
+      request.describe_registry_acls
+        ? security::resource_pattern_filter::resource_subsystem::schema_registry
+        : security::resource_pattern_filter::resource_subsystem::kafka);
 }
 
 /*
@@ -268,8 +268,25 @@ inline int8_t to_kafka_resource_type(security::resource_type type) {
         return 4;
     case security::resource_type::transactional_id:
         return 5;
+    case security::resource_type::sr_subject:
+    case security::resource_type::sr_registry:
+        vassert(
+          false, "Schema Registry resources are not supported in kafka ACLs");
     }
-    __builtin_unreachable();
+}
+
+inline int8_t to_kafka_registry_resource_type(security::resource_type type) {
+    switch (type) {
+    case security::resource_type::sr_subject:
+        return sr_subject_wire_value;
+    case security::resource_type::sr_registry:
+        return sr_registry_wire_value;
+    case security::resource_type::topic:
+    case security::resource_type::group:
+    case security::resource_type::cluster:
+    case security::resource_type::transactional_id:
+        vunreachable("Request only for Schema Registry resources");
+    }
 }
 
 inline int8_t to_kafka_pattern_type(security::pattern_type type) {
@@ -321,15 +338,7 @@ inline int8_t to_kafka_permission(security::acl_permission perm) {
 }
 
 inline ss::sstring to_kafka_principal(const security::acl_principal& p) {
-    switch (p.type()) {
-    case security::principal_type::user:
-        return fmt::format("User:{}", p.name());
-    case security::principal_type::ephemeral_user:
-        return fmt::format("Ephemeral user:{}", p.name());
-    case security::principal_type::role:
-        return fmt::format("RedpandaRole:{}", p.name());
-    }
-    __builtin_unreachable();
+    return fmt::format("{:a}", p);
 }
 
 inline ss::sstring to_kafka_host(security::acl_host host) {
@@ -368,73 +377,22 @@ inline int32_t to_bit_field(const std::vector<security::acl_operation>& ops) {
     return static_cast<int32_t>(bitfield.to_ulong());
 }
 
-/**
- *  list of acl operations for specific resource
- */
 template<typename T>
-const std::vector<security::acl_operation>& get_allowed_operations() {
-    static const std::vector<security::acl_operation> topic_resource_ops{
-      security::acl_operation::read,
-      security::acl_operation::write,
-      security::acl_operation::create,
-      security::acl_operation::describe,
-      security::acl_operation::remove,
-      security::acl_operation::alter,
-      security::acl_operation::describe_configs,
-      security::acl_operation::alter_configs,
-    };
-
-    static const std::vector<security::acl_operation> group_resource_ops{
-      security::acl_operation::read,
-      security::acl_operation::describe,
-      security::acl_operation::remove,
-    };
-
-    static const std::vector<security::acl_operation>
-      transactional_id_resource_ops{
-        security::acl_operation::write,
-        security::acl_operation::describe,
-      };
-
-    static const std::vector<security::acl_operation> cluster_resource_ops{
-      security::acl_operation::create,
-      security::acl_operation::cluster_action,
-      security::acl_operation::describe_configs,
-      security::acl_operation::alter_configs,
-      security::acl_operation::idempotent_write,
-      security::acl_operation::alter,
-      security::acl_operation::describe,
-    };
-
-    auto resource_type = security::get_resource_type<T>();
-
-    switch (resource_type) {
-    case security::resource_type::cluster:
-        return cluster_resource_ops;
-    case security::resource_type::group:
-        return group_resource_ops;
-    case security::resource_type::topic:
-        return topic_resource_ops;
-    case security::resource_type::transactional_id:
-        return transactional_id_resource_ops;
-    };
-
-    __builtin_unreachable();
-}
+using authorized_function = std::function<bool(
+  security::acl_operation, const T&, authz_quiet, audit_authz_check)>;
 
 template<typename T>
 std::vector<security::acl_operation>
-authorized_operations(request_context& ctx, const T& resource) {
+authorized_operations(authorized_function<T> fn, const T& resource) {
     std::vector<security::acl_operation> allowed_operations;
-    auto& ops = get_allowed_operations<T>();
+    auto& ops = security::get_allowed_operations<T>();
 
     std::copy_if(
       ops.begin(),
       ops.end(),
       std::back_inserter(allowed_operations),
-      [&ctx, &resource](security::acl_operation op) {
-          return ctx.authorized(
-            op, resource, authz_quiet::no, audit_authz_check::no);
+      [&fn, &resource](security::acl_operation op) {
+          return fn(op, resource, authz_quiet::no, audit_authz_check::no);
       });
 
     return allowed_operations;
@@ -518,4 +476,15 @@ to_acl_binding_filter(const delete_acls_filter& filter) {
       to_resource_pattern_filter(filter), to_acl_entry_filter(filter));
 }
 
-} // namespace kafka::details
+std::optional<security::scram_algorithm_t>
+kafka_to_security_mechanism(kafka::scram_mechanism mechanism);
+
+scram_mechanism key_size_to_mechanism(size_t key_size);
+
+describe_acls_resource acl_entry_to_resource(
+  security::resource_pattern pattern,
+  chunked_vector<security::acl_entry> acl_entries,
+  bool describe_registry_resource);
+
+} // namespace details
+} // namespace kafka

@@ -17,6 +17,7 @@
 #include "kafka/protocol/schemata/incremental_alter_configs_request.h"
 #include "kafka/protocol/schemata/incremental_alter_configs_response.h"
 #include "kafka/server//handlers/configs/config_utils.h"
+#include "kafka/server/handlers/details/alter_config_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
@@ -129,6 +130,15 @@ create_topic_properties_update(
     model::topic_namespace tp_ns(
       model::kafka_namespace, model::topic(resource.resource_name));
     cluster::topic_properties_update update(tp_ns);
+
+    if (!ctx.is_topic_mutable(tp_ns.tp)) {
+        return make_error_alter_config_resource_response<resp_resource_t>(
+          resource,
+          error_code::policy_violation,
+          fmt::format(
+            "Topic cannot be altered because it belongs to an active "
+            "shadow link."));
+    }
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
       update.properties};
@@ -263,7 +273,10 @@ create_topic_properties_update(
             }
             if (cfg.name == topic_property_max_message_bytes) {
                 parse_and_set_optional(
-                  update.properties.batch_max_bytes, cfg.value, op);
+                  update.properties.batch_max_bytes,
+                  cfg.value,
+                  op,
+                  batch_max_bytes_limits_validator{});
                 continue;
             }
             if (cfg.name == topic_property_replication_factor) {
@@ -324,7 +337,7 @@ create_topic_properties_update(
                   update.properties.flush_ms,
                   cfg.value,
                   op,
-                  flush_ms_validator{});
+                  flush_ms_validator);
                 continue;
             }
             if (cfg.name == topic_property_flush_bytes) {
@@ -354,8 +367,7 @@ create_topic_properties_update(
                 continue;
             }
             if (cfg.name == topic_property_cloud_topic_enabled) {
-                if (config::shard_local_cfg()
-                      .development_enable_cloud_topics()) {
+                if (config::shard_local_cfg().cloud_topics_enabled()) {
                     throw validation_error(
                       "Cloud topics property cannot be changed");
                 }
@@ -363,10 +375,7 @@ create_topic_properties_update(
             }
             if (cfg.name == topic_property_delete_retention_ms) {
                 parse_and_set_tristate(
-                  update.properties.delete_retention_ms,
-                  cfg.value,
-                  op,
-                  delete_retention_ms_validator{});
+                  update.properties.delete_retention_ms, cfg.value, op);
                 continue;
             }
             if (cfg.name == topic_property_iceberg_delete) {
@@ -403,7 +412,7 @@ create_topic_properties_update(
                   update.properties.iceberg_target_lag_ms,
                   cfg.value,
                   op,
-                  iceberg_target_lag_ms_validator{});
+                  iceberg_target_lag_ms_validator);
                 continue;
             }
 
@@ -413,6 +422,44 @@ create_topic_properties_update(
                   cfg.value,
                   op,
                   min_cleanable_dirty_ratio_validator{});
+                continue;
+            }
+
+            if (cfg.name == topic_property_min_compaction_lag_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.min_compaction_lag_ms,
+                  cfg.value,
+                  op,
+                  min_compaction_lag_ms_validator);
+                continue;
+            }
+
+            if (cfg.name == topic_property_max_compaction_lag_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.max_compaction_lag_ms,
+                  cfg.value,
+                  op,
+                  max_compaction_lag_ms_validator);
+                continue;
+            }
+
+            if (cfg.name == topic_property_message_timestamp_before_max_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.message_timestamp_before_max_ms,
+                  cfg.value,
+                  op,
+                  message_timestamp_before_max_ms_validator,
+                  /*clamp_to_duration_max=*/true);
+                continue;
+            }
+
+            if (cfg.name == topic_property_message_timestamp_after_max_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.message_timestamp_after_max_ms,
+                  cfg.value,
+                  op,
+                  message_timestamp_after_max_ms_validator,
+                  /*clamp_to_duration_max=*/true);
                 continue;
             }
         } catch (const validation_error& e) {
@@ -470,6 +517,12 @@ inline std::string_view map_config_name(std::string_view input) {
       .match("log.compression.type", "log_compression_type")
       .match("log.roll.ms", "log_segment_ms")
       .match("log.cleaner.delete.retention.ms", "tombstone_retention_ms")
+      .match(
+        "log.message.timestamp.before.max.ms",
+        "log_message_timestamp_before_max_ms")
+      .match(
+        "log.message.timestamp.after.max.ms",
+        "log_message_timestamp_after_max_ms")
       .default_match(input);
 }
 
@@ -635,9 +688,10 @@ ss::future<response_ptr> incremental_alter_configs_handler::handle(
           incremental_alter_configs_resource>(
           std::move(groupped), std::move(unauthorized_responsens));
 
-        co_return co_await ctx.respond(assemble_alter_config_response<
-                                       incremental_alter_configs_response,
-                                       resp_resource_t>(std::move(responses)));
+        co_return co_await ctx.respond(
+          assemble_alter_config_response<
+            incremental_alter_configs_response,
+            resp_resource_t>(std::move(responses)));
     }
 
     std::vector<ss::future<chunked_vector<resp_resource_t>>> futures;
@@ -651,9 +705,10 @@ ss::future<response_ptr> incremental_alter_configs_handler::handle(
     // include authorization errors
     ret.push_back(std::move(unauthorized_responsens));
 
-    co_return co_await ctx.respond(assemble_alter_config_response<
-                                   incremental_alter_configs_response,
-                                   resp_resource_t>(std::move(ret)));
+    co_return co_await ctx.respond(
+      assemble_alter_config_response<
+        incremental_alter_configs_response,
+        resp_resource_t>(std::move(ret)));
 }
 
 } // namespace kafka

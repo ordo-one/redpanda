@@ -15,6 +15,8 @@
 #include "ssx/future-util.h"
 #include "test_utils/randoms.h"
 
+#include <seastar/util/defer.hh>
+
 using namespace std::chrono_literals;
 
 namespace datalake::translation::scheduling {
@@ -163,6 +165,8 @@ ss::future<> mock_translator::translation_loop() {
         {
             co_await _wait_for_scheduler_cb.wait(
               [this] { return _translation_state.has_value(); });
+            auto clear_finish_request = ss::defer(
+              [this] { _finish_translation_requested = false; });
             auto holder = _translation_state->gate.hold();
             auto deadline = _translation_state->translate_for;
             auto start_time = clock::now();
@@ -194,8 +198,9 @@ ss::future<> mock_translator::translation_loop() {
                     for (size_t i = 0; i < _num_writers; i++) {
                         auto writer_bytes = random_generators::get_int<size_t>(
                           0, remaining);
-                        writers.push_back(_writers[i].write(
-                          writer_bytes, _translation_state->as));
+                        writers.push_back(
+                          _writers[i].write(
+                            writer_bytes, _translation_state->as));
                         remaining -= writer_bytes;
                     }
                     co_await ss::when_all_succeed(
@@ -239,7 +244,7 @@ translation_status mock_translator::status() const {
     return status;
 }
 
-void mock_translator::stop_translation() {
+void mock_translator::stop_translation(translator::stop_reason) {
     auto holder = _gate.hold();
     vassert(_started, "Translator should be started first");
     if (!_translation_state) {
@@ -271,11 +276,11 @@ void exceptional_translator::start_translation(clock::duration translate_for) {
     return mock_translator::start_translation(translate_for);
 }
 
-void exceptional_translator::stop_translation() {
+void exceptional_translator::stop_translation(translator::stop_reason reason) {
     if (tests::random_bool()) {
         throw ss::gate_closed_exception();
     }
-    return mock_translator::stop_translation();
+    return mock_translator::stop_translation(reason);
 }
 
 std::unique_ptr<translator>

@@ -1,0 +1,13 @@
+version: v2
+inputs:
+  - directory: .
+    paths:
+      - proto
+    exclude_paths:
+      - proto/redpanda/core/pbgen
+
+plugins:
+  - remote: buf.build/community/sudorandom-connect-openapi:v0.21.2
+    out: vbuild/openapi
+    opt:
+      - short-service-tags

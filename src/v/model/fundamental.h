@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "base/vassert.h"
 #include "bytes/iobuf.h"
@@ -18,6 +19,7 @@
 #include "serde/rw/rw.h"
 #include "serde/rw/scalar.h"
 #include "serde/rw/sstring.h"
+#include "serde/rw/uuid.h"
 #include "ssx/sformat.h"
 #include "utils/named_type.h"
 #include "utils/uuid.h"
@@ -291,6 +293,10 @@ struct topic_partition_view {
 
     model::topic_view topic;
     model::partition_id partition;
+    friend std::ostream& operator<<(std::ostream&, const topic_partition_view&);
+    friend auto
+    operator<=>(const topic_partition_view&, const topic_partition_view&)
+      = default;
     template<typename H>
     friend H AbslHashValue(H h, const topic_partition_view& tp) {
         return H::combine(std::move(h), tp.topic, tp.partition);
@@ -500,6 +506,13 @@ std::ostream& operator<<(std::ostream&, const shadow_indexing_mode&);
 
 using client_address_t = ss::socket_address;
 
+using opt_abort_source_t
+  = std::optional<std::reference_wrapper<ss::abort_source>>;
+
+using opt_client_address_t = std::optional<client_address_t>;
+
+using translate_offsets = ss::bool_class<struct translate_tag>;
+
 enum class fips_mode_flag : uint8_t {
     // FIPS mode disabled
     disabled = 0,
@@ -522,6 +535,66 @@ constexpr std::string_view to_string_view(fips_mode_flag f) {
 
 std::ostream& operator<<(std::ostream& os, const fips_mode_flag& f);
 std::istream& operator>>(std::istream& is, fips_mode_flag& f);
+
+struct topic_id : named_type<uuid_t, struct topic_id_tag> {
+    static topic_id create() { return topic_id{uuid_t::create()}; }
+    using base = named_type<uuid_t, struct topic_id_tag>;
+    using base::base;
+    using base::operator=;
+
+    fmt::iterator format_to(fmt::iterator it) const;
+
+    constexpr friend bool
+    operator==(const topic_id& lhs, const topic_id& rhs) noexcept
+      = default;
+    constexpr friend auto
+    operator<=>(const topic_id& lhs, const topic_id& rhs) noexcept
+      = default;
+
+    template<typename H>
+    friend H AbslHashValue(H h, const topic_id& u) {
+        return H::combine(std::move(h), static_cast<const base&>(u));
+    }
+};
+
+inline topic_id create_topic_id() { return topic_id::create(); }
+
+struct topic_id_partition {
+    topic_id_partition() = default;
+    topic_id_partition(model::topic_id t, model::partition_id p)
+      : topic_id(t)
+      , partition(p) {}
+
+    static topic_id_partition from(std::string_view);
+
+    model::topic_id topic_id;
+    model::partition_id partition;
+
+    bool operator==(const topic_id_partition& other) const = default;
+    auto operator<=>(const topic_id_partition& other) const noexcept = default;
+
+    friend std::ostream& operator<<(std::ostream&, const topic_id_partition&);
+
+    friend void read_nested(
+      iobuf_parser& in, topic_id_partition& tp, const size_t bytes_left_limit) {
+        using serde::read_nested;
+
+        read_nested(in, tp.topic_id, bytes_left_limit);
+        read_nested(in, tp.partition, bytes_left_limit);
+    }
+
+    friend void write(iobuf& out, topic_id_partition tp) {
+        using serde::write;
+
+        write(out, tp.topic_id);
+        write(out, tp.partition);
+    }
+    template<typename H>
+    friend H AbslHashValue(H h, const topic_id_partition& tp) {
+        return H::combine(std::move(h), tp.topic_id, tp.partition);
+    }
+};
+
 } // namespace model
 
 namespace kafka {

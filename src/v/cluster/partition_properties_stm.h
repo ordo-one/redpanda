@@ -12,7 +12,7 @@
 #pragma once
 
 #include "cluster/state_machine_registry.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "raft/persisted_stm.h"
 #include "serde/envelope.h"
@@ -34,7 +34,7 @@ public:
       storage::kvstore& kvstore,
       config::binding<std::chrono::milliseconds> sync_timeout);
 
-    ss::future<iobuf> take_snapshot(model::offset) final;
+    ss::future<iobuf> take_raft_snapshot(model::offset) final;
 
     // Updates partition properties to disable writes;
     // returns the offset of the blocking message
@@ -48,6 +48,11 @@ public:
     ss::future<result<writes_disabled>> sync_writes_disabled();
     // Returns a current value of the writes disabled property.
     writes_disabled are_writes_disabled() const;
+
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::skip_to_end;
+    }
 
 protected:
     ss::future<raft::local_snapshot_applied>
@@ -152,7 +157,8 @@ public:
 
     void create(
       raft::state_machine_manager_builder& builder,
-      raft::consensus* raft) final;
+      raft::consensus* raft,
+      const cluster::stm_instance_config& cfg) final;
 
 private:
     storage::kvstore& _kvstore;

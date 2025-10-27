@@ -1,0 +1,3 @@
+from os import PathLike
+
+def mkdir_p(path: str | bytes | PathLike[str] | PathLike[bytes]) -> None: ...

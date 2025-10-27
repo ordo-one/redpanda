@@ -13,6 +13,7 @@
 #include "kafka/client/test/utils.h"
 #include "kafka/protocol/exceptions.h"
 #include "model/timeout_clock.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -20,27 +21,12 @@
 inline const model::topic_partition unknown_tp{
   model::topic{"unknown"}, model::partition_id{0}};
 
-FIXTURE_TEST(test_retry_list_offsets, kafka_client_fixture) {
-    auto client = make_connected_client();
-    auto stop_client = ss::defer([&client]() { client.stop().get(); });
-
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(5));
-
-    BOOST_REQUIRE_EXCEPTION(
-      client.list_offsets(unknown_tp).get(),
-      kafka::exception_base,
-      [](kafka::exception_base ex) {
-          return ex.error == kafka::error_code::unknown_topic_or_partition;
-      });
-}
-
 FIXTURE_TEST(test_retry_produce, kafka_client_fixture) {
     auto client = make_connected_client();
     auto stop_client = ss::defer([&client]() { client.stop().get(); });
 
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(5));
+    client.set_retry_base_backoff(10ms);
+    client.set_max_retries(size_t(5));
 
     auto res = client
                  .produce_record_batch(
@@ -83,8 +69,8 @@ FIXTURE_TEST(test_retry_create_topic, kafka_client_create_topic_fixture) {
     auto client = make_connected_client();
     auto stop_client = ss::defer([&client]() { client.stop().get(); });
 
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(5));
+    client.set_retry_base_backoff(10ms);
+    client.set_max_retries(size_t(5));
 
     auto make_topic = [](ss::sstring name) {
         return kafka::creatable_topic{

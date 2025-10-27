@@ -10,7 +10,7 @@
 #include "cluster/cloud_metadata/cluster_recovery_backend.h"
 
 #include "base/seastarx.h"
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_file.h"
 #include "cloud_storage/types.h"
@@ -54,7 +54,7 @@ cluster_recovery_backend::cluster_recovery_backend(
   cluster::cluster_recovery_manager& mgr,
   raft::group_manager& raft_mgr,
   cloud_storage::remote& remote,
-  cloud_storage::cache& cache,
+  cloud_io::cache& cache,
   cluster::members_table& members_table,
   features::feature_table& features,
   security::credential_store& creds,
@@ -233,13 +233,6 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
         topic_configuration_vector topics;
         for (size_t i = 0; i < actions.remote_topics.size(); i++) {
             auto& topic_cfg = actions.remote_topics[i];
-            if (topic_cfg.is_internal()) {
-                vlog(
-                  clusterlog.debug,
-                  "Skipping topic recovery for internal topic {}",
-                  topic_cfg.tp_ns);
-                continue;
-            }
             topics.emplace_back(std::move(topic_cfg));
             vlog(
               clusterlog.debug,

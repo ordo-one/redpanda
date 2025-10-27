@@ -41,6 +41,7 @@ frontend::frontend(
   ss::sharded<features::feature_table>& features,
   ss::sharded<controller_stm>& stm,
   ss::sharded<partition_leaders_table>& leaders,
+  group_proxy& group_proxy,
   ss::sharded<rpc::connection_cache>& connections,
   std::optional<std::reference_wrapper<cloud_storage::topic_mount_handler>>
     topic_mount_handler,
@@ -51,6 +52,7 @@ frontend::frontend(
   , _features(features.local())
   , _controller(stm)
   , _leaders_table(leaders.local())
+  , _group_proxy(group_proxy)
   , _connections(connections.local())
   , _topic_mount_handler(topic_mount_handler)
   , _as(as)
@@ -253,6 +255,21 @@ ss::future<check_ntp_states_reply> frontend::check_ntp_states_on_foreign_node(
 
 ss::future<result<id>> frontend::do_create_migration(data_migration migration) {
     validate_migration_shard();
+
+    if (std::visit(
+          [](const auto& migration) { return !empty(migration.groups); },
+          migration)) {
+        auto deadline = model::timeout_clock::now() + _operation_timeout;
+        if (!co_await _group_proxy.assure_topic_exists(deadline)) {
+            vlog(
+              dm_log.warn,
+              "data migration involving consumer groups failed to create "
+              "consumer offsets topic.");
+            // presumably leadership changed and we failed to create the topic
+            co_return errc::leadership_changed;
+        };
+    }
+
     auto ec = co_await insert_barrier();
     if (ec) {
         co_return ec;
@@ -285,7 +302,10 @@ ss::future<result<id>> frontend::do_create_migration(data_migration migration) {
         create_migration_cmd_data{
           .id = id,
           .migration = std::move(migration),
-          .op_timestamp = model::timestamp::now()}),
+          .op_timestamp = model::timestamp::now(),
+          .fill_outbound_topic_locations = _features.is_active(
+            features::feature::topic_locations_in_outbound_migrations),
+        }),
       _operation_timeout + model::timeout_clock::now());
     if (ec) {
         co_return ec;
@@ -335,9 +355,9 @@ ss::future<std::error_code> frontend::insert_barrier() {
     if (!barrier_result) {
         co_return barrier_result.error();
     }
+    auto [barrier_offset, _] = barrier_result.value();
     try {
-        co_await _controller.local().wait(
-          barrier_result.value(), barrier_deadline);
+        co_await _controller.local().wait(barrier_offset, barrier_deadline);
     } catch (...) {
         co_return errc::timeout;
     }

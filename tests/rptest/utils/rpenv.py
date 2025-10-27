@@ -24,7 +24,26 @@ def sample_license(assert_exists=False):
         assert not assert_exists, (
             "No enterprise license found in the environment variable. "
             "Please follow these instructions to get a sample license for local development: "
-            "https://redpandadata.atlassian.net/l/cp/4eeNEgZW")
+            "https://redpandadata.atlassian.net/l/cp/4eeNEgZW"
+        )
+        return None
+    return license
+
+
+def sample_license_v1(assert_exists=False):
+    """
+    Returns the sample license from the env if it exists, asserts if its
+    missing and the environment is CI
+    """
+    license = os.environ.get("REDPANDA_SAMPLE_LICENSE_V1_PRODUCTS", None)
+    if license is None:
+        is_ci = os.environ.get("CI", "false")
+        assert is_ci == "false"
+        assert not assert_exists, (
+            "No enterprise license found in the environment variable REDPANDA_SAMPLE_LICENSE_V1_PRODUCTS. "
+            "Please follow these instructions to get a sample license for local development: "
+            "https://redpandadata.atlassian.net/l/cp/4eeNEgZW"
+        )
         return None
     return license
 
@@ -38,8 +57,9 @@ class IsCIOrNotEmpty:
 
     @env(REQUIRED_ENV=IsCIOrNotEmpty())
     """
+
     def __init__(self):
-        self.is_ci = os.environ.get('CI', 'false') != 'false'
+        self.is_ci = os.environ.get("CI", "false") != "false"
 
     def __eq__(self, other: str) -> bool:
         return bool(other) or self.is_ci

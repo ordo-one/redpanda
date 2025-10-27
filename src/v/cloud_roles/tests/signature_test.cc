@@ -8,18 +8,21 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "cloud_roles/signature.h"
 #include "http/client.h"
 
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/testing/thread_test_case.hh>
 
-#include <absl/strings/str_join.h>
-#include <absl/strings/str_split.h>
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
 #include <sstream>
+
+static constexpr boost::beast::string_view x_amz_content_sha256
+  = "x-amz-content-sha256";
 
 std::chrono::time_point<std::chrono::system_clock>
 parse_time(const std::string& timestr) {
@@ -36,6 +39,7 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_1) {
     cloud_roles::private_key_str secret_key(
       "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     cloud_roles::aws_region_name region("us-east-1");
+    cloud_roles::aws_service_name service("s3");
     std::string host = "examplebucket.s3.amazonaws.com";
     std::string target = "/test.txt";
     std::string sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959"
@@ -43,15 +47,16 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_1) {
 
     auto tp = parse_time("20130524T000000Z");
     cloud_roles::signature_v4 sign(
-      region, access_key, secret_key, cloud_roles::time_source(tp));
+      service, region, access_key, secret_key, cloud_roles::time_source(tp));
 
     http::client::request_header header;
     header.method(boost::beast::http::verb::get);
     header.target(target);
     header.insert(boost::beast::http::field::host, host);
     header.insert(boost::beast::http::field::range, "bytes=0-9");
+    header.insert(x_amz_content_sha256, sha256);
 
-    BOOST_REQUIRE_EQUAL(sign.sign_header(header, sha256), std::error_code{});
+    BOOST_REQUIRE_EQUAL(sign.sign_header(header), std::error_code{});
 
     std::string expected
       = "AWS4-HMAC-SHA256 "
@@ -71,6 +76,7 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_2) {
     cloud_roles::private_key_str secret_key(
       "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     cloud_roles::aws_region_name region("us-east-1");
+    cloud_roles::aws_service_name service("s3");
     std::string host = "examplebucket.s3.amazonaws.com";
     std::string target = "test$file.text";
     std::string sha256
@@ -78,7 +84,7 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_2) {
 
     auto tp = parse_time("20130524T000000Z");
     cloud_roles::signature_v4 sign(
-      region, access_key, secret_key, cloud_roles::time_source(tp));
+      service, region, access_key, secret_key, cloud_roles::time_source(tp));
 
     http::client::request_header header;
     header.method(boost::beast::http::verb::put);
@@ -87,8 +93,9 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_2) {
     header.insert(boost::beast::http::field::host, host);
     header.insert(
       boost::beast::http::field::date, "Fri, 24 May 2013 00:00:00 GMT");
+    header.insert(x_amz_content_sha256, sha256);
 
-    BOOST_REQUIRE_EQUAL(sign.sign_header(header, sha256), std::error_code{});
+    BOOST_REQUIRE_EQUAL(sign.sign_header(header), std::error_code{});
 
     std::string expected
       = "AWS4-HMAC-SHA256 "
@@ -109,6 +116,7 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_3) {
     cloud_roles::private_key_str secret_key(
       "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     cloud_roles::aws_region_name region("us-east-1");
+    cloud_roles::aws_service_name service("s3");
     std::string host = "examplebucket.s3.amazonaws.com";
     std::string target = "?lifecycle";
     std::string sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959"
@@ -116,14 +124,15 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_3) {
 
     auto tp = parse_time("20130524T000000Z");
     cloud_roles::signature_v4 sign(
-      region, access_key, secret_key, cloud_roles::time_source(tp));
+      service, region, access_key, secret_key, cloud_roles::time_source(tp));
 
     http::client::request_header header;
     header.method(boost::beast::http::verb::get);
     header.target(target);
     header.insert(boost::beast::http::field::host, host);
+    header.insert(x_amz_content_sha256, sha256);
 
-    BOOST_REQUIRE_EQUAL(sign.sign_header(header, sha256), std::error_code{});
+    BOOST_REQUIRE_EQUAL(sign.sign_header(header), std::error_code{});
 
     std::string expected
       = "AWS4-HMAC-SHA256 "
@@ -142,6 +151,7 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_4) {
     cloud_roles::private_key_str secret_key(
       "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
     cloud_roles::aws_region_name region("us-east-1");
+    cloud_roles::aws_service_name service("s3");
     std::string host = "examplebucket.s3.amazonaws.com";
     std::string target = "?max-keys=2&prefix=J";
     std::string sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959"
@@ -149,20 +159,58 @@ SEASTAR_THREAD_TEST_CASE(test_signature_computation_4) {
 
     auto tp = parse_time("20130524T000000Z");
     cloud_roles::signature_v4 sign(
-      region, access_key, secret_key, cloud_roles::time_source(tp));
+      service, region, access_key, secret_key, cloud_roles::time_source(tp));
 
     http::client::request_header header;
     header.method(boost::beast::http::verb::get);
     header.target(target);
     header.insert(boost::beast::http::field::host, host);
+    header.insert(x_amz_content_sha256, sha256);
 
-    BOOST_REQUIRE_EQUAL(sign.sign_header(header, sha256), std::error_code{});
+    BOOST_REQUIRE_EQUAL(sign.sign_header(header), std::error_code{});
 
     std::string expected
       = "AWS4-HMAC-SHA256 "
         "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,"
         "SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature="
         "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7";
+
+    BOOST_REQUIRE_EQUAL(
+      header.at(boost::beast::http::field::authorization), expected);
+}
+
+/// Test is based on 4th example here
+/// https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+/// However, the service has been changed to prove the calculation depends on
+/// the service.
+SEASTAR_THREAD_TEST_CASE(test_signature_computation_non_s3) {
+    cloud_roles::public_key_str access_key("AKIAIOSFODNN7EXAMPLE");
+    cloud_roles::private_key_str secret_key(
+      "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    cloud_roles::aws_region_name region("us-east-1");
+    cloud_roles::aws_service_name service("glue");
+    std::string host = "examplebucket.s3.amazonaws.com";
+    std::string target = "?max-keys=2&prefix=J";
+    std::string sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959"
+                         "91b7852b855"; // empty hash
+
+    auto tp = parse_time("20130524T000000Z");
+    cloud_roles::signature_v4 sign(
+      service, region, access_key, secret_key, cloud_roles::time_source(tp));
+
+    http::client::request_header header;
+    header.method(boost::beast::http::verb::get);
+    header.target(target);
+    header.insert(boost::beast::http::field::host, host);
+    header.insert(x_amz_content_sha256, sha256);
+
+    BOOST_REQUIRE_EQUAL(sign.sign_header(header), std::error_code{});
+
+    std::string expected
+      = "AWS4-HMAC-SHA256 "
+        "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/glue/aws4_request,"
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature="
+        "dd5b4a5a4bec764e14024b6073b14bc90d505ea68a22cc9f7d176fcaa5cf768c";
 
     BOOST_REQUIRE_EQUAL(
       header.at(boost::beast::http::field::authorization), expected);

@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
 #include "base/units.h"
+#include "compaction/key_offset_map.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
@@ -21,8 +24,8 @@
 #include "model/metadata.h"
 #include "random/simple_time_jitter.h"
 #include "storage/batch_cache.h"
+#include "storage/disk.h"
 #include "storage/file_sanitizer_types.h"
-#include "storage/key_offset_map.h"
 #include "storage/log.h"
 #include "storage/log_housekeeping_meta.h"
 #include "storage/ntp_config.h"
@@ -38,9 +41,6 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sstring.hh>
-
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
 
 #include <array>
 #include <chrono>
@@ -59,12 +59,10 @@ struct log_config {
     log_config(
       ss::sstring directory,
       size_t segment_size,
-      ss::io_priority_class compaction_priority = ss::default_priority_class(),
       std::optional<file_sanitize_config> file_cfg = std::nullopt) noexcept;
     log_config(
       ss::sstring directory,
       size_t segment_size,
-      ss::io_priority_class compaction_priority,
       with_cache with,
       std::optional<file_sanitize_config> file_cfg = std::nullopt) noexcept;
     log_config(
@@ -73,7 +71,6 @@ struct log_config {
       config::binding<size_t> compacted_segment_size,
       config::binding<size_t> max_compacted_segment_size,
       jitter_percents segment_size_jitter,
-      ss::io_priority_class compaction_priority,
       config::binding<std::optional<size_t>> ret_bytes,
       config::binding<std::chrono::milliseconds> compaction_ival,
       config::binding<std::optional<std::chrono::milliseconds>> log_ret,
@@ -100,7 +97,6 @@ struct log_config {
     // compacted segment size
     config::binding<size_t> compacted_segment_size;
     config::binding<size_t> max_compacted_segment_size;
-    ss::io_priority_class compaction_priority;
     // same as retention.bytes in kafka
     config::binding<std::optional<size_t>> retention_bytes;
     config::binding<std::chrono::milliseconds> compaction_interval;
@@ -210,7 +206,6 @@ public:
       const ntp_config&,
       model::offset,
       model::term_id,
-      ss::io_priority_class pc,
       size_t read_buffer_size,
       unsigned read_ahead,
       size_t segment_size_hint,
@@ -262,6 +257,8 @@ public:
 
     gc_config default_gc_config() const;
 
+    std::optional<batch_cache_index> create_cache(with_cache);
+
 private:
     using logs_type
       = chunked_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
@@ -299,8 +296,6 @@ private:
 
     disk_space_alert _disk_space_alert{disk_space_alert::ok};
 
-    std::optional<batch_cache_index> create_cache(with_cache);
-
     ss::future<> dispatch_topic_dir_deletion(ss::sstring dir);
     ss::future<> maybe_clear_kvstore(const ntp_config&);
     ss::future<> async_clear_logs();
@@ -319,7 +314,7 @@ private:
 
     // Hash key-map to use across multiple compactions to reuse reserved memory
     // rather than reallocating repeatedly.
-    std::unique_ptr<hash_key_offset_map> _compaction_hash_key_map;
+    std::unique_ptr<compaction::hash_key_offset_map> _compaction_hash_key_map;
 
     // Metrics.
     std::unique_ptr<log_manager_probe> _probe;

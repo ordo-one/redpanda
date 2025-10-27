@@ -88,10 +88,14 @@ public:
       : sr(cloud_io::scoped_remote::create(10, conf))
       , storage(dummy_storage(feature_table))
       , catalog(remote(), bucket_name, ss::sstring(base_location))
-      , schema_mgr(catalog)
+      , schema_mgr(
+          catalog,
+          [this] {
+              feature_table.start().get();
+              return &feature_table.local();
+          }())
       , manifest_io(remote(), bucket_name)
       , committer(storage, catalog, manifest_io, config::mock_binding(false)) {
-        feature_table.start().get();
         feature_table
           .invoke_on_all(
             [](features::feature_table& f) { f.testing_activate_all(); })
@@ -204,7 +208,8 @@ TEST_F(FileCommitterTest, TestMissingTable) {
     ASSERT_EQ(0, load_res.value().snapshots->size());
 
     // Now try again with some data.
-    state.topic_to_state[topic] = make_topic_state({{{0, 100}}});
+    state.topic_to_state[topic] = make_topic_state(
+      {{{0, 100}}}, /*added_at=*/model::offset{1000}, /*with_files=*/true);
     res = committer.commit_topic_files_to_catalog(topic, state).get();
     ASSERT_FALSE(res.has_error());
     ASSERT_EQ(1, res.value().size());
@@ -218,6 +223,27 @@ TEST_F(FileCommitterTest, TestMissingTable) {
     ASSERT_EQ(1, table.schemas[0].schema_struct.fields.size());
     ASSERT_EQ(1, table.partition_specs.size());
     ASSERT_EQ(1, table.partition_specs[0].fields.size());
+    ASSERT_TRUE(table.snapshots.has_value());
+    ASSERT_EQ(1, table.snapshots->size());
+
+    // Now drop the table and try to commit. This should fail, but at least
+    // shouldn't crash.
+    catalog.drop_table(table_ident, /*purge=*/true).get();
+    state.topic_to_state[topic] = make_topic_state(
+      {{{101, 200}}}, /*added_at=*/model::offset{1001}, /*with_files=*/true);
+    res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_TRUE(res.has_error());
+    ASSERT_EQ(res.error(), file_committer::errc::failed);
+
+    // And the same for the DLQ.
+    state.topic_to_state[topic] = make_topic_state(
+      {{{201, 300}}},
+      /*added_at=*/model::offset{1002},
+      /*with_files=*/true,
+      /*dlq=*/true);
+    res = committer.commit_topic_files_to_catalog(topic, state).get();
+    ASSERT_TRUE(res.has_error());
+    ASSERT_EQ(res.error(), file_committer::errc::failed);
 }
 
 TEST_F(FileCommitterTest, TestMissingTopic) {
@@ -284,10 +310,10 @@ TEST_P(FileCommitterPartitionTest, TestFilesGetPartitionKey) {
                         int min_hour,
                         int max_hour,
                         chunked_vector<manifest_file>& ret) {
-        auto load_res = catalog
-                          .load_table(iceberg::table_identifier{
-                            {"redpanda"}, "test-topic"})
-                          .get();
+        auto load_res
+          = catalog
+              .load_table(iceberg::table_identifier{{"redpanda"}, "test-topic"})
+              .get();
         ASSERT_FALSE(load_res.has_error());
         auto lb_matcher = [min_hour, max_hour](const manifest_file& file) {
             auto val = std::get<int_value>(
@@ -472,11 +498,12 @@ TEST_F(FileCommitterTest, TestDeduplicateFromAncestor) {
       .partition = std::move(pk),
       .file_size_bytes = 1024,
     };
-    new_files.emplace_back(iceberg::file_to_append{
-      .file = std::move(icb_file),
-      .schema_id = tx.table().current_schema_id,
-      .partition_spec_id = tx.table().default_spec_id,
-    });
+    new_files.emplace_back(
+      iceberg::file_to_append{
+        .file = std::move(icb_file),
+        .schema_id = tx.table().current_schema_id,
+        .partition_spec_id = tx.table().default_spec_id,
+      });
     auto append_res = tx.merge_append(manifest_io, std::move(new_files)).get();
     ASSERT_FALSE(append_res.has_error());
     EXPECT_FALSE(

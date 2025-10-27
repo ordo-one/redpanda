@@ -10,7 +10,7 @@
 #include "cluster/partition.h"
 #include "config/configuration.h"
 #include "config/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/group.h"
 #include "kafka/server/group_metadata.h"
@@ -63,8 +63,7 @@ static group get() {
       nullptr,
       model::term_id(),
       fr,
-      feature_table,
-      make_consumer_offsets_serializer());
+      feature_table);
 }
 
 static const std::vector<member_protocol> test_group_protos = {

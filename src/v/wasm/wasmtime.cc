@@ -10,6 +10,7 @@
  */
 #include "wasmtime.h"
 
+#include "absl/strings/escaping.h"
 #include "allocator.h"
 #include "base/type_traits.h"
 #include "base/vassert.h"
@@ -19,12 +20,12 @@
 #include "logger.h"
 #include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
+#include "model/batch_compression.h"
 #include "model/record.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
 #include "schema_registry_module.h"
 #include "ssx/thread_worker.h"
-#include "storage/parser_utils.h"
 #include "transform_module.h"
 #include "utils/human.h"
 #include "utils/to_string.h"
@@ -49,10 +50,9 @@
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/optimized_optional.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/strings/escaping.h>
 #include <fmt/ostream.h>
 
+#include <algorithm>
 #include <alloca.h>
 #include <csignal>
 #include <exception>
@@ -172,10 +172,10 @@ private:
     void register_metrics();
 
     static wasmtime_error_t* allocate_stack_memory(
-      void* env, size_t size, wasmtime_stack_memory_t* memory_ret);
+      void* env, size_t size, bool zeroed, wasmtime_stack_memory_t* memory_ret);
 
-    wasmtime_error_t*
-    allocate_stack_memory(size_t size, wasmtime_stack_memory_t* memory_ret);
+    wasmtime_error_t* allocate_stack_memory(
+      size_t size, bool zeroed, wasmtime_stack_memory_t* memory_ret);
 
     // We don't have control over this API.
     // NOLINTBEGIN(bugprone-easily-swappable-parameters)
@@ -507,8 +507,9 @@ public:
 
     ss::future<> stop() final {
         ss::future<> main = std::exchange(_main_task, ss::now());
-        _transform_module.stop(std::make_exception_ptr(
-          wasm_exception("vm was shutdown", errc::engine_shutdown)));
+        _transform_module.stop(
+          std::make_exception_ptr(
+            wasm_exception("vm was shutdown", errc::engine_shutdown)));
         co_await std::move(main);
         // Deleting the store invalidates the instance and actually frees the
         // memory for the underlying instance.
@@ -530,8 +531,7 @@ public:
             co_return;
         }
         if (batch.compressed()) {
-            batch = co_await storage::internal::decompress_batch(
-              std::move(batch));
+            batch = co_await model::decompress_batch(batch);
         }
         ss::future<> fut = co_await ss::coroutine::as_future(
           invoke_transform(std::move(batch), probe, std::move(cb)));
@@ -1332,11 +1332,16 @@ wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
     // whatever is difference between the two is how much host functions can
     // get, make sure to leave our own functions some room to execute.
     wasmtime_config_max_wasm_stack_set(config, max_vm_guest_stack_usage);
-    // This disables static memory, see:
+    // These settings means that Wasmtime only allocates exactly how much memory
+    // is requested by the module:
     // https://docs.wasmtime.dev/contributing-architecture.html#linear-memory
-    wasmtime_config_static_memory_maximum_size_set(config, 0_KiB);
-    wasmtime_config_dynamic_memory_guard_size_set(config, 0_KiB);
-    wasmtime_config_dynamic_memory_reserved_for_growth_set(config, 0_KiB);
+    //
+    // Our memory never moves because we don't allow for relocating memory,
+    // this tells wasmtime to allocate the full amount of memory upfront.
+    wasmtime_config_memory_may_move_set(config, false);
+    wasmtime_config_memory_reservation_set(config, 0_KiB);
+    wasmtime_config_memory_guard_size_set(config, 0_KiB);
+    wasmtime_config_memory_reservation_for_growth_set(config, 0_KiB);
     // Don't modify the unwind info as registering these symbols causes C++
     // exceptions to grab a lock in libgcc and deadlock the Redpanda
     // process.
@@ -1372,20 +1377,22 @@ ss::future<> wasmtime_runtime::start(runtime::config c) {
     size_t aligned_pool_size = ss::align_down(
       c.heap_memory.per_core_pool_size_bytes, page_size);
     if (aligned_pool_size == 0) {
-        throw std::runtime_error(ss::format(
-          "aligned per core wasm memory pool size must be >0 "
-          "(page_size={}, pool_size={})",
-          page_size,
-          c.heap_memory.per_core_pool_size_bytes));
+        throw std::runtime_error(
+          ss::format(
+            "aligned per core wasm memory pool size must be >0 "
+            "(page_size={}, pool_size={})",
+            page_size,
+            c.heap_memory.per_core_pool_size_bytes));
     }
     size_t aligned_instance_limit = ss::align_down(
       c.heap_memory.per_engine_memory_limit, page_size);
     if (aligned_instance_limit == 0) {
-        throw std::runtime_error(ss::format(
-          "aligned per wasm engine memory limit must be >0 (page_size={}, "
-          "limit={})",
-          page_size,
-          c.heap_memory.per_engine_memory_limit));
+        throw std::runtime_error(
+          ss::format(
+            "aligned per wasm engine memory limit must be >0 (page_size={}, "
+            "limit={})",
+            page_size,
+            c.heap_memory.per_engine_memory_limit));
     }
     size_t num_heaps = aligned_pool_size / aligned_instance_limit;
     if (num_heaps == 0) {
@@ -1398,14 +1405,16 @@ ss::future<> wasmtime_runtime::start(runtime::config c) {
     // chunk, otherwise we yield control.
     constexpr static size_t memset_chunk_size = 10_MiB;
 
-    co_await _heap_allocator.start(heap_allocator::config{
-      .heap_memory_size = aligned_instance_limit,
-      .num_heaps = num_heaps,
-      .memset_chunk_size = memset_chunk_size,
-    });
-    co_await _stack_allocator.start(stack_allocator::config{
-      .tracking_enabled = c.stack_memory.debug_host_stack_usage,
-    });
+    co_await _heap_allocator.start(
+      heap_allocator::config{
+        .heap_memory_size = aligned_instance_limit,
+        .num_heaps = num_heaps,
+        .memset_chunk_size = memset_chunk_size,
+      });
+    co_await _stack_allocator.start(
+      stack_allocator::config{
+        .tracking_enabled = c.stack_memory.debug_host_stack_usage,
+      });
     co_await _alien_thread.start({.name = "wasm"});
     co_await ss::smp::invoke_on_all([] {
         // wasmtime needs some signals for it's handling, make sure we
@@ -1428,8 +1437,9 @@ void wasmtime_runtime::register_metrics() {
         sm::make_gauge(
           "executable_memory_usage",
           [this] { return _total_executable_memory; },
-          sm::description("The amount of executable memory used for "
-                          "WebAssembly binaries"))
+          sm::description(
+            "The amount of executable memory used for "
+            "WebAssembly binaries"))
           .aggregate({ss::metrics::shard_label}),
       });
 }
@@ -1517,18 +1527,20 @@ size_t wasmtime_runtime::per_invocation_fuel_amount() const {
 }
 
 wasmtime_error_t* wasmtime_runtime::allocate_stack_memory(
-  void* env, size_t size, wasmtime_stack_memory_t* memory_ret) {
+  void* env, size_t size, bool zeroed, wasmtime_stack_memory_t* memory_ret) {
     auto* runtime = static_cast<wasmtime_runtime*>(env);
-    return runtime->allocate_stack_memory(size, memory_ret);
+    return runtime->allocate_stack_memory(size, zeroed, memory_ret);
 }
 
 wasmtime_error_t* wasmtime_runtime::allocate_stack_memory(
-  size_t size, wasmtime_stack_memory_t* memory_ret) {
+  size_t size, bool zeroed, wasmtime_stack_memory_t* memory_ret) {
+    std::ignore = zeroed; // We always zero the memory in the allocator.
     auto stack = _stack_allocator.local().allocate(size);
     struct vm_stack {
         stack_memory underlying;
         wasm::stack_allocator* allocator;
     };
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     memory_ret->env = new vm_stack{
       .underlying = std::move(stack),
       .allocator = &_stack_allocator.local(),
@@ -1562,12 +1574,15 @@ wasmtime_error_t* wasmtime_runtime::allocate_heap_memory(
       "we only support 32bit addressable memory");
     vassert(
       reserved_size_in_bytes == 0,
-      "this value should be set to 0 according to the config");
+      "this value should be set to 0 according to the config, got: {}",
+      reserved_size_in_bytes);
     vassert(
       guard_size_in_bytes == 0,
-      "this value should be set to 0 according to the config");
+      "this value should be set to 0 according to the config, got: {}",
+      guard_size_in_bytes);
     auto* runtime = static_cast<wasmtime_runtime*>(env);
-    return runtime->allocate_heap_memory({minimum, maximum}, memory_ret);
+    return runtime->allocate_heap_memory(
+      {.minimum = minimum, .maximum = maximum}, memory_ret);
 }
 
 wasmtime_error_t* wasmtime_runtime::allocate_heap_memory(
@@ -1649,7 +1664,7 @@ bool is_exported_memory(const parser::module_export& mod_export) {
 
 bool is_transform_abi_check_fn(const parser::module_import& mod_import) {
     constexpr std::array version = {1, 2};
-    return absl::c_any_of(version, [&mod_import](int version) {
+    return std::ranges::any_of(version, [&mod_import](int version) {
         return mod_import
                == parser::module_import{
                  .module_name = ss::sstring(transform_module::name),

@@ -15,7 +15,7 @@
 #include "cluster/metadata_cache.h"
 #include "cluster/metadata_dissemination_types.h"
 #include "cluster/partition_leaders_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
@@ -60,14 +60,15 @@ metadata_dissemination_handler::do_update_leadership(
                    boost::irange<ss::shard_id>(0, ss::smp::count),
                    [this, &leaders](ss::shard_id shard) {
                        return ss::smp::submit_to(shard, [this, &leaders] {
-                           return ssx::async_for_each(
+                           return ss::do_for_each(
                              leaders,
                              [this](const ntp_leader_revision& leader) {
-                                 _leaders.local().update_partition_leader(
-                                   leader.ntp,
-                                   leader.revision,
-                                   leader.term,
-                                   leader.leader_id);
+                                 return _leaders.local()
+                                   .update_partition_leader(
+                                     leader.ntp,
+                                     leader.revision,
+                                     leader.term,
+                                     leader.leader_id);
                              });
                        });
                    });
@@ -77,9 +78,9 @@ metadata_dissemination_handler::do_update_leadership(
 
 namespace {
 ss::future<get_leadership_reply>
-make_get_leadership_reply(const partition_leaders_table& leaders) {
+make_get_leadership_reply(partition_leaders_table& leaders) {
     try {
-        fragmented_vector<ntp_leader> ret;
+        chunked_vector<ntp_leader> ret;
         co_await leaders.for_each_leader([&ret](
                                            model::topic_namespace_view tp_ns,
                                            model::partition_id pid,

@@ -12,6 +12,8 @@
 #include "base/vassert.h"
 #include "base/vlog.h"
 #include "bytes/iobuf.h"
+#include "model/batch_compression.h"
+#include "model/batch_utils.h"
 #include "model/fundamental.h"
 #include "model/offset_interval.h"
 #include "model/record.h"
@@ -22,64 +24,11 @@
 #include "storage/types.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/coroutine.hh>
 
 #include <fmt/ostream.h>
 
 #include <exception>
-
-namespace {
-model::record_batch make_ghost_batch(
-  model::offset start_offset, model::offset end_offset, model::term_id term) {
-    auto delta = end_offset - start_offset;
-    auto now = model::timestamp::now();
-    model::record_batch_header header = {
-      .size_bytes = model::packed_record_batch_header_size,
-      .base_offset = start_offset,
-      .type = model::record_batch_type::ghost_batch,
-      .crc = 0, // crc computed later
-      .attrs = model::record_batch_attributes{} |= model::compression::none,
-      .last_offset_delta = static_cast<int32_t>(delta),
-      .first_timestamp = now,
-      .max_timestamp = now,
-      .producer_id = -1,
-      .producer_epoch = -1,
-      .base_sequence = -1,
-      .record_count = static_cast<int32_t>(delta() + 1),
-      .ctx = model::record_batch_header::context(term, ss::this_shard_id())};
-
-    model::record_batch batch(
-      std::move(header), model::record_batch::compressed_records{});
-
-    batch.header().crc = model::crc_record_batch(batch);
-    batch.header().header_crc = model::internal_header_only_crc(batch.header());
-    return batch;
-}
-
-/**
- * makes multiple ghost batches required to fill the gap in a way that max batch
- * size (max of int32_t) is not exceeded
- */
-std::vector<model::record_batch> make_ghost_batches(
-  model::offset start_offset, model::offset end_offset, model::term_id term) {
-    std::vector<model::record_batch> batches;
-    while (start_offset <= end_offset) {
-        static constexpr model::offset max_batch_size{
-          std::numeric_limits<int32_t>::max()};
-        // limit max batch size
-        const model::offset delta = std::min<model::offset>(
-          max_batch_size, end_offset - start_offset);
-
-        batches.push_back(
-          make_ghost_batch(start_offset, delta + start_offset, term));
-        start_offset = next_offset(batches.back().last_offset());
-    }
-
-    return batches;
-}
-
-} // anonymous namespace
 
 template<>
 struct fmt::formatter<storage::log_reader> : fmt::formatter<std::string_view> {
@@ -96,18 +45,41 @@ struct fmt::formatter<storage::log_reader> : fmt::formatter<std::string_view> {
 };
 
 namespace storage {
-using records_t = ss::circular_buffer<model::record_batch>;
+using records_t = chunked_circular_buffer<model::record_batch>;
+
+/**
+ * makes multiple ghost batches required to fill the gap in a way that max batch
+ * size (max of int32_t) is not exceeded
+ */
+std::vector<model::record_batch> log_reader::make_ghost_batches(
+  model::offset start_offset, model::offset end_offset, model::term_id term) {
+    std::vector<model::record_batch> batches;
+    while (start_offset <= end_offset) {
+        static constexpr model::offset max_batch_size{
+          std::numeric_limits<int32_t>::max() - 1};
+        // limit max batch size
+        const model::offset delta = std::min<model::offset>(
+          max_batch_size, end_offset - start_offset);
+
+        batches.push_back(
+          make_ghost_batch(start_offset, delta + start_offset, term));
+        start_offset = next_offset(batches.back().last_offset());
+    }
+
+    return batches;
+}
 
 batch_consumer::consume_result skipping_consumer::accept_batch_start(
   const model::record_batch_header& header) const {
     // check for holes in the offset range on disk
     // skip check for compacted logs
     if (unlikely(header.base_offset < _expected_next_batch)) {
-        throw std::runtime_error(fmt::format(
-          "incorrect offset encountered reading from disk log: "
-          "expected batch offset {} (actual {})",
-          _expected_next_batch,
-          header.base_offset()));
+        throw std::runtime_error(
+          fmt::format(
+            "incorrect offset encountered reading from disk log: "
+            "expected batch offset {} (actual {})",
+            _expected_next_batch,
+            header.base_offset()));
     }
 
     /**
@@ -136,7 +108,7 @@ batch_consumer::consume_result skipping_consumer::accept_batch_start(
         _reader._config.start_offset = header.last_offset() + model::offset(1);
         return batch_consumer::consume_result::skip_batch;
     }
-    if (_reader._config.first_timestamp > header.max_timestamp) {
+    if (_reader._config.timestamp > header.max_timestamp) {
         // kakfa requires that we return messages >= the timestamp, it is
         // permitted to include a few earlier
         _reader._config.start_offset = header.last_offset() + model::offset(1);
@@ -169,8 +141,9 @@ void skipping_consumer::consume_records(iobuf&& records) {
 ss::future<batch_consumer::stop_parser> skipping_consumer::consume_batch_end() {
     // Note: This is what keeps the train moving. the `_reader.*` transitively
     // updates the next batch to consume
-    _reader.add_one(model::record_batch(
-      _header, std::move(_records), model::record_batch::tag_ctor_ng{}));
+    _reader.add_one(
+      model::record_batch(
+        _header, std::move(_records), model::record_batch::tag_ctor_ng{}));
     // We keep the batch in the buffer so that the reader can be cached.
     if (
       _header.last_offset() >= _reader._seg.offsets().get_stable_offset()
@@ -198,7 +171,7 @@ void skipping_consumer::print(std::ostream& os) const {
 }
 
 log_segment_batch_reader::log_segment_batch_reader(
-  segment& seg, log_reader_config& config, probe& p) noexcept
+  segment& seg, local_log_reader_config& config, probe& p) noexcept
   : _seg(seg)
   , _config(config)
   , _probe(p) {}
@@ -207,8 +180,7 @@ ss::future<std::unique_ptr<continuous_batch_parser>>
 log_segment_batch_reader::initialize(
   model::timeout_clock::time_point timeout,
   std::optional<model::offset> next_cached_batch) {
-    auto input = co_await _seg.offset_data_stream(
-      _config.start_offset, _config.prio);
+    auto input = co_await _seg.offset_data_stream(_config.start_offset);
     co_return std::make_unique<continuous_batch_parser>(
       std::make_unique<skipping_consumer>(*this, timeout, next_cached_batch),
       std::move(input));
@@ -244,7 +216,7 @@ log_segment_batch_reader::read_some(model::timeout_clock::time_point timeout) {
       _config.start_offset,
       _config.max_offset,
       _config.type_filter,
-      _config.first_timestamp,
+      _config.timestamp,
       std::min(max_buffer_size, _config.max_bytes),
       _config.skip_batch_cache);
 
@@ -287,7 +259,7 @@ log_segment_batch_reader::read_some(model::timeout_clock::time_point timeout) {
       .handle_exception_type(
         [](const std::system_error& ec) -> ss::future<result<records_t>> {
             if (ec.code().value() == EIO) {
-                vassert(false, "I/O error during read!  Disk failure?");
+                vunreachable("I/O error during read!  Disk failure?");
             } else {
                 return ss::make_exception_future<result<records_t>>(
                   std::current_exception());
@@ -297,12 +269,12 @@ log_segment_batch_reader::read_some(model::timeout_clock::time_point timeout) {
 
 log_reader::log_reader(
   std::unique_ptr<lock_manager::lease> l,
-  log_reader_config config,
+  local_log_reader_config config,
   probe& probe,
   ss::lw_shared_ptr<const storage::offset_translator_state> tr) noexcept
   : _lease(std::move(l))
-  , _iterator({})                // overwritten in reset() below
-  , _config(empty_reader_config) // overwritten in reset() below
+  , _iterator({})                      // overwritten in reset() below
+  , _config(empty_local_reader_config) // overwritten in reset() below
   , _probe(probe)
   , _translator(std::move(tr)) {
     // we lean on reset_config for most of the initialization as much as so that
@@ -369,13 +341,13 @@ void log_reader::maybe_log_load_slice_depth_warning(
     const auto size = segs.size();
     auto count = 0;
     constexpr auto max_segments = 10;
-    for (int i = (int)size - 1; i >= 0; --i) {
-        auto& seg = segs[i];
+    for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+        auto& seg = *it;
         vlog(
           stlog.warn,
           "load_slice recursion warning. lease range segment {}/{} "
           "empty {}: {}",
-          i,
+          std::distance(segs.begin(), it.base()) - 1,
           size,
           seg->empty(),
           seg);
@@ -478,10 +450,9 @@ log_reader::do_load_slice(model::timeout_clock::time_point timeout) {
             auto& batches = recs.value();
             if (_config.fill_gaps && _expected_next.has_value()) {
                 records_t batches_filled;
-                batches_filled.reserve(batches.size());
                 for (auto& b : batches) {
                     if (b.base_offset() > _expected_next) {
-                        auto gb = make_ghost_batches(
+                        auto gb = model::make_ghost_batches(
                           _expected_next.value(),
                           model::prev_offset(b.base_offset()),
                           b.term());
@@ -531,13 +502,13 @@ std::optional<log_reader::private_flags> log_reader::get_flags() const {
       .was_cached = _was_cached};
 };
 
-void log_reader::reset_config(log_reader_config cfg) {
+void log_reader::reset_config(local_log_reader_config cfg) {
     reset(
       cfg, {_iterator.current_reader_seg, std::move(_iterator.reader)}, true);
 };
 
 void log_reader::reset(
-  log_reader_config cfg, iterator_pair itr, bool cache_hit) {
+  local_log_reader_config cfg, iterator_pair itr, bool cache_hit) {
     _config = cfg;
     _iterator = std::move(itr);
     _expected_next = _config.fill_gaps
@@ -563,26 +534,30 @@ void log_reader::reset(
     }
 };
 
-static inline bool is_finished_offset(segment_set& s, model::offset o) {
-    if (s.empty()) {
+static inline bool is_finished_offset(segment_set& segs, model::offset o) {
+    if (segs.empty()) {
         return true;
     }
 
-    for (int i = (int)s.size() - 1; i >= 0; --i) {
-        auto& seg = s[i];
-        if (!seg->empty()) {
-            return o > seg->offsets().get_dirty_offset();
-        }
+    auto it = std::find_if(
+      segs.rbegin(), segs.rend(), [](const segment_set::type& seg) {
+          return !seg->empty();
+      });
+
+    if (it == segs.rend()) {
+        return true;
     }
-    return true;
+
+    auto& seg = *it;
+    return o > seg->offsets().get_dirty_offset();
 }
 bool log_reader::is_done() {
     return is_end_of_stream()
            || is_finished_offset(_lease->range, _config.start_offset);
 }
 
-timequery_result batch_timequery(
-  const model::record_batch& b,
+ss::future<timequery_result> batch_timequery(
+  model::record_batch batch,
   model::offset min_offset,
   model::timestamp t,
   model::offset max_offset) {
@@ -593,25 +568,31 @@ timequery_result batch_timequery(
     // parse into the batch far enough to find it: this
     // happens when we had CreateTime input, such that
     // records in the batch have different timestamps.
-    model::offset result_o = b.base_offset();
-    model::timestamp result_t = b.header().first_timestamp;
-    if (!b.compressed()) {
-        b.for_each_record(
-          [&result_o, &result_t, &b, query_interval, t](
-            const model::record& r) -> ss::stop_iteration {
-              auto record_o = model::offset{r.offset_delta()} + b.base_offset();
-              auto record_t = model::timestamp(
-                b.header().first_timestamp() + r.timestamp_delta());
-              if (record_t >= t && query_interval.contains(record_o)) {
-                  result_o = record_o;
-                  result_t = record_t;
-                  return ss::stop_iteration::yes;
-              } else {
-                  return ss::stop_iteration::no;
-              }
-          });
+    model::offset result_o = batch.base_offset();
+    model::timestamp result_t = batch.header().first_timestamp;
+    if (batch.compressed()) {
+        batch = co_await model::decompress_batch(batch);
     }
-    return {result_o, result_t};
+    const auto& header = batch.header();
+    co_await batch.for_each_record_async(
+      [&result_o, &result_t, &header, query_interval, t](
+        const model::record& r) {
+          auto record_o = model::offset{r.offset_delta()} + header.base_offset;
+          auto record_t = header.attrs.timestamp_type()
+                              == model::timestamp_type::create_time
+                            ? model::timestamp(
+                                header.first_timestamp() + r.timestamp_delta())
+                            : header.max_timestamp;
+          if (record_t >= t && query_interval.contains(record_o)) {
+              result_o = record_o;
+              result_t = record_t;
+              return ss::stop_iteration::yes;
+          } else {
+              return ss::stop_iteration::no;
+          }
+      });
+
+    co_return timequery_result{batch.term(), result_o, result_t};
 }
 
 } // namespace storage

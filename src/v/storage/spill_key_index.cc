@@ -17,6 +17,7 @@
 #include "ssx/async_algorithm.h"
 #include "storage/compacted_index.h"
 #include "storage/compacted_index_writer.h"
+#include "storage/compaction_key.h"
 #include "storage/logger.h"
 #include "storage/segment_utils.h"
 #include "utils/vint.h"
@@ -38,14 +39,12 @@ using namespace storage; // NOLINT
 //
 spill_key_index::spill_key_index(
   ss::sstring name,
-  ss::io_priority_class p,
   bool truncate,
   storage_resources& resources,
   std::optional<ntp_sanitizer_config> sanitizer_config)
   : compacted_index_writer(std::move(name))
   , _sanitizer_config(std::move(sanitizer_config))
   , _resources(resources)
-  , _pc(p)
   , _truncate(truncate) {}
 
 /**
@@ -59,10 +58,10 @@ spill_key_index::spill_key_index(
   storage_resources& resources)
   : compacted_index_writer(std::move(name))
   , _resources(resources)
-  , _pc(ss::default_priority_class())
-  , _appender(storage::segment_appender(
-      std::move(dummy_file),
-      segment_appender::options(_pc, 1, std::nullopt, _resources)))
+  , _appender(
+      storage::segment_appender(
+        std::move(dummy_file),
+        segment_appender::options(1, std::nullopt, _resources)))
   , _max_mem(max_mem) {}
 
 spill_key_index::~spill_key_index() {
@@ -74,7 +73,9 @@ spill_key_index::~spill_key_index() {
 }
 
 ss::future<> spill_key_index::index(
-  const compaction_key& v, model::offset base_offset, int32_t delta) {
+  const compaction::compaction_key& v,
+  model::offset base_offset,
+  int32_t delta) {
     return ss::try_with_gate(_gate, [this, &v, base_offset, delta]() {
         if (auto it = _midx.find(v); it != _midx.end()) {
             auto& pair = it->second;
@@ -152,7 +153,8 @@ spill_key_index::spill_some(size_t entry_size, size_t min_index_size) {
     }
 }
 
-ss::future<> spill_key_index::add_key(compaction_key b, value_type v) {
+ss::future<>
+spill_key_index::add_key(compaction::compaction_key b, value_type v) {
     auto f = ss::now();
     const auto entry_size = entry_mem_usage(b);
     const auto expected_size = idx_mem_usage() + _keys_mem_usage + entry_size;
@@ -324,25 +326,6 @@ void spill_key_index::set_flag(compacted_index::footer_flags f) {
     _footer.flags |= f;
 }
 
-ss::future<> spill_key_index::truncate(model::offset o) {
-    return ss::try_with_gate(_gate, [this, o]() {
-        set_flag(compacted_index::footer_flags::truncation);
-        return drain_all_keys().then([this, o] {
-            static constexpr std::string_view compacted_key = "compaction";
-            return spill(
-              compacted_index::entry_type::truncation,
-              bytes_view(
-                // NOLINTNEXTLINE
-                reinterpret_cast<const uint8_t*>(compacted_key.data()),
-                compacted_key.size()),
-              // this is actually the base_offset + max_delta so everything
-              // upto and including this offset must be ignored during self
-              // compaction
-              value_type{o, 0});
-        });
-    });
-}
-
 ss::future<> spill_key_index::maybe_open() {
     if (!_appender.has_value()) {
         co_await open();
@@ -356,9 +339,10 @@ ss::future<> spill_key_index::open() {
     auto index_file = co_await make_writer_handle(
       std::filesystem::path(filename()), _sanitizer_config, _truncate);
 
-    _appender.emplace(storage::segment_appender(
-      std::move(index_file),
-      segment_appender::options(_pc, 1, std::nullopt, _resources)));
+    _appender.emplace(
+      storage::segment_appender(
+        std::move(index_file),
+        segment_appender::options(1, std::nullopt, _resources)));
 }
 
 ss::future<> spill_key_index::close() {
@@ -421,16 +405,22 @@ std::ostream& operator<<(std::ostream& o, const spill_key_index& k) {
     return o;
 }
 
+size_t spill_key_index::size_bytes() const {
+    if (_appender.has_value()) {
+        return _appender->size_bytes();
+    }
+    return 0;
+}
+
 } // namespace storage::internal
 
 namespace storage {
 std::unique_ptr<compacted_index_writer> make_file_backed_compacted_index(
   ss::sstring name,
-  ss::io_priority_class p,
   bool truncate,
   storage_resources& resources,
   std::optional<ntp_sanitizer_config> sanitizer_config) {
     return std::make_unique<internal::spill_key_index>(
-      std::move(name), p, truncate, resources, std::move(sanitizer_config));
+      std::move(name), truncate, resources, std::move(sanitizer_config));
 }
 } // namespace storage

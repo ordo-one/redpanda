@@ -10,7 +10,6 @@ redpanda_cc_library(
     hdrs = [
         "utils.h",
     ],
-    include_prefix = "http",
     deps = [
         "//src/v/base",
         "//src/v/bytes",
@@ -36,7 +35,6 @@ redpanda_cc_library(
         "logger.h",
         "probe.h",
     ],
-    include_prefix = "http",
     deps = [
         ":utils",
         "//src/v/base",
@@ -62,14 +60,13 @@ redpanda_cc_library(
     hdrs = [
         "request_builder.h",
     ],
-    include_prefix = "http",
     deps = [
         "//src/v/base",
         "//src/v/http:utils",
-        "//src/v/thirdparty/ada",
         "//src/v/utils:named_type",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",
+        "@ada",
         "@boost//:algorithm",
         "@boost//:beast",
         "@seastar",
@@ -84,7 +81,6 @@ redpanda_cc_library(
     hdrs = [
         "rest_client/rest_entity.h",
     ],
-    include_prefix = "http",
     deps = [
         "//src/v/base",
         "//src/v/http:request_builder",

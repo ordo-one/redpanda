@@ -10,8 +10,11 @@
  */
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/errc.h"
-#include "container/fragmented_vector.h"
+#include "cluster/offsets_snapshot.h"
+#include "container/chunked_vector.h"
+#include "kafka/protocol/types.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "serde/rw/enum.h"
@@ -25,8 +28,6 @@
 
 #include <seastar/core/sstring.hh>
 
-#include <absl/container/flat_hash_set.h>
-
 #include <ranges>
 
 namespace cluster::data_migrations {
@@ -36,7 +37,7 @@ namespace cluster::data_migrations {
  * same identifiers.
  */
 using id = named_type<int64_t, struct data_migration_type_tag>;
-using consumer_group = named_type<ss::sstring, struct consumer_group_tag>;
+using consumer_group = kafka::group_id;
 /**
  * Migration state
  *  ┌─────────┐
@@ -85,12 +86,19 @@ std::ostream& operator<<(std::ostream& o, state);
  * For each migration state transition that requires work on partitions
  * a partition replica has the following lifecycle:
  * - waiting_for_rpc: work requested by raft0, shard not assigned;
+ * - waiting_for_controller_update: work requested by RPC request, but we
+ *   haven't yet seen the corresponding raft0 update;
  * - can_run: seconded by RPC request, shard may be assigned to work on;
  * - done: shard completed work and unassigned, done.
  * Unless (or until) the shard is the partition leader, it gets stuck
  * in can_run status.
  */
-enum class migrated_replica_status { waiting_for_rpc, can_run, done };
+enum class migrated_replica_status {
+    waiting_for_rpc,
+    waiting_for_controller_update,
+    can_run,
+    done
+};
 std::ostream& operator<<(std::ostream& o, migrated_replica_status);
 
 /**
@@ -132,6 +140,9 @@ struct cloud_storage_location
     operator==(const cloud_storage_location&, const cloud_storage_location&)
       = default;
 
+    friend std::ostream&
+    operator<<(std::ostream&, const cloud_storage_location&);
+
     auto serde_fields() { return std::tie(hint); }
 };
 
@@ -171,6 +182,7 @@ struct inbound_topic
       = default;
     friend std::ostream& operator<<(std::ostream&, const inbound_topic&);
 };
+
 /**
  * Inbound migration object representing topics and consumer groups that
  * ownership should be acquired.
@@ -194,9 +206,16 @@ struct inbound_migration
     friend std::ostream& operator<<(std::ostream&, const inbound_migration&);
 
     auto topic_nts() const {
-        return std::as_const(topics)
+        auto pieces = std::vector{std::as_const(topics) | std::views::all};
+        if (!groups.empty()) {
+            pieces.push_back(consumer_offsets_topic | std::views::all);
+        }
+        return std::move(pieces) | std::views::join
                | std::views::transform(&inbound_topic::effective_topic_name);
     }
+
+private:
+    static const chunked_vector<inbound_topic> consumer_offsets_topic;
 };
 
 /**
@@ -216,6 +235,25 @@ struct copy_target
     friend std::ostream& operator<<(std::ostream&, const copy_target&);
 };
 
+// A struct with information needed to unambiguously find topic data in cloud
+// storage.
+struct topic_location
+  : serde::
+      envelope<topic_location, serde::version<0>, serde::compat_version<0>> {
+    // Topic name when its data was first written to cloud storage.
+    model::topic_namespace remote_topic;
+    // Location hint used to disambiguate between different topic instances.
+    // Empty for topics still using legacy (pre v24.2) cloud storage paths.
+    std::optional<cloud_storage_location> location;
+
+    auto serde_fields() { return std::tie(remote_topic, location); }
+
+    friend bool operator==(const topic_location&, const topic_location&)
+      = default;
+
+    friend std::ostream& operator<<(std::ostream&, const topic_location&);
+};
+
 /**
  * Outbound migration object representing topics and consumer groups that
  * ownership should be released.
@@ -223,7 +261,7 @@ struct copy_target
 struct outbound_migration
   : serde::envelope<
       outbound_migration,
-      serde::version<1>,
+      serde::version<2>,
       serde::compat_version<0>> {
     // topics which ownership should be released
     chunked_vector<model::topic_namespace> topics;
@@ -234,18 +272,29 @@ struct outbound_migration
     std::optional<copy_target> copy_to;
     // run the migration through stages without explicit user action
     bool auto_advance = false;
+    // Topic locations. If not empty, must have the same size as topics.
+    chunked_vector<topic_location> topic_locations;
 
     outbound_migration copy() const;
 
     auto serde_fields() {
-        return std::tie(topics, groups, copy_to, auto_advance);
+        return std::tie(topics, groups, copy_to, auto_advance, topic_locations);
     }
 
     friend bool operator==(const outbound_migration&, const outbound_migration&)
       = default;
     friend std::ostream& operator<<(std::ostream&, const outbound_migration&);
 
-    auto topic_nts() const { return std::as_const(topics) | std::views::all; }
+    auto topic_nts() const {
+        auto pieces = std::vector{std::as_const(topics) | std::views::all};
+        if (!groups.empty()) {
+            pieces.push_back(consumer_offsets_topic | std::views::all);
+        }
+        return std::move(pieces) | std::views::join;
+    }
+
+private:
+    static const chunked_vector<model::topic_namespace> consumer_offsets_topic;
 };
 
 /**
@@ -260,9 +309,13 @@ data_migration copy_migration(const data_migration& migration);
 struct inbound_partition_work_info {
     std::optional<model::topic_namespace> source;
     std::optional<cloud_storage_location> cloud_storage_location;
+    chunked_vector<consumer_group>
+      groups; // not empty iff partition of consumer offsets topic
 };
 struct outbound_partition_work_info {
     std::optional<copy_target> copy_to;
+    chunked_vector<consumer_group>
+      groups; // not empty iff partition of consumer offsets topic
 };
 using partition_work_info
   = std::variant<inbound_partition_work_info, outbound_partition_work_info>;
@@ -334,7 +387,6 @@ struct data_migration_ntp_state
       data_migration_ntp_state,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using self = data_migration_ntp_state;
 
     model::ntp ntp;
@@ -350,13 +402,17 @@ struct data_migration_ntp_state
 struct create_migration_cmd_data
   : serde::envelope<
       create_migration_cmd_data,
-      serde::version<1>,
+      serde::version<2>,
       serde::compat_version<0>> {
     id id;
     data_migration migration;
     model::timestamp op_timestamp{};
+    bool fill_outbound_topic_locations = false;
 
-    auto serde_fields() { return std::tie(id, migration, op_timestamp); }
+    auto serde_fields() {
+        return std::tie(
+          id, migration, op_timestamp, fill_outbound_topic_locations);
+    }
     friend bool operator==(
       const create_migration_cmd_data&, const create_migration_cmd_data&)
       = default;
@@ -402,7 +458,6 @@ struct create_migration_request
       create_migration_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     data_migration migration;
 
     auto serde_fields() { return std::tie(migration); }
@@ -417,8 +472,6 @@ struct create_migration_reply
       create_migration_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     id id{-1};
     cluster::errc ec;
     auto serde_fields() { return std::tie(id, ec); }
@@ -436,7 +489,6 @@ struct update_migration_state_request
       update_migration_state_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     id id;
     state state;
     auto serde_fields() { return std::tie(id, state); }
@@ -454,7 +506,6 @@ struct update_migration_state_reply
       update_migration_state_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     cluster::errc ec;
     auto serde_fields() { return std::tie(ec); }
 
@@ -470,7 +521,6 @@ struct remove_migration_request
       remove_migration_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     id id;
     auto serde_fields() { return std::tie(id); }
     friend bool
@@ -485,7 +535,6 @@ struct remove_migration_reply
       remove_migration_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     cluster::errc ec;
 
     auto serde_fields() { return std::tie(ec); }
@@ -503,7 +552,6 @@ struct check_ntp_states_request
       check_ntp_states_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using self = check_ntp_states_request;
 
     chunked_vector<data_migration_ntp_state> sought_states;
@@ -520,7 +568,6 @@ struct check_ntp_states_reply
       check_ntp_states_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using self = check_ntp_states_reply;
 
     chunked_vector<data_migration_ntp_state> actual_states;
@@ -530,6 +577,12 @@ struct check_ntp_states_reply
     friend bool operator==(const self&, const self&) = default;
 
     friend std::ostream& operator<<(std::ostream&, const self&);
+};
+
+struct entities_status {
+    chunked_vector<group_offsets> groups;
+
+    friend std::ostream& operator<<(std::ostream&, const entities_status&);
 };
 
 } // namespace cluster::data_migrations

@@ -17,7 +17,6 @@
 #include "raft/buffered_protocol.h"
 #include "raft/group_configuration.h"
 #include "raft/rpc_client_protocol.h"
-#include "resource_mgmt/io_priority.h"
 
 #include <seastar/core/scheduling.hh>
 
@@ -31,7 +30,7 @@ group_manager::group_manager(
   ss::scheduling_group raft_send_sg,
   ss::scheduling_group raft_heartbeats_sched_group,
   group_manager::config_provider_fn cfg,
-  recovery_memory_quota::config_provider_fn recovery_mem_cfg,
+  config::binding<std::optional<size_t>> max_recovery_memory,
   ss::sharded<rpc::connection_cache>& clients,
   ss::sharded<storage::api>& storage,
   ss::sharded<coordinated_recovery_throttle>& recovery_throttle,
@@ -40,11 +39,12 @@ group_manager::group_manager(
   , _raft_recv_sg(raft_recv_sg)
   , _raft_send_sg(raft_send_sg)
   , _configuration(cfg())
-  , _buffered_protocol(ss::make_shared<buffered_protocol>(
-      _raft_send_sg,
-      make_rpc_client_protocol(self, clients),
-      _configuration.max_inflight_requests_per_node,
-      _configuration.max_buffered_bytes_per_node))
+  , _buffered_protocol(
+      ss::make_shared<buffered_protocol>(
+        _raft_send_sg,
+        make_rpc_client_protocol(self, clients),
+        _configuration.max_inflight_requests_per_node,
+        _configuration.max_buffered_bytes_per_node))
   , _heartbeats(
       raft_heartbeats_sched_group,
       _configuration.heartbeat_interval,
@@ -55,7 +55,9 @@ group_manager::group_manager(
       feature_table.local())
   , _storage(storage.local())
   , _recovery_throttle(recovery_throttle.local())
-  , _recovery_mem_quota(std::move(recovery_mem_cfg))
+  , _recovery_mem_quota(
+      std::move(max_recovery_memory),
+      _configuration.recovery_concurrency_per_shard)
   , _recovery_scheduler(
       _configuration.recovery_concurrency_per_shard,
       _configuration.heartbeat_interval)
@@ -116,7 +118,7 @@ void group_manager::set_ready() {
     _is_ready = true;
     std::for_each(
       _groups.begin(), _groups.end(), [](ss::lw_shared_ptr<consensus>& c) {
-          c->reset_node_priority();
+          c->mark_ready_for_leader_election();
       });
 }
 
@@ -136,12 +138,13 @@ ss::future<ss::lw_shared_ptr<raft::consensus>> group_manager::create_group(
       raft::group_configuration(nodes, revision),
       raft::timeout_jitter(_configuration.election_timeout_ms),
       log,
-      scheduling_config(_raft_recv_sg, _raft_send_sg, raft_priority()),
+      scheduling_config(_raft_recv_sg, _raft_send_sg),
       _configuration.raft_io_timeout_ms,
       _configuration.enable_longest_log_detection,
       consensus_client_protocol(_buffered_protocol),
+      [this](raft::group_id g) { return trigger_remake_notification(g); },
       [this](raft::leadership_status st) {
-          trigger_leadership_notification(std::move(st));
+          return trigger_leadership_notification(std::move(st));
       },
       _storage,
       enable_learner_recovery_throttle
@@ -152,7 +155,7 @@ ss::future<ss::lw_shared_ptr<raft::consensus>> group_manager::create_group(
       _recovery_mem_quota,
       _recovery_scheduler,
       _feature_table,
-      _is_ready ? std::nullopt : std::make_optional(min_voter_priority),
+      _is_ready,
       keep_snapshotted_log);
 
     return ss::with_gate(_gate, [this, raft] {
@@ -162,7 +165,7 @@ ss::future<ss::lw_shared_ptr<raft::consensus>> group_manager::create_group(
                 // set_ready() was called after we created this consensus
                 // instance but before we insert it into the _groups
                 // collection.
-                raft->reset_node_priority();
+                raft->mark_ready_for_leader_election();
             }
             _groups.push_back(raft);
             return raft;
@@ -195,6 +198,16 @@ ss::future<xshard_transfer_state> group_manager::do_shutdown(
       group_id);
     _groups.erase(it);
     co_return transfer_state;
+}
+
+ss::future<std::error_code>
+group_manager::trigger_remake_notification(raft::group_id g) {
+    if (!_remake_cb || _remake_cb_gate.is_closed()) {
+        co_return raft::errc::shutting_down;
+    }
+
+    auto holder = _remake_cb_gate.hold();
+    co_return co_await (*_remake_cb)(g);
 }
 
 void group_manager::trigger_leadership_notification(

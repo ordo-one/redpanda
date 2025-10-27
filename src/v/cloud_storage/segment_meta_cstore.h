@@ -13,15 +13,10 @@
 #include "cloud_storage/types.h"
 #include "utils/delta_for.h"
 
-#include <absl/container/btree_map.h>
 #include <boost/iterator/iterator_categories.hpp>
 #include <boost/iterator/iterator_facade.hpp>
 
-#include <functional>
-#include <iterator>
 #include <memory>
-#include <tuple>
-#include <variant>
 
 namespace cloud_storage {
 

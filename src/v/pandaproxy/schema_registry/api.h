@@ -25,7 +25,8 @@ class Node;
 
 namespace cluster {
 class controller;
-}
+class metadata_cache;
+} // namespace cluster
 
 namespace schema {
 class registry;
@@ -41,6 +42,7 @@ public:
       size_t max_memory,
       kafka::client::configuration& client_cfg,
       configuration& cfg,
+      ss::sharded<cluster::metadata_cache>* metadata_cache,
       std::unique_ptr<cluster::controller>&,
       ss::sharded<security::audit::audit_log_manager>&) noexcept;
     ~api() noexcept;
@@ -48,6 +50,11 @@ public:
     ss::future<> start();
     ss::future<> stop();
     ss::future<> restart();
+
+    const configuration& get_config() const;
+    const kafka::client::configuration& get_client_config() const;
+
+    bool has_ephemeral_credentials() const;
 
 private:
     friend class schema_id_validator;
@@ -57,6 +64,7 @@ private:
     size_t _max_memory;
     kafka::client::configuration& _client_cfg;
     configuration& _cfg;
+    ss::sharded<cluster::metadata_cache>* _metadata_cache;
     std::unique_ptr<cluster::controller>& _controller;
 
     ss::sharded<kafka::client::client> _client;

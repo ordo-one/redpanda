@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "bytes/bytes.h"
 #include "bytes/random.h"
 #include "hashing/secure.h"
@@ -16,8 +17,6 @@
 #include "security/scram_credential.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
-
-#include <absl/container/node_hash_map.h>
 
 /**
  * scram algorthm - https://tools.ietf.org/html/rfc5802
@@ -236,14 +235,8 @@ public:
     make_credentials(const ss::sstring& password, int iterations) {
         bytes salt = random_generators::get_crypto_bytes(SaltSize);
         bytes salted_password = salt_password(password, salt, iterations);
-        auto clientkey = client_key(salted_password);
-        auto storedkey = stored_key(clientkey);
-        auto serverkey = server_key(salted_password);
-        return scram_credential(
-          std::move(salt),
-          std::move(serverkey),
-          std::move(storedkey),
-          iterations);
+        return make_credentials(
+          std::nullopt, salted_password, salt, iterations);
     }
     static scram_credential make_credentials(
       acl_principal principal, const ss::sstring& password, int iterations) {
@@ -252,12 +245,36 @@ public:
         auto clientkey = client_key(salted_password);
         auto storedkey = stored_key(clientkey);
         auto serverkey = server_key(salted_password);
+        return make_credentials(
+          std::move(principal), salted_password, salt, iterations);
+    }
+
+    static scram_credential make_credentials(
+      std::optional<acl_principal> principal,
+      bytes_view salted_password,
+      bytes_view salt,
+      int iterations) {
+        auto clientkey = client_key(salted_password);
+        auto storedkey = stored_key(clientkey);
+        auto serverkey = server_key(salted_password);
         return scram_credential(
-          std::move(salt),
+          bytes{salt},
           std::move(serverkey),
           std::move(storedkey),
           iterations,
           std::move(principal));
+    }
+
+    /// Test method used to generate credentials and it returns the salted
+    /// password
+    static std::pair<scram_credential, bytes>
+    make_credentials_and_return_password(
+      const ss::sstring& password, int iterations) {
+        bytes salt = random_generators::get_crypto_bytes(SaltSize);
+        bytes salted_password = salt_password(password, salt, iterations);
+        return {
+          make_credentials(std::nullopt, salted_password, salt, iterations),
+          std::move(salted_password)};
     }
 
     static bytes client_proof(

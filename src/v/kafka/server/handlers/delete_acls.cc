@@ -11,7 +11,7 @@
 #include "kafka/server/handlers/delete_acls.h"
 
 #include "cluster/security_frontend.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/delete_acls_response.h"
 #include "kafka/server/errors.h"
@@ -79,10 +79,11 @@ ss::future<response_ptr> delete_acls_handler::handle(
             result_index.emplace_back(filters.size());
             filters.push_back(std::move(filter));
         } catch (const details::acl_conversion_error& e) {
-            result_index.emplace_back(delete_acls_filter_result{
-              .error_code = error_code::invalid_request,
-              .error_message = e.what(),
-            });
+            result_index.emplace_back(
+              delete_acls_filter_result{
+                .error_code = error_code::invalid_request,
+                .error_message = e.what(),
+              });
         }
     }
 
@@ -138,8 +139,9 @@ ss::future<response_ptr> delete_acls_handler::handle(
         response.data.filter_results.reserve(result_index.size());
         for ([[maybe_unused]] auto _ :
              boost::irange<size_t>(result_index.size())) {
-            response.data.filter_results.push_back(delete_acls_filter_result{
-              .error_code = error_code::unknown_server_error});
+            response.data.filter_results.push_back(
+              delete_acls_filter_result{
+                .error_code = error_code::unknown_server_error});
         }
 
         co_return co_await ctx.respond(std::move(response));
@@ -150,10 +152,12 @@ ss::future<response_ptr> delete_acls_handler::handle(
           result,
           [&response, &results](size_t i) {
               auto ec = map_topic_error_code(results[i].error);
-              response.data.filter_results.push_back(delete_acls_filter_result{
-                .error_code = ec,
-                .matching_acls = bindings_to_delete_result(results[i].bindings),
-              });
+              response.data.filter_results.push_back(
+                delete_acls_filter_result{
+                  .error_code = ec,
+                  .matching_acls = bindings_to_delete_result(
+                    results[i].bindings),
+                });
           },
           [&response](delete_acls_filter_result& r) {
               response.data.filter_results.push_back(std::move(r));

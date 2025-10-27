@@ -20,10 +20,12 @@
 #include <seastar/core/future.hh>
 
 namespace {
-raft::replicate_options make_replicate_options(ss::abort_source& as) {
+raft::replicate_options
+make_replicate_options(model::term_id expected_term, ss::abort_source& as) {
     auto opts = raft::replicate_options(
       raft::consistency_level::quorum_ack, std::ref(as));
     opts.set_force_flush();
+    opts.expected_term = expected_term;
 
     return opts;
 }
@@ -148,9 +150,8 @@ ss::future<std::error_code> translation_stm::reset_highest_translated_offset(
         co_return raft::errc::success;
     }
     auto result = co_await _raft->replicate(
-      current_term,
       make_translation_state_batch(new_translated_offset, new_translated_ts),
-      make_replicate_options(as));
+      make_replicate_options(current_term, as));
     auto deadline = model::timeout_clock::now() + timeout;
     if (
       result
@@ -170,17 +171,34 @@ ss::future<std::error_code> translation_stm::reset_highest_translated_offset(
     co_return error;
 }
 
-model::offset translation_stm::max_collectible_offset() {
+model::offset translation_stm::max_removable_local_log_offset() {
     if (!_raft->log_config().iceberg_enabled()) {
         return model::offset::max();
     }
-    // if offset is not initialized, do not attempt translation.
+    // If offset is not initialized (we've never translated anything), avoid
+    // removing data. This means that when we haven't yet translated anything,
+    // local data is pinned until we start translating. Since the first
+    // translation starts at the beginning of the local log, this helps ensure:
+    // - on a new partition, we translate from 0 without reading from cloud
+    // - on a recovery topic partition, we don't backfill historical data
     if (_highest_translated_offset == kafka::offset{}) {
-        return model::offset{};
+        return model::offset::min();
     }
+    // If we have translated data before, no need to pin local data because
+    // translators don't need to read local data.
+    return model::offset::max();
+}
 
-    return highest_log_offset_below_next(
-      _raft->log(), _highest_translated_offset);
+std::optional<kafka::offset>
+translation_stm::lowest_pinned_data_offset() const {
+    if (!_raft->log_config().iceberg_enabled()) {
+        return std::nullopt;
+    }
+    // If we haven't translated anything yet, aggressively pin data.
+    if (_highest_translated_offset == kafka::offset{}) {
+        return kafka::offset{0};
+    }
+    return kafka::next_offset(_highest_translated_offset);
 }
 
 ss::future<raft::local_snapshot_applied> translation_stm::apply_local_snapshot(
@@ -214,7 +232,7 @@ ss::future<> translation_stm::apply_raft_snapshot(const iobuf&) {
     co_return;
 }
 
-ss::future<iobuf> translation_stm::take_snapshot(model::offset) {
+ss::future<iobuf> translation_stm::take_raft_snapshot(model::offset) {
     co_return iobuf{};
 }
 
@@ -237,7 +255,9 @@ bool stm_factory::is_applicable_for(const storage::ntp_config& config) const {
 }
 
 void stm_factory::create(
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config&) {
     auto stm = builder.create_stm<translation_stm>(datalake_log, raft);
     raft->log()->stm_manager()->add_stm(stm);
 }

@@ -10,27 +10,31 @@ import json
 import logging
 import os
 import sys
-
 from dataclasses import dataclass
 
-from pyflink.common import WatermarkStrategy, Types, SimpleStringSchema
-from pyflink.datastream.checkpointing_mode import CheckpointingMode
+from pyflink.common import Configuration, SimpleStringSchema, Types, WatermarkStrategy
+from pyflink.datastream import RuntimeExecutionMode, StreamExecutionEnvironment
 from pyflink.datastream.checkpoint_config import ExternalizedCheckpointCleanup
-
-from pyflink.common import Configuration
-from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
-from pyflink.datastream.connectors.kafka import KafkaSink, DeliveryGuarantee, \
-    KafkaRecordSerializationSchema, KafkaSource, KafkaOffsetsInitializer
+from pyflink.datastream.checkpointing_mode import CheckpointingMode
 from pyflink.datastream.connectors import NumberSequenceSource
+from pyflink.datastream.connectors.kafka import (
+    DeliveryGuarantee,
+    KafkaOffsetsInitializer,
+    KafkaRecordSerializationSchema,
+    KafkaSink,
+    KafkaSource,
+)
 
-MODE_PRODUCE = 'produce'
-MODE_CONSUME = 'consume'
+MODE_PRODUCE = "produce"
+MODE_CONSUME = "consume"
 
 
 @dataclass(kw_only=True)
 class WorkloadConfig:
     # Default values are set for CDT run inside EC2 instance
-    connector_path: str = "File:///opt/flink/connectors/flink-sql-connector-kafka-3.0.1-1.18.jar"
+    connector_path: str = (
+        "File:///opt/flink/connectors/flink-sql-connector-kafka-3.0.1-1.18.jar"
+    )
     python_lib_path: str = "File:///opt/flink/opt/flink-python-1.18.0.jar"
     python_archive: str = "/opt/flink/flink_venv.tgz"
     logger_path: str = "/workloads"
@@ -51,8 +55,8 @@ def setup_logger(logfilepath, level):
     # Simple file logger
     handler = logging.FileHandler(logfilepath)
     handler.setFormatter(
-        logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
     level = logging.getLevelName(level.upper())
     handler.setLevel(level)
     logger = logging.getLogger(__name__)
@@ -102,7 +106,8 @@ class FlinkWorkloadProduce:
         # advanced options:
         # set mode to exactly-once (this is the default)
         env.get_checkpoint_config().set_checkpointing_mode(
-            CheckpointingMode.EXACTLY_ONCE)
+            CheckpointingMode.EXACTLY_ONCE
+        )
         # make sure 1 ms of progress happen between checkpoints
         env.get_checkpoint_config().set_min_pause_between_checkpoints(1)
         # checkpoints have to complete within one minute, or are discarded
@@ -114,7 +119,8 @@ class FlinkWorkloadProduce:
         # enable externalized checkpoints which are retained
         # after job cancellation
         env.get_checkpoint_config().enable_externalized_checkpoints(
-            ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
+            ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+        )
         # enables the unaligned checkpoints
         env.get_checkpoint_config().enable_unaligned_checkpoints()
 
@@ -123,12 +129,12 @@ class FlinkWorkloadProduce:
 
     def prepare_produce_mode(self):
         """
-            Initialized produce mode
+        Initialized produce mode
 
-            Steps:
-            - Use simple number Sequence as a source
-            - Transform it to str
-            - Send to brokers
+        Steps:
+        - Use simple number Sequence as a source
+        - Transform it to str
+        - Send to brokers
         """
 
         # NumberSequence produces Types.LONG
@@ -142,22 +148,27 @@ class FlinkWorkloadProduce:
         ds = self.stream_env.from_source(
             source=source,
             watermark_strategy=WatermarkStrategy.no_watermarks(),
-            source_name="number_sequence")
+            source_name="number_sequence",
+        )
         # Assign transformation
         self.datasource = ds.flat_map(transform, output_type=Types.STRING())
         # Create simple serializer with String schema
-        record_serializer = KafkaRecordSerializationSchema.builder() \
-            .set_topic(self.config.topic_name) \
-            .set_key_serialization_schema(SimpleStringSchema()) \
-            .set_value_serialization_schema(SimpleStringSchema()) \
+        record_serializer = (
+            KafkaRecordSerializationSchema.builder()
+            .set_topic(self.config.topic_name)
+            .set_key_serialization_schema(SimpleStringSchema())
+            .set_value_serialization_schema(SimpleStringSchema())
             .build()
+        )
         # Build KafkaSource class
-        self.sink = KafkaSink.builder() \
-            .set_bootstrap_servers(self.config.brokers) \
-            .set_record_serializer(record_serializer) \
-            .set_delivery_guarantee(DeliveryGuarantee.EXACTLY_ONCE) \
-            .set_transactional_id_prefix(self.config.transaction_id_prefix) \
+        self.sink = (
+            KafkaSink.builder()
+            .set_bootstrap_servers(self.config.brokers)
+            .set_record_serializer(record_serializer)
+            .set_delivery_guarantee(DeliveryGuarantee.EXACTLY_ONCE)
+            .set_transactional_id_prefix(self.config.transaction_id_prefix)
             .build()
+        )
 
     def produce_sequence(self):
         # Add previously created KafkaSink class as a sink to DataStream
@@ -169,35 +180,37 @@ class FlinkWorkloadProduce:
 
     def prepare_consume_mode(self):
         """
-            Initialize consume mode
+        Initialize consume mode
 
-            Steps:
-            - Use KafkaSource
-            - Just dump sequence to stdout
+        Steps:
+        - Use KafkaSource
+        - Just dump sequence to stdout
         """
-        self.logger.info("Creating consumer with target topic of "
-                         f"'{self.config.topic_name}'")
+        self.logger.info(
+            f"Creating consumer with target topic of '{self.config.topic_name}'"
+        )
         # Create consumer from KafkaSource class
-        source = KafkaSource \
-            .builder() \
-            .set_bootstrap_servers(self.config.brokers) \
-            .set_group_id(self.config.consumer_group) \
-            .set_topics(self.config.topic_name) \
-            .set_value_only_deserializer(SimpleStringSchema()) \
-            .set_starting_offsets(KafkaOffsetsInitializer.earliest()) \
-            .set_bounded(KafkaOffsetsInitializer.latest()) \
+        source = (
+            KafkaSource.builder()
+            .set_bootstrap_servers(self.config.brokers)
+            .set_group_id(self.config.consumer_group)
+            .set_topics(self.config.topic_name)
+            .set_value_only_deserializer(SimpleStringSchema())
+            .set_starting_offsets(KafkaOffsetsInitializer.earliest())
+            .set_bounded(KafkaOffsetsInitializer.latest())
             .build()
+        )
 
-        ds = self.stream_env.from_source(source,
-                                         WatermarkStrategy.no_watermarks(),
-                                         "Kafka Source")
+        ds = self.stream_env.from_source(
+            source, WatermarkStrategy.no_watermarks(), "Kafka Source"
+        )
         # Just print received message
         ds.print()
         self.datasource = ds
 
     def consume_sequence(self):
         """
-            Example of a consume task usign Table API
+        Example of a consume task usign Table API
         """
         # Run
         self.logger.info("Runnig consumer")
@@ -221,12 +234,12 @@ class FlinkWorkloadProduce:
 
     def cleanup(self):
         """
-            Cleanup placeholder
+        Cleanup placeholder
         """
         pass
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Load config if specified
     if len(sys.argv) > 1:
         # Validate arguments in a quick and dirty way.
@@ -235,15 +248,17 @@ if __name__ == '__main__':
         try:
             [filename] = sys.argv[1:]
         except Exception as e:
-            raise RuntimeError("Wrong number of arguments."
-                               "Should be one with path to "
-                               "flink_workload_conf.json") from e
+            raise RuntimeError(
+                "Wrong number of arguments."
+                "Should be one with path to "
+                "flink_workload_conf.json"
+            ) from e
     else:
         # No config path provided, just use defaults
         filename = "/workloads/flink_workload_config.json"
 
     # Load configuration
-    with open(filename, 'r+t') as f:
+    with open(filename, "r+t") as f:
         input_config = json.load(f)
 
     # All messages past this point is intercepted by task manager

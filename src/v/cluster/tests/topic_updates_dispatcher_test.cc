@@ -11,6 +11,7 @@
 #include "cluster/tests/topic_table_fixture.h"
 #include "cluster/topic_updates_dispatcher.h"
 #include "model/metadata.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/testing/thread_test_case.hh>
 
@@ -21,7 +22,7 @@ ss::logger logger{"dispatcher_test"};
 
 struct topic_table_updates_dispatcher_fixture : topic_table_fixture {
     topic_table_updates_dispatcher_fixture()
-      : dispatcher(allocator, table, leaders, pb_state) {}
+      : dispatcher(allocator, table, pb_state) {}
 
     template<typename Cmd>
     void dispatch_command(Cmd cmd) {
@@ -112,16 +113,16 @@ FIXTURE_TEST(
 FIXTURE_TEST(
   test_dispatching_happy_path_delete, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    BOOST_REQUIRE(
-      !dispatcher
-         .apply_update(serde_serialize_cmd(cluster::delete_topic_cmd(
-           make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2"))))
-         .get());
-    BOOST_REQUIRE(
-      !dispatcher
-         .apply_update(serde_serialize_cmd(cluster::delete_topic_cmd(
-           make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3"))))
-         .get());
+    BOOST_REQUIRE(!dispatcher
+                     .apply_update(serde_serialize_cmd(
+                       cluster::delete_topic_cmd(
+                         make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2"))))
+                     .get());
+    BOOST_REQUIRE(!dispatcher
+                     .apply_update(serde_serialize_cmd(
+                       cluster::delete_topic_cmd(
+                         make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3"))))
+                     .get());
 
     auto& md = table.local().all_topics_metadata();
     BOOST_REQUIRE_EQUAL(md.size(), 1);
@@ -189,7 +190,7 @@ FIXTURE_TEST(
         BOOST_CHECK_EQUAL(counts, expected);
     };
 
-    auto create_topic_cmd = make_create_topic_cmd("test_tp_1", 4, 3);
+    auto create_topic_cmd = make_create_topic_cmd("test_tp_1", 7, 3);
     logger.info("create topic {}", create_topic_cmd.key);
     dispatch_command(create_topic_cmd);
 
@@ -197,8 +198,8 @@ FIXTURE_TEST(
     allocator.local().register_node(
       create_allocation_node(model::node_id(4), 4));
 
-    check_allocated_counts({4, 4, 4, 0});
-    check_final_counts({4, 4, 4, 0});
+    check_allocated_counts({7, 7, 7, 0});
+    check_final_counts({7, 7, 7, 0});
 
     // get data needed to move a partition
     auto get_partition = [&](model::partition_id::type id) {
@@ -235,14 +236,14 @@ FIXTURE_TEST(
         logger.info("move ntp {}", ntp);
         dispatch_command(
           cluster::move_partition_replicas_cmd{ntp, new_replicas});
-        check_allocated_counts({4, 4, 4, 1});
-        check_final_counts({3, 4, 4, 1});
+        check_allocated_counts({7, 7, 7, 1});
+        check_final_counts({6, 7, 7, 1});
 
         logger.info("finish move");
         dispatch_command(
           cluster::finish_moving_partition_replicas_cmd{ntp, new_replicas});
-        check_allocated_counts({3, 4, 4, 1});
-        check_final_counts({3, 4, 4, 1});
+        check_allocated_counts({6, 7, 7, 1});
+        check_final_counts({6, 7, 7, 1});
     }
 
     // move + cancel + force_cancel + finish
@@ -252,30 +253,32 @@ FIXTURE_TEST(
         logger.info("move ntp {}", ntp);
         dispatch_command(
           cluster::move_partition_replicas_cmd{ntp, new_replicas});
-        check_allocated_counts({3, 4, 4, 2});
-        check_final_counts({2, 4, 4, 2});
+        check_allocated_counts({6, 7, 7, 2});
+        check_final_counts({5, 7, 7, 2});
 
         logger.info("cancel move");
-        dispatch_command(cluster::cancel_moving_partition_replicas_cmd{
-          ntp,
-          cluster::cancel_moving_partition_replicas_cmd_data{
-            cluster::force_abort_update{false}}});
-        check_allocated_counts({3, 4, 4, 2});
-        check_final_counts({3, 4, 4, 1});
+        dispatch_command(
+          cluster::cancel_moving_partition_replicas_cmd{
+            ntp,
+            cluster::cancel_moving_partition_replicas_cmd_data{
+              cluster::force_abort_update{false}}});
+        check_allocated_counts({6, 7, 7, 2});
+        check_final_counts({6, 7, 7, 1});
 
         logger.info("force-cancel move");
-        dispatch_command(cluster::cancel_moving_partition_replicas_cmd{
-          ntp,
-          cluster::cancel_moving_partition_replicas_cmd_data{
-            cluster::force_abort_update{true}}});
-        check_allocated_counts({3, 4, 4, 2});
-        check_final_counts({3, 4, 4, 1});
+        dispatch_command(
+          cluster::cancel_moving_partition_replicas_cmd{
+            ntp,
+            cluster::cancel_moving_partition_replicas_cmd_data{
+              cluster::force_abort_update{true}}});
+        check_allocated_counts({6, 7, 7, 2});
+        check_final_counts({6, 7, 7, 1});
 
         logger.info("finish move");
         dispatch_command(
           cluster::finish_moving_partition_replicas_cmd{ntp, old_replicas});
-        check_allocated_counts({3, 4, 4, 1});
-        check_final_counts({3, 4, 4, 1});
+        check_allocated_counts({6, 7, 7, 1});
+        check_final_counts({6, 7, 7, 1});
     }
 
     // move + cancel + revert_cancel
@@ -285,23 +288,25 @@ FIXTURE_TEST(
         logger.info("move ntp {}", ntp);
         dispatch_command(
           cluster::move_partition_replicas_cmd{ntp, new_replicas});
-        check_allocated_counts({3, 4, 4, 2});
-        check_final_counts({2, 4, 4, 2});
+        check_allocated_counts({6, 7, 7, 2});
+        check_final_counts({5, 7, 7, 2});
 
         logger.info("cancel move");
-        dispatch_command(cluster::cancel_moving_partition_replicas_cmd{
-          ntp,
-          cluster::cancel_moving_partition_replicas_cmd_data{
-            cluster::force_abort_update{false}}});
-        check_allocated_counts({3, 4, 4, 2});
-        check_final_counts({3, 4, 4, 1});
+        dispatch_command(
+          cluster::cancel_moving_partition_replicas_cmd{
+            ntp,
+            cluster::cancel_moving_partition_replicas_cmd_data{
+              cluster::force_abort_update{false}}});
+        check_allocated_counts({6, 7, 7, 2});
+        check_final_counts({6, 7, 7, 1});
 
         logger.info("revert_cancel move");
-        dispatch_command(cluster::revert_cancel_partition_move_cmd(
-          int8_t{0},
-          cluster::revert_cancel_partition_move_cmd_data{.ntp = ntp}));
-        check_allocated_counts({2, 4, 4, 2});
-        check_final_counts({2, 4, 4, 2});
+        dispatch_command(
+          cluster::revert_cancel_partition_move_cmd(
+            int8_t{0},
+            cluster::revert_cancel_partition_move_cmd_data{.ntp = ntp}));
+        check_allocated_counts({5, 7, 7, 2});
+        check_final_counts({5, 7, 7, 2});
     }
 
     // force_move
@@ -318,18 +323,150 @@ FIXTURE_TEST(
         new_replicas = std::vector({*repl_it});
 
         logger.info(
-          "force_partition_reconfiguration ntp {} to {}", ntp, new_replicas);
-        dispatch_command(cluster::force_partition_reconfiguration_cmd{
+          "force_partition_reconfiguration ntp {} from {} to {}",
           ntp,
-          cluster::force_partition_reconfiguration_cmd_data(new_replicas)});
-        check_allocated_counts({2, 4, 4, 2});
-        check_final_counts({2, 3, 3, 2});
+          old_replicas,
+          new_replicas);
+        dispatch_command(
+          cluster::force_partition_reconfiguration_cmd{
+            ntp,
+            cluster::force_partition_reconfiguration_cmd_data(new_replicas)});
+        check_allocated_counts({5, 7, 7, 2});
+        check_final_counts({5, 6, 6, 2});
 
         logger.info("finish move");
         dispatch_command(
           cluster::finish_moving_partition_replicas_cmd{ntp, new_replicas});
-        check_allocated_counts({2, 3, 3, 2});
-        check_final_counts({2, 3, 3, 2});
+        check_allocated_counts({5, 6, 6, 2});
+        check_final_counts({5, 6, 6, 2});
+    }
+
+    // move in progress + force_move
+    {
+        auto [ntp, old_replicas, new_replicas] = get_partition(4);
+
+        logger.info("move ntp {}", ntp);
+        dispatch_command(
+          cluster::move_partition_replicas_cmd{ntp, new_replicas});
+        check_allocated_counts({5, 6, 6, 3});
+        check_final_counts({4, 6, 6, 3});
+
+        auto repl_it = std::find_if(
+          new_replicas.begin(), new_replicas.end(), [](const auto& bs) {
+              return bs.node_id() == 4;
+          });
+
+        BOOST_REQUIRE(repl_it != new_replicas.end());
+        auto force_replicas = std::vector({*repl_it});
+
+        logger.info(
+          "force_partition_reconfiguration ntp {} to {}", ntp, force_replicas);
+        dispatch_command(
+          cluster::force_partition_reconfiguration_cmd{
+            ntp,
+            cluster::force_partition_reconfiguration_cmd_data(force_replicas)});
+        check_allocated_counts({5, 6, 6, 3});
+        check_final_counts({4, 5, 5, 3});
+
+        logger.info("finish move");
+        dispatch_command(
+          cluster::finish_moving_partition_replicas_cmd{ntp, force_replicas});
+        check_allocated_counts({4, 5, 5, 3});
+        check_final_counts({4, 5, 5, 3});
+    }
+
+    // move in progress + cancel + force_move + finish
+    {
+        auto [ntp, old_replicas, new_replicas] = get_partition(5);
+
+        logger.info("move ntp {}", ntp);
+        dispatch_command(
+          cluster::move_partition_replicas_cmd{ntp, new_replicas});
+        check_allocated_counts({4, 5, 5, 4});
+        check_final_counts({3, 5, 5, 4});
+
+        logger.info("cancel move");
+        dispatch_command(
+          cluster::cancel_moving_partition_replicas_cmd{
+            ntp,
+            cluster::cancel_moving_partition_replicas_cmd_data{
+              cluster::force_abort_update{false}}});
+        check_allocated_counts({4, 5, 5, 4});
+        check_final_counts({4, 5, 5, 3});
+
+        auto repl_it = std::find_if(
+          new_replicas.begin(), new_replicas.end(), [](const auto& bs) {
+              return bs.node_id() == 4;
+          });
+
+        BOOST_REQUIRE(repl_it != new_replicas.end());
+        auto force_replicas = std::vector({*repl_it});
+
+        logger.info("force_move ntp {} to {}", ntp, force_replicas);
+        dispatch_command(
+          cluster::force_partition_reconfiguration_cmd{
+            ntp,
+            cluster::force_partition_reconfiguration_cmd_data(force_replicas)});
+        check_allocated_counts({4, 5, 5, 4});
+        check_final_counts({3, 4, 4, 4});
+
+        logger.info("finish move");
+        dispatch_command(
+          cluster::finish_moving_partition_replicas_cmd{ntp, force_replicas});
+        check_allocated_counts({3, 4, 4, 4});
+        check_final_counts({3, 4, 4, 4});
+    }
+
+    // move in progress + force move + force move + finish
+    {
+        auto [ntp, old_replicas, new_replicas] = get_partition(6);
+
+        logger.info("move ntp {}", ntp);
+        dispatch_command(
+          cluster::move_partition_replicas_cmd{ntp, new_replicas});
+        check_allocated_counts({3, 4, 4, 5});
+        check_final_counts({2, 4, 4, 5});
+
+        auto repl_it = std::find_if(
+          new_replicas.begin(), new_replicas.end(), [](const auto& bs) {
+              return bs.node_id() == 4;
+          });
+
+        BOOST_REQUIRE(repl_it != new_replicas.end());
+        auto force_replicas4 = std::vector({*repl_it});
+
+        logger.info("force_move ntp {} to {}", ntp, force_replicas4);
+        dispatch_command(
+          cluster::force_partition_reconfiguration_cmd{
+            ntp,
+            cluster::force_partition_reconfiguration_cmd_data(
+              force_replicas4)});
+        check_allocated_counts({3, 4, 4, 5});
+        check_final_counts({2, 3, 3, 5});
+
+        // force move back to node 1, simulates a stuck force reconfiguration
+        repl_it = std::find_if(
+          old_replicas.begin(), old_replicas.end(), [](const auto& bs) {
+              return bs.node_id() == 1;
+          });
+
+        BOOST_REQUIRE(repl_it != old_replicas.end());
+        auto force_replicas1 = std::vector({*repl_it});
+
+        logger.info("force_move ntp {} to {}", ntp, force_replicas1);
+        dispatch_command(
+          cluster::force_partition_reconfiguration_cmd{
+            ntp,
+            cluster::force_partition_reconfiguration_cmd_data(
+              force_replicas1)});
+        check_allocated_counts({3, 4, 4, 4});
+        check_final_counts({3, 3, 3, 4});
+
+        logger.info("finish move");
+        dispatch_command(
+          cluster::finish_moving_partition_replicas_cmd{ntp, force_replicas1});
+        check_allocated_counts({3, 3, 3, 4});
+        check_final_counts({3, 3, 3, 4});
     }
 
     // move topic + topic delete
@@ -342,12 +479,13 @@ FIXTURE_TEST(
         }
         dispatch_command(
           cluster::move_topic_replicas_cmd(create_topic_cmd.key, cmd_data));
-        check_allocated_counts({4, 4, 4, 2});
-        check_final_counts({4, 4, 4, 0});
+        check_allocated_counts({7, 7, 7, 4});
+        check_final_counts({7, 7, 7, 0});
 
         logger.info("delete topic");
-        dispatch_command(cluster::delete_topic_cmd(
-          create_topic_cmd.key, create_topic_cmd.key));
+        dispatch_command(
+          cluster::delete_topic_cmd(
+            create_topic_cmd.key, create_topic_cmd.key));
         check_allocated_counts({0, 0, 0, 0});
         check_final_counts({0, 0, 0, 0});
     }

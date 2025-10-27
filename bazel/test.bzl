@@ -6,7 +6,10 @@ changes. For example, redpanda_cc_gtest will automatically configure Seastar for
 running tests, like setting a reasonable number of cores and amount of memory.
 """
 
-load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load(":internal.bzl", "redpanda_copts")
 
 def _has_flags(args, *flags):
@@ -49,10 +52,22 @@ def _parse_bytes(value):
     return int(value) * factor
 
 def _test_options():
+    """
+    Returns common data dependencies and environment variables for Redpanda tests.
+
+    This function provides a centralized place to define common settings for all
+    C++ tests, ensuring consistency and making it easier to manage test
+    configurations.
+
+    Returns:
+        A tuple containing:
+        - A list of common data dependencies needed by tests (e.g., suppression files).
+        - A dictionary of common environment variables for test execution.
+    """
     data = [
         "//:ubsan_suppressions",
         "//:lsan_suppressions",
-        "@llvm_18_toolchain//:llvm-symbolizer",
+        "@current_llvm_toolchain//:llvm-symbolizer",
     ]
     env = {
         "BOOST_TEST_LOG_LEVEL": "test_suite",
@@ -61,9 +76,11 @@ def _test_options():
         "BOOST_TEST_REPORT_LEVEL": "no",
         "BOOST_LOGGER": "HRF,test_suite",
         "ASAN_OPTIONS": "disable_coredump=0:abort_on_error=1",
-        "ASAN_SYMBOLIZER_PATH": "$(rootpath @llvm_18_toolchain//:llvm-symbolizer)",
+        "ASAN_SYMBOLIZER_PATH": "$(rootpath @current_llvm_toolchain//:llvm-symbolizer)",
         "LSAN_OPTIONS": "suppressions=$(rootpath //:lsan_suppressions)",
         "UBSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:report_error_type=1:suppressions=$(rootpath //:ubsan_suppressions)",
+        # see https://redpandadata.atlassian.net/wiki/x/BwDSUw
+        "REDPANDA_RNG_SEEDING_MODE_DEFAULT": "fixed",
     }
     return data, env
 
@@ -82,7 +99,8 @@ def _redpanda_cc_test(
         env = {},
         target_compatible_with = [],
         data = [],
-        local_defines = []):
+        local_defines = [],
+        flaky = False):
     """
     Helper to define a Redpanda C++ test.
 
@@ -102,6 +120,7 @@ def _redpanda_cc_test(
       target_compatible_with: constraints
       data: data file dependencies
       local_defines: list of defines
+      flaky: whether the test is flaky (value passed to bazel attribute of the same name)
     """
     common_args = [
         "--blocked-reactor-notify-ms 2000000",
@@ -129,8 +148,7 @@ def _redpanda_cc_test(
         args = ["--"] + args
 
     test_data, test_env = _test_options()
-
-    native.cc_test(
+    cc_test(
         name = name,
         timeout = timeout,
         srcs = srcs,
@@ -146,6 +164,7 @@ def _redpanda_cc_test(
         target_compatible_with = target_compatible_with,
         data = data + test_data,
         local_defines = local_defines,
+        flaky = flaky,
     )
 
 def _redpanda_cc_fuzz_test(
@@ -170,7 +189,7 @@ def _redpanda_cc_fuzz_test(
       env: environment variables
       data: data file dependencies
     """
-    native.cc_test(
+    cc_test(
         name = name,
         timeout = timeout,
         srcs = srcs,
@@ -206,7 +225,7 @@ def _redpanda_cc_unit_test(cpu, memory, **kwargs):
     # TODO(bazel): What are the right defaults here?
     _redpanda_cc_test(
         memory = memory or "1GiB",
-        cpu = cpu or 4,
+        cpu = cpu or 2,
         extra_args = extra_args,
         **kwargs
     )
@@ -221,8 +240,10 @@ def redpanda_cc_gtest(
         env = {},
         cpu = None,
         memory = None,
+        target_compatible_with = [],
         data = [],
-        tags = []):
+        tags = [],
+        flaky = False):
     _redpanda_cc_unit_test(
         dash_dash_protocol = False,
         name = name,
@@ -234,9 +255,11 @@ def redpanda_cc_gtest(
         deps = deps,
         custom_args = args,
         env = env,
+        target_compatible_with = target_compatible_with,
         data = data,
         local_defines = ["IS_GTEST"],
         tags = tags,
+        flaky = flaky,
     )
 
 def redpanda_cc_btest(
@@ -251,7 +274,12 @@ def redpanda_cc_btest(
         memory = None,
         target_compatible_with = [],
         data = [],
-        tags = []):
+        tags = [],
+        flaky = False):
+    deps.append(
+        "//src/v/test_utils:boost_test_hooks",
+    )
+
     _redpanda_cc_unit_test(
         dash_dash_protocol = True,
         name = name,
@@ -265,7 +293,9 @@ def redpanda_cc_btest(
         env = env,
         target_compatible_with = target_compatible_with,
         data = data,
+        local_defines = ["IS_BTEST"],
         tags = tags,
+        flaky = flaky,
     )
 
 def redpanda_cc_fuzz_test(
@@ -296,7 +326,8 @@ def redpanda_cc_btest_no_seastar(
         cpu = 1,
         memory = "128MiB",
         deps = []):
-    native.cc_test(
+    test_data, test_env = _test_options()
+    cc_test(
         name = name,
         timeout = timeout,
         tags = [
@@ -306,10 +337,14 @@ def redpanda_cc_btest_no_seastar(
         srcs = srcs,
         defines = defines,
         copts = redpanda_copts(),
+        local_defines = ["IS_BTEST"],
         deps = [
             "//src/v/test_utils:boost_result_redirect",
+            "//src/v/test_utils:boost_test_hooks",
             "@boost//:test.so",
         ] + deps,
+        data = test_data,
+        env = test_env,
     )
 
 def redpanda_test_cc_library(
@@ -319,17 +354,17 @@ def redpanda_test_cc_library(
         defines = [],
         local_defines = [],
         visibility = None,
-        include_prefix = None,
         implementation_deps = [],
-        deps = []):
-    native.cc_library(
+        deps = [],
+        alwayslink = False):
+    cc_library(
         name = name,
         srcs = srcs,
         hdrs = hdrs,
         defines = defines,
         local_defines = local_defines,
         visibility = visibility,
-        include_prefix = include_prefix,
+        include_prefix = native.package_name().removeprefix("src/v/"),
         implementation_deps = implementation_deps,
         deps = deps,
         copts = redpanda_copts(),
@@ -337,6 +372,7 @@ def redpanda_test_cc_library(
         features = [
             "layering_check",
         ],
+        alwayslink = alwayslink,
     )
 
 def redpanda_cc_bench(
@@ -353,7 +389,7 @@ def redpanda_cc_bench(
         duration = None,
         data = [],
         tags = [],
-        target_compatible_with = []):
+        redirect_stderr = False):
     """
     Create a seastar benchmark target
 
@@ -366,13 +402,20 @@ def redpanda_cc_bench(
       env: any custom environment variables for the binary
       cpu: the number of cores the benchmark needs
       memory: the amount of RAM needed for the benchmark
-      runs: number of runs
-      duration: duration of a single run in seconds
+      runs: number of runs or None for default (applies to run but not test)
+      duration: duration of a single run in seconds or None for default (applies to run but not test)
       data: any data files available to the benchmark as runfiles
       tags: custom tags for the test
       timeout: the timeout for smoke testing the benchmark
-      target_compatible_with: constraints for the test target
+      redirect_stderr: if True, redirects stdout (seastar logging, mostly) to a file
+                       so that it does not overwhelm the result output
     """
+
+    # We require this naming convention as we do things like extract
+    # the list of all benchmarks using a name-based query.
+    if not name.endswith("_rpbench"):
+        fail("benchmark names must end with _rpbench")
+
     args = [
         "--blocked-reactor-notify-ms 2000000",
         "--abort-on-seastar-bad-alloc",
@@ -395,22 +438,26 @@ def redpanda_cc_bench(
         "resources:memory:{}".format(_parse_bytes(memory) / (1 << 20)),
     ]
 
-    binary_args = []
-    if runs != None:
-        binary_args.append("--runs={}".format(runs))
-    if duration != None:
-        binary_args.append("--duration={}".format(duration))
+    # all benches must include the hooks
+    deps.append(
+        "//src/v/test_utils:rpbench_hooks",
+    )
+
+    env = {
+        # see https://redpandadata.atlassian.net/wiki/x/BwDSUw
+        "REDPANDA_RNG_SEEDING_MODE_DEFAULT": "fixed",
+    } | env
 
     tags = tags + ["bench"]
 
-    native.cc_binary(
-        name = name,
+    binary_name = name + "_binary"
+    cc_binary(
+        name = binary_name,
         srcs = srcs,
         defines = defines,
         deps = deps,
         testonly = True,
         copts = redpanda_copts(),
-        args = args + binary_args,
         features = [
             "layering_check",
         ],
@@ -418,26 +465,41 @@ def redpanda_cc_bench(
         env = env,
         data = data,
     )
-    write_file(
-        name = name + "_test_script",
-        out = name + "_test_wrapper.sh",
-        content = [
-            "#!/bin/bash",
-            "exec $@ --iterations=1 --runs=1 --duration=0 --no-stdout --overprovisioned",
-        ],
+
+    args = ["$(rootpath :{})".format(binary_name)] + args
+    env = env | {
+        "MB_EXEC_IN_SHM": "1",
+        "MB_REDIRECT_STDERR_DEFAULT": "1" if redirect_stderr else "0",
+    }
+
+    binary_args = []
+    if runs != None:
+        binary_args.append("--runs={}".format(runs))
+    if duration != None:
+        binary_args.append("--duration={}".format(duration))
+
+    # to run a benchmark in the right way, we need to wrap it in bench-wrapper.sh,
+    # which can cd to the right location and make other adjustments
+    py_binary(
+        name = name,
+        srcs = ["//bazel:bench_wrapper"],
+        main = "bench_wrapper.py",
+        args = args + binary_args,
+        data = data + [":" + binary_name],
+        env = env,
+        testonly = True,
     )
+
+    # we write a wrapper to test the benchmark, which tries to
+    # run it as quickly as possible in order to smoke test it
     test_data, test_env = _test_options()
-    native.sh_test(
+    py_test(
         name = name + "_test",
         timeout = timeout,
+        main = "bench_wrapper.py",
         tags = resource_tags + tags,
-        srcs = [name + "_test_script"],
+        srcs = ["//bazel:bench_wrapper"],
         env = env | test_env,
-        args = [
-            "$(rootpath :{})".format(name),
-        ] + args,
-        data = [
-            ":" + name,
-        ] + data + test_data,
-        target_compatible_with = target_compatible_with,
+        args = args + ["--iterations=1 --runs=1 --duration=0 --no-stdout --overprovisioned"],
+        data = [":" + binary_name] + data + test_data,
     )

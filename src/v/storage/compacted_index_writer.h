@@ -11,6 +11,7 @@
 
 #pragma once
 #include "bytes/bytes.h"
+#include "compaction/key.h"
 #include "model/fundamental.h"
 #include "model/record_batch_types.h"
 #include "storage/compacted_index.h"
@@ -53,7 +54,7 @@ public:
 
     // accepts a compaction_key which is already prefixed with batch_type
     virtual ss::future<>
-    index(const compaction_key& b, model::offset, int32_t) = 0;
+    index(const compaction::compaction_key& b, model::offset, int32_t) = 0;
 
     virtual ss::future<> index(
       model::record_batch_type,
@@ -73,11 +74,11 @@ public:
 
     virtual ss::future<> append(compacted_index::entry) = 0;
 
-    virtual ss::future<> truncate(model::offset) = 0;
     virtual ss::future<> close() = 0;
     virtual void set_flag(compacted_index::footer_flags) = 0;
     virtual void print(std::ostream&) const = 0;
     const ss::sstring& filename() const { return _name; }
+    virtual size_t size_bytes() const = 0;
 
 private:
     friend std::ostream&
@@ -91,7 +92,6 @@ private:
 
 std::unique_ptr<compacted_index_writer> make_file_backed_compacted_index(
   ss::sstring filename,
-  ss::io_priority_class p,
   bool truncate,
   storage_resources& resources,
   std::optional<ntp_sanitizer_config> sanitizer_config);

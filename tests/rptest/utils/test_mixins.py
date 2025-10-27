@@ -1,8 +1,9 @@
 from logging import Logger
-from typing import Any, Callable, cast
+from typing import Any, cast
+
 from ducktape.cluster.cluster import ClusterNode
 from ducktape.cluster.cluster_spec import ClusterSpec
-from ducktape.tests.test import TestContext, Test
+from ducktape.tests.test import Test, TestContext
 from ducktape.utils.util import wait_until
 
 from rptest.services.redpanda import RedpandaService, RedpandaServiceCloud
@@ -36,10 +37,11 @@ class PreallocNodesMixin:
     def preallocated_nodes(self):
         if not self._preallocated_nodes:
             self._preallocated_nodes = self.test_context.cluster.alloc(
-                ClusterSpec.simple_linux(self.node_prealloc_count))
+                ClusterSpec.simple_linux(self.node_prealloc_count)
+            )
 
             for node in self._preallocated_nodes:
-                self.logger.debug(f'Allocated node {node.name}')
+                self.logger.debug(f"Allocated node {node.name}")
 
         return self._preallocated_nodes
 
@@ -63,9 +65,11 @@ class PreallocNodesMixin:
             # with subsequent tests' use of the node. Clear them down first.
             # For example, those tests that use KgoVerifierProducer.
             for node in self.preallocated_nodes:
-                wait_until(lambda: self.__redpanda.sockets_clear(node),
-                           timeout_sec=120,
-                           backoff_sec=10)
+                wait_until(
+                    lambda: self.__redpanda.sockets_clear(node),
+                    timeout_sec=120,
+                    backoff_sec=10,
+                )
 
                 # Free the hand-allocated nodes
                 self.logger.debug(f"Freeing node {node.name}")
@@ -75,4 +79,4 @@ class PreallocNodesMixin:
 
     @property
     def __redpanda(self) -> RedpandaService | RedpandaServiceCloud:
-        return getattr(self, 'redpanda')
+        return getattr(self, "redpanda")

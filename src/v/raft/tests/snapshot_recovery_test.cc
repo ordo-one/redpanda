@@ -8,9 +8,6 @@
 // by the Apache License, Version 2.0
 
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "model/record.h"
-#include "model/record_batch_reader.h"
 #include "raft/tests/raft_fixture.h"
 #include "raft/tests/raft_fixture_retry_policy.h"
 #include "test_utils/test.h"
@@ -37,8 +34,7 @@ TEST_F_CORO(raft_fixture, test_snapshot_recovery) {
     co_await ss::recursive_touch_directory(n1.work_directory());
     storage::simple_snapshot_manager snapshot_manager(
       std::filesystem::path(n1.work_directory()),
-      storage::simple_snapshot_manager::default_snapshot_filename,
-      ss::default_priority_class());
+      storage::simple_snapshot_manager::default_snapshot_filename);
 
     co_await raft::details::persist_snapshot(snapshot_manager, md, iobuf{});
 

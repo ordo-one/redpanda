@@ -12,6 +12,7 @@
 #include "cluster/data_migrated_resources.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/tests/partition_balancer_planner_fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/stable_iterator_adaptor.h"
 
 #include <seastar/testing/thread_test_case.hh>
@@ -221,7 +222,14 @@ FIXTURE_TEST(
     auto plan_data = planner.plan_actions(hr, as).get();
 
     check_violations(plan_data, unavailable_nodes, {});
+    // No nodes within the max disk usage ratio.
+    BOOST_REQUIRE_EQUAL(plan_data.reassignments.size(), 0);
 
+    // Bump the max disk usage ratio and try again
+    auto new_planner = make_planner(
+      model::partition_autobalancing_mode::continuous, 2, false, 0.95);
+    plan_data = new_planner.plan_actions(hr, as).get();
+    check_violations(plan_data, unavailable_nodes, {});
     BOOST_REQUIRE_EQUAL(plan_data.reassignments.size(), 1);
 
     std::unordered_set<model::node_id> expected_nodes(
@@ -530,7 +538,7 @@ FIXTURE_TEST(
     // Set partition sizes
     for (auto& [tp_ns, partitions] : nr_0.topics) {
         if (tp_ns.tp == "topic-1") {
-            for (auto& partition : partitions) {
+            for (auto& [_, partition] : partitions) {
                 if (partition.id == 1) {
                     partition.size_bytes = default_partition_size - 1_KiB;
                 }
@@ -947,17 +955,19 @@ FIXTURE_TEST(
         for (model::partition_id::type i = 0; i < partitions; ++i) {
             std::vector<model::broker_shard> replicas;
             for (int r = 0; r < replication_factor; ++r) {
-                replicas.push_back(model::broker_shard{
-                  model::node_id{r},
-                  random_generators::get_int<uint32_t>(0, 3)});
+                replicas.push_back(
+                  model::broker_shard{
+                    model::node_id{r},
+                    random_generators::get_int<uint32_t>(0, 3)});
             }
             std::shuffle(
               replicas.begin(),
               replicas.end(),
-              random_generators::internal::gen);
+              random_generators::global().engine());
 
-            assignments.push_back(cluster::partition_assignment{
-              raft::group_id{1}, model::partition_id{i}, replicas});
+            assignments.push_back(
+              cluster::partition_assignment{
+                raft::group_id{1}, model::partition_id{i}, replicas});
         }
         return cluster::create_topic_cmd{
           make_tp_ns(name),

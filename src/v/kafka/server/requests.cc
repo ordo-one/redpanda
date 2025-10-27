@@ -66,10 +66,11 @@ do_process(request_context&& ctx, ss::smp_service_group g) {
         if (
           ctx.header().version < Request::min_supported
           || ctx.header().version > Request::max_supported) {
-            throw kafka_api_version_not_supported_exception(fmt::format(
-              "Unsupported version {} for {} API",
-              ctx.header().version,
-              Request::api::name));
+            throw kafka_api_version_not_supported_exception(
+              fmt::format(
+                "Unsupported version {} for {} API",
+                ctx.header().version,
+                Request::api::name));
         }
     }
 
@@ -80,7 +81,7 @@ process_result_stages process_generic(
   handler handler,
   request_context&& ctx,
   ss::smp_service_group g,
-  const session_resources& sres) {
+  const request_resources& rres) {
     vlog(
       kwire.trace,
       "[{}:{}] processing name:{}, key:{}, version:{} for {}, mem_units: {}, "
@@ -91,7 +92,7 @@ process_result_stages process_generic(
       ctx.header().key,
       ctx.header().version,
       ctx.header().client_id.value_or(std::string_view("unset-client-id")),
-      sres.memlocks.count(),
+      rres.memlocks.count(),
       ctx.reader().bytes_left());
 
     // We do a version check for most API requests, but for api_version
@@ -102,10 +103,11 @@ process_result_stages process_generic(
     if (ctx.header().key != api_versions_api::key &&
       (ctx.header().version < handler->min_supported() ||
        ctx.header().version > handler->max_supported())) {
-        throw kafka_api_version_not_supported_exception(fmt::format(
-          "Unsupported version {} for {} API",
-          ctx.header().version,
-          handler->name()));
+        throw kafka_api_version_not_supported_exception(
+          fmt::format(
+            "Unsupported version {} for {} API",
+            ctx.header().version,
+            handler->name()));
     }
 
     return handler->handle(std::move(ctx), g);
@@ -272,7 +274,7 @@ bool track_latency(api_key key) {
 process_result_stages process_request(
   request_context&& ctx,
   ss::smp_service_group g,
-  const session_resources& sres) {
+  const request_resources& rres) {
     auto key = ctx.header().key;
 
     if (
@@ -328,14 +330,15 @@ process_result_stages process_request(
     }
 
     if (ctx.sasl() && ctx.sasl()->expired()) [[unlikely]] {
-        throw sasl_session_expired_exception(fmt::format(
-          "Session for client '{}' expired after {}",
-          ctx.header().client_id.value_or(""),
-          ctx.sasl()->max_reauth()));
+        throw sasl_session_expired_exception(
+          fmt::format(
+            "Session for client '{}' expired after {}",
+            ctx.header().client_id.value_or(""),
+            ctx.sasl()->max_reauth()));
     }
 
     if (auto handler = handler_for_key(key)) {
-        return process_generic(*handler, std::move(ctx), g, sres);
+        return process_generic(*handler, std::move(ctx), g, rres);
     }
 
     throw std::runtime_error(

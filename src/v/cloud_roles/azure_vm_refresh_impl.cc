@@ -20,6 +20,7 @@ namespace cloud_roles {
 
 azure_vm_refresh_impl::azure_vm_refresh_impl(
   net::unresolved_address address,
+  aws_service_name, // Ignored for Azure VM
   aws_region_name region,
   ss::abort_source& as,
   retry_params retry_params)
@@ -57,12 +58,13 @@ ss::future<api_response> azure_vm_refresh_impl::fetch_credentials() {
     auto req = http::client::request_header{};
     req.method(boost::beast::http::verb::get);
     // TODO fix deps and use boost::url
-    req.target(fmt::format(
-      "/metadata/identity/oauth2/token?"
-      "api-version=2018-02-01"
-      "&resource=https%3A%2F%2Fstorage.azure.com%2F"
-      "&client_id={}",
-      client_id_opt.value()));
+    req.target(
+      fmt::format(
+        "/metadata/identity/oauth2/token?"
+        "api-version=2018-02-01"
+        "&resource=https%3A%2F%2Fstorage.azure.com%2F"
+        "&client_id={}",
+        client_id_opt.value()));
     req.set("Metadata", "true");
 
     co_return co_await make_request(

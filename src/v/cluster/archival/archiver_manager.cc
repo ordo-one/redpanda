@@ -10,14 +10,14 @@
 
 #include "cluster/archival/archiver_manager.h"
 
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cluster/archival/logger.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/archival/upload_housekeeping_service.h"
 #include "cluster/partition_manager.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -409,8 +409,8 @@ public:
             // is true for the `ssx::spawn_with_gate` call. The danger of not
             // running the archiver is that the broker may run out of disk
             // space. Because the data is not uploaded to the cloud storage the
-            // max_collectible_offset can't be propagated forward. Because of
-            // that the local data can't be evicted.
+            // max_removable_local_log_offset can't be propagated forward.
+            // Because of that the local data can't be evicted.
             vlog(
               fsm._ctxlog.error,
               "ALERT! ntp_archiver failed to start {}",
@@ -495,7 +495,7 @@ public:
     using transition_table = boost::mpl::vector<
     //  Source state      | Event                  | Dest state        | Action
     row<st_passive,         ev_leadership_acquired,  st_starting_async,  tr_passive_to_starting >, /* Start archiver when the leadership is acquired */
-    row<st_starting_async,  ev_archiver_started,     st_active,          tr_starting_to_active  >, /* Transition to active when the archiver is started */ 
+    row<st_starting_async,  ev_archiver_started,     st_active,          tr_starting_to_active  >, /* Transition to active when the archiver is started */
     row<st_starting_async,  ev_archiver_failure,     st_passive,         tr_starting_to_passive >, /* Return to the initial state due to failure */
     row<st_starting_async,  ev_leadership_lost,      none,               defer                  >, /* Leadership notification during archiver startup */
     row<st_starting_async,  ev_shutdown,             none,               defer                  >, /* Shutdown notification during archiver startup */
@@ -514,7 +514,7 @@ public:
       ss::lw_shared_ptr<cluster::partition> part,
       ss::lw_shared_ptr<const archival::configuration> config,
       cloud_storage::remote& remote,
-      cloud_storage::cache& cache,
+      cloud_io::cache& cache,
       archival::upload_housekeeping_service& housekeeping)
       : _ntp(std::move(ntp))
       , _self_id(broker_id)
@@ -616,7 +616,7 @@ private:
     ss::lw_shared_ptr<cluster::partition> _part;
     ss::lw_shared_ptr<const archival::configuration> _config;
     cloud_storage::remote& _remote;
-    cloud_storage::cache& _cache;
+    cloud_io::cache& _cache;
     archival::upload_housekeeping_service& _upload_housekeeping;
     ss::abort_source _as;
     retry_chain_node _rtc;
@@ -638,7 +638,7 @@ struct managed_partition : public managed_partition_fsm::state_machine_t {
       ss::lw_shared_ptr<cluster::partition> part,
       ss::lw_shared_ptr<const archival::configuration> config,
       cloud_storage::remote& remote,
-      cloud_storage::cache& cache,
+      cloud_io::cache& cache,
       archival::upload_housekeeping_service& housekeeping)
       : managed_partition_fsm::state_machine_t(
           ntp,
@@ -716,7 +716,7 @@ public:
       ss::sharded<cluster::partition_manager>& pm,
       ss::sharded<raft::group_manager>& gm,
       ss::sharded<cloud_storage::remote>& api,
-      ss::sharded<cloud_storage::cache>& cache,
+      ss::sharded<cloud_io::cache>& cache,
       ss::sharded<archival::upload_housekeeping_service>& upload_housekeeping,
       ss::lw_shared_ptr<const configuration>& config)
       : _self_node_id(node_id)
@@ -750,8 +750,8 @@ public:
 
         _unmanage_notifications = _pm.local().register_unmanage_notification(
           model::kafka_namespace, [this](model::topic_partition_view tpv) {
-              model::ntp ntp(model::kafka_namespace, tpv.topic, tpv.partition);
-              stop_managing_partition(ntp);
+              stop_managing_partition(
+                {model::kafka_namespace, tpv.topic, tpv.partition});
           });
 
         vassert(_gm.local_is_initialized(), "group_manager is not initialized");
@@ -926,8 +926,8 @@ public:
         }
     }
 
-    fragmented_vector<model::ntp> managed_partitions() const {
-        fragmented_vector<model::ntp> results;
+    chunked_vector<model::ntp> managed_partitions() const {
+        chunked_vector<model::ntp> results;
         for (const auto& kv : _managed) {
             results.push_back(kv.first);
         }
@@ -935,8 +935,8 @@ public:
     }
 
     /// Snapshot of managed partitions which are leaders
-    fragmented_vector<model::ntp> leader_partitions() const {
-        fragmented_vector<model::ntp> results;
+    chunked_vector<model::ntp> leader_partitions() const {
+        chunked_vector<model::ntp> results;
         for (const auto& kv : _managed) {
             if (kv.second->is_active()) {
                 results.push_back(kv.first);
@@ -949,7 +949,7 @@ public:
     ss::sharded<cluster::partition_manager>& _pm;
     ss::sharded<raft::group_manager>& _gm;
     ss::sharded<cloud_storage::remote>& _remote;
-    ss::sharded<cloud_storage::cache>& _cache;
+    ss::sharded<cloud_io::cache>& _cache;
     ss::sharded<archival::upload_housekeeping_service>& _upload_housekeeping;
     ss::lw_shared_ptr<const configuration> _config;
     std::map<model::ntp, ss::shared_ptr<managed_partition>> _managed;
@@ -968,11 +968,12 @@ archiver_manager::archiver_manager(
   ss::sharded<cluster::partition_manager>& pm,
   ss::sharded<raft::group_manager>& gm,
   ss::sharded<cloud_storage::remote>& api,
-  ss::sharded<cloud_storage::cache>& cache,
+  ss::sharded<cloud_io::cache>& cache,
   ss::sharded<archival::upload_housekeeping_service>& upload_housekeeping,
   ss::lw_shared_ptr<const configuration> config)
-  : _impl(std::make_unique<impl>(
-      node_id, pm, gm, api, cache, upload_housekeeping, config)) {}
+  : _impl(
+      std::make_unique<impl>(
+        node_id, pm, gm, api, cache, upload_housekeeping, config)) {}
 
 archiver_manager::~archiver_manager() {}
 
@@ -980,12 +981,12 @@ ss::future<> archiver_manager::start() { co_await _impl->start(); }
 
 ss::future<> archiver_manager::stop() { co_await _impl->stop(); }
 
-fragmented_vector<model::ntp> archiver_manager::managed_partitions() const {
+chunked_vector<model::ntp> archiver_manager::managed_partitions() const {
     return _impl->managed_partitions();
 }
 
 /// Snapshot of managed partitions which are leaders
-fragmented_vector<model::ntp> archiver_manager::leader_partitions() const {
+chunked_vector<model::ntp> archiver_manager::leader_partitions() const {
     return _impl->leader_partitions();
 }
 

@@ -12,7 +12,7 @@
 #include "base/vlog.h"
 #include "cluster/topic_table.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/catalog_schema_manager.h"
 #include "datalake/coordinator/state_update.h"
 #include "datalake/logger.h"
@@ -391,10 +391,15 @@ coordinator::do_ensure_table_exists(
     // TODO: verify stm state after replication
 
     auto table_id = schema_provider.get_table_id(topic);
-
     auto record_type = co_await schema_provider.get_record_type(
       std::move(comps));
     if (!record_type.has_value()) {
+        vlog(
+          datalake_log.warn,
+          "{} failed, couldn't resolve record type for {} rev {}",
+          method_name,
+          topic,
+          topic_revision);
         co_return errc::failed;
     }
 
@@ -442,9 +447,8 @@ struct coordinator::main_table_schema_provider
 
     ss::sstring
     get_partition_spec(const cluster::topic_metadata& topic_md) const final {
-        return topic_md.get_configuration()
-          .properties.iceberg_partition_spec.value_or(
-            parent.default_partition_spec_());
+        return parent.get_effective_default_partition_spec(
+          topic_md.get_configuration().properties.iceberg_partition_spec);
     }
 
     const coordinator& parent;
@@ -496,7 +500,7 @@ struct coordinator::dlq_table_schema_provider
     }
 
     ss::sstring get_partition_spec(const cluster::topic_metadata&) const final {
-        return parent.default_partition_spec_();
+        return parent.get_effective_default_partition_spec(std::nullopt);
     }
 
     const coordinator& parent;
@@ -543,11 +547,13 @@ coordinator::sync_add_files(
     }
     vlog(
       datalake_log.debug,
-      "Sync add files requested {} (topic rev: {}): [{}, {}], {} files",
+      "Sync add files requested {} (topic rev: {}): [{}, {}], kafka_bytes: {} "
+      "files: {}",
       tp,
       topic_revision,
       entries.begin()->start_offset,
       entries.back().last_offset,
+      entries.back().kafka_bytes_processed,
       entries.size());
     auto sync_res = co_await stm_->sync(10s);
     if (sync_res.has_error()) {
@@ -741,12 +747,17 @@ coordinator::update_lifecycle_state(
           model::topic_namespace_view{model::kafka_namespace, t});
         if (tombstone_it != topic_table_.get_iceberg_tombstones().end()) {
             auto tombstone_rev = tombstone_it->second.last_deleted_revision;
+            // The Glue REST catalog doesn't support purging data; explicitly
+            // pass that down to the drop operations.
+            auto should_purge = using_glue_catalog()
+                                  ? file_committer::purge_data::no
+                                  : file_committer::purge_data::yes;
             if (tombstone_rev >= topic.revision) {
                 // Drop the main table if it exists.
                 {
                     auto table_id = table_id_provider::table_id(t);
                     auto drop_res = co_await file_committer_.drop_table(
-                      table_id);
+                      table_id, should_purge);
                     if (drop_res.has_error()) {
                         switch (drop_res.error()) {
                         case file_committer::errc::shutting_down:
@@ -765,7 +776,7 @@ coordinator::update_lifecycle_state(
                 {
                     auto dlq_table_id = table_id_provider::dlq_table_id(t);
                     auto drop_res = co_await file_committer_.drop_table(
-                      dlq_table_id);
+                      dlq_table_id, should_purge);
                     if (drop_res.has_error()) {
                         switch (drop_res.error()) {
                         case file_committer::errc::shutting_down:
@@ -825,6 +836,83 @@ coordinator::update_lifecycle_state(
     }
 
     co_return ss::stop_iteration::no;
+}
+
+ss::future<checked<datalake_usage_stats, coordinator::errc>>
+coordinator::sync_get_usage_stats() {
+    auto gate = maybe_gate();
+    if (gate.has_error()) {
+        co_return gate.error();
+    }
+    auto sync_res = co_await stm_->sync(10s);
+    if (sync_res.has_error()) {
+        co_return convert_stm_errc(sync_res.error());
+    }
+
+    datalake_usage_stats result;
+    for (const auto& [topic, state] : stm_->state().topic_to_state) {
+        result.topic_usages.emplace_back(
+          topic, state.revision, state.total_kafka_bytes_processed);
+    }
+    co_return result;
+}
+
+ss::future<
+  checked<chunked_hash_map<model::topic, topic_state>, coordinator::errc>>
+coordinator::sync_get_topic_state(chunked_vector<model::topic> topics_filter) {
+    auto gate = maybe_gate();
+    if (gate.has_error()) {
+        co_return gate.error();
+    }
+    auto sync_res = co_await stm_->sync(10s);
+    if (sync_res.has_error()) {
+        co_return convert_stm_errc(sync_res.error());
+    }
+
+    chunked_hash_map<model::topic, topic_state> result;
+    if (topics_filter.empty()) {
+        for (const auto& [t, state] : stm_->state().topic_to_state) {
+            result.emplace(t, state.copy());
+        }
+        co_return result;
+    }
+    for (const auto& topic : topics_filter) {
+        auto topic_it = stm_->state().topic_to_state.find(topic);
+        if (topic_it != stm_->state().topic_to_state.end()) {
+            result.insert({topic, topic_it->second.copy()});
+        }
+    }
+    co_return result;
+}
+
+ss::sstring coordinator::get_effective_default_partition_spec(
+  const std::optional<ss::sstring>& partition_spec) const {
+    const auto& cfg = config::shard_local_cfg();
+    auto current_spec = partition_spec.value_or(default_partition_spec_());
+    if (
+      using_glue_catalog()
+      && current_spec == cfg.iceberg_default_partition_spec.default_value()) {
+        // Glue can't partition on nested fields like redpanda.timestamp.
+        static constexpr auto rate_limit = std::chrono::seconds(5);
+        static thread_local ss::logger::rate_limit rate(rate_limit);
+        vloglr(
+          datalake_log,
+          ss::log_level::warn,
+          rate,
+          "Overriding default partition spec to '()' for AWS Glue "
+          "compatibility");
+        return "()";
+    }
+
+    return current_spec;
+}
+
+bool coordinator::using_glue_catalog() const {
+    const auto& cfg = config::shard_local_cfg();
+    return cfg.iceberg_catalog_type() == config::datalake_catalog_type::rest
+           && cfg.iceberg_rest_catalog_authentication_mode()
+                == config::datalake_catalog_auth_mode::aws_sigv4
+           && cfg.iceberg_rest_catalog_aws_service_name() == "glue";
 }
 
 } // namespace datalake::coordinator

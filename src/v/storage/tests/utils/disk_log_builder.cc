@@ -9,6 +9,7 @@
 
 #include "storage/tests/utils/disk_log_builder.h"
 
+#include "compaction/types.h"
 #include "model/record_batch_types.h"
 #include "storage/disk_log_appender.h"
 #include "storage/types.h"
@@ -49,9 +50,10 @@ ss::future<> disk_log_builder::add_random_batch(
   log_append_config config,
   should_flush_after flush,
   std::optional<model::timestamp> base_ts) {
-    auto buff = ss::circular_buffer<model::record_batch>();
-    buff.push_back(model::test::make_random_batch(
-      offset, num_records, bool(comp), bt, std::nullopt, now(base_ts)));
+    auto buff = chunked_circular_buffer<model::record_batch>();
+    buff.push_back(
+      model::test::make_random_batch(
+        offset, num_records, bool(comp), bt, std::nullopt, now(base_ts)));
     advance_time(buff.back());
     return write(std::move(buff), config, flush);
 }
@@ -60,7 +62,7 @@ ss::future<> disk_log_builder::add_random_batch(
   model::test::record_batch_spec spec,
   log_append_config config,
   should_flush_after flush) {
-    auto buff = ss::circular_buffer<model::record_batch>();
+    auto buff = chunked_circular_buffer<model::record_batch>();
     buff.push_back(model::test::make_random_batch(spec));
     advance_time(buff.back());
     return write(std::move(buff), config, flush);
@@ -89,7 +91,7 @@ ss::future<> disk_log_builder::add_batch(
   model::record_batch batch,
   log_append_config config,
   should_flush_after flush) {
-    auto buf = ss::circular_buffer<model::record_batch>();
+    auto buf = chunked_circular_buffer<model::record_batch>();
     advance_time(batch);
     buf.push_back(std::move(batch));
     return write(std::move(buf), config, flush);
@@ -113,8 +115,7 @@ ss::future<> disk_log_builder::start(storage::ntp_config cfg) {
 }
 
 ss::future<> disk_log_builder::truncate(model::offset o) {
-    return get_log()->truncate(
-      storage::truncate_config(o, ss::default_priority_class()));
+    return get_log()->truncate(storage::truncate_config(o));
 }
 
 ss::future<> disk_log_builder::gc(
@@ -129,15 +130,17 @@ ss::future<> disk_log_builder::gc(
         collection_upper_bound,
         max_partition_retention_size,
         model::offset::max(),
+        model::offset::max(),
         tombstone_retention_ms,
-        ss::default_priority_class(),
+        std::nullopt,
+        std::chrono::milliseconds{0},
         _abort_source))
       .get();
 
     if (eviction_future.available()) {
         auto evict_until = eviction_future.get();
-        return get_log()->truncate_prefix(storage::truncate_prefix_config{
-          model::next_offset(evict_until), ss::default_priority_class()});
+        return get_log()->truncate_prefix(
+          storage::truncate_prefix_config{model::next_offset(evict_until)});
     } else {
         as.request_abort();
         eviction_future.ignore_ready_future();
@@ -159,12 +162,15 @@ disk_log_builder::apply_retention(gc_config cfg) {
 }
 
 ss::future<> disk_log_builder::apply_adjacent_merge_compaction(
-  compaction_config cfg, std::optional<model::offset> new_start_offset) {
-    return get_disk_log_impl().adjacent_merge_compact(cfg, new_start_offset);
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().adjacent_merge_compact(
+      get_disk_log_impl().segments().copy(), cfg, new_start_offset);
 }
 
 ss::future<bool> disk_log_builder::apply_sliding_window_compaction(
-  compaction_config cfg, std::optional<model::offset> new_start_offset) {
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
     return get_disk_log_impl().sliding_window_compact(cfg, new_start_offset);
 }
 
@@ -212,9 +218,9 @@ segment_index& disk_log_builder::get_seg_index_ptr(size_t index) {
 }
 
 // Create segments
-ss::future<> disk_log_builder::add_segment(
-  model::offset offset, model::term_id term, ss::io_priority_class pc) {
-    return get_disk_log_impl().new_segment(offset, term, pc);
+ss::future<>
+disk_log_builder::add_segment(model::offset offset, model::term_id term) {
+    return get_disk_log_impl().new_segment(offset, term);
 }
 
 // Configuration getters
@@ -224,7 +230,7 @@ const log_config& disk_log_builder::get_log_config() const {
 
 // Common interface for appending batches
 ss::future<> disk_log_builder::write(
-  ss::circular_buffer<model::record_batch> buff,
+  chunked_circular_buffer<model::record_batch> buff,
   const log_append_config& config,
   should_flush_after flush) {
     if (buff.empty()) {
@@ -245,6 +251,24 @@ ss::future<> disk_log_builder::write(
           }
           return ss::now();
       });
+}
+
+void populate_log(storage::disk_log_builder& b, const log_spec& spec) {
+    auto first = spec.segment_starts.begin();
+    auto second = std::next(first);
+    for (; second != spec.segment_starts.end(); ++first, ++second) {
+        auto num_records = *second - *first;
+        b | storage::add_segment(*first)
+          | storage::add_random_batch(*first, num_records);
+    }
+    b | storage::add_segment(*first)
+      | storage::add_random_batch(*first, spec.last_segment_num_records);
+
+    for (auto i : spec.compacted_segment_indices) {
+        b.get_segment(i).index().maybe_set_self_compact_timestamp(
+          model::timestamp::now());
+        b.get_segment(i).mark_as_finished_windowed_compaction();
+    }
 }
 
 } // namespace storage

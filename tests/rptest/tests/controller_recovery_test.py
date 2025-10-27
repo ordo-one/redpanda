@@ -7,9 +7,9 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.cluster import cluster
 from ducktape.utils.util import wait_until
 
+from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
 
 
@@ -17,21 +17,25 @@ class ControllerRecoveryTest(RedpandaTest):
     """
     Test controller failover.
     """
+
     def _failover(self):
         """
         stop controller node and wait for failover
         """
         prev = self.redpanda.controller()
+        assert prev, "no controller?"
         self.redpanda.stop_node(prev)
 
         def new_controller_elected():
             curr = self.redpanda.controller()
             return curr and curr != prev
 
-        wait_until(new_controller_elected,
-                   timeout_sec=20,
-                   backoff_sec=1,
-                   err_msg="Controller did not failover")
+        wait_until(
+            new_controller_elected,
+            timeout_sec=20,
+            backoff_sec=1,
+            err_msg="Controller did not failover",
+        )
 
         return prev
 
@@ -42,7 +46,7 @@ class ControllerRecoveryTest(RedpandaTest):
             lambda: self.redpanda.healthy(),
             timeout_sec=20,
             backoff_sec=2,
-            err_msg=f"Cluster did not become healthy after {controller} restart"
+            err_msg=f"Cluster did not become healthy after {controller} restart",
         )
 
     @cluster(num_nodes=3)

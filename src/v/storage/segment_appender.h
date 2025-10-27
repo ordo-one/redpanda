@@ -13,7 +13,7 @@
 
 #include "base/seastarx.h"
 #include "bytes/bytes.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/record.h"
 #include "ssx/semaphore.h"
 #include "storage/config.h"
@@ -58,16 +58,11 @@ public:
 
     struct options {
         options(
-          ss::io_priority_class p,
-          size_t chunks_no,
-          std::optional<uint64_t> s,
-          storage_resources& r)
-          : priority(p)
-          , number_of_chunks(chunks_no)
+          size_t chunks_no, std::optional<uint64_t> s, storage_resources& r)
+          : number_of_chunks(chunks_no)
           , segment_size(s)
           , resources(r) {}
 
-        ss::io_priority_class priority;
         size_t number_of_chunks;
         // Generally a segment appender doesn't need to know the target size
         // of the segment it's appending to, but this is used as an input
@@ -88,6 +83,10 @@ public:
     uint64_t file_byte_offset() const {
         return _committed_offset + _bytes_flush_pending;
     }
+
+    // The size of the underlying file on disk, which is the
+    // _fallocation_offset.
+    size_t size_bytes() const { return _fallocation_offset; }
 
     /**
      * @brief Appends a batch.
@@ -130,10 +129,6 @@ public:
     };
 
     void set_callbacks(callbacks* callbacks) { _callbacks = callbacks; }
-
-    constexpr ss::io_priority_class get_priority_class() const {
-        return _opts.priority;
-    }
 
 private:
     using chunk_ptr = ss::lw_shared_ptr<chunk>;
@@ -190,11 +185,7 @@ private:
         }
     };
 
-    // There is one segment_appender per partition replica so we don't want to
-    // allocate too many elements by default and hence limit.
-    // Limit to 16 elements which is about 640 bytes per chunk.
-    using flush_ops_container
-      = fragmented_vector<flush_op, sizeof(flush_op) * 16>;
+    using flush_ops_container = chunked_vector<flush_op>;
     flush_ops_container _flush_ops;
     size_t _flushed_offset{0};
     size_t _stable_offset{0};

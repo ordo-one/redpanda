@@ -9,14 +9,15 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
+#include "kafka/protocol/types.h"
 #include "model/fundamental.h"
-#include "model/ktp.h"
+#include "model/kitp.h"
 #include "model/timeout_clock.h"
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/iterator/iterator_adaptor.hpp>
 #include <boost/iterator/transform_iterator.hpp>
 #include <boost/iterator_adaptors.hpp>
@@ -24,7 +25,7 @@
 namespace kafka {
 
 struct fetch_session_partition {
-    model::ktp_with_hash topic_partition;
+    model::kitp_with_hash topic_partition;
     int32_t max_bytes;
     model::offset start_offset;
     model::offset fetch_offset;
@@ -33,9 +34,12 @@ struct fetch_session_partition {
     kafka::leader_epoch current_leader_epoch = invalid_leader_epoch;
 
     fetch_session_partition(
-      const model::topic& tp, const fetch_request::partition& p)
-      : topic_partition(tp, p.partition_index)
-      , max_bytes(p.max_bytes)
+      const model::topic_id id,
+      const model::topic& tp,
+      const fetch_request::partition& p)
+      : topic_partition(id, tp, p.partition)
+      , max_bytes(p.partition_max_bytes)
+      , start_offset(p.log_start_offset)
       , fetch_offset(p.fetch_offset)
       , high_watermark(model::offset(-1))
       , last_stable_offset(model::offset(-1))
@@ -46,7 +50,7 @@ struct fetch_session_partition {
  * list to allow interation with preserved insertion order. We require such
  * semantics as partitions order in fetch request/response have to be the same.
  *
- * Internally the map is based on absl::flat_hash_map containing entries that
+ * Internally the map is based on chunked_hash_map containing entries that
  * are additionally linked by being elements of an intrusive list. The intrusive
  * list provides the insertion order traversal across the partitions.
  */
@@ -60,51 +64,8 @@ private:
         intrusive_list_hook _hook;
     };
 
-    struct topic_partition_hash {
-        using is_transparent = void;
-
-        size_t operator()(model::topic_partition_view v) const {
-            return absl::Hash<model::topic_partition_view>{}(v);
-        }
-
-        size_t operator()(const model::topic_partition& v) const {
-            return absl::Hash<model::topic_partition>{}(v);
-        }
-    };
-
-    struct topic_partition_eq {
-        using is_transparent = void;
-
-        bool operator()(
-          const model::topic_partition& lhs,
-          const model::topic_partition& rhs) const {
-            return lhs.topic == rhs.topic && lhs.partition == rhs.partition;
-        }
-
-        bool operator()(
-          const model::topic_partition_view& lhs,
-          const model::topic_partition_view& rhs) const {
-            return lhs.topic == rhs.topic && lhs.partition == rhs.partition;
-        }
-
-        bool operator()(
-          const model::topic_partition& lhs,
-          const model::topic_partition_view& rhs) const {
-            return model::topic_view(lhs.topic) == rhs.topic
-                   && lhs.partition == rhs.partition;
-        }
-        bool operator()(
-          const model::topic_partition_view& lhs,
-          const model::topic_partition& rhs) const {
-            return operator()(rhs, lhs);
-        }
-    };
-
-    using underlying_t = absl::flat_hash_map<
-      model::topic_partition_view,
-      std::unique_ptr<entry>,
-      topic_partition_hash,
-      topic_partition_eq>;
+    using underlying_t
+      = chunked_hash_map<model::kitp_view, std::unique_ptr<entry>>;
 
     using io_list_t = intrusive_list<entry, &entry::_hook>;
 
@@ -129,7 +90,7 @@ public:
     void emplace(kafka::fetch_session_partition v) {
         auto e = std::make_unique<entry>(std::move(v));
         auto [it, success] = partitions.emplace(
-          e->partition.topic_partition.as_tp_view(), std::move(e));
+          e->partition.topic_partition.as_kitp_view(), std::move(e));
         vassert(
           success,
           "Can not insert {} to partitions map as it is already present.",
@@ -137,17 +98,13 @@ public:
         insertion_order.push_back(*it->second);
     }
 
-    bool contains(model::topic_partition_view v) {
-        return partitions.contains(v);
-    }
+    bool contains(model::kitp_view v) { return partitions.contains(v); }
 
-    void erase(model::topic_partition_view v) { partitions.erase(v); }
+    void erase(model::kitp_view v) { partitions.erase(v); }
 
-    iterator find(model::topic_partition_view v) { return partitions.find(v); }
+    iterator find(model::kitp_view v) { return partitions.find(v); }
 
-    const_iterator find(model::topic_partition_view v) const {
-        return partitions.find(v);
-    }
+    const_iterator find(model::kitp_view v) const { return partitions.find(v); }
 
     bool empty() const { return partitions.empty(); }
 
@@ -162,9 +119,7 @@ public:
     }
 
     size_t mem_usage() {
-        using debug = absl::container_internal::hashtable_debug_internal::
-          HashtableDebugAccess<underlying_t>;
-        return debug::AllocatedByteSize(partitions)
+        return memory_usage_lower_bound(partitions)
                + partitions.size() * sizeof(fetch_session_partition);
     }
 

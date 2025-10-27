@@ -12,11 +12,14 @@
 #include "kafka/client/partitioners.h"
 
 #include "hashing/murmur.h"
+#include "kafka/client/exceptions.h"
+#include "kafka/client/utils.h"
+#include "kafka/protocol/errors.h"
+#include "kafka/protocol/metadata.h"
+#include "random/generators.h"
 
-#include <functional>
 #include <optional>
 #include <tuple>
-#include <type_traits>
 
 namespace kafka::client {
 
@@ -106,6 +109,55 @@ partitioner default_partitioner(model::partition_id initial) {
       detail::identity_partitioner{},
       detail::murmur2_key_partitioner{},
       detail::roundrobin_partitioner{initial})};
+}
+
+void partitioners_cache::apply_metadata(const metadata_update& data) {
+    if (!data.topics.has_value()) {
+        // No topics in metadata update, nothing to do
+        return;
+    }
+    chunked_hash_set<model::topic> metadata_topics;
+    for (const auto& t : *data.topics) {
+        static_assert(
+          api_version_for(metadata_request::api_type::key) < api_version(12),
+          "topic::name is nullable in v12+");
+        const auto& t_name = *t.name;
+        metadata_topics.emplace(t_name);
+        auto it = _partitioners.find(t_name);
+        if (
+          it != _partitioners.end()
+          && it->second.partition_count == t.partitions.size()) {
+            // If the topic already exists with the same partition count,
+            // we can skip it.
+            continue;
+        }
+
+        const auto initial_partition_id = model::partition_id{
+          random_generators::get_int<model::partition_id::type>(
+            t.partitions.size())};
+
+        _partitioners[t_name] = entry{
+          .partition_count = t.partitions.size(),
+          .partitioner = default_partitioner(initial_partition_id)};
+    }
+    // remove partitioners for topics that are no longer in the metadata
+    // response
+    std::erase_if(_partitioners, [&metadata_topics](const auto& entry) {
+        return !metadata_topics.contains(entry.first);
+    });
+}
+
+model::partition_id partitioners_cache::partition_for(
+  model::topic_view tv, const record_essence& rec) {
+    if (auto topic_it = _partitioners.find(tv);
+        topic_it != _partitioners.end()) {
+        auto& entry = topic_it->second;
+        auto partition_opt = entry.partitioner(rec, entry.partition_count);
+        if (partition_opt) {
+            return *partition_opt;
+        }
+    }
+    throw topic_error(tv, error_code::unknown_topic_or_partition);
 }
 
 } // namespace kafka::client

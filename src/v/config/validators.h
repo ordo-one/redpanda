@@ -31,6 +31,9 @@ validate_connection_rate(const std::vector<ss::sstring>& ips_with_limit);
 std::optional<ss::sstring>
 validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms);
 
+std::optional<ss::sstring> validate_sasl_mechanisms_overrides(
+  const std::vector<config::sasl_mechanisms_override>& overrides);
+
 std::optional<ss::sstring>
 validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms);
 
@@ -60,10 +63,19 @@ std::optional<ss::sstring> validate_tombstone_retention_ms(
 std::optional<ss::sstring>
 validate_iceberg_partition_spec(const ss::sstring& spec);
 
+std::optional<ss::sstring> validate_iceberg_topic_name_dot_replacement(
+  const std::optional<ss::sstring>& value);
+
 std::optional<ss::sstring>
 validate_iceberg_rest_catalog_auth_mode(const configuration& config);
 
 std::optional<ss::sstring>
+validate_iceberg_rest_catalog_config(const configuration& config);
+
+std::optional<ss::sstring>
 validate_consumer_group_metrics(const std::vector<ss::sstring>& metrics);
+
+std::optional<ss::sstring>
+validate_cloud_storage_cluster_name(const std::optional<ss::sstring>&);
 
 }; // namespace config

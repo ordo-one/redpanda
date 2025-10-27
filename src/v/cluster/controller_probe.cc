@@ -11,6 +11,7 @@
 
 #include "cluster/controller_probe.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/cloud_metadata/uploader.h"
 #include "cluster/controller.h"
 #include "cluster/members_table.h"
@@ -22,8 +23,7 @@
 
 #include <seastar/core/metrics.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/container/flat_hash_set.h>
+#include <algorithm>
 
 namespace cluster {
 
@@ -114,10 +114,11 @@ void controller_probe::setup_metrics() {
               const auto& nodes = members_table.nodes();
               auto fips_mode_val = model::from_config(
                 config::node().fips_mode());
-              return absl::c_count_if(nodes, [fips_mode_val](const auto& iter) {
-                  return iter.second.broker.properties().in_fips_mode
-                         != fips_mode_val;
-              });
+              return std::ranges::count_if(
+                nodes, [fips_mode_val](const auto& iter) {
+                    return iter.second.broker.properties().in_fips_mode
+                           != fips_mode_val;
+                });
           },
           sm::description(
             "Number of nodes that have a non-homogenous FIPS mode value"))
@@ -153,8 +154,9 @@ void controller_probe::setup_metrics() {
                     now_ts - manifest.upload_time_since_epoch);
                   return int64_t{age_s.count()};
               },
-              sm::description("Age in seconds of the latest "
-                              "cluster_metadata_manifest uploaded"))
+              sm::description(
+                "Age in seconds of the latest "
+                "cluster_metadata_manifest uploaded"))
               .aggregate({sm::shard_label}),
           });
     }

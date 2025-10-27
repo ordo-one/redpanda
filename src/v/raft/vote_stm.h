@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "base/outcome.h"
 #include "model/fundamental.h"
 #include "raft/fwd.h"
@@ -21,8 +22,6 @@
 
 #include <seastar/core/gate.hh>
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/flat_hash_map.h>
 
 namespace raft {
 using is_prevote = ss::bool_class<struct is_prevote_tag>;
@@ -146,6 +145,9 @@ private:
     absl::flat_hash_map<vnode, vmeta> _replies;
     ctx_log _ctxlog;
     clock_type::time_point _requests_dispatched_ts;
+    // flag to indicate if the priority was set to blocked when the vote_stm
+    // started
+    bool _blocked_when_started = false;
 };
 
 } // namespace raft

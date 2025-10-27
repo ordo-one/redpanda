@@ -13,12 +13,15 @@ from enum import Enum
 
 
 class QueryEngineType(str, Enum):
-    SPARK = 'spark'
-    TRINO = 'trino'
+    SPARK = "spark"
+    TRINO = "trino"
+    DATABRICKS_SQL = "databricks_sql"
+    DUCKDB_PY = "duckdb_py"
 
 
 class QueryEngineBase(ABC):
     """Captures all the common operations across registered query engines"""
+
     @staticmethod
     @abstractmethod
     def engine_name() -> QueryEngineType:
@@ -26,10 +29,18 @@ class QueryEngineBase(ABC):
 
     @abstractmethod
     def make_client(self):
+        """
+        A PEP 249 compliant client connection object.
+        See https://peps.python.org/pep-0249/#connection-objects
+        """
         raise NotImplementedError
 
     @contextmanager
     def run_query(self, query):
+        """
+        A PEP 249 compliant cursor object.
+        See https://peps.python.org/pep-0249/#cursor-objects
+        """
         client = self.make_client()
         assert client
         self.logger.debug(f"running query: {query}")
@@ -68,9 +79,7 @@ class QueryEngineBase(ABC):
             return cursor.fetchone()[0]
 
     @abstractmethod
-    def count_parquet_files(self, namespace, table) -> int:
-        ...
+    def count_parquet_files(self, namespace, table) -> int: ...
 
     @abstractmethod
-    def optimize_parquet_files(self, namespace, table) -> None:
-        ...
+    def optimize_parquet_files(self, namespace, table) -> None: ...

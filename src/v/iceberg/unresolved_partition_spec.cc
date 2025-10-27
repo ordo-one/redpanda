@@ -13,6 +13,7 @@
 #include "iceberg/transform.h"
 
 #include <fmt/format.h>
+#include <fmt/ostream.h>
 
 #include <type_traits>
 
@@ -44,9 +45,10 @@ bool unresolved_partition_spec::is_valid_for_default_spec() const {
 
 namespace {
 template<typename Transform>
-static constexpr auto transform_suffix = fixed_string{"_"} + Transform::key;
+constexpr auto transform_suffix = fixed_string{"_"} + Transform::key;
+
 template<>
-static constexpr auto transform_suffix<identity_transform> = fixed_string{""};
+constexpr auto transform_suffix<identity_transform> = fixed_string{""};
 } // namespace
 
 void unresolved_partition_spec::field::autogenerate_name() {

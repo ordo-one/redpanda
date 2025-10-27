@@ -9,6 +9,7 @@
 #pragma once
 #include "storage/log.h"
 #include "storage/offset_translator_state.h"
+#include "storage/types.h"
 
 namespace raft {
 
@@ -33,8 +34,9 @@ public:
     failure_injectable_log& operator=(const failure_injectable_log&) = delete;
     ~failure_injectable_log() noexcept final = default;
 
-    ss::future<>
-    start(std::optional<storage::truncate_prefix_config> cfg) final;
+    ss::future<> start(
+      std::optional<storage::truncate_prefix_config> cfg,
+      ss::abort_source& as) final;
     ss::future<> housekeeping(storage::housekeeping_config cfg) final;
 
     ss::future<> truncate(storage::truncate_config) final;
@@ -44,7 +46,7 @@ public:
     ss::future<> apply_segment_ms() final;
 
     ss::future<model::record_batch_reader>
-      make_reader(storage::log_reader_config) final;
+      make_reader(storage::local_log_reader_config) final;
 
     storage::log_appender make_appender(storage::log_append_config) final;
 
@@ -99,20 +101,24 @@ public:
     offset_range_size(
       model::offset first,
       model::offset last,
-      ss::io_priority_class io_priority) final;
+      ss::semaphore::time_point timeout) final;
 
     ss::future<std::optional<offset_range_size_result_t>> offset_range_size(
-      model::offset first,
-      offset_range_size_requirements_t target,
-      ss::io_priority_class io_priority) final;
+      model::offset first, offset_range_size_requirements_t target) final;
 
     bool is_compacted(model::offset first, model::offset last) const final;
+
+    bool eligible_for_compacted_reupload(
+      model::offset first, model::offset last) const final;
+
+    std::optional<model::offset> max_eligible_for_compacted_reupload_offset(
+      model::offset first = model::offset{0}) const final;
 
     void set_overrides(storage::ntp_config::default_overrides) final;
 
     bool notify_compaction_update() final;
 
-    int64_t compaction_backlog() const final;
+    int64_t compaction_backlog() final;
 
     ss::future<storage::usage_report> disk_usage(storage::gc_config) final;
 
@@ -124,7 +130,7 @@ public:
     const storage::segment_set& segments() const final;
     storage::segment_set& segments() final;
 
-    ss::future<> force_roll(ss::io_priority_class) final;
+    ss::future<> force_roll() final;
 
     storage::probe& get_probe() final;
 
@@ -136,7 +142,14 @@ public:
     ssize_t dirty_segment_bytes() const final;
     ssize_t closed_segment_bytes() const final;
 
-    double dirty_ratio() final;
+    double dirty_ratio() const final;
+
+    virtual std::optional<model::timestamp>
+    earliest_dirty_segment_ts() const final;
+
+    virtual model::offset cleanly_compacted_prefix_offset() const final;
+
+    bool needs_compaction() const final;
 
 private:
     ss::shared_ptr<storage::log> _underlying_log;

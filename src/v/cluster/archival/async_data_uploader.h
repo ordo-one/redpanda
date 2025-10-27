@@ -95,8 +95,11 @@ struct upload_reconciliation_result {
     size_t size_bytes;
     /// True if at least one segment is compacted
     bool is_compacted;
+    bool eligible_for_compacted_reupload;
     /// Offset range of the segment
     inclusive_offset_range offsets;
+    model::timestamp base_timestamp;
+    model::timestamp max_timestamp;
 };
 
 /// Individual segment upload
@@ -138,7 +141,11 @@ public:
         upload_reconciliation_result p{
           .size_bytes = _params.value().size_bytes,
           .is_compacted = _params.value().is_compacted,
+          .eligible_for_compacted_reupload
+          = _params.value().eligible_for_compacted_reupload,
           .offsets = _params.value().offsets,
+          .base_timestamp = _params.value().base_timestamp,
+          .max_timestamp = _params.value().max_timestamp,
         };
         return p;
     }
@@ -155,7 +162,7 @@ public:
     /// \return initialized segment_upload object
     static ss::future<result<std::unique_ptr<segment_upload>>>
     make_segment_upload(
-      ss::lw_shared_ptr<cluster::partition> part,
+      cluster::partition* part,
       inclusive_offset_range range,
       size_t read_buffer_size,
       ss::scheduling_group sg,
@@ -189,7 +196,7 @@ public:
     /// \return initialized segment_upload object
     static ss::future<result<std::unique_ptr<segment_upload>>>
     make_segment_upload(
-      ss::lw_shared_ptr<cluster::partition> part,
+      cluster::partition* part,
       size_limited_offset_range range,
       size_t read_buffer_size,
       ss::scheduling_group sg,
@@ -197,7 +204,7 @@ public:
 
 private:
     explicit segment_upload(
-      ss::lw_shared_ptr<cluster::partition> part,
+      cluster::partition* part,
       size_t read_buffer_size,
       ss::scheduling_group sg);
 
@@ -215,10 +222,11 @@ private:
 
     /// Calculate upload size using segment indexes
     ss::future<result<upload_reconciliation_result>> compute_upload_parameters(
-      std::variant<inclusive_offset_range, size_limited_offset_range> range);
+      std::variant<inclusive_offset_range, size_limited_offset_range> range,
+      ss::semaphore::clock::time_point deadline);
 
     model::ntp _ntp;
-    ss::lw_shared_ptr<cluster::partition> _part;
+    cluster::partition* _part;
     size_t _rd_buffer_size;
     ss::scheduling_group _sg;
     std::optional<ss::input_stream<char>> _stream;

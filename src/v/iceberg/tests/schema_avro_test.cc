@@ -92,20 +92,22 @@ TEST(SchemaAvroSerialization, TestSimpleFields) {
 
 TEST(SchemaAvroSerialization, TestListFields) {
     struct_type type;
-    type.fields.emplace_back(nested_field::create(
-      0,
-      "foo",
-      field_required::no,
-      list_type::create(1, field_required::yes, int_type())));
-    type.fields.emplace_back(nested_field::create(
-      2,
-      "bar",
-      field_required::yes,
-      list_type::create(
-        3,
+    type.fields.emplace_back(
+      nested_field::create(
+        0,
+        "foo",
+        field_required::no,
+        list_type::create(1, field_required::yes, int_type())));
+    type.fields.emplace_back(
+      nested_field::create(
+        2,
+        "bar",
         field_required::yes,
-        map_type::create(
-          4, int_type(), 5, field_required::no, string_type()))));
+        list_type::create(
+          3,
+          field_required::yes,
+          map_type::create(
+            4, int_type(), 5, field_required::no, string_type()))));
     schema s{
       .schema_struct = std::move(type),
       .schema_id = schema::id_t{0},
@@ -181,8 +183,9 @@ TEST(SchemaAvroSerialization, TestStruct) {
       nested_field::create(1, "foo", field_required::yes, int_type()));
     subtype.fields.emplace_back(
       nested_field::create(2, "bar", field_required::no, int_type()));
-    type.fields.emplace_back(nested_field::create(
-      3, "substruct", field_required::no, std::move(subtype)));
+    type.fields.emplace_back(
+      nested_field::create(
+        3, "substruct", field_required::no, std::move(subtype)));
     schema s{
       .schema_struct = std::move(type),
       .schema_id = schema::id_t{0},
@@ -238,23 +241,75 @@ TEST(SchemaAvroSerialization, TestStruct) {
     ASSERT_EQ(s.schema_struct, parsed_struct);
 }
 
+TEST(SchemaAvroSerialization, TestStructInvalidFieldNames) {
+    struct_type type;
+    type.fields.emplace_back(
+      nested_field::create(
+        0, "42_starts_with_digit", field_required::yes, int_type()));
+    type.fields.emplace_back(
+      nested_field::create(
+        0, "42.also.has.dots", field_required::yes, int_type()));
+
+    // Note: Encoding this type of characters is inconsistent between Redpanda,
+    // Java Iceberg, and Python Iceberg.
+    // - Redpanda encodes one char (byte) at a time: `_xF0_x9F_x98_x8E`,
+    // - Java encodes one UTF-16 char at a time: `_xD83D_xDE0E`.
+    // - Python encodes unicode character at a time: `_x1F60E`.
+    type.fields.emplace_back(
+      nested_field::create(0, "😎", field_required::yes, int_type()));
+    schema s{
+      .schema_struct = std::move(type),
+      .schema_id = schema::id_t{0},
+      .identifier_field_ids = {}};
+    auto avro_root = struct_type_to_avro(s.schema_struct, "test_schema");
+    auto avro_schema = avro::ValidSchema(avro_root);
+    const auto expected_str = R"({
+    "type": "record",
+    "name": "test_schema",
+    "fields": [
+        {
+            "name": "_42_starts_with_digit",
+            "type": "int",
+            "field-id": 0
+        },
+        {
+            "name": "_42_x2Ealso_x2Ehas_x2Edots",
+            "type": "int",
+            "field-id": 0
+        },
+        {
+            "name": "_xF0_x9F_x98_x8E",
+            "type": "int",
+            "field-id": 0
+        }
+    ]
+}
+)";
+    ASSERT_STREQ(expected_str, avro_schema.toJson().c_str());
+
+    // We don't try to parse it back as these names aren't decoded when
+    // deserializing from Avro.
+}
+
 TEST(SchemaAvroSerialization, TestMap) {
     struct_type type;
-    type.fields.emplace_back(nested_field::create(
-      0,
-      "intmap",
-      field_required::yes,
-      map_type::create(1, int_type(), 2, field_required::no, int_type())));
-    type.fields.emplace_back(nested_field::create(
-      3,
-      "listmap",
-      field_required::yes,
-      map_type::create(
-        4,
-        list_type::create(5, field_required::no, int_type()),
-        6,
-        field_required::no,
-        string_type())));
+    type.fields.emplace_back(
+      nested_field::create(
+        0,
+        "intmap",
+        field_required::yes,
+        map_type::create(1, int_type(), 2, field_required::no, int_type())));
+    type.fields.emplace_back(
+      nested_field::create(
+        3,
+        "listmap",
+        field_required::yes,
+        map_type::create(
+          4,
+          list_type::create(5, field_required::no, int_type()),
+          6,
+          field_required::no,
+          string_type())));
     schema s{
       .schema_struct = std::move(type),
       .schema_id = schema::id_t{0},
@@ -405,14 +460,16 @@ TEST(SchemaAvroSerialization, TestNestedSchema) {
 
 TEST(SchemaAvroSerialization, TestLogicalTypes) {
     struct_type type;
-    type.fields.emplace_back(nested_field::create(
-      0, "decimal", field_required::yes, decimal_type{8, 0}));
+    type.fields.emplace_back(
+      nested_field::create(
+        0, "decimal", field_required::yes, decimal_type{8, 0}));
     type.fields.emplace_back(
       nested_field::create(1, "date", field_required::yes, date_type{}));
     type.fields.emplace_back(
       nested_field::create(2, "time", field_required::yes, time_type{}));
-    type.fields.emplace_back(nested_field::create(
-      3, "timestamp", field_required::yes, timestamp_type{}));
+    type.fields.emplace_back(
+      nested_field::create(
+        3, "timestamp", field_required::yes, timestamp_type{}));
     type.fields.emplace_back(
       nested_field::create(4, "uuid", field_required::yes, uuid_type{}));
 

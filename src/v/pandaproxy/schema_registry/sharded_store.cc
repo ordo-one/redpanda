@@ -13,7 +13,7 @@
 
 #include "base/vlog.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "hashing/jump_consistent_hash.h"
 #include "hashing/xx.h"
 #include "pandaproxy/logger.h"
@@ -28,16 +28,14 @@
 #include "pandaproxy/schema_registry/util.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/exception.hh>
 
-#include <absl/algorithm/container.h>
 #include <fmt/core.h>
 
-#include <exception>
+#include <algorithm>
 #include <functional>
 #include <iterator>
 
@@ -81,18 +79,19 @@ ss::future<> sharded_store::start(is_mutable mut, ss::smp_service_group sg) {
 
 ss::future<> sharded_store::stop() { return _store.stop(); }
 
-ss::future<canonical_schema>
-sharded_store::make_canonical_schema(unparsed_schema schema, normalize norm) {
-    norm = norm
-           || normalize{
-             config::shard_local_cfg().schema_registry_always_normalize()};
-    switch (schema.type()) {
-    case schema_type::avro: {
-        auto [sub, unparsed] = std::move(schema).destructure();
-        co_return canonical_schema{
-          std::move(sub),
-          sanitize_avro_schema_definition(std::move(unparsed)).value()};
+ss::future<subject_schema> sharded_store::make_canonical_schema(
+  subject_schema schema,
+  normalize norm,
+  bool consider_always_normalize_config) {
+    if (consider_always_normalize_config) {
+        norm = norm
+               || normalize{
+                 config::shard_local_cfg().schema_registry_always_normalize()};
     }
+    switch (schema.type()) {
+    case schema_type::avro:
+        co_return co_await make_canonical_avro_schema(
+          *this, std::move(schema), norm);
     case schema_type::protobuf:
         co_return co_await make_canonical_protobuf_schema(
           *this, std::move(schema), norm);
@@ -103,7 +102,7 @@ sharded_store::make_canonical_schema(unparsed_schema schema, normalize norm) {
     __builtin_unreachable();
 }
 
-ss::future<> sharded_store::validate_schema(canonical_schema schema) {
+ss::future<> sharded_store::validate_schema(subject_schema schema) {
     switch (schema.type()) {
     case schema_type::avro: {
         co_await make_avro_schema_definition(*this, std::move(schema));
@@ -119,8 +118,23 @@ ss::future<> sharded_store::validate_schema(canonical_schema schema) {
     __builtin_unreachable();
 }
 
+ss::future<schema_definition>
+sharded_store::format_schema(schema_definition schema, output_format format) {
+    switch (schema.type()) {
+    case schema_type::avro:
+        co_return co_await format_avro_schema_definition(
+          *this, std::move(schema), format);
+    case schema_type::protobuf:
+        co_return co_await format_protobuf_schema_definition(
+          *this, std::move(schema), format);
+    case schema_type::json:
+        // json doesn't act on format parameter
+        co_return schema;
+    }
+}
+
 ss::future<valid_schema>
-sharded_store::make_valid_schema(canonical_schema schema) {
+sharded_store::make_valid_schema(subject_schema schema) {
     // This method seems to confuse clang 12.0.1
     // See #3596 for details, especially if modifying it.
     switch (schema.type()) {
@@ -139,148 +153,14 @@ sharded_store::make_valid_schema(canonical_schema schema) {
     throw as_exception(invalid_schema_type(schema.type()));
 }
 
-ss::future<sharded_store::has_schema_result>
-sharded_store::get_schema_version(subject_schema schema, normalize norm) {
-    // Validate the schema (may throw)
-    co_await validate_schema(schema.schema.share());
-
-    // Determine if the definition already exists
-    auto map = [this, norm, &schema](
-                 const store& s) -> ss::future<std::optional<schema_id>> {
-        chunked_vector<schema_id> stored_ids{
-          s.get_schemas() | std::views::keys};
-
-        return ss::do_with(
-          std::optional<schema_id>{},
-          std::move(stored_ids),
-          [this, norm, &s, &schema](
-            std::optional<schema_id>& ret_id, chunked_vector<schema_id>& ids) {
-              auto loop_condition = [&ret_id, &ids]() {
-                  return ret_id.has_value() || ids.empty();
-              };
-
-              auto loop_body =
-                [this, norm, &s, &ids, &ret_id, &schema]() -> ss::future<> {
-                  auto id = ids.back();
-                  ids.pop_back();
-
-                  auto s_res = s.get_schema_definition(id);
-                  if (s_res.has_error()) {
-                      return ss::make_ready_future();
-                  }
-
-                  auto [raw, type, refs]
-                    = std::move(s_res.value()).destructure();
-                  return this
-                    ->make_canonical_schema(
-                      unparsed_schema{
-                        subject{},
-                        unparsed_schema_definition{
-                          std::move(raw), type, std::move(refs)}},
-                      norm)
-                    .then([id, &ret_id, &schema](canonical_schema processed) {
-                        if (processed.def() == schema.schema.def()) {
-                            ret_id = id;
-                        }
-                        return ss::make_ready_future();
-                    })
-                    .handle_exception([id](std::exception_ptr e) {
-                        vlog(
-                          plog.warn,
-                          "Failed to parse stored schema with "
-                          "id {}. Error: {}",
-                          id,
-                          e);
-                    });
-              };
-
-              return ss::do_until(
-                       std::move(loop_condition), std::move(loop_body))
-                .then([&ret_id] { return ret_id; });
-          });
-    };
-    auto reduce = [](
-                    std::optional<schema_id> acc,
-                    std::optional<schema_id> s_id) { return acc ? acc : s_id; };
-    auto s_id = co_await _store.map_reduce0(
-      map, std::optional<schema_id>{}, reduce);
-
-    // Determine if a provided schema id is appropriate
-    if (schema.id != invalid_schema_id) {
-        if (s_id.has_value() && s_id != schema.id) {
-            co_return ss::coroutine::return_exception(exception(
-              error_code::subject_version_schema_id_already_exists,
-              fmt::format(
-                "Schema already registered with id {} instead of input id {}",
-                s_id.value()(),
-                schema.id())));
-        } else if (co_await has_schema(schema.id)) {
-            // The supplied id already exists, but the schema is different
-            co_return ss::coroutine::return_exception(exception(
-              error_code::subject_version_schema_id_already_exists,
-              fmt::format(
-                "Overwrite new schema with id {} is not permitted.",
-                schema.id())));
-        } else {
-            // Use the supplied id
-            s_id = schema.id;
-            vlog(plog.debug, "project_ids: using supplied ID {}", s_id.value());
-        }
-    } else if (s_id) {
-        vlog(plog.debug, "project_ids: existing ID {}", s_id.value());
-    }
-
-    // Determine if the subject already has a version that references this
-    // schema, deleted versions are seen.
-    const auto& sub = schema.schema.sub();
-    const auto versions = co_await _store.invoke_on(
-      shard_for(sub),
-      _smp_opts,
-      [sub](auto& s) -> std::vector<subject_version_entry> {
-          auto res = s.get_version_ids(sub, include_deleted::no);
-          if (
-            res.has_error()
-            && res.assume_error().code() == error_code::subject_not_found) {
-              return {};
-          }
-          return res.value();
-      });
-
-    std::optional<schema_version> v_id;
-    if (s_id.has_value()) {
-        auto v_it = absl::c_find_if(versions, [id = *s_id](const auto& s_id_v) {
-            return s_id_v.id == id;
-        });
-        if (v_it != versions.end()) {
-            v_id.emplace(v_it->version);
-        }
-    }
-
-    // Check compatibility of the schema
-    if (!v_id.has_value() && !versions.empty()) {
-        auto compat = co_await is_compatible(
-          versions.back().version, schema.schema.share(), verbose::yes);
-        if (!compat.is_compat) {
-            throw exception(
-              error_code::schema_incompatible,
-              fmt::format(
-                "Schema being registered is incompatible with an earlier "
-                "schema for subject \"{}\", details: [{}]",
-                sub,
-                fmt::join(compat.messages, ", ")));
-        }
-    }
-    co_return has_schema_result{s_id, v_id};
-}
-
 ss::future<sharded_store::insert_result>
-sharded_store::project_ids(subject_schema schema) {
+sharded_store::project_ids(stored_schema schema) {
     const auto& sub = schema.schema.sub();
     auto s_id = schema.id;
     if (s_id == invalid_schema_id) {
         // New schema, project an ID for it.
         s_id = co_await project_schema_id();
-        vlog(plog.debug, "project_ids: projected new ID {}", s_id);
+        vlog(srlog.debug, "project_ids: projected new ID {}", s_id);
     }
 
     auto sub_shard{shard_for(sub)};
@@ -291,6 +171,14 @@ sharded_store::project_ids(subject_schema schema) {
 
     const bool is_new = v_id.has_value();
     if (is_new && schema.version != invalid_schema_version) {
+        const auto mode = co_await get_mode(sub, default_to_global::yes);
+        if (v_id != schema.version && mode != mode::import) {
+            throw as_exception(
+              error_info{
+                error_code::schema_version_not_next,
+                "Version is not one more than previous version"});
+        }
+
         v_id = schema.version;
     }
 
@@ -300,14 +188,55 @@ sharded_store::project_ids(subject_schema schema) {
 
 ss::future<bool> sharded_store::upsert(
   seq_marker marker,
-  unparsed_schema schema,
+  subject_schema schema,
   schema_id id,
   schema_version version,
   is_deleted deleted) {
+    auto canonical_fut = co_await ss::coroutine::as_future(
+      make_canonical_schema(schema.share(), normalize::no, false));
+    bool processing_failed = canonical_fut.failed();
+    if (processing_failed) {
+        canonical_fut.ignore_ready_future();
+    } else {
+        schema = canonical_fut.get();
+    }
+
     auto [sub, def] = std::move(schema).destructure();
-    co_await upsert_schema(id, std::move(def));
+    // mark schemas that failed to be processed here. They will be given
+    // one more chance once we have loaded all the topic to the store.
+    co_await upsert_schema(id, std::move(def), processing_failed);
     co_return co_await upsert_subject(
       marker, std::move(sub), version, id, deleted);
+}
+
+ss::future<> sharded_store::process_marked_schemas() {
+    return _store.invoke_on_all([this](store& store) {
+        return ss::do_with(
+          store.extract_marked_schemas(), [this, &store](auto& marked) {
+              return ss::do_for_each(marked, [this, &store](auto id) {
+                  auto schema = store.get_schema_definition(id);
+                  if (schema.has_failure()) {
+                      // schema not found, ignore
+                      return ss::now();
+                  }
+                  return make_canonical_schema(
+                           {{}, std::move(schema).assume_value()},
+                           normalize::no,
+                           false)
+                    .then([id, &store](auto canonical) {
+                        // Update the stored form of this schema to its
+                        // canonical form
+                        store.upsert_schema(
+                          id, std::move(canonical).def(), false);
+                    })
+                    .handle_exception([](const std::exception_ptr&) {
+                        // processing attempt failed on marked schema. This is
+                        // not an issue of forward references. Ignore error and
+                        // keep schema in the store as-is
+                    });
+              });
+          });
+    });
 }
 
 ss::future<bool> sharded_store::has_schema(schema_id id) {
@@ -322,8 +251,8 @@ ss::future<> sharded_store::delete_schema(schema_id id) {
       shard_for(id), _smp_opts, [id](store& s) { s.delete_schema(id); });
 }
 
-ss::future<subject_schema> sharded_store::has_schema(
-  canonical_schema schema, include_deleted inc_del, normalize norm) {
+ss::future<stored_schema>
+sharded_store::has_schema(subject_schema schema, include_deleted inc_del) {
     auto versions = co_await get_versions(schema.sub(), inc_del);
 
     try {
@@ -332,24 +261,28 @@ ss::future<subject_schema> sharded_store::has_schema(
         throw as_exception(invalid_subject_schema(schema.sub()));
     }
 
-    std::optional<subject_schema> sub_schema;
-    for (auto ver : versions) {
+    // Find the maximal id schema with the given definition
+    struct match {
+        stored_schema sub_schema;
+        schema_id id;
+    };
+    std::optional<match> found;
+    for (auto ver : std::views::reverse(versions)) {
         try {
-            auto res = co_await get_subject_schema(
-              schema.sub(), ver, inc_del, norm);
-            if (schema.def() == res.schema.def()) {
-                sub_schema.emplace(std::move(res));
-                break;
+            auto res = co_await get_subject_schema(schema.sub(), ver, inc_del);
+            if (
+              (!found || res.id > found->id)
+              && schema.def() == res.schema.def()) {
+                auto id = res.id;
+                found.emplace(match{.sub_schema = std::move(res), .id = id});
             }
         } catch (const exception& e) {
-            if (
-              e.code() == error_code::subject_not_found
-              || e.code() == error_code::subject_version_not_found) {
+            if (failed_subject_schema_lookup(e.code())) {
             } else if (
               // Stored schemas might be invalid if imported improperly
               e.code() == error_code::schema_invalid) {
                 vlog(
-                  plog.warn,
+                  srlog.warn,
                   "Failed to parse stored schema, subject '{}', version {}. "
                   "Error: {}",
                   schema.sub(),
@@ -359,19 +292,19 @@ ss::future<subject_schema> sharded_store::has_schema(
                 throw;
             }
         }
-    };
-    if (!sub_schema.has_value()) {
+    }
+    if (!found.has_value()) {
         throw as_exception(schema_not_found());
     }
-    co_return std::move(sub_schema).value();
+    co_return std::move(found->sub_schema);
 }
 
-ss::future<std::optional<canonical_schema_definition>>
+ss::future<std::optional<schema_definition>>
 sharded_store::maybe_get_schema_definition(schema_id id) {
-    auto unparsed = co_await _store.invoke_on(
+    co_return co_await _store.invoke_on(
       shard_for(id),
       _smp_opts,
-      [id](store& s) -> std::optional<unparsed_schema_definition> {
+      [id](store& s) -> std::optional<schema_definition> {
           auto s_res = s.get_schema_definition(id);
           if (
             s_res.has_error()
@@ -380,53 +313,21 @@ sharded_store::maybe_get_schema_definition(schema_id id) {
           }
           return std::move(s_res.value());
       });
-    if (!unparsed.has_value()) {
-        co_return std::nullopt;
-    }
-
-    try {
-        auto canonical = co_await make_canonical_schema(
-          {{}, std::move(unparsed.value())});
-
-        co_return std::move(canonical).def();
-    } catch (const exception& e) {
-        vlog(
-          plog.warn,
-          "Failed to parse stored schema with id {}: Error {}",
-          id,
-          e.what());
-        throw;
-    }
 }
 
-ss::future<canonical_schema_definition>
+ss::future<schema_definition>
 sharded_store::get_schema_definition(schema_id id) {
-    auto unparsed = co_await _store.invoke_on(
-      shard_for(id), _smp_opts, [id](store& s) {
-          return s.get_schema_definition(id).value();
-      });
-
-    try {
-        auto canonical = co_await make_canonical_schema(
-          {{}, std::move(unparsed)});
-
-        co_return std::move(canonical).def();
-    } catch (const exception& e) {
-        vlog(
-          plog.warn,
-          "Failed to parse stored schema with id {}: Error {}",
-          id,
-          e.what());
-        throw;
-    }
+    return get_schema_definition(id, output_format::none);
 }
 
-ss::future<unparsed_schema_definition>
-sharded_store::get_unparsed_schema_definition(schema_id id) {
-    co_return co_await _store.invoke_on(
+ss::future<schema_definition>
+sharded_store::get_schema_definition(schema_id id, output_format format) {
+    auto def = co_await _store.invoke_on(
       shard_for(id), _smp_opts, [id](store& s) {
           return s.get_schema_definition(id).value();
       });
+
+    co_return co_await format_schema(std::move(def), format);
 }
 
 ss::future<chunked_vector<subject_version>>
@@ -441,6 +342,22 @@ sharded_store::get_schema_subject_versions(schema_id id) {
     co_return co_await _store.map_reduce0(map, subject_versions{}, reduce);
 }
 
+ss::future<std::vector<subject_version_entry>>
+sharded_store::get_subject_versions(subject sub, include_deleted inc_del) {
+    co_return co_await _store.invoke_on(
+      shard_for(sub),
+      _smp_opts,
+      [sub, inc_del](store& s) -> std::vector<subject_version_entry> {
+          auto res = s.get_version_ids(sub, inc_del);
+          if (
+            res.has_error()
+            && res.assume_error().code() == error_code::subject_not_found) {
+              return {};
+          }
+          return res.value();
+      });
+}
+
 ss::future<chunked_vector<subject>>
 sharded_store::get_schema_subjects(schema_id id, include_deleted inc_del) {
     using subjects = chunked_vector<subject>;
@@ -453,7 +370,7 @@ sharded_store::get_schema_subjects(schema_id id, include_deleted inc_del) {
         return acc;
     };
     auto subs = co_await _store.map_reduce0(map, subjects{}, reduce);
-    absl::c_sort(subs);
+    std::ranges::sort(subs);
     co_return subs;
 }
 
@@ -468,16 +385,8 @@ sharded_store::get_id(subject sub, std::optional<schema_version> version) {
     co_return v_id.id;
 }
 
-ss::future<subject_schema> sharded_store::get_subject_schema(
+ss::future<stored_schema> sharded_store::get_subject_schema(
   subject sub, std::optional<schema_version> version, include_deleted inc_del) {
-    return get_subject_schema(sub, version, inc_del, normalize::no);
-}
-
-ss::future<subject_schema> sharded_store::get_subject_schema(
-  subject sub,
-  std::optional<schema_version> version,
-  include_deleted inc_del,
-  normalize norm) {
     auto sub_shard{shard_for(sub)};
     auto v_id = co_await _store.invoke_on(
       sub_shard, _smp_opts, [sub, version, inc_del](store& s) {
@@ -489,24 +398,11 @@ ss::future<subject_schema> sharded_store::get_subject_schema(
           return s.get_schema_definition(id).value();
       });
 
-    try {
-        auto canonical = co_await make_canonical_schema(
-          {sub, std::move(def)}, norm);
-
-        co_return subject_schema{
-          .schema = std::move(canonical),
-          .version = v_id.version,
-          .id = v_id.id,
-          .deleted = v_id.deleted};
-    } catch (const exception& e) {
-        vlog(
-          plog.warn,
-          "Failed to parse stored schema, subject {}, version {}: {}",
-          sub,
-          v_id.version,
-          e.what());
-        throw;
-    }
+    co_return stored_schema{
+      .schema = {sub, std::move(def)},
+      .version = v_id.version,
+      .id = v_id.id,
+      .deleted = v_id.deleted};
 }
 
 ss::future<chunked_vector<subject>> sharded_store::get_subjects(
@@ -763,12 +659,14 @@ sharded_store::clear_compatibility(seq_marker marker, subject sub) {
       });
 }
 
-ss::future<bool>
-sharded_store::upsert_schema(schema_id id, unparsed_schema_definition def) {
+ss::future<bool> sharded_store::upsert_schema(
+  schema_id id, schema_definition def, bool mark_schema) {
     co_await maybe_update_max_schema_id(id);
     co_return co_await _store.invoke_on(
-      shard_for(id), _smp_opts, [id, def{std::move(def)}](store& s) mutable {
-          return s.upsert_schema(id, std::move(def));
+      shard_for(id),
+      _smp_opts,
+      [id, mark_schema, def{std::move(def)}](store& s) mutable {
+          return s.upsert_schema(id, std::move(def), mark_schema);
       });
 }
 
@@ -814,7 +712,7 @@ ss::future<> sharded_store::maybe_update_max_schema_id(schema_id id) {
         auto old = _next_schema_id;
         _next_schema_id = std::max(_next_schema_id, id + 1);
         vlog(
-          plog.debug,
+          srlog.debug,
           "maybe_update_max_schema_id: {}->{}",
           old,
           _next_schema_id);
@@ -824,19 +722,19 @@ ss::future<> sharded_store::maybe_update_max_schema_id(schema_id id) {
 }
 
 ss::future<bool> sharded_store::is_compatible(
-  schema_version version, canonical_schema new_schema) {
+  schema_version version, subject_schema new_schema) {
     auto rslt = co_await do_is_compatible(
       version, std::move(new_schema), verbose::no);
     co_return rslt.is_compat;
 }
 
 ss::future<compatibility_result> sharded_store::is_compatible(
-  schema_version version, canonical_schema new_schema, verbose is_verbose) {
+  schema_version version, subject_schema new_schema, verbose is_verbose) {
     return do_is_compatible(version, std::move(new_schema), is_verbose);
 }
 
 ss::future<compatibility_result> sharded_store::do_is_compatible(
-  schema_version version, canonical_schema new_schema, verbose is_verbose) {
+  schema_version version, subject_schema new_schema, verbose is_verbose) {
     // Lookup the version_ids
     const auto sub = new_schema.sub();
     const auto versions = co_await _store.invoke_on(
@@ -992,6 +890,14 @@ ss::future<bool> sharded_store::has_version(
           return s.has_version(sub, id, i);
       });
     co_return has_id.has_value() && has_id.assume_value();
+}
+
+ss::future<std::optional<schema_id>>
+sharded_store::get_schema_id(schema_definition def) const {
+    auto map = [&def](const store& s) { return s.get_schema_id(def); };
+    auto reduce = [](auto acc, auto s_id) { return std::max(acc, s_id); };
+    co_return co_await _store.map_reduce0(
+      map, std::optional<schema_id>{}, reduce);
 }
 
 } // namespace pandaproxy::schema_registry

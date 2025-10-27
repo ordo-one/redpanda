@@ -786,6 +786,59 @@
                     }
                 }
             ]
+        },
+        {
+            "path": "/v1/debug/log_backtrace",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Emit a backtrace to the log",
+                    "type": "void",
+                    "nickname": "log_backtrace",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "simple",
+                            "in": "query",
+                            "required": false,
+                            "allowMultiple": false,
+                            "type": "boolean"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/trigger_crash",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Trigger various internal failure scenarios.",
+                    "type": "void",
+                    "nickname": "trigger_crash",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "type",
+                            "in": "query",
+                            "required": true,
+                            "allowMultiple": false,
+                            "type": "string",
+                            "enum": [
+                                "segfault",
+                                "abort",
+                                "assert",
+                                "asan_crash",
+                                "ubsan_crash"
+                            ]
+                        }
+                    ]
+                }
+            ]
         }
     ],
     "models": {
@@ -835,7 +888,7 @@
                     "description": "Number of samples that were dropped due to space limitations during the measurement period."
                 },
                 "samples": {
-                    "type": "array",
+                    "type": "chunked_array",
                     "items": {
                         "type": "cpu_profile_sample"
                     }
@@ -1137,9 +1190,9 @@
                     "type": "long",
                     "description": "Last applied offset"
                 },
-                "max_collectible_offset": {
+                "max_removable_local_log_offset": {
                     "type": "long",
-                    "description": "Max collectible offset"
+                    "description": "Max removable offset"
                 }
             }
         },

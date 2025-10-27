@@ -10,6 +10,7 @@
 
 #include "cloud_storage/materialized_resources.h"
 
+#include "absl/container/btree_map.h"
 #include "base/vlog.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/materialized_manifest_cache.h"
@@ -17,7 +18,6 @@
 #include "cloud_storage/remote_segment.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
-#include "resource_mgmt/io_priority.h"
 #include "resource_mgmt/memory_groups.h"
 #include "ssx/future-util.h"
 
@@ -26,8 +26,6 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/temporary_buffer.hh>
-
-#include <absl/container/btree_map.h>
 
 #include <algorithm>
 #include <chrono>
@@ -55,10 +53,12 @@ materialized_resources::materialized_resources()
       "cst_materialized_resources_memory")
   , _manifest_meta_size(
       config::shard_local_cfg().cloud_storage_manifest_cache_size.bind())
-  , _manifest_cache(ss::make_shared<materialized_manifest_cache>(
-      config::shard_local_cfg().cloud_storage_manifest_cache_size()))
-  , _cache_carryover_bytes(config::shard_local_cfg()
-                             .cloud_storage_cache_trim_carryover_bytes.bind()) {
+  , _manifest_cache(
+      ss::make_shared<materialized_manifest_cache>(
+        config::shard_local_cfg().cloud_storage_manifest_cache_size()))
+  , _cache_carryover_bytes(
+      config::shard_local_cfg()
+        .cloud_storage_cache_trim_carryover_bytes.bind()) {
     auto update_max_mem = [this]() {
         // Update memory capacity to accommodate new max number of segment
         // readers
@@ -256,7 +256,7 @@ void materialized_resources::register_segment(materialized_segment_state& s) {
 namespace {
 
 ss::future<ssx::semaphore_units> get_units_abortable(
-  adjustable_semaphore& sem, ssize_t units, storage::opt_abort_source_t as) {
+  adjustable_semaphore& sem, ssize_t units, model::opt_abort_source_t as) {
     return as.has_value() ? sem.get_units(units, as.value())
                           : sem.get_units(units);
 }
@@ -264,8 +264,7 @@ ss::future<ssx::semaphore_units> get_units_abortable(
 } // namespace
 
 ss::future<segment_reader_units>
-materialized_resources::get_segment_reader_units(
-  storage::opt_abort_source_t as) {
+materialized_resources::get_segment_reader_units(model::opt_abort_source_t as) {
     // Estimate segment reader memory requirements
     auto size_bytes = projected_remote_segment_reader_memory_usage();
     if (_mem_units.available_units() <= size_bytes) {
@@ -283,7 +282,7 @@ materialized_resources::get_segment_reader_units(
 
 ss::future<ssx::semaphore_units>
 materialized_resources::get_partition_reader_units(
-  storage::opt_abort_source_t as) {
+  model::opt_abort_source_t as) {
     auto sz = projected_remote_partition_reader_memory_usage();
     if (_mem_units.available_units() <= sz) {
         // Update metrics counter if we are trying to acquire units while
@@ -295,7 +294,7 @@ materialized_resources::get_partition_reader_units(
 }
 
 ss::future<segment_units>
-materialized_resources::get_segment_units(storage::opt_abort_source_t as) {
+materialized_resources::get_segment_units(model::opt_abort_source_t as) {
     auto sz = projected_remote_segment_memory_usage();
     if (_mem_units.available_units() <= sz) {
         // Update metrics counter if we are trying to acquire units while

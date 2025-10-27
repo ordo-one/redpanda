@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/state.h"
 #include "datalake/coordinator/translated_offset_range.h"
 #include "datalake/errors.h"
@@ -17,6 +17,7 @@
 #include "model/fundamental.h"
 #include "serde/rw/enum.h"
 #include "serde/rw/envelope.h"
+#include "serde/rw/map.h"
 
 namespace datalake::coordinator {
 
@@ -46,8 +47,6 @@ struct ensure_table_exists_reply
       ensure_table_exists_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     ensure_table_exists_reply() = default;
     explicit ensure_table_exists_reply(errc err)
       : errc(err) {}
@@ -64,7 +63,6 @@ struct ensure_table_exists_request
       ensure_table_exists_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using resp_t = ensure_table_exists_reply;
 
     ensure_table_exists_request() = default;
@@ -95,8 +93,6 @@ struct ensure_dlq_table_exists_reply
       ensure_dlq_table_exists_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     ensure_dlq_table_exists_reply() = default;
     explicit ensure_dlq_table_exists_reply(errc err)
       : errc(err) {}
@@ -114,7 +110,6 @@ struct ensure_dlq_table_exists_request
       ensure_dlq_table_exists_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using resp_t = ensure_dlq_table_exists_reply;
 
     ensure_dlq_table_exists_request() = default;
@@ -139,8 +134,6 @@ struct add_translated_data_files_reply
       add_translated_data_files_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     add_translated_data_files_reply() = default;
     explicit add_translated_data_files_reply(errc err)
       : errc(err) {}
@@ -157,7 +150,6 @@ struct add_translated_data_files_request
       add_translated_data_files_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using resp_t = add_translated_data_files_reply;
 
     add_translated_data_files_request() = default;
@@ -207,8 +199,6 @@ struct fetch_latest_translated_offset_reply
       fetch_latest_translated_offset_reply,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     fetch_latest_translated_offset_reply() = default;
     explicit fetch_latest_translated_offset_reply(errc err)
       : errc(err) {}
@@ -242,7 +232,6 @@ struct fetch_latest_translated_offset_request
       fetch_latest_translated_offset_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
     using resp_t = fetch_latest_translated_offset_reply;
 
     fetch_latest_translated_offset_request() = default;
@@ -264,6 +253,133 @@ struct stm_snapshot
     topics_state topics;
 
     auto serde_fields() { return std::tie(topics); }
+};
+
+struct per_topic_usage_stats
+  : serde::envelope<
+      per_topic_usage_stats,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    per_topic_usage_stats() = default;
+    explicit per_topic_usage_stats(
+      model::topic topic,
+      model::revision_id revision,
+      uint64_t kafka_bytes_processed)
+      : topic(std::move(topic))
+      , revision(revision)
+      , total_kafka_bytes_processed(kafka_bytes_processed) {}
+
+    model::topic topic;
+    model::revision_id revision;
+    uint64_t total_kafka_bytes_processed{0};
+
+    friend std::ostream&
+    operator<<(std::ostream&, const per_topic_usage_stats&);
+
+    auto serde_fields() {
+        return std::tie(topic, revision, total_kafka_bytes_processed);
+    }
+};
+
+struct datalake_usage_stats
+  : serde::envelope<
+      datalake_usage_stats,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    friend std::ostream& operator<<(std::ostream&, const datalake_usage_stats&);
+
+    chunked_vector<per_topic_usage_stats> topic_usages;
+
+    auto serde_fields() { return std::tie(topic_usages); }
+};
+
+struct usage_stats_reply
+  : serde::
+      envelope<usage_stats_reply, serde::version<0>, serde::compat_version<0>> {
+    usage_stats_reply() = default;
+    explicit usage_stats_reply(errc err)
+      : errc(err) {}
+
+    friend std::ostream& operator<<(std::ostream&, const usage_stats_reply&);
+
+    errc errc;
+    // only valid if errc == errc::ok
+    datalake_usage_stats stats;
+
+    auto serde_fields() { return std::tie(errc, stats); }
+};
+
+// Request to fetch usage stats for all topics coordinated by a given
+// coordinator topic partition.
+struct usage_stats_request
+  : serde::envelope<
+      usage_stats_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using resp_t = usage_stats_reply;
+
+    model::partition_id coordinator_partition;
+
+    usage_stats_request() = default;
+    explicit usage_stats_request(model::partition_id coordinator_partition)
+      : coordinator_partition(coordinator_partition) {}
+    friend std::ostream& operator<<(std::ostream&, const usage_stats_request&);
+
+    model::partition_id get_coordinator_partition() {
+        return coordinator_partition;
+    }
+
+    auto serde_fields() { return std::tie(coordinator_partition); }
+};
+
+struct get_topic_state_reply
+  : serde::envelope<
+      get_topic_state_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    get_topic_state_reply() = default;
+    explicit get_topic_state_reply(errc err)
+      : errc(err) {}
+
+    friend std::ostream&
+    operator<<(std::ostream&, const get_topic_state_reply&);
+
+    errc errc;
+    // Map from topic to its state. Only valid if errc == errc::ok
+    chunked_hash_map<model::topic, topic_state> topic_states;
+
+    auto serde_fields() { return std::tie(errc, topic_states); }
+};
+
+struct get_topic_state_request
+  : serde::envelope<
+      get_topic_state_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using resp_t = get_topic_state_reply;
+
+    get_topic_state_request() = default;
+    explicit get_topic_state_request(
+      model::partition_id coordinator_partition,
+      chunked_vector<model::topic> topics_filter)
+      : coordinator_partition(coordinator_partition)
+      , topics_filter(std::move(topics_filter)) {}
+
+    model::partition_id coordinator_partition;
+
+    // Topics to return. If empty, returns all topics.
+    chunked_vector<model::topic> topics_filter;
+
+    model::partition_id get_coordinator_partition() const {
+        return coordinator_partition;
+    }
+
+    friend std::ostream&
+    operator<<(std::ostream&, const get_topic_state_request&);
+
+    auto serde_fields() {
+        return std::tie(coordinator_partition, topics_filter);
+    }
 };
 
 } // namespace datalake::coordinator

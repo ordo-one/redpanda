@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "model/timestamp.h"
 #include "utils/named_type.h"
 #include "wasm/ffi.h"
@@ -35,8 +36,6 @@
 
 #include <seastar/core/sstring.hh>
 #include <seastar/util/noncopyable_function.hh>
-
-#include <absl/container/flat_hash_map.h>
 
 #include <chrono>
 #include <string_view>
@@ -299,7 +298,7 @@ public:
     errno_t path_filestat_set_times(
       fd_t, uint32_t, ffi::array<uint8_t>, timestamp_t, timestamp_t, uint16_t);
     errno_t
-      path_link(fd_t, uint32_t, ffi::array<uint8_t>, fd_t, ffi::array<uint8_t>);
+    path_link(fd_t, uint32_t, ffi::array<uint8_t>, fd_t, ffi::array<uint8_t>);
     errno_t path_open(
       fd_t,
       uint32_t,

@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0
 
 #include "cluster/config_frontend.h"
+#include "cluster/controller.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/create_partitions.h"
 #include "kafka/protocol/create_topics.h"
@@ -50,10 +51,11 @@ public:
                 std::move(client),
                 [f = std::forward<Func>(f)](
                   kafka::client::transport& client) mutable {
-                    return client.connect().then(
-                      [&client, f = std::forward<Func>(f)]() mutable {
+                    return client.connect()
+                      .then([&client, f = std::forward<Func>(f)]() mutable {
                           return f(client);
-                      });
+                      })
+                      .finally([&client] { return client.stop(); });
                 });
           });
     }
@@ -94,11 +96,12 @@ public:
         return do_with_client(
                  [tp, count](kafka::client::transport& client) mutable {
                      chunked_vector<kafka::create_partitions_topic> topics;
-                     topics.emplace_back(kafka::create_partitions_topic{
-                       .name = tp,
-                       .count = count,
-                       .assignments = std::nullopt,
-                       .unknown_tags = {}});
+                     topics.emplace_back(
+                       kafka::create_partitions_topic{
+                         .name = tp,
+                         .count = count,
+                         .assignments = std::nullopt,
+                         .unknown_tags = {}});
                      return client.dispatch(
                        kafka::create_partitions_request{
                          .data{

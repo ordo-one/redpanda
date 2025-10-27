@@ -7,6 +7,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
+#include "bytes/bytes.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
 #include "model/compression.h"
@@ -21,14 +25,13 @@
 #include "serde/rw/sstring.h"
 #include "serde/serde_exception.h"
 #include "strings/string_switch.h"
+#include "utils/base64.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/print.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/strings/str_split.h>
 #include <fmt/ostream.h>
 
 #include <iostream>
@@ -52,8 +55,18 @@ void read_nested(
 
 void write(iobuf& out, timestamp ts) { serde::write(out, ts._v); }
 
+std::ostream& operator<<(std::ostream& os, const topic_partition_view& tp) {
+    fmt::print(os, "{{{}/{}}}", tp.topic(), tp.partition());
+    return os;
+}
+
 std::ostream& operator<<(std::ostream& os, const topic_partition& tp) {
     fmt::print(os, "{{{}/{}}}", tp.topic(), tp.partition());
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const topic_id_partition& tp) {
+    fmt::print(os, "{{{}/{}}}", tp.topic_id(), tp.partition());
     return os;
 }
 
@@ -396,12 +409,18 @@ std::ostream& operator<<(std::ostream& o, record_batch_type bt) {
         return o << "batch_type::partition_properties_update";
     case record_batch_type::datalake_coordinator:
         return o << "batch_type::datalake_coordinator";
-    case record_batch_type::dl_placeholder:
-        return o << "batch_type::dl_placeholder";
-    case record_batch_type::dl_stm_command:
-        return o << "batch_type::dl_overlay";
+    case record_batch_type::ctp_placeholder:
+        return o << "batch_type::ctp_placeholder";
+    case record_batch_type::ctp_stm_command:
+        return o << "batch_type::ctp_stm_command";
     case record_batch_type::datalake_translation_state:
         return o << "datalake_translation_state";
+    case record_batch_type::cluster_link:
+        return o << "cluster_link";
+    case record_batch_type::group_block:
+        return o << "group_block";
+    case record_batch_type::l1_stm:
+        return o << "l1_stm";
     }
 
     return o << "batch_type::unknown{" << static_cast<int>(bt) << "}";
@@ -764,6 +783,64 @@ std::istream& operator>>(std::istream& is, fips_mode_flag& f) {
             to_string_view(fips_mode_flag::permissive),
             fips_mode_flag::permissive);
     return is;
+}
+
+fmt::iterator topic_id::format_to(fmt::iterator it) const {
+    const auto& uuid = (*this)().uuid();
+    const bytes_view bv{uuid.begin(), uuid.size()};
+    return fmt::format_to(it, "{}", bytes_to_base64(bv));
+}
+
+topic_id_partition topic_id_partition::from(std::string_view s) {
+    std::vector<ss::sstring> ss = absl::StrSplit(s, "/");
+    if (ss.size() != 2) {
+        throw std::runtime_error(
+          fmt::format("Invalid topic_id_partition: {}", s));
+    }
+    auto tid = uuid_t::from_string(ss[0]);
+    int p{0};
+    if (!absl::SimpleAtoi(ss[1].data(), &p)) {
+        throw std::runtime_error(
+          fmt::format("Invalid topic_id_partition: {}", s));
+    }
+    return model::topic_id_partition(
+      model::topic_id(tid), model::partition_id(p));
+}
+
+std::optional<kafka_batch_validation_mode>
+kafka_batch_validation_mode_from_string(std::string_view s) {
+    return string_switch<std::optional<kafka_batch_validation_mode>>(s)
+      .match(
+        model::kafka_batch_validation_mode_to_string(
+          model::kafka_batch_validation_mode::legacy),
+        model::kafka_batch_validation_mode::legacy)
+      .match(
+        model::kafka_batch_validation_mode_to_string(
+          model::kafka_batch_validation_mode::relaxed),
+        model::kafka_batch_validation_mode::relaxed)
+      .match(
+        model::kafka_batch_validation_mode_to_string(
+          model::kafka_batch_validation_mode::strict),
+        model::kafka_batch_validation_mode::strict)
+      .default_match(std::nullopt);
+}
+
+std::ostream&
+operator<<(std::ostream& o, const kafka_batch_validation_mode& mode) {
+    o << kafka_batch_validation_mode_to_string(mode);
+    return o;
+}
+
+std::istream& operator>>(std::istream& i, kafka_batch_validation_mode& mode) {
+    ss::sstring s;
+    i >> s;
+    auto value = kafka_batch_validation_mode_from_string(s);
+    if (!value) {
+        i.setstate(std::ios::failbit);
+        return i;
+    }
+    mode = *value;
+    return i;
 }
 
 } // namespace model

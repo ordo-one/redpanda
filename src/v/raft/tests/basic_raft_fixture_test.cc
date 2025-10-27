@@ -72,8 +72,9 @@ TEST_F(raft_fixture, test_empty_writes) {
       model::record_batch_type::raft_data, model::offset(0));
 
     // Catch the error when appending.
-    auto res = replicate(chunked_vector<model::record_batch>::single(
-                           std::move(builder).build()))
+    auto res = replicate(
+                 chunked_vector<model::record_batch>::single(
+                   std::move(builder).build()))
                  .get();
     ASSERT_TRUE(res.has_error());
     ASSERT_EQ(res.error(), errc::leader_append_failed);
@@ -151,7 +152,7 @@ TEST_P_CORO(all_acks_fixture, validate_replication) {
 
     ASSERT_EQ_CORO(all_batches.size(), 3);
 
-    co_await assert_logs_equal();
+    ASSERT_TRUE_CORO(co_await assert_logs_equal());
 }
 
 TEST_P_CORO(all_acks_fixture, single_node_replication) {
@@ -169,7 +170,7 @@ TEST_P_CORO(all_acks_fixture, single_node_replication) {
 
     // wait for committed offset to propagate
     co_await wait_for_committed_offset(result.value().last_offset, 5s);
-    co_await assert_logs_equal();
+    ASSERT_TRUE_CORO(co_await assert_logs_equal());
 }
 
 TEST_P_CORO(all_acks_fixture, validate_recovery) {
@@ -200,7 +201,7 @@ TEST_P_CORO(all_acks_fixture, validate_recovery) {
 
     ASSERT_EQ_CORO(all_batches.size(), 3);
 
-    co_await assert_logs_equal();
+    ASSERT_TRUE_CORO(co_await assert_logs_equal());
 }
 
 TEST_F_CORO(raft_fixture, validate_adding_nodes_to_cluster) {
@@ -236,7 +237,7 @@ TEST_F_CORO(raft_fixture, validate_adding_nodes_to_cluster) {
 
     ASSERT_EQ_CORO(all_batches.size(), 3);
 
-    co_await assert_logs_equal();
+    ASSERT_TRUE_CORO(co_await assert_logs_equal());
 }
 
 TEST_P_CORO(
@@ -270,7 +271,7 @@ TEST_P_CORO(
     ASSERT_EQ_CORO(
       committed_offset_before, leader_node.raft()->committed_offset());
 
-    co_await assert_logs_equal();
+    ASSERT_TRUE_CORO(co_await assert_logs_equal());
 
     vlog(logger().info, "Reset-ing background flushing..");
 
@@ -382,11 +383,12 @@ TEST_P_CORO(
           }
           auto target = random_generators::random_choice(not_leaders);
           return raft
-            ->transfer_leadership(transfer_leadership_request{
-              .group = raft->group(),
-              .target = target.id(),
-              .timeout = 25ms,
-            })
+            ->transfer_leadership(
+              transfer_leadership_request{
+                .group = raft->group(),
+                .target = target.id(),
+                .timeout = 25ms,
+              })
             .then([this](transfer_leadership_reply r) {
                 if (r.result != raft::errc::success) {
                     vlog(logger().info, "error(transferring): {}", r);
@@ -557,13 +559,54 @@ TEST_F_CORO(raft_fixture, test_prioritizing_longest_log) {
         co_await n->init_and_start(all_vnodes());
     }
 
-    auto leader_id = wait_for_leader(10s);
+    co_await wait_for_leader(10s);
 
     co_await wait_for_visible_offset(visible_offset, 10s);
 }
 
 TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
+    // a struct to handle which nodes to stop, start, reconfigure, etc
+    struct reconfiguration_helper {
+        const std::vector<vnode> vnodes;
+
+        static model::revision_id increment_rid(model::revision_id id) {
+            return static_cast<model::revision_id>(static_cast<long>(id) + 1);
+        }
+
+        vnode get_designated_survivor() const { return vnodes.at(0); }
+
+        // get all nodes that aren't the designated survivor
+        std::vector<vnode> get_nodes_to_remove() const {
+            return vnodes | std::views::filter([this](const vnode& node) {
+                       return node != get_designated_survivor();
+                   })
+                   | std::ranges::to<std::vector<vnode>>();
+        }
+
+        // version increment the nodes which were previously stopped s.t. they
+        // can be restarted with a new revision number
+        std::vector<vnode> get_nodes_to_start() const {
+            return get_nodes_to_remove()
+                   | std::views::transform([](const vnode& node) {
+                         return vnode{
+                           node.id(), increment_rid(node.revision())};
+                     })
+                   | std::ranges::to<std::vector<vnode>>();
+        }
+
+        // new configuration should be restarted nodes plus the designated
+        // survivor which never left the raft group
+        std::vector<vnode> get_restarted_vnode_configuration() const {
+            auto restarted_nodes = get_nodes_to_start();
+            restarted_nodes.emplace_back(get_designated_survivor());
+            return restarted_nodes;
+        }
+    };
+
+    // setup
     co_await create_simple_group(3);
+    reconfiguration_helper reconfiguration_helper{.vnodes = all_vnodes()};
+
     auto replicate_some_data = [&] {
         return retry_with_leader(
                  10s + model::timeout_clock::now(),
@@ -589,12 +632,20 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
 
     co_await replicate_some_data();
 
+    // the reconfiguration process looks like
+    // 1. reconfigure from 3 nodes to 1 node
+    // 2. wait for reconfiguration
+    // 3. stop the dropped nodes
+
+    // pick one node to remain in the group
     co_await retry_with_leader(
       10s + model::timeout_clock::now(),
-      [this](raft_node_instance& leader_node) {
+      [&reconfiguration_helper](raft_node_instance& leader_node) {
           return leader_node.raft()->replace_configuration(
-            {all_vnodes()[0]}, model::revision_id{1});
+            {reconfiguration_helper.get_designated_survivor()},
+            model::revision_id{1});
       });
+
     // wait for reconfiguration
     auto wait_for_reconfiguration = [&](size_t expected_nodes) {
         return tests::cooperative_spin_wait_with_timeout(
@@ -610,8 +661,13 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
                 });
           });
     };
-
     co_await wait_for_reconfiguration(1);
+
+    // stop the nodes removed from the group
+    for (const auto node_to_stop :
+         reconfiguration_helper.get_nodes_to_remove()) {
+        co_await stop_node(node_to_stop.id());
+    }
 
     auto leader_node_id = get_leader();
     ASSERT_TRUE_CORO(leader_node_id.has_value());
@@ -620,11 +676,24 @@ TEST_F_CORO(raft_fixture, test_delayed_snapshot_request) {
 
     co_await replicate_some_data();
 
+    // the reconfiguration process back to 3 looks like
+    // 1. add & start new nodes
+    // 2. reconfigure to attatch the new nodes
+    // 3. wait for reconfiguration
+
+    // build new nodes s.t. the cluster can reconfigure back to 3 nodes
+    for (const vnode node : reconfiguration_helper.get_nodes_to_start()) {
+        auto& added_node = add_node(node.id(), node.revision());
+        co_await added_node.init_and_start(/*no initial nodes*/ {});
+    }
+
+    // dispatch the reconfiguration to join new nodes to the raft group
     co_await retry_with_leader(
       10s + model::timeout_clock::now(),
-      [this](raft_node_instance& leader_node) {
+      [&reconfiguration_helper](raft_node_instance& leader_node) {
           return leader_node.raft()->replace_configuration(
-            {all_vnodes()}, model::revision_id{2});
+            reconfiguration_helper.get_restarted_vnode_configuration(),
+            model::revision_id{2});
       });
 
     // wait for reconfiguration
@@ -760,11 +829,12 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
     ss::circular_buffer<leadership_changed_event> events;
 
     register_leader_callback([&](model::node_id id, leadership_status status) {
-        events.push_back(leadership_changed_event{
-          .node = id,
-          .status = status,
-          .timestamp = clock_t::now(),
-        });
+        events.push_back(
+          leadership_changed_event{
+            .node = id,
+            .status = status,
+            .timestamp = clock_t::now(),
+          });
     });
     auto leader_id = get_leader().value();
     auto& leader_node = node(leader_id);
@@ -827,7 +897,7 @@ TEST_F_CORO(raft_fixture, leadership_transfer_delay) {
         co_await stop_node(vn.id());
     }
 
-    auto tolerance_multiplier = 1.3;
+    auto tolerance_multiplier = 1.7;
     /**
      * Validate that election time after reconfiguration is simillar to the
      * time needed for leadership transfer
@@ -943,7 +1013,7 @@ TEST_F_CORO(raft_fixture, test_redelivery_of_matching_logs) {
       [&, term_1_match_offset](reply_variant reply, model::node_id) {
           return ss::visit(
             std::move(reply),
-            [&, term_1_match_offset](append_entries_reply& a_r) {
+            [&, term_1_match_offset](append_entries_reply a_r) {
                 if (
                   a_r.last_dirty_log_index
                   == model::next_offset(term_1_match_offset)) {
@@ -953,7 +1023,7 @@ TEST_F_CORO(raft_fixture, test_redelivery_of_matching_logs) {
                 }
                 return ss::make_ready_future<reply_variant>(a_r);
             },
-            [](auto& r) {
+            [](auto r) {
                 return ss::make_ready_future<reply_variant>(std::move(r));
             });
       });
@@ -975,9 +1045,8 @@ TEST_F_CORO(raft_fixture, test_term_conditional_replication) {
     auto term = leader_node.raft()->term();
     // this should succeed as there were no leadership changes
     auto result = co_await leader_node.raft()->replicate(
-      term,
       make_batches(10, 10, 128),
-      replicate_options(consistency_level::quorum_ack, 10s));
+      replicate_options(consistency_level::quorum_ack, term, 10s));
 
     ASSERT_TRUE_CORO(result.has_value());
     /**
@@ -993,9 +1062,8 @@ TEST_F_CORO(raft_fixture, test_term_conditional_replication) {
     auto new_leader_id = co_await wait_for_leader(10s);
     ASSERT_EQ_CORO(new_leader_id, leader_id);
     auto result_with_term = co_await leader_node.raft()->replicate(
-      term,
       make_batches(10, 10, 128),
-      replicate_options(consistency_level::quorum_ack, 10s));
+      replicate_options(consistency_level::quorum_ack, term, 10s));
 
     // Replication must fail as the term was increased in leader election
     ASSERT_TRUE_CORO(result_with_term.has_error());
@@ -1049,4 +1117,53 @@ TEST_F_CORO(raft_fixture, test_replicate_abort_source) {
 
     ASSERT_TRUE_CORO(r_2.has_error());
     ASSERT_EQ_CORO(r_2.error(), raft::errc::replicate_first_stage_exception);
+}
+
+TEST_F_CORO(raft_fixture, test_leadership_blocked_replicas_can_elect_leader) {
+    co_await create_simple_group(3);
+    auto leader_id = co_await wait_for_leader(10s);
+    auto& leader_node = node(leader_id);
+    // replicate some batches to all replicas
+    auto res = co_await leader_node.raft()->replicate(
+      make_batches(1, 1, 128),
+      replicate_options(consistency_level::quorum_ack));
+    ASSERT_FALSE_CORO(res.has_error());
+    auto blocked_follower = random_follower_id().value();
+    /**
+     * Block append entries to one of the followers
+     */
+    leader_node.on_dispatch([blocked_follower](
+                              model::node_id node, raft::msg_type mt) {
+        if (mt == raft::msg_type::append_entries && blocked_follower == node) {
+            throw std::runtime_error("error");
+        }
+        return ss::now();
+    });
+    // replicate more batches.
+    res = co_await leader_node.raft()->replicate(
+      make_batches(1, 1, 128),
+      replicate_options(consistency_level::quorum_ack));
+    ASSERT_FALSE_CORO(res.has_error());
+    /**
+     * Since append entries to one of the followers is blocked the two other
+     * replicas has the log longer than the blocked one.
+     *
+     * Now block leadership on all replicas but not the follower with the
+     * shortest log. The follower with shortest log can not be elected as a
+     * leader as it would cause truncation.
+     *
+     * Even tho the other replicas are blocked from being a leaders the raft
+     * group should finally elect a leader when enough failed election will
+     * cause the target priority to go down to 1.
+     */
+
+    for (auto& [nid, node] : nodes()) {
+        if (nid != blocked_follower) {
+            node->raft()->block_new_leadership();
+        }
+    }
+    co_await leader_node.raft()->step_down("test-step-down");
+
+    auto leader = co_await wait_for_leader(60s);
+    ASSERT_NE_CORO(leader, blocked_follower);
 }

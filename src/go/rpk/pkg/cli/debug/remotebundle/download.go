@@ -41,6 +41,7 @@ func newDownloadCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		noConfirm bool
 		jobID     string
 		outFile   string
+		uploadURL string
 	)
 	cmd := &cobra.Command{
 		Use:   "download",
@@ -65,7 +66,7 @@ Use the flag '--no-confirm' to avoid the confirmation prompt.
 			if jobID != "" {
 				status = filterStatusByJobID(status, jobID)
 			}
-			ready := filterReadyBrokers(status)
+			ready, _ := filterCompletedBrokers(status)
 			if len(ready) == 0 {
 				out.Die("There are no bundles ready for download; to check status run 'rpk debug remote-bundle status'")
 			}
@@ -103,11 +104,18 @@ Use the flag '--no-confirm' to avoid the confirmation prompt.
 				os.Exit(1)
 			}
 			fmt.Printf("\nSuccessfully downloaded remote debug bundle to %v\n", downloadPath)
+
+			if uploadURL != "" {
+				err = common.UploadBundle(cmd.Context(), downloadPath, uploadURL)
+				out.MaybeDie(err, "unable to upload bundle: %v", err)
+				fmt.Println("Successfully uploaded the bundle")
+			}
 		},
 	}
 	cmd.Flags().StringVarP(&outFile, "output", "o", "", "The file path where the debug file will be written (default ./<timestamp>-remote-bundle.zip)")
 	cmd.Flags().StringVar(&jobID, "job-id", "", "ID of the job to download the debug bundle from")
 	cmd.Flags().BoolVar(&noConfirm, "no-confirm", false, "Disable confirmation prompt")
+	cmd.Flags().StringVar(&uploadURL, "upload-url", "", "If provided, where to upload the bundle in addition to creating a copy on disk")
 	return cmd
 }
 
@@ -184,14 +192,17 @@ func downloadBundle(ctx context.Context, fs afero.Fs, downloadPath string, statu
 	return anyErr, response, nil
 }
 
-func filterReadyBrokers(status []statusResponse) []statusResponse {
-	var filtered []statusResponse
+func filterCompletedBrokers(status []statusResponse) (readyBrokers, erroredBrokers []statusResponse) {
+	var ready []statusResponse
+	var errored []statusResponse
 	for _, s := range status {
 		if strings.EqualFold(s.Status, "success") {
-			filtered = append(filtered, s)
+			ready = append(ready, s)
+		} else if strings.EqualFold(s.Status, "error") {
+			errored = append(ready, s)
 		}
 	}
-	return filtered
+	return ready, errored
 }
 
 func fileLocation(fs afero.Fs, path string) (string, error) {

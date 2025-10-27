@@ -9,16 +9,17 @@
  */
 
 #include "cloud_io/tests/s3_imposter.h"
-#include "cloud_storage/remote.h"
-#include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/manual_fixture.h"
 #include "cloud_storage/tests/produce_utils.h"
 #include "cloud_storage/tests/read_replica_e2e_fixture.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/tests/manual_mixin.h"
+#include "cluster/controller_api.h"
 #include "cluster/health_monitor_frontend.h"
-#include "config/configuration.h"
+#include "kafka/data/replicated_partition.h"
+#include "kafka/protocol/find_coordinator.h"
+#include "kafka/server/tests/delete_records_utils.h"
 #include "kafka/server/tests/list_offsets_utils.h"
 #include "kafka/server/tests/produce_consume_utils.h"
 #include "model/fundamental.h"
@@ -26,12 +27,14 @@
 #include "model/namespace.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
+#include "storage/disk.h"
 #include "storage/ntp_config.h"
 #include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
 
-#include <seastar/core/io_priority_class.hh>
+#include <seastar/coroutine/as_future.hh>
 
+#include <boost/algorithm/string.hpp>
 #include <gtest/gtest.h>
 
 #include <iterator>
@@ -83,7 +86,9 @@ TEST_F(ManualFixture, TestSpilloverRetentionCompactedTopic) {
     const auto num_segs = 100;
     auto partition = app.partition_manager.local().get(ntp);
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(records_per_seg)
                            .produce()
@@ -95,6 +100,7 @@ TEST_F(ManualFixture, TestSpilloverRetentionCompactedTopic) {
     archiver.apply_archive_retention().get();
 
     tests::kafka_list_offsets_transport lister(make_kafka_client().get());
+    auto deferred_l_close = ss::defer([&lister] { lister.stop().get(); });
     lister.start().get();
 
     auto offset
@@ -104,6 +110,90 @@ TEST_F(ManualFixture, TestSpilloverRetentionCompactedTopic) {
     ASSERT_EQ(
       archiver.manifest().full_log_start_offset().value_or(model::offset{})(),
       0);
+}
+
+TEST_F(ManualFixture, TestSizeEstimationWithCloud) {
+    test_local_cfg.get("log_compaction_interval_ms")
+      .set_value(std::chrono::duration_cast<std::chrono::milliseconds>(1s));
+    test_local_cfg.get("cloud_storage_disable_upload_loop_for_tests")
+      .set_value(true);
+    test_local_cfg.get("cloud_storage_spillover_manifest_max_segments")
+      .set_value(std::make_optional<size_t>(5));
+    test_local_cfg.get("cloud_storage_spillover_manifest_size")
+      .set_value(std::optional<size_t>{});
+    const model::topic topic_name("tapioca");
+    model::ntp ntp(model::kafka_namespace, topic_name, 0);
+
+    cluster::topic_properties props;
+    props.shadow_indexing = model::shadow_indexing_mode::full;
+    props.cleanup_policy_bitflags = model::cleanup_policy_bitflags::deletion;
+    add_topic({model::kafka_namespace, topic_name}, 1, props).get();
+    wait_for_leader(ntp).get();
+
+    const auto records_per_seg = 5;
+    const auto num_segs = 100;
+    auto partition = app.partition_manager.local().get(ntp);
+    auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
+    tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
+
+    auto total_records = gen.num_segments(num_segs)
+                           .batches_per_segment(records_per_seg)
+                           .additional_local_segments(10)
+                           .produce()
+                           .get();
+    ASSERT_GE(total_records, 550);
+    ASSERT_TRUE(archiver.sync_for_tests().get());
+    archiver.apply_spillover().get();
+
+    // Aggressively GC, relying on max removable to preserve local segments
+    // not yet in tiered storage.
+    auto log = partition->log();
+    auto& manifest = partition->archival_meta_stm()->manifest();
+    log->set_cloud_gc_offset(model::next_offset(manifest.get_last_offset()));
+    RPTEST_REQUIRE_EVENTUALLY(5s, [&] {
+        vlog(e2e_test_log.info, "Log has {} segments", log->segment_count());
+        return log->segment_count() == 11;
+    });
+
+    kafka::replicated_partition kafka_partition(partition);
+    auto lso_res = kafka_partition.last_stable_offset();
+    ASSERT_FALSE(lso_res.has_error());
+    auto last_offset = kafka::prev_offset(model::offset_cast(lso_res.value()));
+    auto local_start = model::offset_cast(kafka_partition.local_start_offset());
+
+    auto total_estimated_sz = kafka_partition.estimate_size_between(
+      kafka::offset(0), last_offset);
+    auto cloud_estimated_sz = kafka_partition.estimate_size_between(
+      kafka::offset(0), kafka::prev_offset(local_start));
+    auto local_estimated_sz = kafka_partition.estimate_size_between(
+      local_start, last_offset);
+
+    vlog(
+      e2e_test_log.info,
+      "Local log start: {}, last offset: {}",
+      local_start,
+      last_offset);
+    EXPECT_EQ(local_estimated_sz, partition->size_bytes());
+    EXPECT_EQ(cloud_estimated_sz, partition->cloud_log_size());
+    EXPECT_EQ(total_estimated_sz, local_estimated_sz + cloud_estimated_sz);
+
+    for (int64_t i = 0; i < 13; i++) {
+        kafka::offset cut(i * total_records / 13);
+        auto left_estimated_sz = kafka_partition.estimate_size_between(
+          kafka::offset(0), kafka::prev_offset(cut));
+        auto right_estimated_sz = kafka_partition.estimate_size_between(
+          cut, last_offset);
+        EXPECT_LE(left_estimated_sz, total_estimated_sz);
+        EXPECT_LE(right_estimated_sz, total_estimated_sz);
+
+        // NOTE: error of 4000 chosen emperically.
+        // TODO: we expect some error given the estimate is based on the
+        // segment index, but it seems a little high, figure out why that is.
+        EXPECT_NEAR(
+          total_estimated_sz, left_estimated_sz + right_estimated_sz, 4000);
+    }
 }
 
 class EndToEndFixture
@@ -146,21 +236,26 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloud) {
     auto partition = app.partition_manager.local().get(ntp);
     auto log = partition->log();
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     ASSERT_TRUE(archiver.sync_for_tests().get());
 
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
+
     ASSERT_EQ(3, gen.records_per_batch(3).produce().get());
     ASSERT_EQ(2, log->segments().size());
     ASSERT_EQ(1, archiver.manifest().size());
 
-    // Compact the local log to GC to the collectible offset.
+    // Compact the local log to GC to the removable offset.
     ss::abort_source as;
     storage::housekeeping_config housekeeping_conf(
       model::timestamp::min(),
       1,
-      log->stm_manager()->max_collectible_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     partition->log()->housekeeping(housekeeping_conf).get();
     // NOTE: the storage layer only initially requests eviction; it relies on
@@ -173,6 +268,8 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloud) {
     // has been truncated, this exercises reading from cloud storage.
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
+
     auto consumed_records = consumer
                               .consume_from_partition(
                                 topic_name,
@@ -180,15 +277,15 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloud) {
                                 model::offset(0))
                               .get();
     auto records = kv_t::sequence(0, 3);
-    BOOST_CHECK_EQUAL(records.size(), consumed_records.size());
+    EXPECT_EQ(records.size(), consumed_records.size());
     for (size_t i = 0; i < records.size(); ++i) {
-        BOOST_CHECK_EQUAL(records[i].key, consumed_records[i].key);
-        BOOST_CHECK_EQUAL(records[i].val, consumed_records[i].val);
+        EXPECT_EQ(records[i].key, consumed_records[i].key);
+        EXPECT_EQ(records[i].val, consumed_records[i].val);
     }
 }
 
 TEST_P(EndToEndFixture, TestProduceConsumeFromCloudWithSpillover) {
-#ifndef _NDEBUG
+#ifdef NDEBUG
     test_local_cfg.get("cloud_storage_disable_upload_loop_for_tests")
       .set_value(true);
     test_local_cfg.get("cloud_storage_spillover_manifest_size")
@@ -220,9 +317,11 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloudWithSpillover) {
     auto archiver_ref = partition->archiver();
     ASSERT_TRUE(archiver_ref.has_value());
     auto& archiver = archiver_ref.value().get();
+    archiver.initialize_probe();
 
     kafka_produce_transport producer(make_kafka_client().get());
     producer.start().get();
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
 
     // Produce to partition until the manifest is large enough to trigger
     // spillover
@@ -244,7 +343,7 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloudWithSpillover) {
           .get();
         total_records += records.size();
         log->flush().get();
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
 
         ASSERT_TRUE(archiver.sync_for_tests().get());
         archiver
@@ -352,6 +451,8 @@ TEST_P(EndToEndFixture, TestProduceConsumeFromCloudWithSpillover) {
     // Consume from start offset of the partition (data available in the STM).
     vlog(e2e_test_log.info, "Consuming from the partition");
     kafka_consume_transport consumer(make_kafka_client().get());
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
+
     consumer.start().get();
     std::vector<kv_t> consumed_records;
     auto next_offset = archive_ko;
@@ -475,6 +576,7 @@ public:
         partition = app.partition_manager.local().get(ntp).get();
         log = partition->log();
         archiver = &partition->archiver()->get();
+        archiver->initialize_probe();
     }
 
     scoped_config test_local_cfg;
@@ -487,12 +589,10 @@ public:
 
 namespace {
 
-ss::future<bool> check_consume_from_beginning(
-  kafka::client::transport client,
+ss::future<bool> do_check_consume_from_beginning(
+  kafka_consume_transport& consumer,
   const model::topic& topic_name,
   ss::gate& gate) {
-    kafka_consume_transport consumer(std::move(client));
-    co_await consumer.start();
     int iters = 0;
     while (iters == 0 || !gate.is_closed()) {
         auto holder = gate.hold();
@@ -515,6 +615,19 @@ ss::future<bool> check_consume_from_beginning(
     co_return true;
 }
 
+ss::future<bool> check_consume_from_beginning(
+  kafka::client::transport client,
+  const model::topic& topic_name,
+  ss::gate& gate) {
+    kafka_consume_transport consumer(std::move(client));
+    co_await consumer.start();
+    auto res_f = co_await ss::coroutine::as_future(
+      do_check_consume_from_beginning(consumer, topic_name, gate));
+
+    co_await consumer.stop();
+    co_return res_f.get();
+}
+
 } // namespace
 
 TEST_P(CloudStorageEndToEndManualTest, TestConsumeDuringSpillover) {
@@ -522,6 +635,8 @@ TEST_P(CloudStorageEndToEndManualTest, TestConsumeDuringSpillover) {
     const auto records_per_seg = 5;
     const auto num_segs = 40;
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
+
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(records_per_seg)
                            .produce()
@@ -557,7 +672,7 @@ TEST_P(CloudStorageEndToEndManualTest, TestConsumeDuringSpillover) {
 
     g.close().get();
     for (auto& check : checks) {
-        BOOST_CHECK(check.get());
+        EXPECT_TRUE(check.get());
     }
     cleanup.cancel();
 }
@@ -569,6 +684,7 @@ TEST_P(CloudStorageEndToEndManualTest, TestTimequeryAfterArchivalGC) {
     const auto records_per_seg = 5;
     const auto num_segs = 40;
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(records_per_seg)
                            .batch_time_delta_ms(10)
@@ -582,9 +698,11 @@ TEST_P(CloudStorageEndToEndManualTest, TestTimequeryAfterArchivalGC) {
     storage::housekeeping_config housekeeping_conf(
       model::timestamp::min(),
       1, // max_bytes_in_log
-      log->stm_manager()->max_collectible_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     partition->log()->housekeeping(housekeeping_conf).get();
     RPTEST_REQUIRE_EVENTUALLY(
@@ -623,6 +741,14 @@ TEST_P(CloudStorageEndToEndManualTest, TestTimequeryAfterArchivalGC) {
       archiver->manifest().get_spillover_map().begin()->base_offset,
       first_seg.base_offset);
 
+    // Supply some phony disk stats so that the cache doesn't panic and
+    // think it has zero bytes of space. Otherwise we seem to be racing
+    // against an async notification in release mode.
+    app.shadow_index_cache.local().notify_disk_status(
+      100ULL * 1024 * 1024 * 1024,
+      50ULL * 1024 * 1024 * 1024,
+      storage::disk_space_alert::ok);
+
     // To be sure we actually query S3, force removal of any cached files.
     app.shadow_index_cache.local()
       .trim_manually(
@@ -631,6 +757,7 @@ TEST_P(CloudStorageEndToEndManualTest, TestTimequeryAfterArchivalGC) {
 
     tests::kafka_list_offsets_transport lister(make_kafka_client().get());
     lister.start().get();
+    auto deferred_l_close = ss::defer([&lister] { lister.stop().get(); });
 
     // Timequery to somewhere within the segment that was deleted. This should
     // succeed, and return the next offset after the new start.
@@ -695,7 +822,7 @@ TEST_F(CloudStorageManualMultiNodeTestBase, ReclaimableReportedInHealthReport) {
 
     kafka_produce_transport producer(fx_l->make_kafka_client().get());
     producer.start().get();
-
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
     auto get_reclaimable = [&]() -> std::optional<std::vector<size_t>> {
         auto report = app.controller->get_health_monitor()
                         .local()
@@ -714,7 +841,7 @@ TEST_F(CloudStorageManualMultiNodeTestBase, ReclaimableReportedInHealthReport) {
                         model::kafka_namespace, topic_name)) {
                         continue;
                     }
-                    for (auto partition : partitions) {
+                    for (auto& [id, partition] : partitions) {
                         sizes.push_back(
                           partition.reclaimable_size_bytes.value_or(0));
                     }
@@ -739,6 +866,7 @@ TEST_F(CloudStorageManualMultiNodeTestBase, ReclaimableReportedInHealthReport) {
 
         // drive the uploading
         auto& archiver = prt_l->archiver()->get();
+        archiver.initialize_probe();
         archiver.sync_for_tests().get();
         archiver
           .upload_next_candidates(
@@ -779,6 +907,7 @@ TEST_F(EndToEndFixture, TestLocalTimequery) {
     auto partition = app.partition_manager.local().get(ntp);
     auto log = partition->log();
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     ASSERT_TRUE(archiver.sync_for_tests().get());
 
     const auto batches_per_segment = 1;
@@ -786,6 +915,7 @@ TEST_F(EndToEndFixture, TestLocalTimequery) {
     const auto batch_time_delta_ms = 10;
     const auto base_timestamp = model::timestamp{0};
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(batches_per_segment)
                            .base_timestamp(base_timestamp)
@@ -801,7 +931,7 @@ TEST_F(EndToEndFixture, TestLocalTimequery) {
         bool expect_value = false,
         std::optional<model::offset> expected_o = std::nullopt) {
           auto timequery_conf = storage::timequery_config(
-            model::offset(0), t, o, ss::default_priority_class(), std::nullopt);
+            model::offset(0), t, o, std::nullopt);
 
           auto result = partition->timequery(timequery_conf).get();
 
@@ -858,6 +988,7 @@ TEST_P(EndToEndFixture, TestCloudStorageTimequery) {
     auto partition = app.partition_manager.local().get(ntp);
     auto log = partition->log();
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     ASSERT_TRUE(archiver.sync_for_tests().get());
 
     const auto batches_per_segment = 1;
@@ -865,6 +996,7 @@ TEST_P(EndToEndFixture, TestCloudStorageTimequery) {
     const auto batch_time_delta_ms = 10;
     const auto base_timestamp = model::timestamp{0};
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(batches_per_segment)
                            .base_timestamp(base_timestamp)
@@ -879,9 +1011,11 @@ TEST_P(EndToEndFixture, TestCloudStorageTimequery) {
     storage::housekeeping_config housekeeping_conf(
       model::timestamp::max(),
       0,
-      log->stm_manager()->max_collectible_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
+      log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     partition->log()->housekeeping(housekeeping_conf).get();
 
@@ -895,7 +1029,7 @@ TEST_P(EndToEndFixture, TestCloudStorageTimequery) {
         bool expect_value = false,
         std::optional<model::offset> expected_o = std::nullopt) {
           auto timequery_conf = storage::timequery_config(
-            model::offset(0), t, o, ss::default_priority_class(), std::nullopt);
+            model::offset(0), t, o, std::nullopt);
 
           auto result = partition->timequery(timequery_conf).get();
 
@@ -949,6 +1083,7 @@ TEST_F(ReadReplicaFixture, TestCloudStorageTimequeryReadReplicaMode) {
     auto partition = app.partition_manager.local().get(ntp);
     auto log = partition->log();
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     ASSERT_TRUE(archiver.sync_for_tests().get());
     archiver.upload_topic_manifest().get();
 
@@ -957,6 +1092,7 @@ TEST_F(ReadReplicaFixture, TestCloudStorageTimequeryReadReplicaMode) {
     const auto batch_time_delta_ms = 10;
     const auto base_timestamp = model::timestamp{0};
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(batches_per_segment)
                            .base_timestamp(base_timestamp)
@@ -977,11 +1113,12 @@ TEST_F(ReadReplicaFixture, TestCloudStorageTimequeryReadReplicaMode) {
     rr_rp->wait_for_leader(ntp).get();
     auto rr_partition = rr_rp->app.partition_manager.local().get(ntp).get();
     auto rr_archiver_ref = rr_partition->archiver();
-    BOOST_REQUIRE(rr_archiver_ref.has_value());
+    ASSERT_TRUE(rr_archiver_ref.has_value());
     auto& rr_archiver = rr_partition->archiver()->get();
-    BOOST_REQUIRE(rr_archiver.sync_for_tests().get());
+    rr_archiver.initialize_probe();
+    ASSERT_TRUE(rr_archiver.sync_for_tests().get());
     rr_archiver.sync_manifest().get();
-    BOOST_REQUIRE_EQUAL(rr_archiver.manifest().size(), 5);
+    ASSERT_EQ(rr_archiver.manifest().size(), 5);
 
     auto make_and_verify_timequery =
       [rr_partition](
@@ -990,7 +1127,7 @@ TEST_F(ReadReplicaFixture, TestCloudStorageTimequeryReadReplicaMode) {
         bool expect_value = false,
         std::optional<model::offset> expected_o = std::nullopt) {
           auto timequery_conf = storage::timequery_config(
-            model::offset(0), t, o, ss::default_priority_class(), std::nullopt);
+            model::offset(0), t, o, std::nullopt);
 
           auto result = rr_partition->timequery(timequery_conf).get();
 
@@ -1045,6 +1182,7 @@ TEST_P(EndToEndFixture, TestMixedTimequery) {
     auto partition = app.partition_manager.local().get(ntp);
     auto log = partition->log();
     auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
     ASSERT_TRUE(archiver.sync_for_tests().get());
 
     // Generate batches [0, 10, 20, ..., 100]
@@ -1052,6 +1190,7 @@ TEST_P(EndToEndFixture, TestMixedTimequery) {
     const auto batches_per_segment = 1;
     const auto batch_time_delta_ms = 10;
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(batches_per_segment)
                            .base_timestamp(model::timestamp{0})
@@ -1099,7 +1238,7 @@ TEST_P(EndToEndFixture, TestMixedTimequery) {
         bool expect_value = false,
         std::optional<model::offset> expected_o = std::nullopt) {
           auto timequery_conf = storage::timequery_config(
-            model::offset(0), t, o, ss::default_priority_class(), std::nullopt);
+            model::offset(0), t, o, std::nullopt);
 
           auto result = partition->timequery(timequery_conf).get();
 
@@ -1147,6 +1286,150 @@ TEST_P(EndToEndFixture, TestMixedTimequery) {
           true,
           model::offset{i});
     }
+}
+
+TEST_P(EndToEndFixture, TestConsumerOffsetsNoTieredStorage) {
+    model::ntp ntp(
+      model::kafka_consumer_offsets_nt.ns,
+      model::kafka_consumer_offsets_nt.tp,
+      model::partition_id{0});
+
+    auto client = make_kafka_client().get();
+    auto client_stop_guard = ss::defer([&client] { client.stop().get(); });
+
+    client.connect().get();
+    kafka::find_coordinator_request req(kafka::group_instance_id("foo"));
+    req.data.key_type = kafka::coordinator_type::group;
+    client.dispatch(std::move(req), kafka::api_version(1)).get();
+
+    ASSERT_EQ(
+      cluster::errc::success,
+      app.controller->get_api()
+        .local()
+        .wait_for_topic(
+          model::kafka_consumer_offsets_nt, model::timeout_clock::now() + 30s)
+        .get());
+
+    auto partition = app.partition_manager.local().get(ntp);
+    ASSERT_FALSE(partition->archiver().has_value());
+    ASSERT_EQ(nullptr, partition->archival_meta_stm().get());
+    ASSERT_FALSE(partition->cloud_data_available());
+}
+
+TEST_F(ManualFixture, TestSpilloverWithTruncationRetainsStartOffset) {
+    test_local_cfg.get("cloud_storage_disable_upload_loop_for_tests")
+      .set_value(true);
+    test_local_cfg.get("cloud_storage_spillover_manifest_max_segments")
+      .set_value(std::make_optional<size_t>(2));
+    test_local_cfg.get("cloud_storage_spillover_manifest_size")
+      .set_value(std::optional<size_t>{});
+
+    const model::topic topic_name("spillover_truncate_test");
+    model::ntp ntp(model::kafka_namespace, topic_name, 0);
+
+    cluster::topic_properties props;
+    props.shadow_indexing = model::shadow_indexing_mode::full;
+    props.cleanup_policy_bitflags = model::cleanup_policy_bitflags::deletion;
+    props.retention_bytes = tristate<size_t>(disable_tristate_t{});
+    props.retention_duration = tristate<std::chrono::milliseconds>(
+      disable_tristate_t{});
+    add_topic({model::kafka_namespace, topic_name}, 1, props).get();
+    wait_for_leader(ntp).get();
+
+    auto partition = app.partition_manager.local().get(ntp);
+    auto& archiver = partition->archiver().value().get();
+    archiver.initialize_probe();
+
+    SCOPED_TRACE("Seeding partition data");
+
+    tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
+
+    auto first_batch = gen.num_segments(6)
+                         .batches_per_segment(5)
+                         .records_per_batch(1)
+                         .produce()
+                         .get();
+    ASSERT_GE(first_batch, 30);
+
+    // Sync and upload segments
+    ASSERT_TRUE(archiver.sync_for_tests().get());
+
+    // Step 2: Apply spillover
+    vlog(e2e_test_log.info, "Applying first spillover");
+    archiver.apply_spillover().get();
+
+    // Capture start offset before truncation
+    auto start_kafka_offset_before
+      = archiver.manifest().full_log_start_kafka_offset();
+    vlog(
+      e2e_test_log.info,
+      "Start kafka offset before truncation: {}",
+      start_kafka_offset_before);
+
+    SCOPED_TRACE("Truncating via DeleteRecords");
+    const auto timeout = 10s;
+
+    tests::kafka_delete_records_transport deleter(make_kafka_client().get());
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
+    deleter.start().get();
+
+    // Delete offset from second segment of the first spillover manifest.
+    auto new_lwm = deleter
+                     .delete_records_from_partition(
+                       topic_name, ntp.tp.partition, model::offset{8}, timeout)
+                     .get();
+    ASSERT_EQ(new_lwm, model::offset{8});
+
+    ASSERT_EQ(
+      archiver.manifest().full_log_start_kafka_offset(), kafka::offset{0});
+    ASSERT_EQ(
+      archiver.manifest().get_start_kafka_offset_override(), kafka::offset{8});
+
+    // Additional segments to trigger another spillover round.
+    gen.num_segments(6)
+      .batches_per_segment(5)
+      .records_per_batch(1)
+      .produce()
+      .get();
+
+    archiver.housekeeping().get();
+
+    // Due to implementation deficiencies truncation doesn't advance start
+    // offset but at least the override should not regress.
+    ASSERT_EQ(
+      archiver.manifest().full_log_start_kafka_offset(), kafka::offset{5});
+    ASSERT_EQ(
+      archiver.manifest().get_start_kafka_offset_override(), kafka::offset{8});
+
+    vlog(e2e_test_log.info, "Deleting from middle of STM region");
+
+    auto second_to_last_offset = kafka::offset_cast(
+      kafka::prev_offset(archiver.manifest().get_last_kafka_offset().value()));
+    ASSERT_GT(second_to_last_offset, model::offset{0});
+
+    new_lwm = deleter
+                .delete_records_from_partition(
+                  topic_name, ntp.tp.partition, second_to_last_offset, timeout)
+                .get();
+    ASSERT_EQ(new_lwm, second_to_last_offset);
+
+    vlog(e2e_test_log.info, "Housekeeping after second truncation");
+    archiver.housekeeping().get();
+
+    ASSERT_EQ(
+      archiver.manifest().full_log_start_kafka_offset(), kafka::offset{40});
+    ASSERT_EQ(
+      archiver.manifest().get_start_kafka_offset_override(), kafka::offset{48});
+
+    // Offsets will advance as we'll remove from STM region this time too.
+    vlog(e2e_test_log.info, "Last housekeeping");
+    archiver.housekeeping().get();
+
+    ASSERT_EQ(
+      archiver.manifest().full_log_start_kafka_offset(), kafka::offset{45});
+    ASSERT_EQ(
+      archiver.manifest().get_start_kafka_offset_override(), kafka::offset{48});
 }
 
 INSTANTIATE_TEST_SUITE_P(WithOverride, EndToEndFixture, ::testing::Bool());

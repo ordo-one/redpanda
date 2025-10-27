@@ -23,8 +23,6 @@
 #include "model/timestamp.h"
 #include "utils/retry_chain_node.h"
 
-#include <seastar/core/io_priority_class.hh>
-
 namespace datalake::translation {
 
 class translator_out_of_memory_error final : public std::runtime_error {
@@ -45,12 +43,51 @@ public:
       : std::runtime_error("translator_time_quota_exceeded") {}
 };
 
+class translator_out_of_disk_error final : public std::runtime_error {
+public:
+    explicit translator_out_of_disk_error()
+      : std::runtime_error("translator_out_of_disk") {}
+};
+
+class noop_disk_tracker : public writer_disk_tracker {
+    ss::future<reservation_error>
+    reserve_bytes(size_t, ss::abort_source&) noexcept override;
+    ss::future<> free_bytes(size_t, ss::abort_source&) override;
+    void release() override;
+    void release_unused() override;
+};
+
 class noop_mem_tracker : public writer_mem_tracker {
 public:
     ss::future<reservation_error>
     reserve_bytes(size_t, ss::abort_source&) noexcept override;
     ss::future<> free_bytes(size_t, ss::abort_source&) override;
     void release() override;
+    writer_disk_tracker& disk() override;
+
+private:
+    noop_disk_tracker _disk;
+};
+
+/**
+ * Tracks disk usage across all writers in a single translator.
+ */
+class translator_disk_tracker : public writer_disk_tracker {
+public:
+    explicit translator_disk_tracker(
+      scheduling::reservations_tracker& scheduling_reservations)
+      : _reservations_tracker(scheduling_reservations) {}
+
+    ss::future<reservation_error>
+    reserve_bytes(size_t, ss::abort_source&) noexcept override;
+    ss::future<> free_bytes(size_t, ss::abort_source&) override;
+    void release() override;
+    void release_unused() override;
+
+private:
+    size_t _current_usage{0};
+    scheduling::reservations_tracker& _reservations_tracker;
+    ssx::semaphore_units _reservations;
 };
 
 /**
@@ -60,12 +97,14 @@ class translator_mem_tracker : public writer_mem_tracker {
 public:
     explicit translator_mem_tracker(
       scheduling::reservations_tracker& scheduling_reservations)
-      : _reservations_tracker(scheduling_reservations) {}
+      : _reservations_tracker(scheduling_reservations)
+      , _disk(scheduling_reservations) {}
 
     ss::future<reservation_error>
     reserve_bytes(size_t, ss::abort_source&) noexcept override;
     ss::future<> free_bytes(size_t, ss::abort_source&) override;
     void release() override;
+    writer_disk_tracker& disk() override;
 
     size_t current_usage() const;
     size_t total_reserved() const;
@@ -74,6 +113,7 @@ private:
     size_t _current_usage{0};
     scheduling::reservations_tracker& _reservations_tracker;
     ssx::semaphore_units _reservations;
+    translator_disk_tracker _disk;
 };
 
 class coordinator_api {
@@ -147,8 +187,7 @@ public:
       = 0;
 
     virtual ss::future<std::optional<model::record_batch_reader>>
-    make_log_reader(kafka::offset, ss::io_priority_class, ss::abort_source&)
-      = 0;
+    make_log_reader(kafka::offset, ss::abort_source&) = 0;
 
     virtual kafka::offset min_offset_for_translation() const = 0;
 
@@ -160,14 +199,6 @@ public:
       model::term_id,
       model::timeout_clock::duration timeout,
       ss::abort_source&)
-      = 0;
-
-    virtual void update_commit_lag(
-      std::optional<kafka::offset> max_committed_kafka_offset) const
-      = 0;
-
-    virtual void
-    update_translation_lag(kafka::offset max_translated_kafka_offset) const
       = 0;
 
     static std::unique_ptr<data_source>
@@ -183,6 +214,8 @@ enum translation_errc {
     oom_error,
     time_limit_exceeded,
     shutting_down,
+    out_of_disk,
+    type_resolution_error,
 };
 
 std::ostream& operator<<(std::ostream&, translation_errc);
@@ -221,13 +254,10 @@ public:
     virtual std::optional<kafka::offset> last_translated_offset() const = 0;
 
     /**
-     * Reconciles the translator configurations.
-     */
-    virtual void reconcile_properties() = 0;
-
-    /**
      * Cleans up state and uploads data to cloud storage. Should be called in
      * all cases for appropriate cleanup.
+     * This is called outside of translation scheduler context so it does not
+     * block translation of other partitions.
      */
     virtual ss::future<
       checked<coordinator::translated_offset_range, translation_errc>>
@@ -242,6 +272,12 @@ public:
      */
     virtual size_t buffered_bytes() const = 0;
 
+    // Report and update the lag of data that has yet to be translated.
+    virtual void report_translation_lag(int64_t new_lag) = 0;
+
+    // Report and update the lag of data that has yet to be committed.
+    virtual void report_commit_lag(int64_t new_lag) = 0;
+
     static std::unique_ptr<translation_context>
     make_default_translation_context(
       local_path,
@@ -253,7 +289,6 @@ public:
       std::unique_ptr<record_translator>,
       std::unique_ptr<table_creator>,
       location_provider,
-      remote_path,
       scheduling::reservations_tracker&,
       ss::sharded<cluster::topic_table>*,
       ss::sharded<features::feature_table>*,

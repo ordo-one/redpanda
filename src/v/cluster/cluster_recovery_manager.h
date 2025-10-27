@@ -26,11 +26,20 @@ namespace cluster {
 
 class cluster_recovery_manager {
 public:
+    enum class errc : uint8_t {
+        success = 0,
+        unknown,
+        not_a_leader,
+        misconfigured,
+        no_matching_metadata,
+        already_in_progress,
+    };
+
+public:
     static constexpr ss::shard_id shard = 0;
     cluster_recovery_manager(
       ss::sharded<ss::abort_source>&,
       ss::sharded<controller_stm>&,
-      ss::sharded<features::feature_table>&,
       ss::sharded<cloud_storage::remote>& remote,
       ss::sharded<cluster_recovery_table>&,
       ss::sharded<storage::api>&,
@@ -44,8 +53,9 @@ public:
     ss::future<std::optional<model::term_id>> sync_leader(ss::abort_source&);
 
     // Starts a recovery if one isn't already in progress.
-    ss::future<result<cluster::errc, cloud_metadata::error_outcome>>
-    initialize_recovery(cloud_storage_clients::bucket_name bucket);
+    ss::future<checked<void, errc>> initialize_recovery(
+      cloud_storage_clients::bucket_name bucket,
+      std::optional<model::cluster_uuid> cluster_uuid_override);
 
     // Returns true if the update was successfuly replicated and applied.
     // Otherwise, logs a warning and returns false.
@@ -87,7 +97,6 @@ private:
     // Still only used on shard-0.
     ss::sharded<ss::abort_source>& _sharded_as;
     ss::sharded<controller_stm>& _controller_stm;
-    ss::sharded<features::feature_table>& _feature_table;
 
     ss::sharded<cloud_storage::remote>& _remote;
 

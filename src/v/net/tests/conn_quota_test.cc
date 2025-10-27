@@ -10,7 +10,7 @@
 #include "config/mock_property.h"
 #include "net/conn_quota.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/preempt.hh>
@@ -249,6 +249,12 @@ void conn_quota_fixture::test_borrows(
     // a reclaim.
     vlog(logger.debug, "Trigger a reclaim");
     scq.invoke_on(1, [this](conn_quota&) { shard_units.erase(1); }).get();
+    // Reclaiming happens through a shard 1->0 background fiber fired through
+    // ~units(), which is not covered by waiting on the invoked task.
+    // The following invoke_on starts a task that includes a shard 2->0 request.
+    // Add a barier to protect against race condition between shard {1|2} ->
+    // shard 0 requests
+    tests::flush_tasks();
     scq
       .invoke_on(
         2,
@@ -351,7 +357,9 @@ FIXTURE_TEST(test_change_limits, conn_quota_fixture) {
       .get();
 
     // We cleared the limit, should be able to get as many tokens as we like
-    { auto u = take_units(addr1, initial_limit * 2); }
+    {
+        auto u = take_units(addr1, initial_limit * 2);
+    }
 
     // Releasing a bunch of units after disabling the limit should
     // work (they should be dropped)

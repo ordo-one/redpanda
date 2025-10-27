@@ -44,13 +44,14 @@ offset_to_filepos_consumer::operator()(::model::record_batch batch) {
     if (
       _target_last_offset > batch.base_offset()
       && _target_last_offset <= batch.last_offset()) {
-        throw std::runtime_error(fmt::format(
-          "Offset to file position consumer isn't able to translate "
-          "offsets other than batch base offset or offset being in the "
-          "gap. Requested offset: {}, current batch offsets: [{},{}]",
-          _target_last_offset,
-          batch.base_offset(),
-          batch.last_offset()));
+        throw std::runtime_error(
+          fmt::format(
+            "Offset to file position consumer isn't able to translate "
+            "offsets other than batch base offset or offset being in the "
+            "gap. Requested offset: {}, current batch offsets: [{},{}]",
+            _target_last_offset,
+            batch.base_offset(),
+            batch.last_offset()));
     }
 
     _prev_batch_last_offset = batch.last_offset();
@@ -77,7 +78,6 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
   model::offset begin_inclusive,
   ss::lw_shared_ptr<segment> segment,
   model::timestamp base_timestamp,
-  ss::io_priority_class io_priority,
   should_fail_on_missing_offset fail_on_missing_offset) {
     auto ix_begin = segment->index().find_nearest(begin_inclusive);
     size_t scan_from = ix_begin ? ix_begin->filepos : 0;
@@ -86,8 +86,7 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
 
     model::timestamp ts = base_timestamp;
     bool offset_found = false;
-    auto handle = co_await segment->reader().data_stream(
-      scan_from, io_priority);
+    auto handle = co_await segment->reader().data_stream(scan_from);
 
     bool offset_inside_batch = false;
     auto res = co_await storage::internal::with_segment_reader_handle(
@@ -129,10 +128,9 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
     if (!offset_found && fail_on_missing_offset) {
         vlog(
           stlog.warn,
-          "Segment does not contain searched for offset: {}, segment offsets: "
-          "{}",
-          sto,
-          segment->offsets());
+          "Segment {} does not contain searched for offset: {}",
+          segment,
+          sto);
         co_return std::make_error_code(std::errc::invalid_seek);
     }
 
@@ -154,7 +152,6 @@ ss::future<result<offset_to_file_pos_result>> convert_end_offset_to_file_pos(
   model::offset end_inclusive,
   ss::lw_shared_ptr<segment> segment,
   model::timestamp max_timestamp,
-  ss::io_priority_class io_priority,
   should_fail_on_missing_offset fail_on_missing_offset) {
     // Handle truncated segment upload (if the upload was triggered by time
     // limit). Note that the upload is not necessarily started at the beginning
@@ -190,8 +187,7 @@ ss::future<result<offset_to_file_pos_result>> convert_end_offset_to_file_pos(
     bool offset_found = false;
     model::timestamp ts = max_timestamp;
 
-    auto reader_handle = co_await segment->reader().data_stream(
-      scan_from, io_priority);
+    auto reader_handle = co_await segment->reader().data_stream(scan_from);
 
     bool offset_inside_batch = false;
     auto res = co_await storage::internal::with_segment_reader_handle(

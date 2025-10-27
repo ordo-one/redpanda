@@ -82,11 +82,13 @@ public:
         model::iceberg_mode iceberg_mode{default_iceberg_mode};
         bool cloud_topic_enabled{default_cloud_topic_enabled};
 
-        // Should not be enabled at the same time as any other tiered storage
-        // properties.
-        tristate<std::chrono::milliseconds> tombstone_retention_ms;
+        tristate<std::chrono::milliseconds> delete_retention_ms;
 
+        // Controls segment compaction eligiblity.
         tristate<double> min_cleanable_dirty_ratio;
+        std::optional<std::chrono::milliseconds> min_compaction_lag_ms;
+        std::optional<std::chrono::milliseconds> max_compaction_lag_ms;
+
         // Controls behavior during pause
         std::optional<bool> remote_allow_gaps;
 
@@ -147,23 +149,39 @@ public:
     ss::sstring& base_directory() { return _base_dir; }
 
     const default_overrides& get_overrides() const { return *_overrides; }
+
     default_overrides& get_overrides() { return *_overrides; }
 
     bool has_overrides() const { return _overrides != nullptr; }
 
-    bool has_compacted_override() const {
-        auto cp_override = cleanup_policy_override();
-        if (!cp_override) {
+    // If compaction is enabled for local storage.
+    bool is_locally_compacted() const {
+        if (cloud_topic_enabled()) {
             return false;
         }
-        return model::is_compaction_enabled(cp_override.value());
-    }
-
-    bool is_compacted() const {
         return model::is_compaction_enabled(cleanup_policy());
     }
 
-    bool is_collectable() const {
+    // If compaction is enabled for remote storage.
+    //
+    // NOTE: currently this is only supported for cloud topics
+    bool is_remotely_compacted() const {
+        return cloud_topic_enabled()
+               && model::is_compaction_enabled(cleanup_policy());
+    }
+
+    // If time/bytes based retention is enabled for local storage.
+    bool is_locally_collectable() const {
+        if (cloud_topic_enabled()) {
+            // Cloud topics always manually retains the log based
+            // on what has been written to L1.
+            return false;
+        }
+        return model::is_deletion_enabled(cleanup_policy());
+    }
+
+    // If time/bytes based retention is enabled for remote storage.
+    bool is_remotely_collectable() const {
         return model::is_deletion_enabled(cleanup_policy());
     }
 
@@ -218,19 +236,36 @@ public:
         return config::shard_local_cfg().log_retention_ms();
     }
 
+    topic_recovery_enabled recovery_enabled() const {
+        if (cloud_topic_enabled()) {
+            return topic_recovery_enabled::no;
+        }
+        return _overrides != nullptr ? _overrides->recovery_enabled
+                                     : topic_recovery_enabled::no;
+    }
+
     bool is_archival_enabled() const {
+        if (cloud_topic_enabled()) {
+            return false;
+        }
         return _overrides != nullptr && _overrides->shadow_indexing_mode
                && model::is_archival_enabled(
                  _overrides->shadow_indexing_mode.value());
     }
 
     bool is_remote_fetch_enabled() const {
+        if (cloud_topic_enabled()) {
+            return false;
+        }
         return _overrides != nullptr && _overrides->shadow_indexing_mode
                && model::is_fetch_enabled(
                  _overrides->shadow_indexing_mode.value());
     }
 
     bool is_read_replica_mode_enabled() const {
+        if (cloud_topic_enabled()) {
+            return false;
+        }
         return _overrides != nullptr && _overrides->read_replica
                && _overrides->read_replica.value();
     }
@@ -249,6 +284,9 @@ public:
      * both reads and writes to S3, and is not a read replica.
      */
     bool is_tiered_storage() const {
+        if (cloud_topic_enabled()) {
+            return false;
+        }
         return _overrides != nullptr
                && !_overrides->read_replica.value_or(false)
                && _overrides->shadow_indexing_mode
@@ -284,7 +322,7 @@ public:
     }
 
     bool write_caching() const {
-        if (!model::is_user_topic(_ntp)) {
+        if (!model::is_user_topic(_ntp) || cloud_topic_enabled()) {
             return false;
         }
         auto cluster_default
@@ -314,13 +352,40 @@ public:
                           : cluster_default;
     }
 
-    std::optional<std::chrono::milliseconds> tombstone_retention_ms() const {
+    std::optional<std::chrono::milliseconds> delete_retention_ms() const {
         if (is_read_replica_mode_enabled()) {
             // RRR sanity check.
             return std::nullopt;
         }
         auto& cluster_default
           = config::shard_local_cfg().tombstone_retention_ms();
+        if (_overrides) {
+            // If the tristate is disabled, return nullopt.
+            if (_overrides->delete_retention_ms.is_disabled()) {
+                return std::nullopt;
+            }
+            // If the tristate has a value, use it.
+            if (_overrides->delete_retention_ms.has_optional_value()) {
+                return _overrides->delete_retention_ms.value();
+            }
+
+            // If the tristate holds an empty optional, fall back to cluster
+            // default.
+            return cluster_default;
+        }
+
+        // Fall back to cluster default
+        return cluster_default;
+    }
+
+    // Unfortunately delete.retention.ms has to be split into two logical
+    // properties- tombstone_retention_ms and tx_retention_ms.
+    // This is because of the race conditions that exist with tombstone removal
+    // within a tiered storage enabled topic that don't exist with tx batch
+    // removal.
+    // tombstone_retention_ms should always == std::nullopt if tiered storage is
+    // enabled.
+    std::optional<std::chrono::milliseconds> tombstone_retention_ms() const {
         if (_overrides) {
             // Tombstone deletion should not be enabled at the same time as
             // tiered storage.
@@ -330,22 +395,12 @@ public:
                    != model::shadow_indexing_mode::disabled) {
                 return std::nullopt;
             }
-            // If the tristate is disabled, return nullopt.
-            if (_overrides->tombstone_retention_ms.is_disabled()) {
-                return std::nullopt;
-            }
-            // If the tristate has a value, use it.
-            if (_overrides->tombstone_retention_ms.has_optional_value()) {
-                return _overrides->tombstone_retention_ms.value();
-            }
-
-            // If the tristate holds an empty optional, fall back to cluster
-            // default.
-            return cluster_default;
         }
-        // Fall back to cluster default, since _overrides being nullptr signals
-        // that remote.read and remote.write is disabled for this topic.
-        return cluster_default;
+        return delete_retention_ms();
+    }
+
+    std::optional<std::chrono::milliseconds> tx_retention_ms() const {
+        return delete_retention_ms();
     }
 
     std::optional<model::cleanup_policy_bitflags>
@@ -360,6 +415,10 @@ public:
     }
 
     model::iceberg_mode iceberg_mode() const {
+        // TODO(cloud_topics): support iceberg
+        if (cloud_topic_enabled()) {
+            return model::iceberg_mode::disabled;
+        }
         if (!config::shard_local_cfg().iceberg_enabled) {
             return model::iceberg_mode::disabled;
         }
@@ -371,7 +430,7 @@ public:
     }
 
     bool cloud_topic_enabled() const {
-        if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+        if (!config::shard_local_cfg().cloud_topics_enabled()) {
             return false;
         }
         return _overrides ? _overrides->cloud_topic_enabled
@@ -388,6 +447,20 @@ public:
             }
         }
         return config::shard_local_cfg().min_cleanable_dirty_ratio();
+    }
+
+    std::chrono::milliseconds min_compaction_lag_ms() const {
+        if (_overrides && _overrides->min_compaction_lag_ms.has_value()) {
+            return _overrides->min_compaction_lag_ms.value();
+        }
+        return config::shard_local_cfg().min_compaction_lag_ms();
+    }
+
+    std::chrono::milliseconds max_compaction_lag_ms() const {
+        if (_overrides && _overrides->max_compaction_lag_ms.has_value()) {
+            return _overrides->max_compaction_lag_ms.value();
+        }
+        return config::shard_local_cfg().max_compaction_lag_ms();
     }
 
     ntp_config copy() const {

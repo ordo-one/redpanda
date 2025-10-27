@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
+#include "base/seastarx.h"
 #include "cloud_storage_clients/client.h"
 #include "config/configuration.h"
 #include "http/tests/registered_urls.h"
@@ -20,10 +22,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/http/httpd.hh>
 
-#include <absl/container/flat_hash_set.h>
-
-#include <chrono>
-#include <exception>
 #include <map>
 #include <vector>
 
@@ -116,7 +114,6 @@ public:
     const cloud_storage_clients::bucket_name bucket_name
       = random_test_bucket_name();
 
-protected:
     cloud_storage_clients::s3_url_style url_style;
     cloud_storage_clients::s3_configuration conf;
 

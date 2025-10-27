@@ -23,6 +23,7 @@
 #include <boost/lexical_cast.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <unordered_map>
 
 namespace YAML {
@@ -374,6 +375,7 @@ struct convert<model::cloud_storage_backend> {
        "azure",
        "minio",
        "oracle_s3_compat",
+       "linode_s3_compat",
        "unknown"});
 
     static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
@@ -397,6 +399,9 @@ struct convert<model::cloud_storage_backend> {
                 .match(
                   "oracle_s3_compat",
                   model::cloud_storage_backend::oracle_s3_compat)
+                .match(
+                  "linode_s3_compat",
+                  model::cloud_storage_backend::linode_s3_compat)
                 .match("unknown", model::cloud_storage_backend::unknown);
 
         return true;
@@ -689,32 +694,13 @@ struct convert<model::iceberg_invalid_record_action> {
 
 template<>
 struct convert<config::datalake_catalog_auth_mode> {
-    static Node encode(const config::datalake_catalog_auth_mode& rhs) {
-        return Node(fmt::format("{}", rhs));
-    }
+    using type = config::datalake_catalog_auth_mode;
 
-    static bool
-    decode(const Node& node, config::datalake_catalog_auth_mode& rhs) {
-        static constexpr auto acceptable_values
-          = config::acceptable_datalake_catalog_auth_modes();
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
         auto value = node.as<std::string>();
-        if (
-          std::find(acceptable_values.begin(), acceptable_values.end(), value)
-          == acceptable_values.end()) {
-            return false;
-        }
-
-        rhs = string_switch<config::datalake_catalog_auth_mode>(
-                std::string_view{value})
-                .match(
-                  to_string_view(config::datalake_catalog_auth_mode::none),
-                  config::datalake_catalog_auth_mode::none)
-                .match(
-                  to_string_view(config::datalake_catalog_auth_mode::bearer),
-                  config::datalake_catalog_auth_mode::bearer)
-                .match(
-                  to_string_view(config::datalake_catalog_auth_mode::oauth2),
-                  config::datalake_catalog_auth_mode::oauth2);
+        rhs = boost::lexical_cast<type>(value);
         return true;
     }
 };
@@ -736,6 +722,42 @@ struct convert<config::tls_name_format> {
         }
         std::istringstream iss(value);
         iss >> rhs;
+        return true;
+    }
+};
+
+template<>
+struct convert<config::audit_failure_policy> {
+    static Node encode(const config::audit_failure_policy& rhs) {
+        return Node(fmt::format("{}", rhs));
+    }
+
+    static bool decode(const Node& node, config::audit_failure_policy& rhs) {
+        static constexpr auto acceptable_values
+          = config::acceptable_audit_log_failure_policy_values();
+        auto valid = node.as<std::string>();
+        if (!std::ranges::contains(acceptable_values, valid)) {
+            return false;
+        }
+        std::istringstream iss(valid);
+        iss >> rhs;
+        return true;
+    }
+};
+
+template<>
+struct convert<model::kafka_batch_validation_mode> {
+    using type = model::kafka_batch_validation_mode;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto mode = model::kafka_batch_validation_mode_from_string(value);
+        if (!mode) {
+            return false;
+        }
+        rhs = mode.value();
         return true;
     }
 };

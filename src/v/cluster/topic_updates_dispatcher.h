@@ -54,7 +54,6 @@ public:
     topic_updates_dispatcher(
       ss::sharded<partition_allocator>&,
       ss::sharded<topic_table>&,
-      ss::sharded<partition_leaders_table>&,
       ss::sharded<partition_balancer_state>&);
 
     ss::future<std::error_code> apply_update(model::record_batch);
@@ -118,6 +117,10 @@ private:
     template<typename T>
     void add_allocations_for_new_partitions(const T&);
 
+    void update_final_counts(
+      const std::vector<model::broker_shard>& previous,
+      const std::vector<model::broker_shard>& target);
+
     void update_allocations_for_reconfiguration(
       const std::vector<model::broker_shard>& previous,
       const std::vector<model::broker_shard>& target);
@@ -135,7 +138,6 @@ private:
 
     ss::sharded<partition_allocator>& _partition_allocator;
     ss::sharded<topic_table>& _topic_table;
-    ss::sharded<partition_leaders_table>& _partition_leaders_table;
     ss::sharded<partition_balancer_state>& _partition_balancer_state;
 };
 

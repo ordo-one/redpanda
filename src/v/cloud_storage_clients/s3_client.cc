@@ -10,8 +10,10 @@
 
 #include "cloud_storage_clients/s3_client.h"
 
+#include "base/units.h"
 #include "base/vlog.h"
 #include "bytes/bytes.h"
+#include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "cloud_storage_clients/logger.h"
 #include "cloud_storage_clients/s3_error.h"
@@ -400,6 +402,7 @@ std::string request_creator::make_target(
 
 // client //
 
+namespace {
 inline cloud_storage_clients::s3_error_code
 status_to_error_code(boost::beast::http::status s) {
     // According to this https://repost.aws/knowledge-center/http-5xx-errors-s3
@@ -412,36 +415,88 @@ status_to_error_code(boost::beast::http::status s) {
     return cloud_storage_clients::s3_error_code::_unknown;
 }
 
-template<class ResultT = void>
-ss::future<ResultT>
-parse_rest_error_response(boost::beast::http::status result, iobuf&& buf) {
-    if (buf.empty()) {
-        // AWS errors occasionally come with an empty body
-        // (See https://github.com/redpanda-data/redpanda/issues/6061)
-        // Without a proper code, we treat it as a hint to gracefully retry
-        // (synthesize the slow_down code).
-        rest_error_response err(
-          fmt::format("{}", status_to_error_code(result)),
-          fmt::format("Empty error response, status code {}", result),
-          "",
-          "");
-        return ss::make_exception_future<ResultT>(err);
-    } else {
-        try {
-            auto resp = util::iobuf_to_ptree(std::move(buf), s3_log);
-            constexpr const char* empty = "";
-            auto code = resp.get<ss::sstring>("Error.Code", empty);
-            auto msg = resp.get<ss::sstring>("Error.Message", empty);
-            auto rid = resp.get<ss::sstring>("Error.RequestId", empty);
-            auto res = resp.get<ss::sstring>("Error.Resource", empty);
-            rest_error_response err(code, msg, rid, res);
-            return ss::make_exception_future<ResultT>(err);
-        } catch (...) {
-            vlog(
-              s3_log.error, "!!error parse error {}", std::current_exception());
-            throw;
+rest_error_response parse_xml_rest_error_response(iobuf&& buf) {
+    try {
+        auto resp = util::iobuf_to_ptree(std::move(buf), s3_log);
+        constexpr const char* empty = "";
+        auto code = resp.get<ss::sstring>("Error.Code", empty);
+        auto msg = resp.get<ss::sstring>("Error.Message", empty);
+        auto rid = resp.get<ss::sstring>("Error.RequestId", empty);
+        auto res = resp.get<ss::sstring>("Error.Resource", empty);
+        rest_error_response err(code, msg, rid, res);
+        return err;
+    } catch (...) {
+        vlog(s3_log.error, "!!error parse error {}", std::current_exception());
+        throw;
+    }
+}
+
+rest_error_response parse_unknown_format_error_response(
+  boost::beast::http::status status, iobuf buf) {
+    static constexpr auto max_body_size = static_cast<size_t>(4_KiB);
+    static constexpr auto truncation_warning_segment = " [truncated~4096]";
+
+    auto maybe_truncation_warning = "";
+    auto read_size = buf.size_bytes();
+
+    // if the error message exceeds reasonable size (4k), truncate it and
+    // indicate a truncation to the recipient
+    if (read_size > max_body_size) {
+        maybe_truncation_warning = truncation_warning_segment;
+        read_size = max_body_size;
+    }
+
+    ss::sstring error_body = "";
+    iobuf_parser parser{std::move(buf)};
+
+    // this is the unhappy unhappy path, handle potentially invalid utf8
+    try {
+        error_body = parser.read_string_safe(read_size);
+    } catch (const invalid_utf8_exception& e) {
+        vlog(s3_log.info, "response body contains invalid utf8 {}", e);
+    } catch (...) {
+        vlog(s3_log.error, "error parse error {}", std::current_exception());
+        throw;
+    }
+
+    return rest_error_response{
+      fmt::format("{}", status_to_error_code(status)),
+      fmt::format(
+        "http status: {}, error body{}: {}",
+        status,
+        maybe_truncation_warning,
+        error_body),
+      "",
+      ""};
+}
+
+template<typename ResultT = void>
+ss::future<ResultT> parse_rest_error_response(
+  response_content_type type, boost::beast::http::status result, iobuf buf) {
+    // AWS errors occasionally come with an empty body
+    // (See https://github.com/redpanda-data/redpanda/issues/6061)
+    // Without a proper code, we treat it as a hint to gracefully retry
+    // (synthesize the slow_down code).
+    if (!buf.empty()) {
+        if (type == response_content_type::xml) {
+            // Error responses from S3 _should_ have the Content-Type header set
+            // with `application/xml`- however, certain responses (such as `503
+            // Service Unavailable`) may not be of this form.
+            // https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+            return ss::make_exception_future<ResultT>(
+              parse_xml_rest_error_response(std::move(buf)));
+        } else {
+            // render out up to 4k of plaintext or json errors
+            return ss::make_exception_future<ResultT>(
+              parse_unknown_format_error_response(result, std::move(buf)));
         }
     }
+
+    return ss::make_exception_future<ResultT>(rest_error_response(
+      fmt::format("{}", status_to_error_code(result)),
+      fmt::format("Empty error response, status code {}", result),
+      "",
+      ""));
 }
 
 /// Head response doesn't give us an XML encoded error object in
@@ -478,6 +533,7 @@ ss::future<ResultT> parse_head_error_response(
         throw;
     }
 }
+} // namespace
 
 template<typename T>
 ss::future<result<T, error_outcome>> s3_client::send_request(
@@ -569,8 +625,27 @@ s3_client::self_configure() {
     // but self-configuration will misconfigure to virtual-host style due to a
     // ListObjects request that happens to succeed. Override for this
     // specific case.
+    //
+    // Similarily, MinIO supports `virtual_host` only iff the property
+    // MINIO_DOMAIN is set, see:
+    // (https://min.io/docs/minio/linux/reference/minio-server/settings/core.html#envvar.MINIO_DOMAIN).
+    // If it is not, API calls with `virtual_host` will fail, though the
+    // ListObjects request used for self configuration still manages to succeed,
+    // leading to a similarily bad state as Oracle. Override for this case as
+    // well.
+    auto backend = config::shard_local_cfg().cloud_storage_backend();
+    if (
+      backend == model::cloud_storage_backend::oracle_s3_compat
+      || backend == model::cloud_storage_backend::minio) {
+        result.url_style = s3_url_style::path;
+        co_return result;
+    }
+
+    // Also handle possibly inferred backend.
     auto inferred_backend = infer_backend_from_uri(_requestor._ap);
-    if (inferred_backend == model::cloud_storage_backend::oracle_s3_compat) {
+    if (
+      inferred_backend == model::cloud_storage_backend::oracle_s3_compat
+      || inferred_backend == model::cloud_storage_backend::minio) {
         result.url_style = s3_url_style::path;
         co_return result;
     }
@@ -708,11 +783,13 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
                         ref->get_headers().result(),
                         ref->get_headers());
                   }
+                  const auto content_type = util::get_response_content_type(
+                    ref->get_headers());
                   return util::drain_response_stream(std::move(ref))
-                    .then([result](iobuf&& res) {
+                    .then([content_type, result](iobuf&& res) {
                         return parse_rest_error_response<
                           http::client::response_stream_ref>(
-                          result, std::move(res));
+                          content_type, result, std::move(res));
                     });
               }
               return ss::make_ready_future<http::client::response_stream_ref>(
@@ -839,8 +916,11 @@ ss::future<> s3_client::do_put_object(
                             id,
                             status,
                             ref->get_headers());
+                          const auto content_type
+                            = util::get_response_content_type(
+                              ref->get_headers());
                           return parse_rest_error_response<>(
-                            status, std::move(res));
+                            content_type, status, std::move(res));
                       }
                       return ss::now();
                   });
@@ -849,8 +929,15 @@ ss::future<> s3_client::do_put_object(
               [](const ss::abort_requested_exception& err) {
                   return ss::make_exception_future<>(err);
               })
-            .handle_exception_type([this](const rest_error_response& err) {
+            .handle_exception_type([this, id](const rest_error_response& err) {
                 _probe->register_failure(err.code(), op_type_tag::upload);
+                if (err.code() == s3_error_code::_unknown) {
+                    vlog(
+                      s3_log.error,
+                      "S3 PUT request failed with error for key {}: {}",
+                      id,
+                      err);
+                }
                 return ss::make_exception_future<>(err);
             })
             .handle_exception([id](std::exception_ptr eptr) {
@@ -924,36 +1011,19 @@ ss::future<s3_client::list_bucket_result> s3_client::do_list_objects_v2(
                       header.result(),
                       header);
 
+                    const auto content_type = util::get_response_content_type(
+                      header);
                     // In the error path we drain the response stream fully, the
                     // error response should not be very large.
                     return util::drain_chunked_response_stream(resp).then(
-                      [result = header.result()](iobuf buf) {
+                      [result = header.result(), content_type](iobuf buf) {
                           return parse_rest_error_response<list_bucket_result>(
-                            result, std::move(buf));
+                            content_type, result, std::move(buf));
                       });
                 }
 
-                return ss::do_with(
-                  resp->as_input_stream(),
-                  xml_sax_parser{},
-                  [pred = std::move(gather_item_if)](
-                    ss::input_stream<char>& stream, xml_sax_parser& p) mutable {
-                      p.start_parse(
-                        std::make_unique<aws_parse_impl>(std::move(pred)));
-                      return ss::do_until(
-                               [&stream] { return stream.eof(); },
-                               [&stream, &p] {
-                                   return stream.read().then(
-                                     [&p](ss::temporary_buffer<char>&& chunk) {
-                                         p.parse_chunk(std::move(chunk));
-                                     });
-                               })
-                        .then([&stream] { return stream.close(); })
-                        .then([&p] {
-                            p.end_parse();
-                            return p.result();
-                        });
-                  });
+                return parse_from_stream<aws_parse_impl>(
+                  resp->as_input_stream(), std::move(gather_item_if));
             });
       });
 }
@@ -1016,7 +1086,10 @@ ss::future<> s3_client::do_delete_object(
                     key,
                     status,
                     ref->get_headers());
-                  return parse_rest_error_response<>(status, std::move(res));
+                  const auto content_type = util::get_response_content_type(
+                    ref->get_headers());
+                  return parse_rest_error_response<>(
+                    content_type, status, std::move(res));
               }
               return ss::now();
           });
@@ -1106,8 +1179,10 @@ auto s3_client::do_delete_objects(
             [response](iobuf&& res) {
                 auto status = response->get_headers().result();
                 if (status != boost::beast::http::status::ok) {
+                    const auto content_type = util::get_response_content_type(
+                      response->get_headers());
                     return parse_rest_error_response<delete_objects_result>(
-                      status, std::move(res));
+                      content_type, status, std::move(res));
                 }
                 auto parse_result = iobuf_to_delete_objects_result(
                   std::move(res));

@@ -10,6 +10,7 @@
  */
 
 #include "base/vassert.h"
+#include "cluster/controller.h"
 #include "cluster/topics_frontend.h"
 #include "kafka/server/handlers/fetch.h"
 #include "kafka/server/request_context.h"
@@ -17,11 +18,26 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
+#include "random/generators.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
 
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/testing/perf_tests.hh>
+
+namespace {
+
+constexpr auto version_with_rack{kafka::api_version{11}};
+constexpr auto version_with_epoch_validation{kafka::api_version{12}};
+constexpr auto version_with_topic_ids{kafka::api_version{13}};
+constexpr auto version_max_supported{kafka::fetch_handler::max_supported};
+
+static_assert(
+  version_max_supported == version_with_topic_ids,
+  "Consider adding a test for next supported version");
+
+} // namespace
 
 struct fetch_bench_config {
     int num_fetches;
@@ -61,33 +77,58 @@ struct fetch_topic {
     std::vector<fetch_part> partitions;
 };
 
-using fetch_request_config = std::vector<fetch_topic>;
+struct fetch_request_config {
+    std::vector<fetch_topic> topics;
+    kafka::api_version api_version;
+};
 
 template<fetch_bench_config cfg>
 struct fetch_bench_fixture : redpanda_thread_fixture {
     ss::future<size_t> fetch_from(fetch_request_config req_config) {
-        std::optional<size_t> total_batches_per_fetch = std::nullopt;
         auto conn_context = make_connection_context();
         co_await conn_context->start();
+        auto fut = co_await ss::coroutine::as_future<size_t>(
+          do_fetch_from(req_config, conn_context));
+        co_await conn_context->stop();
+        co_return fut.get();
+    }
 
+    ss::future<size_t>
+    do_fetch_from(fetch_request_config req_config, conn_ptr conn_context) {
+        std::optional<size_t> total_batches_per_fetch = std::nullopt;
         auto make_rctx = [&] {
             size_t total_batches = 0;
 
+            const auto& md_cache = app.metadata_cache.local();
+
             chunked_vector<kafka::fetch_topic> fetch_topics;
-            for (auto& topic_fetch : req_config) {
+            for (auto& topic_fetch : req_config.topics) {
                 kafka::fetch_topic ft;
-                ft.name = topic_fetch.name;
+                if (req_config.api_version >= version_with_topic_ids) {
+                    auto tp_id = md_cache
+                                   .get_topic_metadata_ref(
+                                     model::topic_namespace_view(
+                                       model::kafka_namespace,
+                                       topic_fetch.name))
+                                   ->get()
+                                   .get_configuration()
+                                   .tp_id.value();
+                    ft.topic_id = tp_id;
+                } else {
+                    ft.topic = topic_fetch.name;
+                }
 
                 // add the partitions to the fetch request
                 for (const auto& part : topic_fetch.partitions) {
                     kafka::fetch_partition fp;
-                    fp.partition_index = model::partition_id(part.pid);
+                    fp.partition = model::partition_id(part.pid);
                     fp.fetch_offset = part.offset;
                     fp.current_leader_epoch = kafka::leader_epoch(-1);
                     fp.log_start_offset = model::offset(-1);
-                    fp.max_bytes = part.num_batches
-                                   * (cfg.batch_size + cfg.batch_overhead);
-                    ft.fetch_partitions.push_back(std::move(fp));
+                    fp.partition_max_bytes
+                      = part.num_batches
+                        * (cfg.batch_size + cfg.batch_overhead);
+                    ft.partitions.push_back(std::move(fp));
                     total_batches += part.num_batches;
                 }
 
@@ -104,7 +145,7 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
             frq_data.max_wait_ms = 500ms;
             frq_data.min_bytes = total_batches
                                  * (cfg.batch_size + cfg.batch_overhead);
-            frq_data.max_bytes = 52428800;
+            frq_data.max_bytes = 50_MiB;
             frq_data.isolation_level = model::isolation_level::read_uncommitted;
             frq_data.session_id = kafka::invalid_fetch_session_id;
             frq_data.session_epoch = kafka::final_fetch_session_epoch;
@@ -114,7 +155,7 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
 
             kafka::request_header header{
               .key = kafka::fetch_handler::api::key,
-              .version = kafka::fetch_handler::max_supported};
+              .version = req_config.api_version};
 
             return make_request_context(
               std::move(request), header, conn_context);
@@ -122,12 +163,14 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
 
         std::vector<std::unique_ptr<kafka::op_context>> octxs;
         for (int i = 0; i < cfg.num_fetches + 1; i++) {
-            octxs.emplace_back(std::make_unique<kafka::op_context>(
-              make_rctx(), ss::default_smp_service_group()));
+            octxs.emplace_back(
+              std::make_unique<kafka::op_context>(
+                make_rctx(), ss::default_smp_service_group()));
         }
 
-        // Do a single fetch outside of the measured region first to ensure the
-        // fetched batches are in the batch cache in the subsequent fetches.
+        // Do a single fetch outside of the measured region first to ensure
+        // the fetched batches are in the batch cache in the subsequent
+        // fetches.
         co_await kafka::testing::do_fetch(*octxs[cfg.num_fetches]);
 
         // Drain task queue before running the measured region in order to
@@ -144,7 +187,10 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
                                       * (cfg.batch_size + cfg.batch_overhead);
         for (int i = 0; i < cfg.num_fetches + 1; i++) {
             auto& octx = *octxs[i];
-            vassert(!octx.response_error, "fetch wasn't successful");
+            vassert(
+              !octx.response_error,
+              "fetch wasn't successful {}",
+              octx.response_error);
             vassert(
               octx.response_size == expected_response_size,
               "not the expected response size. expected {} actual {}",
@@ -172,6 +218,7 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
                   {std::move(msg)});
             }
         }
+        co_await producer.stop();
     }
 
     ss::future<model::topic>
@@ -213,7 +260,7 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
         // reconfigurations. Therefore waiting until there is no on-going
         // updates will let us know if the previous partition movements have
         // finished.
-        RPTEST_REQUIRE_EVENTUALLY_CORO(30s, [&topic_table] {
+        co_await tests::cooperative_spin_wait_with_timeout(30s, [&topic_table] {
             return !topic_table.has_updates_in_progress();
         });
 
@@ -251,23 +298,25 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
 
     // Creates a topic with a single partition that is on shard 0.
     ss::future<model::topic> initialize_single_partition_topic() {
-        auto t = co_await create_topic(
-          {model::broker_shard{model::node_id{0}, 0}});
+        auto t = co_await create_topic({model::broker_shard{this_node(), 0}});
         co_await produce_to_topic(t, 1, 1);
         co_return t;
     }
 
-    // Creates a topic with two partitions. One on shard 0 the other on shard 1.
+    // Creates a topic with two partitions. One on shard 0 the other on
+    // shard 1.
     ss::future<model::topic> initialize_multi_partition_topic() {
         vassert(ss::smp::count >= 2, "requires at least 2 shards");
 
         auto t = co_await create_topic({
-          model::broker_shard{model::node_id{0}, 0},
-          model::broker_shard{model::node_id{0}, 1},
+          model::broker_shard{this_node(), 0},
+          model::broker_shard{this_node(), 1},
         });
         co_await produce_to_topic(t, 2, 1);
         co_return t;
     }
+
+    auto this_node() { return config::node().node_id().value(); }
 
     scoped_config test_local_cfg;
 };
@@ -275,33 +324,69 @@ struct fetch_bench_fixture : redpanda_thread_fixture {
 using large_fetch_t = fetch_bench_fixture<large_fetch_config>;
 using small_fetch_t = fetch_bench_fixture<small_fetch_config>;
 
-fetch_request_config single_partition_req_config(model::topic t) {
-    return fetch_request_config{fetch_topic{
-      .name = std::move(t),
-      .partitions = {fetch_part{model::partition_id(0), model::offset(0), 1}}}};
+fetch_request_config single_partition_req_config(
+  model::topic t, kafka::api_version v = version_max_supported) {
+    return fetch_request_config{
+      .topics = {fetch_topic{
+        .name = std::move(t),
+        .partitions = {fetch_part{
+          model::partition_id(0), model::offset(0), 1}}}},
+      .api_version = v};
 }
 
-fetch_request_config multi_partition_req_config(model::topic t) {
-    return fetch_request_config{fetch_topic{
-      .name = std::move(t),
-      .partitions = {
-        fetch_part{model::partition_id(0), model::offset(0), 1},
-        fetch_part{model::partition_id(1), model::offset(0), 1}}}};
+fetch_request_config multi_partition_req_config(
+  model::topic t, kafka::api_version v = version_max_supported) {
+    return fetch_request_config{
+      .topics = {fetch_topic{
+        .name = std::move(t),
+        .partitions
+        = {fetch_part{model::partition_id(0), model::offset(0), 1}, fetch_part{model::partition_id(1), model::offset(0), 1}}}},
+      .api_version = v};
 }
 
-PERF_TEST_CN(large_fetch_t, single_partition_fetch) {
+PERF_TEST_CN(large_fetch_t, single_partition_fetch_version_max) {
     static model::topic t = co_await initialize_single_partition_topic();
 
     co_return co_await fetch_from(single_partition_req_config(t));
 }
 
-PERF_TEST_CN(small_fetch_t, single_partition_fetch) {
+PERF_TEST_CN(large_fetch_t, single_partition_fetch_version_with_rack) {
+    static model::topic t = co_await initialize_single_partition_topic();
+
+    co_return co_await fetch_from(
+      single_partition_req_config(t, version_with_rack));
+}
+
+PERF_TEST_CN(
+  large_fetch_t, single_partition_fetch_version_with_epoch_validation) {
+    static model::topic t = co_await initialize_single_partition_topic();
+
+    co_return co_await fetch_from(
+      single_partition_req_config(t, version_with_epoch_validation));
+}
+
+PERF_TEST_CN(small_fetch_t, single_partition_fetch_version_max) {
     static model::topic t = co_await initialize_single_partition_topic();
 
     co_return co_await fetch_from(single_partition_req_config(t));
 }
 
-PERF_TEST_CN(large_fetch_t, multi_partition_fetch) {
+PERF_TEST_CN(small_fetch_t, single_partition_fetch_version_with_rack) {
+    static model::topic t = co_await initialize_single_partition_topic();
+
+    co_return co_await fetch_from(
+      single_partition_req_config(t, version_with_rack));
+}
+
+PERF_TEST_CN(
+  small_fetch_t, single_partition_fetch_version_with_epoch_validation) {
+    static model::topic t = co_await initialize_single_partition_topic();
+
+    co_return co_await fetch_from(
+      single_partition_req_config(t, version_with_epoch_validation));
+}
+
+PERF_TEST_CN(large_fetch_t, multi_partition_fetch_version_max) {
     static model::topic t = co_await initialize_multi_partition_topic();
 
     // One partition will be from the same shard, while the other will be
@@ -310,11 +395,41 @@ PERF_TEST_CN(large_fetch_t, multi_partition_fetch) {
     co_return co_await fetch_from(multi_partition_req_config(t));
 }
 
-PERF_TEST_CN(small_fetch_t, multi_partition_fetch) {
+PERF_TEST_CN(large_fetch_t, multi_partition_fetch_version_with_rack) {
+    static model::topic t = co_await initialize_multi_partition_topic();
+
+    co_return co_await fetch_from(
+      multi_partition_req_config(t, version_with_rack));
+}
+
+PERF_TEST_CN(
+  large_fetch_t, multi_partition_fetch_version_with_epoch_validation) {
+    static model::topic t = co_await initialize_multi_partition_topic();
+
+    co_return co_await fetch_from(
+      multi_partition_req_config(t, version_with_epoch_validation));
+}
+
+PERF_TEST_CN(small_fetch_t, multi_partition_fetch_version_max) {
     static model::topic t = co_await initialize_multi_partition_topic();
 
     // One partition will be from the same shard, while the other will be
     // from a foreign shard. This will hopefully allow us to detect if more
     // or less cross shard calls are being made for a fetch.
     co_return co_await fetch_from(multi_partition_req_config(t));
+}
+
+PERF_TEST_CN(small_fetch_t, multi_partition_fetch_version_with_rack) {
+    static model::topic t = co_await initialize_multi_partition_topic();
+
+    co_return co_await fetch_from(
+      multi_partition_req_config(t, version_with_rack));
+}
+
+PERF_TEST_CN(
+  small_fetch_t, multi_partition_fetch_version_with_epoch_validation) {
+    static model::topic t = co_await initialize_multi_partition_topic();
+
+    co_return co_await fetch_from(
+      multi_partition_req_config(t, version_with_epoch_validation));
 }

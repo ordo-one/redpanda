@@ -8,6 +8,7 @@ redpanda_cc_btest(
         "utils.h",
     ],
     deps = [
+        "//src/v/base",
         "//src/v/bytes",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
@@ -118,5 +119,20 @@ redpanda_cc_bench(
         "//src/v/random:generators",
         "//src/v/test_utils:random_bytes",
         "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "iobuf_parser_test",
+    timeout = "short",
+    srcs = [
+        "iobuf_parser_tests.cc",
+    ],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar//:testing",
     ],
 )

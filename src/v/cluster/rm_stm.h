@@ -11,36 +11,30 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "bytes/iobuf.h"
 #include "cluster/fwd.h"
 #include "cluster/producer_state.h"
 #include "cluster/rm_stm_types.h"
 #include "cluster/state_machine_registry.h"
-#include "cluster/topic_table.h"
 #include "cluster/tx_utils.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "raft/persisted_stm.h"
+#include "raft/replicate.h"
 #include "raft/state_machine.h"
 #include "storage/snapshot.h"
 #include "utils/available_promise.h"
-#include "utils/mutex.h"
 #include "utils/prefix_logger.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
 
-#include <absl/container/btree_map.h>
-#include <absl/container/btree_set.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-
 #include <string_view>
-#include <system_error>
 
 struct rm_stm_test_fixture;
 
@@ -155,7 +149,7 @@ public:
      * transactions this will return next offset to be applied to the the stm.
      */
     model::offset last_stable_offset();
-    ss::future<fragmented_vector<tx::tx_range>>
+    ss::future<chunked_vector<tx::tx_range>>
       aborted_transactions(model::offset, model::offset);
 
     /**
@@ -166,11 +160,11 @@ public:
      *
      * Callers should be wary to either ensure that the stm is synced before
      * calling, or ensure that the producer_id doesn't need to reflect batches
-     * later than the max_collectible_offset.
+     * later than the max_removable_local_log_offset.
      */
     model::producer_id highest_producer_id() const;
 
-    model::offset max_collectible_offset() override {
+    model::offset max_removable_local_log_offset() override {
         const auto lso = last_stable_offset();
         if (lso < model::offset{0}) {
             return model::offset{};
@@ -187,7 +181,7 @@ public:
         return storage::stm_type::user_topic_transactional;
     }
 
-    ss::future<fragmented_vector<model::tx_range>>
+    ss::future<chunked_vector<model::tx_range>>
     aborted_tx_ranges(model::offset from, model::offset to) override {
         return aborted_transactions(from, to);
     }
@@ -221,11 +215,18 @@ public:
 
     uint64_t get_local_snapshot_size() const override;
 
-    ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
+    ss::future<iobuf> take_raft_snapshot(model::offset) final {
+        co_return iobuf{};
+    }
 
     const producers_t& get_producers() const { return _producers; }
 
     ss::future<tx::errc> abort_all_txes();
+
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
 
 protected:
     ss::future<> apply_raft_snapshot(const iobuf&) final;
@@ -233,7 +234,7 @@ protected:
 private:
     void setup_metrics();
     ss::future<> do_remove_persistent_state();
-    ss::future<fragmented_vector<tx::tx_range>>
+    ss::future<chunked_vector<tx::tx_range>>
       do_aborted_transactions(model::offset, model::offset);
 
     // Tells whether the producer is already known or is created
@@ -278,8 +279,10 @@ private:
       raft::replicate_options,
       ss::lw_shared_ptr<available_promise<>>);
 
-    ss::future<result<kafka_result>>
-      transactional_replicate(model::batch_identity, model::record_batch);
+    ss::future<result<kafka_result>> transactional_replicate(
+      model::batch_identity,
+      model::record_batch,
+      std::optional<model::term_id>);
 
     ss::future<result<kafka_result>> transactional_replicate(
       model::term_id,
@@ -300,7 +303,6 @@ private:
       ss::lw_shared_ptr<available_promise<>>);
 
     ss::future<result<kafka_result>> do_idempotent_replicate(
-      model::term_id,
       tx::producer_ptr,
       model::batch_identity,
       model::record_batch,
@@ -310,7 +312,6 @@ private:
       producer_previously_known);
 
     ss::future<result<kafka_result>> idempotent_replicate(
-      model::term_id,
       tx::producer_ptr,
       model::batch_identity,
       model::record_batch,
@@ -349,8 +350,8 @@ private:
 
     // Populated from state machine up calls.
     struct aborted_tx_state {
-        fragmented_vector<tx::tx_range> aborted;
-        fragmented_vector<tx::abort_index> abort_indexes;
+        chunked_vector<tx::tx_range> aborted;
+        chunked_vector<tx::abort_index> abort_indexes;
         tx::abort_snapshot last_abort_snapshot{.last = model::offset(-1)};
     };
 
@@ -445,10 +446,12 @@ public:
       bool enable_idempotence,
       ss::sharded<tx_gateway_frontend>&,
       ss::sharded<cluster::tx::producer_state_manager>&,
-      ss::sharded<features::feature_table>&,
-      ss::sharded<cluster::topic_table>&);
+      ss::sharded<features::feature_table>&);
     bool is_applicable_for(const storage::ntp_config&) const final;
-    void create(raft::state_machine_manager_builder&, raft::consensus*) final;
+    void create(
+      raft::state_machine_manager_builder&,
+      raft::consensus*,
+      const cluster::stm_instance_config&) final;
 
 private:
     bool _enable_transactions;
@@ -456,7 +459,6 @@ private:
     ss::sharded<tx_gateway_frontend>& _tx_gateway_frontend;
     ss::sharded<cluster::tx::producer_state_manager>& _producer_state_manager;
     ss::sharded<features::feature_table>& _feature_table;
-    ss::sharded<topic_table>& _topics;
 };
 
 } // namespace cluster

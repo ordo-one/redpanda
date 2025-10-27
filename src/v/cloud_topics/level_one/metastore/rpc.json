@@ -1,0 +1,64 @@
+{
+    "namespace": "cloud_topics::l1::rpc::impl",
+    "service_name": "l1_rpc",
+    "includes": [
+        "cloud_topics/level_one/metastore/rpc_types.h"
+    ],
+    "methods": [
+        {
+            "name": "add_objects",
+            "input_type": "add_objects_request",
+            "output_type": "add_objects_reply"
+        },
+        {
+            "name": "replace_objects",
+            "input_type": "replace_objects_request",
+            "output_type": "replace_objects_reply"
+        },
+        {
+            "name": "get_first_offset_ge",
+            "input_type": "get_first_offset_ge_request",
+            "output_type": "get_first_offset_ge_reply"
+        },
+        {
+            "name": "get_first_timestamp_ge",
+            "input_type": "get_first_timestamp_ge_request",
+            "output_type": "get_first_timestamp_ge_reply"
+        },
+        {
+            "name": "get_first_offset_for_bytes",
+            "input_type": "get_first_offset_for_bytes_request",
+            "output_type": "get_first_offset_for_bytes_reply"
+        },
+        {
+            "name": "get_offsets",
+            "input_type": "get_offsets_request",
+            "output_type": "get_offsets_reply"
+        },
+        {
+            "name": "get_term_for_offset",
+            "input_type": "get_term_for_offset_request",
+            "output_type": "get_term_for_offset_reply"
+        },
+        {
+            "name": "get_end_offset_for_term",
+            "input_type": "get_end_offset_for_term_request",
+            "output_type": "get_end_offset_for_term_reply"
+        },
+        {
+            "name": "get_compaction_info",
+            "input_type": "get_compaction_info_request",
+            "output_type": "get_compaction_info_reply"
+        },
+        {
+            "name": "set_start_offset",
+            "input_type": "set_start_offset_request",
+            "output_type": "set_start_offset_reply"
+        },
+        {
+            "name": "remove_topics",
+            "input_type": "remove_topics_request",
+            "output_type": "remove_topics_reply"
+        }
+    ]
+}

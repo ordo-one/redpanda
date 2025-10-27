@@ -18,6 +18,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/scheduling.hh>
 
 namespace cloud_io {
 
@@ -28,7 +29,7 @@ class io_resources {
     friend class throttled_dl_source;
 
 public:
-    io_resources();
+    explicit io_resources(seastar::scheduling_group);
 
     ss::future<> start();
     ss::future<> stop();
@@ -45,6 +46,8 @@ public:
 
     /// How many partition_record_batch_reader_impl instances exist
     size_t current_ongoing_hydrations() const;
+
+    ss::scheduling_group get_scheduling_group() const;
 
 private:
     config::binding<std::optional<uint32_t>>
@@ -71,6 +74,7 @@ private:
     config::binding<std::optional<size_t>> _relative_throughput;
     bool _throttling_disabled{false};
     std::optional<size_t> _device_throughput;
+    seastar::scheduling_group _scheduling_group;
 };
 
 } // namespace cloud_io

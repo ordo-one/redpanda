@@ -10,10 +10,9 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "config/property.h"
 #include "datalake/translation/scheduling.h"
-
-#include <absl/container/flat_hash_map.h>
 
 namespace datalake::translation::scheduling {
 
@@ -151,6 +150,13 @@ private:
 
         translator_id id;
         status status;
+        translator::stop_reason reason;
+
+        finish_choice_info(
+          translator_id id, enum status status, translator::stop_reason reason)
+          : id(std::move(id))
+          , status(status)
+          , reason(reason) {}
     };
 
     /*

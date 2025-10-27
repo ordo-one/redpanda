@@ -9,13 +9,13 @@
 
 #include "model/record_batch_reader.h"
 #include "storage/tests/utils/disk_log_builder.h"
-#include "test_utils/fixture.h"
 
-#include <seastar/testing/thread_test_case.hh>
+#include <boost/range/irange.hpp>
+#include <gtest/gtest.h>
 
 using namespace storage; // NOLINT
 
-SEASTAR_THREAD_TEST_CASE(produce_consume_concurrency) {
+TEST(ProduceConsumeTest, produce_consume_concurrency) {
     auto cfg = log_builder_config();
     cfg.cache = storage::with_cache::no;
     storage::disk_log_builder builder(std::move(cfg));
@@ -23,7 +23,6 @@ SEASTAR_THREAD_TEST_CASE(produce_consume_concurrency) {
 
     storage::log_append_config app_cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
     auto log = builder.get_log();
     auto range = boost::irange(0, 1000);
@@ -46,12 +45,11 @@ SEASTAR_THREAD_TEST_CASE(produce_consume_concurrency) {
 
     auto consumer = ss::do_for_each(range.begin(), range.end(), [log](int) {
         auto lstats = log->offsets();
-        storage::log_reader_config rdr_cfg(
+        storage::local_log_reader_config rdr_cfg(
           lstats.dirty_offset < model::offset(0)
             ? lstats.dirty_offset
             : lstats.dirty_offset - model::offset(1),
-          std::max(model::offset(0), lstats.dirty_offset),
-          ss::default_priority_class());
+          std::max(model::offset(0), lstats.dirty_offset));
         return log->make_reader(rdr_cfg)
           .then([](model::record_batch_reader reader) {
               return model::consume_reader_to_memory(

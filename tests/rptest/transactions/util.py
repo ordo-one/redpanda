@@ -7,11 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.util import wait_until_result
 import random
 from contextlib import contextmanager
-import confluent_kafka as ck
 from typing import Optional
+
+import confluent_kafka as ck
+
+from rptest.util import wait_until_result
 
 
 @contextmanager
@@ -27,10 +29,12 @@ def expect_kafka_error(err: Optional[ck.KafkaError] = None):
 
 
 @contextmanager
-def try_transaction(producer: ck.Producer,
-                    consumer: ck.Consumer,
-                    send_offset_err: Optional[ck.KafkaError] = None,
-                    commit_err: Optional[ck.KafkaError] = None):
+def try_transaction(
+    producer: ck.Producer,
+    consumer: ck.Consumer,
+    send_offset_err: Optional[ck.KafkaError] = None,
+    commit_err: Optional[ck.KafkaError] = None,
+):
     producer.begin_transaction()
 
     yield
@@ -39,8 +43,8 @@ def try_transaction(producer: ck.Producer,
 
     with expect_kafka_error(send_offset_err):
         producer.send_offsets_to_transaction(
-            consumer.position(consumer.assignment()),
-            consumer.consumer_group_metadata())
+            consumer.position(consumer.assignment()), consumer.consumer_group_metadata()
+        )
 
     with expect_kafka_error(commit_err):
         producer.commit_transaction()
@@ -62,23 +66,21 @@ class TransactionsMixin:
             find_tx_coordinator,
             timeout_sec=30,
             backoff_sec=2,
-            err_msg=f"Can't find a coordinator for tx.id={txid}")
+            err_msg=f"Can't find a coordinator for tx.id={txid}",
+        )
 
     def on_delivery(self, err, _):
         assert err is None, err
 
     def generate_data(self, topic, num_records, extra_cfg={}):
         producer_cfg = {
-            'bootstrap.servers': self.redpanda.brokers(),
+            "bootstrap.servers": self.redpanda.brokers(),
         }
         producer_cfg.update(extra_cfg)
         producer = ck.Producer(producer_cfg)
 
         for i in range(num_records):
-            producer.produce(topic.name,
-                             str(i),
-                             str(i),
-                             on_delivery=self.on_delivery)
+            producer.produce(topic.name, str(i), str(i), on_delivery=self.on_delivery)
 
         producer.flush()
 
@@ -91,7 +93,9 @@ class TransactionsMixin:
             else:
                 return False, records
 
-        return wait_until_result(consume_records,
-                                 timeout_sec=30,
-                                 backoff_sec=2,
-                                 err_msg="Can not consume data")
+        return wait_until_result(
+            consume_records,
+            timeout_sec=30,
+            backoff_sec=2,
+            err_msg="Can not consume data",
+        )

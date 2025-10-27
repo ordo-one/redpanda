@@ -1,61 +1,8 @@
-load("@rules_proto//proto:defs.bzl", "proto_library")
-load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest", "redpanda_test_cc_library")
-
-proto_library(
-    name = "person_proto",
-    srcs = ["testdata/person.proto"],
-)
-
-proto_library(
-    name = "complex_proto",
-    srcs = ["testdata/complex.proto"],
-    deps = ["@protobuf//:timestamp_proto"],
-)
-
-proto_library(
-    name = "test_messages_proto",
-    srcs = ["testdata/iceberg_ready_test_messages_edition2023.proto"],
-)
-
-proto_library(
-    name = "not_supported_proto",
-    srcs = ["testdata/not_supported.proto"],
-)
-
-proto_library(
-    name = "proto2_proto",
-    srcs = ["testdata/proto2.proto"],
-)
-
-cc_proto_library(
-    name = "person_cc_proto",
-    deps = [":person_proto"],
-)
-
-cc_proto_library(
-    name = "complex_cc_proto",
-    deps = [":complex_proto"],
-)
-
-cc_proto_library(
-    name = "test_messages_cc_proto",
-    deps = [":test_messages_proto"],
-)
-
-cc_proto_library(
-    name = "not_supported_cc_proto",
-    deps = [":not_supported_proto"],
-)
-
-cc_proto_library(
-    name = "proto2_cc_proto",
-    deps = [":proto2_proto"],
-)
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
     name = "catalog_and_registry_fixture",
     hdrs = ["catalog_and_registry_fixture.h"],
-    include_prefix = "datalake/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/cloud_io:remote",
@@ -69,25 +16,9 @@ redpanda_test_cc_library(
 redpanda_test_cc_library(
     name = "test_data",
     hdrs = ["test_data.h"],
-    include_prefix = "datalake/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/iceberg:datatypes",
-    ],
-)
-
-#TODO: this wrapper can be removed when we completely remove cmake tests support
-redpanda_test_cc_library(
-    name = "proto_definitions_wrapper",
-    hdrs = ["proto_definitions.h"],
-    defines = ["BAZEL_TEST=1"],
-    include_prefix = "datalake/tests",
-    deps = [
-        ":complex_cc_proto",
-        ":not_supported_cc_proto",
-        ":person_cc_proto",
-        ":proto2_cc_proto",
-        ":test_messages_cc_proto",
     ],
 )
 
@@ -101,20 +32,20 @@ redpanda_test_cc_library(
     ],
     implementation_deps = [
         "//src/v/container:chunked_hash_map",
+        "//src/v/pandaproxy/schema_registry:registry",
         "//src/v/schema:registry",
         "//src/v/utils:absl_sstring_hash",
         "//src/v/utils:vint",
         "@avro",
         "@protobuf",
     ],
-    include_prefix = "datalake/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
         "//src/v/bytes:iobuf",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/model",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:server",
         "//src/v/serde/avro/tests:data_generator",
         "//src/v/serde/protobuf/tests:data_generator",
         "//src/v/storage:record_batch_builder",
@@ -128,7 +59,6 @@ redpanda_test_cc_library(
     hdrs = [
         "test_data_writer.h",
     ],
-    include_prefix = "datalake/tests",
     deps = [
         "//src/v/datalake:serde_parquet_writer",
         "//src/v/datalake:writer",
@@ -152,7 +82,6 @@ redpanda_test_cc_library(
         "//src/v/datalake:table_definition",
         "//src/v/datalake:table_id_provider",
     ],
-    include_prefix = "datalake/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/datalake:catalog_schema_manager",
@@ -173,6 +102,7 @@ redpanda_cc_gtest(
         "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_io/tests:scoped_remote",
         "//src/v/datalake:catalog_schema_manager",
+        "//src/v/features",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:field_collecting_visitor",
         "//src/v/iceberg:filesystem_catalog",
@@ -180,33 +110,6 @@ redpanda_cc_gtest(
         "//src/v/iceberg/tests:test_schemas",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
-    ],
-)
-
-redpanda_cc_gtest(
-    name = "datalake_protobuf_test",
-    timeout = "short",
-    srcs = [
-        "datalake_protobuf_tests.cc",
-    ],
-    deps = [
-        ":complex_cc_proto",
-        ":person_cc_proto",
-        ":proto2_cc_proto",
-        ":proto_definitions_wrapper",
-        ":test_messages_cc_proto",
-        "//src/v/datalake:schema_protobuf",
-        "//src/v/datalake:values_protobuf",
-        "//src/v/iceberg:datatypes",
-        "//src/v/serde/protobuf",
-        "//src/v/ssx:future_util",
-        "//src/v/test_utils:gtest",
-        "@fmt",
-        "@googletest//:gtest",
-        "@protobuf",
-        "@protobuf//src/google/protobuf/compiler:importer",
-        "@protobuf//src/google/protobuf/io:tokenizer",
-        "@seastar",
     ],
 )
 
@@ -251,13 +154,13 @@ redpanda_cc_gtest(
         "record_multiplexer_test.cc",
     ],
     cpu = 1,
-    tags = ["exclusive"],
     deps = [
         ":catalog_and_registry_fixture",
         ":record_generator",
         ":test_data_writer",
         ":test_utils",
         "//src/v/cloud_io:provider",
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:location",
         "//src/v/datalake:record_multiplexer",
@@ -266,10 +169,11 @@ redpanda_cc_gtest(
         "//src/v/datalake:table_definition",
         "//src/v/datalake:table_id_provider",
         "//src/v/datalake/translation:translation_probe",
+        "//src/v/features",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/model",
         "//src/v/model/tests:random",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/random:generators",
         "//src/v/schema:registry",
         "//src/v/storage:record_batch_builder",
@@ -293,7 +197,8 @@ redpanda_cc_gtest(
         "//src/v/datalake:logger",
         "//src/v/datalake:record_schema_resolver",
         "//src/v/iceberg:datatypes",
-        "//src/v/pandaproxy",
+        "//src/v/metrics",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/schema:registry",
         "//src/v/schema/tests:fake_registry",
         "//src/v/test_utils:gtest",
@@ -319,47 +224,6 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
-    name = "datalake_avro_tests",
-    timeout = "short",
-    srcs = [
-        "datalake_avro_tests.cc",
-    ],
-    deps = [
-        "//src/v/bytes:iobuf_parser",
-        "//src/v/datalake:schema_avro",
-        "//src/v/datalake:values_avro",
-        "//src/v/iceberg:avro_decimal",
-        "//src/v/iceberg:datatypes",
-        "//src/v/serde/avro/tests:data_generator",
-        "//src/v/test_utils:gtest",
-        "@avro",
-        "@fmt",
-        "@googletest//:gtest",
-        "@seastar",
-    ],
-)
-
-redpanda_cc_gtest(
-    name = "datalake_parquet_tests",
-    timeout = "short",
-    srcs = [
-        "datalake_parquet_tests.cc",
-    ],
-    deps = [
-        "//src/v/bytes:iobuf_parser",
-        "//src/v/datalake:schema_parquet",
-        "//src/v/datalake:values_parquet",
-        "//src/v/iceberg:datatypes",
-        "//src/v/iceberg/tests:value_generator",
-        "//src/v/test_utils:gtest",
-        "//src/v/test_utils:random",
-        "@fmt",
-        "@googletest//:gtest",
-        "@seastar",
-    ],
-)
-
-redpanda_cc_gtest(
     name = "local_parquet_file_writer_test",
     timeout = "short",
     srcs = [
@@ -372,7 +236,6 @@ redpanda_cc_gtest(
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg/tests:value_generator",
         "//src/v/test_utils:gtest",
-        "//src/v/test_utils:seastar_boost",
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
@@ -393,7 +256,6 @@ redpanda_cc_gtest(
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg/tests:value_generator",
         "//src/v/test_utils:gtest",
-        "//src/v/test_utils:seastar_boost",
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
@@ -412,17 +274,18 @@ redpanda_cc_bench(
         ":test_data_writer",
         ":test_utils",
         "//src/v/cloud_io:provider",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:location",
         "//src/v/datalake:record_multiplexer",
         "//src/v/datalake:record_schema_resolver",
         "//src/v/datalake:record_translator",
         "//src/v/datalake:table_creator",
+        "//src/v/features",
         "//src/v/model",
+        "//src/v/model:batch_compression",
         "//src/v/serde/avro/tests:data_generator",
         "//src/v/serde/protobuf/tests:data_generator",
-        "//src/v/storage:parser_utils",
         "@seastar",
         "@seastar//:benchmark",
     ],
@@ -441,5 +304,128 @@ redpanda_cc_gtest(
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "translation_task_test",
+    timeout = "short",
+    srcs = [
+        "translation_task_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":test_data_writer",
+        ":test_utils",
+        "//src/v/cloud_io/tests:s3_imposter",
+        "//src/v/cloud_io/tests:scoped_remote",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/datalake:catalog_schema_manager",
+        "//src/v/datalake:cloud_data_io",
+        "//src/v/datalake:local_parquet_file_writer",
+        "//src/v/datalake:location",
+        "//src/v/datalake:record_schema_resolver",
+        "//src/v/datalake:record_translator",
+        "//src/v/datalake:table_creator",
+        "//src/v/datalake:translation_task",
+        "//src/v/datalake/translation:translation_probe",
+        "//src/v/features",
+        "//src/v/iceberg:uri",
+        "//src/v/model",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:gtest",
+        "@boost//:range",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "gtest_record_multiplexer_test",
+    timeout = "short",
+    srcs = [
+        "gtest_record_multiplexer_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":catalog_and_registry_fixture",
+        ":record_generator",
+        ":test_data_writer",
+        ":test_utils",
+        "//src/v/cloud_io:provider",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/datalake:base_types",
+        "//src/v/datalake:catalog_schema_manager",
+        "//src/v/datalake:cloud_data_io",
+        "//src/v/datalake:local_parquet_file_writer",
+        "//src/v/datalake:location",
+        "//src/v/datalake:record_multiplexer",
+        "//src/v/datalake:record_schema_resolver",
+        "//src/v/datalake:record_translator",
+        "//src/v/datalake:serde_parquet_writer",
+        "//src/v/datalake:table_creator",
+        "//src/v/datalake:translation_task",
+        "//src/v/datalake/translation:translation_probe",
+        "//src/v/features",
+        "//src/v/iceberg:filesystem_catalog",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:gtest",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "translator_fixture",
+    hdrs = ["fixture.h"],
+    visibility = [":__subpackages__"],
+    deps = [
+        "//src/v/cluster/archival/tests:archival_service_fixture",
+        "//src/v/datalake/coordinator:frontend",
+        "//src/v/datalake/coordinator:stm",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "translator_fixture_test",
+    timeout = "moderate",
+    srcs = [
+        "translator_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":translator_fixture",
+        "//src/v/kafka/client",
+        "//src/v/kafka/client/test:utils",
+        "//src/v/model/tests:random",
+        "//src/v/test_utils:random",
+        "//src/v/test_utils:scoped_config",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "credential_manager_test",
+    timeout = "short",
+    srcs = [
+        "credential_manager_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/cloud_roles",
+        "//src/v/cloud_roles:types",
+        "//src/v/config",
+        "//src/v/datalake:credential_manager",
+        "//src/v/hashing:secure",
+        "//src/v/http",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:scoped_config",
+        "@boost//:beast",
+        "@googletest//:gtest",
     ],
 )

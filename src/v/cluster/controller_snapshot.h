@@ -11,21 +11,21 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_map.h"
 #include "cluster/client_quota_serde.h"
 #include "cluster/cluster_recovery_state.h"
 #include "cluster/data_migration_types.h"
 #include "cluster/types.h"
+#include "cluster_link/model/types.h"
 #include "container/chunked_hash_map.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table_snapshot.h"
 #include "security/role.h"
 #include "security/types.h"
 #include "serde/envelope.h"
-
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/node_hash_map.h>
 
 namespace cluster {
 
@@ -110,7 +110,7 @@ struct config_t
       envelope<config_t, serde::version<0>, serde::compat_version<0>> {
     config_version version;
     absl::btree_map<ss::sstring, ss::sstring> values;
-    fragmented_vector<config_status> nodes_status;
+    chunked_vector<config_status> nodes_status;
 
     friend bool operator==(const config_t&, const config_t&) = default;
 
@@ -119,7 +119,7 @@ struct config_t
 
 struct topics_t
   : public serde::
-      envelope<topics_t, serde::version<2>, serde::compat_version<0>> {
+      envelope<topics_t, serde::version<3>, serde::compat_version<0>> {
     // NOTE: layout here is a bit different than in the topic table because it
     // allows more compact storage and more convenient generation of controller
     // backend deltas when applying the snapshot.
@@ -200,6 +200,13 @@ struct topics_t
       model::topic_namespace_eq>
       iceberg_tombstones;
 
+    chunked_hash_map<
+      nt_revision,
+      nt_cloud_topic_tombstone,
+      nt_revision_hash,
+      nt_revision_eq>
+      cloud_topic_tombstones;
+
     friend bool operator==(const topics_t&, const topics_t&) = default;
 
     ss::future<> serde_async_write(iobuf&);
@@ -224,8 +231,8 @@ struct named_role_t
 struct security_t
   : public serde::
       envelope<security_t, serde::version<1>, serde::compat_version<0>> {
-    fragmented_vector<user_and_credential> user_credentials;
-    fragmented_vector<security::acl_binding> acls;
+    chunked_vector<user_and_credential> user_credentials;
+    chunked_vector<security::acl_binding> acls;
     chunked_vector<named_role_t> roles;
 
     friend bool operator==(const security_t&, const security_t&) = default;
@@ -296,12 +303,28 @@ struct data_migrations_t
     auto serde_fields() { return std::tie(next_id, migrations); }
 };
 
+struct cluster_link_t
+  : public serde::
+      envelope<cluster_link_t, serde::version<0>, serde::compat_version<0>> {
+    chunked_hash_map<
+      ::cluster_link::model::id_t,
+      ::cluster_link::model::metadata>
+      links;
+    chunked_hash_map<::cluster_link::model::id_t, model::revision_id>
+      link_revisions;
+
+    friend bool operator==(const cluster_link_t&, const cluster_link_t&)
+      = default;
+
+    auto serde_fields() { return std::tie(links, link_revisions); }
+};
+
 } // namespace controller_snapshot_parts
 
 struct controller_snapshot
   : public serde::checksum_envelope<
       controller_snapshot,
-      serde::version<4>,
+      serde::version<5>,
       serde::compat_version<0>> {
     controller_snapshot_parts::bootstrap_t bootstrap;
     controller_snapshot_parts::features_t features;
@@ -314,6 +337,7 @@ struct controller_snapshot
     controller_snapshot_parts::cluster_recovery_t cluster_recovery;
     controller_snapshot_parts::client_quotas_t client_quotas;
     controller_snapshot_parts::data_migrations_t data_migrations;
+    controller_snapshot_parts::cluster_link_t cluster_links;
 
     friend bool
     operator==(const controller_snapshot&, const controller_snapshot&)

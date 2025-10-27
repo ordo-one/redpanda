@@ -17,6 +17,7 @@
 #include "logger.h"
 #include "probes.h"
 #include "random/simple_time_jitter.h"
+#include "ssx/future-util.h"
 #include "strings/utf8.h"
 #include "transform/logging/errc.h"
 
@@ -25,8 +26,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/coroutine/as_future.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/strings/escaping.h>
+#include <algorithm>
 
 namespace transform::logging {
 namespace {
@@ -34,7 +34,7 @@ using namespace std::chrono_literals;
 
 bool contains_invalid_characters(std::string_view str) {
     // Only allow valid utf8: non-control characters or newlines or tabs.
-    return !is_valid_utf8(str) || absl::c_any_of(str, [](char c) {
+    return !is_valid_utf8(str) || std::ranges::any_of(str, [](char c) {
         return is_control_char(c) && c != '\n' && c != '\t';
     });
 }

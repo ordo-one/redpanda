@@ -16,12 +16,12 @@
 #include "raft/consensus.h"
 #include "raft/group_manager.h"
 #include "raft/types.h"
-#include "random/generators.h"
 #include "rpc/connection_cache.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
 #include "test_utils/async.h"
+#include "test_utils/test_env.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/sharded.hh>
@@ -36,7 +36,7 @@ using namespace std::chrono_literals; // NOLINT
 struct simple_raft_fixture {
     simple_raft_fixture()
       : _self{0}
-      , _data_dir("test_dir_" + random_generators::gen_alphanum_string(6)) {}
+      , _data_dir(test_env::random_dir_path()) {}
 
     void create_raft(storage::ntp_config::default_overrides overrides = {}) {
         // configure and start kvstore
@@ -98,13 +98,7 @@ struct simple_raft_fixture {
                   = config::mock_binding<size_t>(10),
                 };
             },
-            [] {
-                return raft::recovery_memory_quota::configuration{
-                  .max_recovery_memory
-                  = config::mock_binding<std::optional<size_t>>(std::nullopt),
-                  .default_read_buffer_size = config::mock_binding(512_KiB),
-                };
-            },
+            config::mock_binding<std::optional<size_t>>(std::nullopt),
             std::ref(_connections),
             std::ref(_storage),
             std::ref(_recovery_throttle),
@@ -115,11 +109,12 @@ struct simple_raft_fixture {
 
         _raft = _storage.local()
                   .log_mgr()
-                  .manage(storage::ntp_config(
-                    _ntp,
-                    _data_dir,
-                    std::make_unique<storage::ntp_config::default_overrides>(
-                      overrides)))
+                  .manage(
+                    storage::ntp_config(
+                      _ntp,
+                      _data_dir,
+                      std::make_unique<storage::ntp_config::default_overrides>(
+                        overrides)))
                   .then([this](ss::shared_ptr<storage::log> log) mutable {
                       auto group = raft::group_id(0);
                       return _group_mgr.local().create_group(
@@ -163,7 +158,6 @@ struct simple_raft_fixture {
         return storage::log_config(
           _data_dir,
           100_MiB,
-          ss::default_priority_class(),
           storage::with_cache::yes,
           storage::make_sanitized_file_config());
     }

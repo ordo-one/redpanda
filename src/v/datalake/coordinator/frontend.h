@@ -25,6 +25,16 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 
+template<typename T>
+concept request_has_topic = requires(T t) {
+    { t.get_topic() } -> std::same_as<const model::topic&>;
+};
+
+template<typename T>
+concept request_has_coordinator_partition = requires(T t) {
+    { t.get_coordinator_partition() } -> std::same_as<model::partition_id>;
+};
+
 namespace datalake::coordinator {
 
 /*
@@ -61,6 +71,21 @@ public:
       fetch_latest_translated_offset(
         fetch_latest_translated_offset_request, local_only = local_only::no);
 
+    ss::future<usage_stats_reply>
+      get_usage_stats(usage_stats_request, local_only = local_only::no);
+
+    ss::future<get_topic_state_reply>
+      get_topic_state(get_topic_state_request, local_only = local_only::no);
+
+    /**
+     * Returns the partition of datalake coordinator topic that
+     * coordinates datalake tasks for this topic partitions.
+     */
+    std::optional<model::partition_id>
+    coordinator_partition(const model::topic&) const;
+
+    std::optional<int32_t> coordinator_partition_count() const;
+
 private:
     using proto_t = datalake::coordinator::rpc::impl::
       datalake_coordinator_rpc_client_protocol;
@@ -81,17 +106,11 @@ private:
     requires requires(
       datalake::coordinator::frontend f, const model::ntp& ntp, req_t req) {
         (f.*LocalFunc)(std::move(req), ntp, ss::shard_id{0});
+        request_has_topic<req_t> || request_has_coordinator_partition<req_t>;
     }
     auto process(req_t req, bool local_only);
 
     ss::future<bool> ensure_topic_exists();
-
-    /**
-     * Returns the partition of datalake coordinator topic that
-     * coordinates datalake tasks for this topic partitions.
-     */
-    std::optional<model::partition_id>
-    coordinator_partition(const model::topic&) const;
 
     ss::future<ensure_table_exists_reply> ensure_table_exists_locally(
       ensure_table_exists_request,
@@ -112,6 +131,16 @@ private:
     ss::future<fetch_latest_translated_offset_reply>
     fetch_latest_translated_offset_locally(
       fetch_latest_translated_offset_request,
+      const model::ntp& coordinator_partition,
+      ss::shard_id);
+
+    ss::future<usage_stats_reply> get_usage_stats_locally(
+      usage_stats_request,
+      const model::ntp& coordinator_partition,
+      ss::shard_id);
+
+    ss::future<get_topic_state_reply> get_topic_state_locally(
+      get_topic_state_request,
       const model::ntp& coordinator_partition,
       ss::shard_id);
 

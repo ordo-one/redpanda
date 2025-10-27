@@ -11,7 +11,9 @@
 #include "base/vlog.h"
 #include "cluster/controller.h"
 #include "cluster/data_migration_frontend.h"
+#include "cluster/data_migration_irpc_frontend.h"
 #include "cluster/data_migration_types.h"
+#include "cluster/offsets_snapshot.h"
 #include "json/document.h"
 #include "json/validator.h"
 #include "json/writer.h"
@@ -53,9 +55,23 @@ ss::httpd::migration_json::namespaced_topic to_admin_type(
     ss::httpd::migration_json::namespaced_topic ret;
     ret.ns = tp_ns.ns;
     ret.topic = cloud_storage_location
-                  ? ss::sstring(fmt::format(
-                      "{}/{}", tp_ns.tp, cloud_storage_location->hint))
+                  ? ss::sstring(
+                      fmt::format(
+                        "{}/{}", tp_ns.tp, cloud_storage_location->hint))
                   : tp_ns.tp;
+    return ret;
+}
+
+ss::httpd::migration_json::outbound_topic to_admin_type(
+  const model::topic_namespace& tp_ns,
+  const cluster::data_migrations::topic_location* tp_loc) {
+    ss::httpd::migration_json::outbound_topic ret;
+    ret.ns = tp_ns.ns;
+    ret.topic = tp_ns.tp;
+    if (tp_loc && tp_loc->location) {
+        ret.remote_location = ssx::sformat(
+          "{}/{}", tp_loc->remote_topic.tp, tp_loc->location->hint);
+    }
     return ret;
 }
 
@@ -87,8 +103,22 @@ to_admin_type(const cluster::data_migrations::outbound_migration& odm) {
     using migration_type_enum = ss::httpd::migration_json::outbound_migration::
       outbound_migration_migration_type;
     migration.migration_type = migration_type_enum::outbound;
-    for (auto& t : odm.topics) {
-        migration.topics.push(to_admin_type(t));
+
+    if (!(odm.topic_locations.empty()
+          || odm.topic_locations.size() == odm.topics.size())) {
+        // topic_locations should be either empty (written by pre-v25.2
+        // redpanda) or have the same size as topics
+        throw std::runtime_error(
+          fmt::format(
+            "unexpected migration topic locations size: {}, expected: {}",
+            odm.topic_locations.size(),
+            odm.topics.size()));
+    }
+
+    for (size_t i = 0; i < odm.topics.size(); ++i) {
+        const auto* loc = !odm.topic_locations.empty() ? &odm.topic_locations[i]
+                                                       : nullptr;
+        migration.topics.push(to_admin_type(odm.topics[i], loc));
     }
     for (auto& cg : odm.groups) {
         migration.consumer_groups.push(cg);
@@ -135,7 +165,7 @@ void write_migration_as_json(
 }
 
 json::validator make_migration_validator() {
-    const std::string schema = R"(
+    const std::string_view schema = R"(
 {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "type": "object",
@@ -338,6 +368,20 @@ void admin_server::register_data_migration_routes() {
       [this](std::unique_ptr<ss::http::request> req) {
           return delete_migration(std::move(req));
       });
+    register_route_raw_async<superuser>(
+      ss::httpd::migration_json::get_migrated_entities_status,
+      [this](
+        std::unique_ptr<ss::http::request> req,
+        std::unique_ptr<ss::http::reply> reply) {
+          return get_migrated_entities_status(std::move(req), std::move(reply));
+      });
+    register_route_raw_async<superuser>(
+      ss::httpd::migration_json::set_migrated_entities_status,
+      [this](
+        std::unique_ptr<ss::http::request> req,
+        std::unique_ptr<ss::http::reply> reply) {
+          return set_migrated_entities_status(std::move(req), std::move(reply));
+      });
 }
 
 ss::future<std::unique_ptr<ss::http::reply>> admin_server::list_data_migrations(
@@ -425,4 +469,115 @@ admin_server::delete_migration(std::unique_ptr<ss::http::request> req) {
         co_await throw_on_error(*req, ec, model::controller_ntp);
     }
     co_return ss::json::json_void();
+}
+static constexpr auto consumer_groups_data_key = "consumer_groups_data";
+static constexpr auto group_id_key = "group_id";
+static constexpr auto topics_key = "topics";
+static constexpr auto topic_key = "topic";
+static constexpr auto partitions_key = "partitions";
+static constexpr auto partition_key = "partition";
+static constexpr auto offset_key = "offset";
+
+ss::future<std::unique_ptr<ss::http::reply>>
+admin_server::get_migrated_entities_status(
+  std::unique_ptr<ss::http::request> req,
+  std::unique_ptr<ss::http::reply> reply) {
+    auto id = parse_data_migration_id(*req);
+
+    auto& ifrontend = _controller->get_data_migration_irpc_frontend();
+
+    auto entities_status = co_await ifrontend.local().get_entities_status(id);
+
+    if (!entities_status.has_value()) [[unlikely]] {
+        co_await throw_on_error(
+          *req, entities_status.error(), model::controller_ntp);
+        vassert(false, "should have thrown");
+    }
+
+    json::StringBuffer buf;
+    json::Writer<json::StringBuffer> writer(buf);
+    writer.StartObject();
+    ssx::async_counter counter;
+    const auto& groups = entities_status.assume_value().groups;
+    writer.Key(consumer_groups_data_key);
+    writer.StartArray();
+    for (const auto& group : groups) {
+        writer.StartObject();
+        writer.Key(group_id_key);
+        writer.String(group.group_id);
+        writer.Key(topics_key);
+        writer.StartArray();
+        for (const auto& topic : group.offsets) {
+            writer.StartObject();
+            writer.Key(topic_key);
+            writer.String(topic.topic());
+            writer.Key(partitions_key);
+            writer.StartArray();
+            co_await ssx::async_for_each_counter(
+              counter, topic.partitions, [&writer](const auto& partition) {
+                  writer.StartObject();
+                  writer.Key(partition_key);
+                  writer.Int(partition.partition);
+                  writer.Key(offset_key);
+                  writer.Int64(partition.offset);
+                  writer.EndObject();
+              });
+            writer.EndArray();
+            writer.EndObject();
+        }
+        writer.EndArray();
+        writer.EndObject();
+    }
+    writer.EndArray();
+    writer.EndObject();
+    reply->set_status(ss::http::reply::status_type::ok, buf.GetString());
+    co_return std::move(reply);
+}
+
+cluster::data_migrations::entities_status
+parse_migrated_entities_status(json::Value& json) {
+    cluster::data_migrations::entities_status ret;
+
+    if (auto it = json.FindMember(consumer_groups_data_key);
+        it != json.MemberEnd()) {
+        auto consumer_groups_array = it->value.GetArray();
+        ret.groups.reserve(consumer_groups_array.Size());
+        for (auto& group : consumer_groups_array) {
+            cluster::group_offsets group_res{
+              .group_id = group[group_id_key].GetString()};
+            for (auto& topic : group[topics_key].GetArray()) {
+                cluster::group_offsets::topic_partitions topic_res;
+                topic_res.topic = model::topic(topic[topic_key].GetString());
+                for (auto& partition : topic[partitions_key].GetArray()) {
+                    topic_res.partitions.push_back(
+                      {model::partition_id{partition[partition_key].GetInt()},
+                       kafka::offset{partition[offset_key].GetInt64()}});
+                }
+                group_res.offsets.push_back(std::move(topic_res));
+            }
+            ret.groups.emplace_back(std::move(group_res));
+        }
+    }
+    return ret;
+}
+
+ss::future<std::unique_ptr<ss::http::reply>>
+admin_server::set_migrated_entities_status(
+  std::unique_ptr<ss::http::request> req,
+  std::unique_ptr<ss::http::reply> reply) {
+    auto id = parse_data_migration_id(*req);
+
+    auto& ifrontend = _controller->get_data_migration_irpc_frontend();
+    auto json_doc = co_await parse_json_body(req.get());
+    auto status_data = parse_migrated_entities_status(json_doc);
+
+    auto res = co_await ifrontend.local().set_entities_status(
+      id, std::move(status_data));
+
+    if (res != cluster::errc::success) {
+        vlog(adminlog.warn, "unable to set migration entities status: {}", res);
+        co_await throw_on_error(*req, res, model::controller_ntp);
+    }
+    reply->set_status(ss::http::reply::status_type::ok);
+    co_return std::move(reply);
 }

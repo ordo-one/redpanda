@@ -10,7 +10,9 @@
  */
 
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "bytes/bytes.h"
+#include "compaction/key.h"
 #include "hashing/crc32c.h"
 #include "hashing/xx.h"
 #include "model/fundamental.h"
@@ -20,14 +22,11 @@
 #include "storage/compacted_index_writer.h"
 #include "storage/segment_appender.h"
 #include "storage/storage_resources.h"
-#include "storage/types.h"
 #include "utils/vint.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
-
-#include <absl/container/node_hash_map.h>
-#include <absl/hash/hash.h>
+#include <seastar/core/gate.hh>
 namespace storage::internal {
 using namespace storage; // NOLINT
 class spill_key_index final : public compacted_index_writer {
@@ -40,14 +39,13 @@ public:
     static constexpr size_t max_key_size = compacted_index::max_entry_size
                                            - (2 * vint::max_length);
     using underlying_t = absl::node_hash_map<
-      compaction_key,
+      compaction::compaction_key,
       value_type,
       bytes_hasher<uint64_t, xxhash_64>,
       bytes_type_eq>;
 
     spill_key_index(
       ss::sstring filename,
-      ss::io_priority_class,
       bool truncate,
       storage_resources&,
       std::optional<ntp_sanitizer_config> sanitizer_config);
@@ -71,18 +69,19 @@ public:
       const iobuf& key,
       model::offset,
       int32_t) final;
-    ss::future<> index(const compaction_key& b, model::offset, int32_t) final;
+    ss::future<>
+    index(const compaction::compaction_key& b, model::offset, int32_t) final;
     ss::future<> index(
       model::record_batch_type,
       bool is_control_batch,
       bytes&&,
       model::offset,
       int32_t) final;
-    ss::future<> truncate(model::offset) final;
     ss::future<> append(compacted_index::entry) final;
     ss::future<> close() final;
     void print(std::ostream&) const final;
     void set_flag(compacted_index::footer_flags) final;
+    size_t size_bytes() const final;
 
 private:
     /**
@@ -118,7 +117,7 @@ private:
     ss::future<> maybe_open();
     ss::future<> open();
     ss::future<> drain_all_keys();
-    ss::future<> add_key(compaction_key, value_type);
+    ss::future<> add_key(compaction::compaction_key, value_type);
     // called during add_key if the index should have keys spilled into the
     // backing file in order to free up capacity for new keys. see function for
     // details on the exact spill policy.
@@ -143,7 +142,6 @@ private:
 
     std::optional<ntp_sanitizer_config> _sanitizer_config;
     storage_resources& _resources;
-    ss::io_priority_class _pc;
     bool _truncate;
     std::optional<segment_appender> _appender;
     underlying_t _midx;

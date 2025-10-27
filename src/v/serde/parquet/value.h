@@ -12,7 +12,7 @@
 #pragma once
 
 #include "bytes/iobuf.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 
 #include <cstdint>
 #include <unistd.h>
@@ -117,14 +117,15 @@ struct fmt::formatter<serde::parquet::value>
 template<>
 struct fmt::formatter<serde::parquet::group_member>
   : fmt::formatter<std::string_view> {
-    auto format(const serde::parquet::group_member&, fmt::format_context& ctx)
-      const -> decltype(ctx.out());
+    auto
+    format(const serde::parquet::group_member&, fmt::format_context& ctx) const
+      -> decltype(ctx.out());
 };
 
 template<>
 struct fmt::formatter<serde::parquet::repeated_element>
   : fmt::formatter<std::string_view> {
     auto format(
-      const serde::parquet::repeated_element&,
-      fmt::format_context& ctx) const -> decltype(ctx.out());
+      const serde::parquet::repeated_element&, fmt::format_context& ctx) const
+      -> decltype(ctx.out());
 };

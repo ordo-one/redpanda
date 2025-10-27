@@ -10,6 +10,7 @@
  */
 #include "kafka/server/group_router.h"
 
+#include "kafka/protocol/offset_fetch.h"
 #include "kafka/server/logger.h"
 
 #include <seastar/core/coroutine.hh>
@@ -167,9 +168,9 @@ auto group_router::route_stages(Request r, FwdFunc func) {
     return return_type(std::move(dispatched_f), std::move(f));
 }
 
-ss::future<std::vector<deletable_group_result>>
+ss::future<chunked_vector<deletable_group_result>>
 group_router::route_delete_groups(
-  ss::shard_id shard, std::vector<std::pair<model::ntp, group_id>> groups) {
+  ss::shard_id shard, chunked_vector<std::pair<model::ntp, group_id>> groups) {
     return ss::with_scheduling_group(
       _sg, [this, shard, groups = std::move(groups)]() mutable {
           return get_group_manager().invoke_on(
@@ -187,10 +188,13 @@ ss::future<> group_router::parallel_route_delete_groups(
     return ss::parallel_for_each(
       groups_by_shard, [this, &results](sharded_groups::value_type& groups) {
           return route_delete_groups(groups.first, std::move(groups.second))
-            .then([&results](std::vector<deletable_group_result> new_results) {
-                results.insert(
-                  results.end(), new_results.begin(), new_results.end());
-            });
+            .then(
+              [&results](chunked_vector<deletable_group_result> new_results) {
+                  results.insert(
+                    results.end(),
+                    std::make_move_iterator(new_results.begin()),
+                    std::make_move_iterator(new_results.end()));
+              });
       });
 }
 
@@ -206,22 +210,16 @@ group_router::delete_groups(chunked_vector<group_id> groups) {
             groups_by_shard[m->second].emplace_back(
               std::make_pair(std::move(m->first), std::move(group)));
         } else {
-            results.push_back(deletable_group_result{
-              .group_id = std::move(group),
-              .error_code = error_code::not_coordinator,
-            });
+            results.push_back(
+              deletable_group_result{
+                .group_id = std::move(group),
+                .error_code = error_code::not_coordinator,
+              });
         }
     }
 
-    return ss::do_with(
-      std::move(results),
-      std::move(groups_by_shard),
-      [this](
-        std::vector<deletable_group_result>& results,
-        sharded_groups& groups_by_shard) {
-          return parallel_route_delete_groups(results, groups_by_shard)
-            .then([&results] { return std::move(results); });
-      });
+    co_await parallel_route_delete_groups(results, groups_by_shard);
+    co_return std::move(results);
 }
 
 ss::future<described_group> group_router::describe_group(kafka::group_id g) {
@@ -263,8 +261,46 @@ group_router::leave_group(leave_group_request&& request) {
 }
 
 ss::future<offset_fetch_response>
-group_router::offset_fetch(offset_fetch_request&& request) {
-    return route(std::move(request), &group_manager::offset_fetch);
+group_router::offset_fetch(offset_fetch_request request) {
+    chunked_hash_map<
+      std::optional<std::pair<model::ntp, ss::shard_id>>,
+      offset_fetch_request>
+      requests_by_shard;
+
+    offset_fetch_response response;
+    // Collect requests by shard
+    for (auto& group : request.data.groups) {
+        requests_by_shard
+          .try_emplace(shard_for(group.group_id), offset_fetch_request{})
+          .first->second.data.groups.push_back(std::move(group));
+    }
+    // Collect responses
+    for (auto& [key, request] : requests_by_shard) {
+        if (key.has_value()) {
+            auto& [ntp, shard] = key.value();
+            request.ntp = std::move(ntp);
+            auto shard_res = co_await with_scheduling_group(
+              _sg, [this, shard, r = std::move(request)]() mutable {
+                  return get_group_manager().invoke_on(
+                    shard, _ssg, &group_manager::offset_fetch, std::move(r));
+              });
+            std::ranges::move(
+              shard_res.data.groups, std::back_inserter(response.data.groups));
+        } else {
+            // Not coordinator for these groups
+            for (auto& group : request.data.groups) {
+                vlog(
+                  cg_klog.trace,
+                  "in route() not coordinator for {}",
+                  group.group_id);
+                response.data.groups.push_back(
+                  offset_fetch_response_group{
+                    .group_id = std::move(group.group_id),
+                    .error_code = error_code::not_coordinator});
+            }
+        }
+    }
+    co_return response;
 }
 
 ss::future<offset_delete_response>

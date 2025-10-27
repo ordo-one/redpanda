@@ -14,8 +14,8 @@ redpanda_cc_gtest(
         "//src/v/compression",
         "//src/v/random:generators",
         "//src/v/test_utils:gtest",
-        "//src/v/thirdparty/lz4",
         "@googletest//:gtest",
+        "@lz4",
     ],
 )
 
@@ -42,6 +42,26 @@ redpanda_cc_gtest(
         "@googletest//:gtest",
         "@seastar",
         "@snappy",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "gzip_stream_decompression_test",
+    timeout = "short",
+    srcs = [
+        "gzip_stream_decompression_tests.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iostream",
+        "//src/v/compression",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random",
+        "//src/v/utils:base64",
+        "@googletest//:gtest",
+        "@seastar",
     ],
 )
 

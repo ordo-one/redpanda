@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/seastarx.h"
+#include "pandaproxy/schema_registry/auth.h"
 #include "pandaproxy/schema_registry/service.h"
 #include "pandaproxy/server.h"
 
@@ -53,7 +54,9 @@ ss::future<ctx_server<service>::reply_t> get_schemas_types(
   ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
 
 ss::future<ctx_server<service>::reply_t> get_schemas_ids_id(
-  ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
+  ctx_server<service>::request_t rq,
+  ctx_server<service>::reply_t rp,
+  std::optional<request_auth_result> auth_result);
 
 ss::future<ctx_server<service>::reply_t> get_schemas_ids_id_versions(
   ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
@@ -62,7 +65,9 @@ ss::future<ctx_server<service>::reply_t> get_schemas_ids_id_subjects(
   ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
 
 ss::future<ctx_server<service>::reply_t> get_subjects(
-  ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
+  ctx_server<service>::request_t rq,
+  ctx_server<service>::reply_t rp,
+  std::optional<request_auth_result> auth_result);
 
 ss::future<ctx_server<service>::reply_t> get_subject_versions(
   ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
@@ -94,5 +99,14 @@ ss::future<ctx_server<service>::reply_t> compatibility_subject_version(
 
 ss::future<ctx_server<service>::reply_t> status_ready(
   ctx_server<service>::request_t rq, ctx_server<service>::reply_t rp);
+
+ss::future<ctx_server<service>::reply_t> get_security_acls(
+  ctx_server<service>::request_t, ctx_server<service>::reply_t);
+
+ss::future<ctx_server<service>::reply_t> post_security_acls(
+  ctx_server<service>::request_t, ctx_server<service>::reply_t);
+
+ss::future<ctx_server<service>::reply_t> delete_security_acls(
+  ctx_server<service>::request_t, ctx_server<service>::reply_t);
 
 } // namespace pandaproxy::schema_registry

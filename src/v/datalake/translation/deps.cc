@@ -23,6 +23,7 @@
 #include "datalake/translation_task.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/utils/txn_reader.h"
+#include "utils/human.h"
 
 #include <seastar/util/defer.hh>
 
@@ -45,6 +46,10 @@ map_error_code(datalake::translation_task::errc errc) {
         return translation_errc::time_limit_exceeded;
     case datalake::translation_task::errc::shutting_down:
         return translation_errc::shutting_down;
+    case datalake::translation_task::errc::out_of_disk:
+        return translation_errc::out_of_disk;
+    case datalake::translation_task::errc::type_resolution_error:
+        return translation_errc::type_resolution_error;
     }
 }
 } // namespace
@@ -69,6 +74,16 @@ ss::future<cluster::errc> wait_stm_translated(
 } // namespace
 
 ss::future<reservation_error>
+noop_disk_tracker::reserve_bytes(size_t, ss::abort_source&) noexcept {
+    return ss::make_ready_future<reservation_error>(reservation_error::ok);
+}
+ss::future<> noop_disk_tracker::free_bytes(size_t, ss::abort_source&) {
+    return ss::make_ready_future<>();
+}
+void noop_disk_tracker::release() {}
+void noop_disk_tracker::release_unused() {}
+
+ss::future<reservation_error>
 noop_mem_tracker::reserve_bytes(size_t, ss::abort_source&) noexcept {
     return ss::make_ready_future<reservation_error>(reservation_error::ok);
 }
@@ -76,6 +91,7 @@ ss::future<> noop_mem_tracker::free_bytes(size_t, ss::abort_source&) {
     return ss::make_ready_future<>();
 }
 void noop_mem_tracker::release() {}
+writer_disk_tracker& noop_mem_tracker::disk() { return _disk; }
 
 ss::future<reservation_error> translator_mem_tracker::reserve_bytes(
   size_t bytes, ss::abort_source& as) noexcept {
@@ -97,6 +113,8 @@ ss::future<reservation_error> translator_mem_tracker::reserve_bytes(
         co_return reservation_error::shutting_down;
     } catch (const translator_time_quota_exceeded_error&) {
         co_return reservation_error::time_quota_exceeded;
+    } catch (const translator_out_of_disk_error&) {
+        co_return reservation_error::out_of_disk;
     } catch (...) {
         co_return reservation_error::unknown;
     }
@@ -118,6 +136,57 @@ size_t translator_mem_tracker::current_usage() const { return _current_usage; }
 
 size_t translator_mem_tracker::total_reserved() const {
     return _reservations.count();
+}
+
+writer_disk_tracker& translator_mem_tracker::disk() { return _disk; }
+
+ss::future<reservation_error> translator_disk_tracker::reserve_bytes(
+  size_t bytes, ss::abort_source& as) noexcept {
+    _current_usage += bytes;
+    try {
+        while (_current_usage > _reservations.count()) {
+            auto reservation = co_await _reservations_tracker.reserve_disk(
+              bytes, as);
+            if (_reservations.count()) {
+                _reservations.adopt(std::move(reservation));
+            } else {
+                _reservations = std::move(reservation);
+            }
+        }
+    } catch (const translator_out_of_memory_error&) {
+        co_return reservation_error::out_of_memory;
+    } catch (const translator_shutdown_error&) {
+        co_return reservation_error::shutting_down;
+    } catch (const translator_time_quota_exceeded_error&) {
+        co_return reservation_error::time_quota_exceeded;
+    } catch (const translator_out_of_disk_error&) {
+        co_return reservation_error::out_of_disk;
+    } catch (...) {
+        co_return reservation_error::unknown;
+    }
+    co_return reservation_error::ok;
+}
+ss::future<>
+translator_disk_tracker::free_bytes(size_t bytes, ss::abort_source&) {
+    // we don't update the reservation here as the next time we call
+    // reserve_bytes we'll have already reserved an excess amount
+    _current_usage -= std::min(_current_usage, bytes);
+    return ss::now();
+}
+void translator_disk_tracker::release() {
+    _current_usage = 0;
+    _reservations.return_all();
+}
+void translator_disk_tracker::release_unused() {
+    if (_reservations.count() > _current_usage) {
+        const auto units = _reservations.count() - _current_usage;
+        _reservations.return_units(units);
+        vlog(
+          datalake_log.debug,
+          "Releasing {} excess disk reservation. Current reserved {}",
+          human::bytes(units),
+          human::bytes(_reservations.count()));
+    }
 }
 
 // Creates or alters the table by delegating to the coordinator.
@@ -253,8 +322,9 @@ public:
       ss::lw_shared_ptr<cluster::partition> partition)
       : _partition(std::move(partition))
       , _stm(_partition->raft()->stm_manager()->get<translation_stm>())
-      , _partition_proxy(std::make_unique<kafka::partition_proxy>(
-          kafka::make_partition_proxy(_partition)))
+      , _partition_proxy(
+          std::make_unique<kafka::partition_proxy>(
+            kafka::make_partition_proxy(_partition)))
       , _partition_flush_subscription(_partition->register_flush_hook(
           std::bind_front(&wait_stm_translated, _stm))) {}
 
@@ -289,23 +359,25 @@ public:
         co_return min_offset_for_translation();
     }
 
-    ss::future<std::optional<model::record_batch_reader>> make_log_reader(
-      kafka::offset begin_offset,
-      ss::io_priority_class io_priority,
-      ss::abort_source& as) final {
+    ss::future<std::optional<model::record_batch_reader>>
+    make_log_reader(kafka::offset begin_offset, ss::abort_source& as) final {
+        // Bump the reader start offset up to the log start. Untranslated data
+        // should typically be pinned, so the input offset should be above the
+        // log start in normal circumstances, but it's possible that e.g. data
+        // was removed when Iceberg was disabled.
+        auto reader_start_offset = std::max(
+          begin_offset, model::offset_cast(_partition_proxy->start_offset()));
         auto max_translatable_offset = max_offset_for_translation();
         if (
           !max_translatable_offset
-          || max_translatable_offset.value() < begin_offset) {
+          || max_translatable_offset.value() < reader_start_offset) {
             co_return std::nullopt;
         }
         auto log_reader = co_await _partition_proxy->make_reader(
-          {kafka::offset_cast(begin_offset),
-           kafka::offset_cast(max_translatable_offset.value()),
+          {reader_start_offset,
+           max_translatable_offset.value(),
            0,
            std::numeric_limits<size_t>::max(),
-           io_priority,
-           std::nullopt,
            std::nullopt,
            as});
         auto tracker = kafka::aborted_transaction_tracker::create_default(
@@ -315,6 +387,10 @@ public:
     }
 
     kafka::offset min_offset_for_translation() const final {
+        auto highest_translated = _stm->cached_highest_translated_offset();
+        if (highest_translated != kafka::offset::min()) {
+            return kafka::next_offset(highest_translated);
+        }
         return calculate_min_offset_for_translation(
           _partition->is_read_replica_mode_enabled(), *_partition_proxy);
     }
@@ -331,33 +407,6 @@ public:
       ss::abort_source& as) final {
         return _stm->reset_highest_translated_offset(
           new_offset, translation_timestamp, term, timeout, as);
-    }
-
-    void update_commit_lag(
-      std::optional<kafka::offset> max_committed_kafka_offset) const final {
-        auto max_translatable_offset = max_offset_for_translation();
-        if (
-          !max_translatable_offset
-          || max_translatable_offset.value() < kafka::offset{0}) {
-            return;
-        }
-        auto offset_lag = max_translatable_offset.value()
-                          - max_committed_kafka_offset.value_or(
-                            kafka::offset{-1});
-        _partition->probe().update_iceberg_commit_offset_lag(offset_lag);
-    }
-
-    void
-    update_translation_lag(kafka::offset max_translated_offset) const final {
-        auto max_translatable_offset = max_offset_for_translation();
-        if (
-          !max_translatable_offset
-          || max_translatable_offset.value() < kafka::offset{0}) {
-            return;
-        }
-        auto offset_lag = max_translatable_offset.value()
-                          - std::max(max_translated_offset, kafka::offset{-1});
-        _partition->probe().update_iceberg_translation_offset_lag(offset_lag);
     }
 
 private:
@@ -401,6 +450,10 @@ std::ostream& operator<<(std::ostream& o, translation_errc ec) {
         return o << "translation_errc::time_limit_exceeded";
     case shutting_down:
         return o << "translation_errc::shutting_down";
+    case out_of_disk:
+        return o << "translation_errc::out_of_disk";
+    case type_resolution_error:
+        return o << "translation_errc::type_resolution_error";
     }
 }
 
@@ -416,7 +469,6 @@ public:
       std::unique_ptr<record_translator> record_translator,
       std::unique_ptr<table_creator> table_creator,
       location_provider location_provider,
-      remote_path upload_path_prefix,
       scheduling::reservations_tracker& reservations,
       ss::sharded<cluster::topic_table>* topics,
       ss::sharded<features::feature_table>* features,
@@ -430,14 +482,14 @@ public:
       , _record_translator(std::move(record_translator))
       , _table_creator(std::move(table_creator))
       , _location_provider(std::move(location_provider))
-      , _upload_path_prefix(std::move(upload_path_prefix))
       , _reservations(reservations)
       , _topics(topics->local())
       , _features(features->local())
       , _probe(std::move(probe))
       , _invalid_record_action(compute_invalid_record_action())
-      , _cp_enabled(translation_task::custom_partitioning_enabled{
-          _features.is_active(features::feature::datalake_iceberg_ga)})
+      , _cp_enabled(
+          translation_task::custom_partitioning_enabled{
+            _features.is_active(features::feature::datalake_iceberg_ga)})
       , _mem_tracker(translator_mem_tracker{_reservations}) {}
 
     ss::future<> translate_now(
@@ -445,55 +497,23 @@ public:
       kafka::offset start_offset,
       ss::abort_source& as) final {
         if (!_in_progress_translation) {
-            _in_progress_translation.emplace(translation_task{
-              _ntp,
-              _topic_revision,
-              make_writer_factory(),
-              _cloud_io,
-              _schema_mgr,
-              *_type_resolver,
-              *_record_translator,
-              *_table_creator,
-              _invalid_record_action,
-              _location_provider,
-              *_probe});
-            _discard_translated_state = false;
-        }
-        if (_discard_translated_state) {
-            return std::move(reader).release()->finally().then([] {
-                return ss::make_exception_future(
-                  "state changed, reset translation");
-            });
+            _in_progress_translation.emplace(
+              translation_task{
+                _ntp,
+                _topic_revision,
+                make_writer_factory(),
+                _cloud_io,
+                &_features,
+                _schema_mgr,
+                *_type_resolver,
+                *_record_translator,
+                *_table_creator,
+                _invalid_record_action,
+                _location_provider,
+                *_probe});
         }
         return _in_progress_translation->translate_once(
           std::move(reader), start_offset, as);
-    }
-
-    void reconcile_properties() final {
-        auto old_invalid_action = _invalid_record_action;
-        auto old_cp_enabled = _cp_enabled;
-
-        // target lag changes will be picked dynamically and does not
-        // need a state reset.
-        _invalid_record_action = compute_invalid_record_action();
-        _cp_enabled = translation_task::custom_partitioning_enabled{
-          _features.is_active(features::feature::datalake_iceberg_ga)};
-
-        auto properties_updated = old_invalid_action != _invalid_record_action
-                                  || old_cp_enabled != _cp_enabled;
-        if (properties_updated) {
-            vlog(
-              datalake_log.info,
-              "[{}] properties updated, new properties: invalid record action: "
-              "{}, custom_partition_enabled: {}",
-              _ntp,
-              _invalid_record_action,
-              _cp_enabled);
-        }
-        if (_in_progress_translation && properties_updated) {
-            // discard any state so far
-            _discard_translated_state = properties_updated;
-        }
     }
 
     size_t flushed_bytes() const final {
@@ -531,11 +551,20 @@ public:
                   }
                   auto result = result_f.get();
                   if (result.has_error()) {
-                      return ss::make_exception_future(result.error());
+                      return ss::make_exception_future(
+                        std::runtime_error(
+                          fmt::format(
+                            "Error flushing in-progress translation: {}",
+                            result.error())));
                   }
                   return ss::now();
               })
-              .finally([this]() { _mem_tracker.release(); });
+              .finally([this]() {
+                  _mem_tracker.release();
+                  // the translator finished a round of translation and may be
+                  // taken out of the running state, so give back unused units.
+                  _mem_tracker.disk().release_unused();
+              });
         }
         return ss::now();
     }
@@ -544,18 +573,18 @@ public:
     finish(retry_chain_node& rcn, ss::abort_source& as) final {
         // This is strictly not needed as flush() is always called after
         // every scheduler iteration but we do it just to be extra cautious.
-        auto cleanup = ss::defer([this] { _mem_tracker.release(); });
+        auto cleanup = ss::defer([this] {
+            _mem_tracker.release();
+            // staging data will be deleted via finish()
+            _mem_tracker.disk().release();
+        });
         if (!_in_progress_translation) {
             co_return translation_errc::no_data;
         }
         vlog(datalake_log.debug, "[{}] finishing translation", _ntp);
-        if (_discard_translated_state) {
-            co_await discard().discard_result();
-            co_return translation_errc::discard_error;
-        }
         auto task = std::exchange(_in_progress_translation, std::nullopt);
-        auto result = co_await std::move(task.value())
-                        .finish(_cp_enabled, _upload_path_prefix, rcn, as);
+        auto result
+          = co_await std::move(task.value()).finish(_cp_enabled, rcn, as);
 
         if (result.has_error()) {
             co_return map_error_code(result.error());
@@ -564,6 +593,8 @@ public:
     }
 
     ss::future<> discard() final {
+        // staging data will be deleted via discard()
+        auto cleanup = ss::defer([this] { _mem_tracker.disk().release(); });
         if (!_in_progress_translation) {
             co_return;
         }
@@ -572,6 +603,14 @@ public:
     }
 
     size_t buffered_bytes() const final { return _mem_tracker.current_usage(); }
+
+    void report_translation_lag(int64_t new_lag) final {
+        _probe->update_translation_offset_lag(new_lag);
+    }
+
+    void report_commit_lag(int64_t new_lag) final {
+        _probe->update_commit_offset_lag(new_lag);
+    }
 
 private:
     scheduling::clock::duration compute_target_lag() const {
@@ -615,7 +654,6 @@ private:
     std::unique_ptr<record_translator> _record_translator;
     std::unique_ptr<table_creator> _table_creator;
     location_provider _location_provider;
-    remote_path _upload_path_prefix;
     scheduling::reservations_tracker& _reservations;
     cluster::topic_table& _topics;
     features::feature_table& _features;
@@ -624,7 +662,6 @@ private:
     translation_task::custom_partitioning_enabled _cp_enabled;
     translator_mem_tracker _mem_tracker;
     std::optional<translation_task> _in_progress_translation;
-    bool _discard_translated_state{false};
 };
 
 std::unique_ptr<translation_context>
@@ -638,7 +675,6 @@ translation_context::make_default_translation_context(
   std::unique_ptr<record_translator> record_translator,
   std::unique_ptr<table_creator> table_creator,
   location_provider location_provider,
-  remote_path upload_path_prefix,
   scheduling::reservations_tracker& reservations,
   ss::sharded<cluster::topic_table>* topics,
   ss::sharded<features::feature_table>* features,
@@ -653,7 +689,6 @@ translation_context::make_default_translation_context(
       std::move(record_translator),
       std::move(table_creator),
       std::move(location_provider),
-      std::move(upload_path_prefix),
       reservations,
       topics,
       features,
@@ -666,8 +701,9 @@ public:
       ss::lw_shared_ptr<cluster::partition> partition,
       cluster::topic_table& topics)
       : _partition(std::move(partition))
-      , _partition_proxy(std::make_unique<kafka::partition_proxy>(
-          kafka::make_partition_proxy(_partition)))
+      , _partition_proxy(
+          std::make_unique<kafka::partition_proxy>(
+            kafka::make_partition_proxy(_partition)))
       , _topics(topics)
       , _stm(_partition->raft()->stm_manager()->get<translation_stm>()) {}
 
@@ -692,6 +728,13 @@ public:
          * Everything there is to translate was translated
          */
         if (last_translated == max_offset_for_translation) {
+            vlog(
+              datalake_log.trace,
+              "[{}] translation up-to-date: last_translated={}, "
+              "max_translatable={}",
+              _partition->ntp(),
+              last_translated,
+              max_offset_for_translation.value_or(kafka::offset{-1}));
             return no_lag;
         }
         const auto last_ts = _stm->cached_last_translated_timestamp();
@@ -701,6 +744,13 @@ public:
         if (!last_ts.has_value()) {
             // no target is set and we do not have any translated offsets, it
             // means that the lag is 0
+            vlog(
+              datalake_log.trace,
+              "[{}] lag calculation - no last_ts: last_translated={}, "
+              "max_translatable={}",
+              _partition->ntp(),
+              last_translated,
+              max_offset_for_translation.value_or(kafka::offset{-1}));
             if (!_translation_target.has_value()) {
                 return no_lag;
             }
@@ -708,6 +758,14 @@ public:
               std::max<int64_t>(0, (now - _translation_target->ts).value())};
         }
 
+        vlog(
+          datalake_log.trace,
+          "[{}] lag calculation - using last_ts: "
+          "last_translated={}, max_translatable={}, last_ts={}",
+          _partition->ntp(),
+          last_translated,
+          max_offset_for_translation.value_or(kafka::offset{-1}),
+          last_ts.value());
         return std::chrono::milliseconds{
           std::max<int64_t>(0, (now - last_ts.value()).value())};
     }
@@ -749,7 +807,9 @@ public:
           _partition->ntp(),
           translated_offset,
           _translation_target);
-        if (translated_offset >= _translation_target->offset) {
+        if (
+          _translation_target.has_value()
+          && translated_offset >= _translation_target->offset) {
             _translation_target.reset();
         }
         // Reset inflight translation lto. The lag tracker is notified about
@@ -772,59 +832,25 @@ public:
     }
 
     std::optional<size_t> translation_backlog() const final {
+        auto lso_res = _partition_proxy->last_stable_offset();
+        if (lso_res.has_error()) {
+            return std::nullopt;
+        }
+        auto max_translatable = kafka::prev_offset(
+          model::offset_cast(lso_res.value()));
         auto checkpointed_lto = _stm->cached_highest_translated_offset();
-
-        const auto final_lto
-          = _inflight_translation_lto
-              ? std::max(checkpointed_lto, *_inflight_translation_lto)
-              : checkpointed_lto;
-
-        auto min_offset_for_translation = calculate_min_offset_for_translation(
-          _partition->is_read_replica_mode_enabled(), *_partition_proxy);
-
-        if (final_lto <= min_offset_for_translation) {
-            return _partition->size_bytes();
+        auto next_to_translate
+          = checkpointed_lto == kafka::offset::min()
+              ? calculate_min_offset_for_translation(
+                  _partition->is_read_replica_mode_enabled(), *_partition_proxy)
+              : kafka::next_offset(checkpointed_lto);
+        if (_inflight_translation_lto) {
+            next_to_translate = std::max(
+              kafka::next_offset(*_inflight_translation_lto),
+              next_to_translate);
         }
-
-        const auto log_lto = highest_log_offset_below_next(
-          _partition->log(), final_lto);
-
-        const auto max_translatable_offset = model::prev_offset(
-          _partition->last_stable_offset());
-
-        if (log_lto == max_translatable_offset) {
-            return 0;
-        }
-        /**
-         * It is possible that the last stable offset is not yet established or
-         * simply smaller than the highest translated offset. f.e. during the
-         * partition movement. In such cases, we cannot calculate the backlog.
-         */
-        if (log_lto > max_translatable_offset) {
-            return std::nullopt;
-        }
-
-        auto size_after_translated = _partition->log()->size_bytes_after_offset(
-          log_lto);
-
-        auto size_after_max_translatable
-          = _partition->log()->size_bytes_after_offset(max_translatable_offset);
-
-        if (size_after_translated < size_after_max_translatable) {
-            vlog(
-              datalake_log.error,
-              "Expected partition {} size after translated offset({}) {} to be "
-              "greater than or equal to the size of log after max translatable "
-              "offset({}): {}",
-              _partition->ntp().path(),
-              log_lto,
-              size_after_translated,
-              max_translatable_offset,
-              size_after_max_translatable);
-            return std::nullopt;
-        }
-
-        return size_after_translated - size_after_max_translatable;
+        return _partition_proxy->estimate_size_between(
+          next_to_translate, max_translatable);
     }
 
     std::optional<model::timestamp> get_translated_offset_timestamp_estimate(

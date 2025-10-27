@@ -10,7 +10,7 @@
 #include "pandaproxy/json/requests/fetch.h"
 
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "json/stringbuffer.h"
 #include "json/writer.h"
 #include "kafka/client/test/utils.h"
@@ -44,20 +44,21 @@ auto make_fetch_response(
     chunked_vector<kafka::fetch_response::partition> parts;
     for (const auto& tp : tps) {
         kafka::fetch_response::partition res{tp.topic};
-        res.partitions.push_back(kafka::fetch_response::partition_response{
-          .partition_index{tp.partition},
-          .error_code = kafka::error_code::none,
-          .high_watermark{model::offset{0}},
-          .last_stable_offset{model::offset{1}},
-          .log_start_offset{model::offset{0}},
-          .aborted{},
-          .records{make_record_set(offset, count)}});
+        res.partitions.push_back(
+          kafka::fetch_response::partition_response{
+            .partition_index{tp.partition},
+            .error_code = kafka::error_code::none,
+            .high_watermark{model::offset{0}},
+            .last_stable_offset{model::offset{1}},
+            .log_start_offset{model::offset{0}},
+            .aborted_transactions{},
+            .records{make_record_set(offset, count)}});
         parts.push_back(std::move(res));
     }
     return kafka::fetch_response{
       .data = {
         .error_code = kafka::error_code::none,
-        .topics = std::move(parts),
+        .responses = std::move(parts),
       }};
 }
 

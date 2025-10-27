@@ -1,7 +1,7 @@
 import http.server
-import socketserver
 import json
 import signal
+import socketserver
 
 
 class PrintingHandler(http.server.BaseHTTPRequestHandler):
@@ -25,20 +25,26 @@ class PrintingHandler(http.server.BaseHTTPRequestHandler):
         self._handle()
 
     def _handle(self):
+        # read and capture request content
+        req = {}
+        req["method"] = self.command
+        req["path"] = self.path
+        if "Content-Length" in self.headers:
+            req["content_length"] = int(self.headers.get("Content-Length"))
+            raw_body = self.rfile.read(req["content_length"])
+            if len(raw_body) != req["content_length"]:
+                # Ignore invalid requests and force a new request
+                self.connection.close()
+                return
+
+            req["body"] = raw_body.decode("ascii")
+
         # set reply
         self.send_response(200)
         self.send_header("Content-type", "application/json")
         self.end_headers()
 
         # print request content
-        req = {}
-        req['method'] = self.command
-        req['path'] = self.path
-        if 'Content-Length' in self.headers:
-            req['content_length'] = int(self.headers.get('Content-Length'))
-            req['body'] = self.rfile.read(
-                req['content_length']).decode('ascii')
-
         print(json.dumps(req), flush=True)
 
 
@@ -50,11 +56,8 @@ def main():
     import argparse
 
     def generate_options():
-        parser = argparse.ArgumentParser(description='Simple HTTP server')
-        parser.add_argument('--port',
-                            type=int,
-                            help='Port to listen on',
-                            default=8080)
+        parser = argparse.ArgumentParser(description="Simple HTTP server")
+        parser.add_argument("--port", type=int, help="Port to listen on", default=8080)
         return parser
 
     parser = generate_options()
@@ -69,5 +72,5 @@ def main():
         httpd.serve_forever()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

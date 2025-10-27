@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "base/units.h"
 #include "bytes/bytes.h"
 #include "bytes/details/io_allocation_size.h"
 #include "bytes/iobuf.h"
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <iterator>
 #include <span>
+#include <stdexcept>
 
 SEASTAR_THREAD_TEST_CASE(test_copy_equal) {
     iobuf buf;
@@ -67,6 +69,36 @@ SEASTAR_THREAD_TEST_CASE(test_lt) {
     BOOST_CHECK(
       (std::string_view("dog") <=> "cat")
       == (iobuf::from("dog") <=> iobuf::from("cat")));
+}
+
+namespace std {
+std::ostream& operator<<(std::ostream& ostr, const strong_ordering& o) {
+    if (o == std::strong_ordering::less) {
+        ostr << "std::strong_ordering::less";
+    } else if (o == std::strong_ordering::greater) {
+        ostr << "std::strong_ordering::greater";
+    } else {
+        ostr << "std::strong_ordering::equal";
+    }
+    return ostr;
+}
+} // namespace std
+
+SEASTAR_THREAD_TEST_CASE(test_cmp_str_view) {
+    BOOST_CHECK_LT(iobuf::from(""), "cat");
+    BOOST_CHECK_LT(iobuf::from("cat"), "dog");
+    BOOST_CHECK_LT(iobuf::from("cat"), "catastrophe");
+    BOOST_CHECK_EQUAL(false, iobuf::from("cat") < "cat");
+    BOOST_CHECK_EQUAL(false, iobuf{} < "");
+    iobuf multiple_frags;
+    multiple_frags.append_fragments(iobuf::from("cat"));
+    multiple_frags.append_fragments(iobuf::from("astrophe"));
+    BOOST_CHECK_EQUAL(false, multiple_frags < "cat");
+    BOOST_CHECK_EQUAL(true, multiple_frags > "cat");
+    BOOST_CHECK_EQUAL(
+      std::strong_ordering::equal, (multiple_frags.share(0, 3) <=> "cat"));
+    BOOST_CHECK_LT(iobuf::from(""), iobuf::from("cat"));
+    BOOST_CHECK_GT(iobuf::from("cat"), iobuf::from(""));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_appended_data_is_retained) {
@@ -798,4 +830,24 @@ SEASTAR_THREAD_TEST_CASE(iobuf_hexdump) {
     BOOST_TEST_REQUIRE(h == R"(
   00000000 | 41 65 6e 65 61 6e 20 73  65 64 20 6c 65 6f 20 70  | Aenean sed leo p
   00000010 | 6f 72 74 74 69 74 6f 72  2e                       | orttitor.)");
+}
+
+SEASTAR_THREAD_TEST_CASE(iobuf_tail) {
+    iobuf buf = iobuf::from("hello");
+    buf.append_fragments(iobuf::from("world"));
+    BOOST_CHECK_EQUAL(buf.tail(3), "rld");
+    BOOST_CHECK_EQUAL(buf.tail(5), "world");
+    BOOST_CHECK_EQUAL(buf.tail(6), "oworld");
+    BOOST_CHECK_EQUAL(buf.tail(10), "helloworld");
+    BOOST_CHECK_EQUAL(buf.tail(0), "");
+    BOOST_CHECK_THROW(buf.tail(11), std::out_of_range);
+}
+
+SEASTAR_THREAD_TEST_CASE(iobuf_linearize) {
+    iobuf buf = iobuf::from("hello");
+    BOOST_CHECK_EQUAL(buf.linearize_to_string(), "hello");
+    BOOST_CHECK_EQUAL(buf.tail(3).linearize_to_string(), "llo");
+    BOOST_CHECK_EQUAL(iobuf{}.linearize_to_string(), "");
+    iobuf large = iobuf::from(std::string(128_KiB + 1, 'a'));
+    BOOST_CHECK_THROW(large.linearize_to_string(), std::runtime_error);
 }

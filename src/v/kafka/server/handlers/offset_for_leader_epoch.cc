@@ -9,9 +9,10 @@
 
 #include "kafka/server/handlers/offset_for_leader_epoch.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/shard_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/offset_for_leader_epoch_response.h"
@@ -23,8 +24,6 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
-
-#include <absl/container/flat_hash_set.h>
 
 #include <algorithm>
 #include <iterator>
@@ -64,22 +63,25 @@ static ss::future<std::vector<epoch_end_offset>> fetch_offsets(
         // offsets_for_leader_epoch request should only be answered by
         // leader
         if (!p || !p->is_leader()) {
-            ret.push_back(response_t::make_epoch_end_offset(
-              r.ktp.get_partition(), error_code::not_leader_for_partition));
+            ret.push_back(
+              response_t::make_epoch_end_offset(
+                r.ktp.get_partition(), error_code::not_leader_for_partition));
             continue;
         }
 
         auto l_epoch_error = details::check_leader_epoch(r.current_epoch, *p);
         if (l_epoch_error != error_code::none) {
-            ret.push_back(response_t::make_epoch_end_offset(
-              r.ktp.get_partition(), l_epoch_error));
+            ret.push_back(
+              response_t::make_epoch_end_offset(
+                r.ktp.get_partition(), l_epoch_error));
             continue;
         }
 
-        ret.push_back(response_t::make_epoch_end_offset(
-          r.ktp.get_partition(),
-          co_await get_epoch_end_offset(r.requested_epoch, *p),
-          r.requested_epoch));
+        ret.push_back(
+          response_t::make_epoch_end_offset(
+            r.ktp.get_partition(),
+            co_await get_epoch_end_offset(r.requested_epoch, *p),
+            r.requested_epoch));
     }
     co_return ret;
 }
@@ -234,8 +236,9 @@ ss::future<response_ptr> offset_for_leader_epoch_handler::handle(
               offset_for_leader_topic_result res;
               res.partitions.reserve(topic.partitions.size());
               for (auto& p : topic.partitions) {
-                  res.partitions.push_back(response_t::make_epoch_end_offset(
-                    p.partition, error_code::topic_authorization_failed));
+                  res.partitions.push_back(
+                    response_t::make_epoch_end_offset(
+                      p.partition, error_code::topic_authorization_failed));
               }
               return res;
           });

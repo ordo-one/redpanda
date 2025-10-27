@@ -15,17 +15,22 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/schemata/metadata_response.h"
+#include "kafka/protocol/types.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/fwd.h"
+#include "kafka/server/handlers/describe_cluster.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/response.h"
+#include "model/errc.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
+#include "random/generators.h"
+#include "security/acl.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/coroutine.hh>
@@ -35,16 +40,16 @@
 #include <boost/numeric/conversion/cast.hpp>
 #include <fmt/ostream.h>
 
+#include <algorithm>
 #include <iterator>
 #include <type_traits>
 
 namespace {
 using is_node_isolated_or_decommissioned
   = ss::bool_class<struct is_node_isolated_or_decommissioned_tag>;
-}
+} // namespace
 namespace kafka {
 
-static constexpr model::node_id no_leader(-1);
 /**
  * We use simple heuristic to tolerate isolation of a node hosting both
  * partition leader and follower.
@@ -86,11 +91,10 @@ std::optional<cluster::leader_term> get_leader_term(
     /**
      * If current broker do not yet have any information about leadership we
      * fallback to leader guesstimating. We return first replica from the
-     * replica set and term 0. (This is the same logic that has been a part of
-     * cluster::topic_dispatcher before)
+     * replica without the leader epoch.
      */
     if (!leader_term) {
-        leader_term.emplace(replicas[0], model::term_id(0));
+        leader_term.emplace(replicas[0]);
         return leader_term;
     }
     if (!leader_term->leader.has_value()) {
@@ -98,7 +102,7 @@ std::optional<cluster::leader_term> get_leader_term(
         leader_term->leader = previous;
 
         if (previous == *config::node().node_id()) {
-            auto idx = fast_prng_source() % replicas.size();
+            auto idx = random_generators::global().get_int(replicas.size() - 1);
             leader_term->leader = replicas[idx];
         }
     }
@@ -118,12 +122,16 @@ metadata_response::topic make_topic_response_from_topic_metadata(
   const cluster::topic_metadata& tp_md,
   const is_node_isolated_or_decommissioned is_node_isolated,
   bool recovery_mode_enabled) {
-    metadata_response::topic tp;
-    tp.error_code = error_code::none;
-    model::topic_namespace_view tp_ns = tp_md.get_configuration().tp_ns;
-    tp.name = tp_md.get_configuration().tp_ns.tp;
+    static constexpr model::node_id no_leader(-1);
+    const auto& topic_cfg = tp_md.get_configuration();
+    const auto& tp_ns = topic_cfg.tp_ns;
 
-    tp.is_internal = is_internal(tp_ns);
+    metadata_response::topic tp{
+      .error_code = error_code::none,
+      .name = tp_ns.tp,
+      .topic_id = topic_cfg.tp_id.value_or(model::topic_id{}),
+      .is_internal = is_internal(tp_ns),
+    };
 
     const bool is_user_topic = model::is_user_topic(tp_ns);
     const auto* disabled_set = md_cache.get_topic_disabled_set(tp_ns);
@@ -173,9 +181,10 @@ metadata_response::topic make_topic_response_from_topic_metadata(
     return tp;
 }
 
-static ss::future<metadata_response::topic> create_topic(
+namespace {
+ss::future<metadata_response::topic> create_topic(
   request_context& ctx,
-  model::topic&& topic,
+  model::topic topic,
   const is_node_isolated_or_decommissioned is_node_isolated) {
     if (is_node_isolated) {
         vlog(
@@ -186,7 +195,7 @@ static ss::future<metadata_response::topic> create_topic(
         metadata_response::topic t;
         t.name = std::move(topic);
         t.error_code = error_code::broker_not_available;
-        return ss::make_ready_future<metadata_response::topic>(std::move(t));
+        co_return t;
     }
     // default topic configuration
     cluster::topic_configuration cfg{
@@ -195,56 +204,56 @@ static ss::future<metadata_response::topic> create_topic(
       config::shard_local_cfg().default_topic_partitions(),
       config::shard_local_cfg().default_topic_replication()};
     auto tout = config::shard_local_cfg().create_topic_timeout_ms();
-    return ctx.topics_frontend()
-      .autocreate_topics({std::move(cfg)}, tout)
-      .then([&ctx, &md_cache = ctx.metadata_cache(), tout](
-              std::vector<cluster::topic_result> res) {
-          vassert(res.size() == 1, "expected single result");
+    try {
+        auto res = co_await ctx.topics_frontend().autocreate_topics(
+          {std::move(cfg)}, tout);
+        vassert(res.size() == 1, "expected single result");
+        // error, neither success nor topic exists
+        if (!(res[0].ec == cluster::errc::success
+              || res[0].ec == cluster::errc::topic_already_exists)) {
+            metadata_response::topic t;
+            t.name = std::move(res[0].tp_ns.tp);
+            t.error_code = map_topic_error_code(res[0].ec);
+            co_return t;
+        }
 
-          // error, neither success nor topic exists
-          if (!(res[0].ec == cluster::errc::success
-                || res[0].ec == cluster::errc::topic_already_exists)) {
-              metadata_response::topic t;
-              t.name = std::move(res[0].tp_ns.tp);
-              t.error_code = map_topic_error_code(res[0].ec);
-              return ss::make_ready_future<metadata_response::topic>(
-                std::move(t));
-          }
-          auto tp_md = md_cache.get_topic_metadata(res[0].tp_ns);
+        co_await wait_for_topics(
+          ctx.metadata_cache(),
+          res,
+          ctx.controller_api(),
+          tout + model::timeout_clock::now());
 
-          if (!tp_md) {
-              metadata_response::topic t;
-              t.name = std::move(res[0].tp_ns.tp);
-              t.error_code = error_code::invalid_topic_exception;
-              return ss::make_ready_future<metadata_response::topic>(
-                std::move(t));
-          }
+        auto tp_md = ctx.metadata_cache().get_topic_metadata(res[0].tp_ns);
+        if (!tp_md) {
+            metadata_response::topic t;
+            t.name = std::move(res[0].tp_ns.tp);
+            t.error_code = error_code::invalid_topic_exception;
+            co_return t;
+        }
 
-          return wait_for_topics(
-                   md_cache,
-                   res,
-                   ctx.controller_api(),
-                   tout + model::timeout_clock::now())
-            .then([&ctx, tp_md = std::move(tp_md)]() mutable {
-                return make_topic_response_from_topic_metadata(
-                  ctx.metadata_cache(),
-                  tp_md.value(),
-                  is_node_isolated_or_decommissioned::no,
-                  ctx.recovery_mode_enabled());
-            });
-      })
-      .handle_exception([topic = std::move(topic)](
-                          [[maybe_unused]] std::exception_ptr e) mutable {
-          metadata_response::topic t;
-          t.name = std::move(topic);
-          t.error_code = error_code::request_timed_out;
-          return t;
-      });
+        co_return make_topic_response_from_topic_metadata(
+          ctx.metadata_cache(),
+          tp_md.value(),
+          is_node_isolated_or_decommissioned::no,
+          ctx.recovery_mode_enabled());
+    } catch (const std::exception& e) {
+        metadata_response::topic t;
+        t.name = std::move(topic);
+        t.error_code = error_code::request_timed_out;
+        vlog(klog.warn, "Failed to autocreate topic({}): {}", t.name, e.what());
+        co_return t;
+    }
 }
+} // namespace
 
 metadata_response::topic
 make_error_topic_response(model::topic tp, error_code ec) {
     return metadata_response::topic{.error_code = ec, .name = std::move(tp)};
+}
+
+metadata_response::topic
+make_error_topic_response(model::topic_id id, error_code ec) {
+    return metadata_response::topic{.error_code = ec, .topic_id = id};
 }
 
 static metadata_response::topic make_topic_response(
@@ -259,19 +268,27 @@ static metadata_response::topic make_topic_response(
      * if requested include topic authorized operations
      */
     if (rq.data.include_topic_authorized_operations) {
-        res.topic_authorized_operations = details::to_bit_field(
-          details::authorized_operations(ctx, md.get_configuration().tp_ns.tp));
+        res.topic_authorized_operations = kafka::topic_authorized_operations{
+          details::to_bit_field(
+            details::authorized_operations<model::topic>(
+              [&ctx](
+                security::acl_operation op,
+                const model::topic& resource,
+                authz_quiet q,
+                audit_authz_check c) {
+                  return ctx.authorized(op, resource, q, c);
+              },
+              md.get_configuration().tp_ns.tp))};
     }
 
     return res;
 }
 
-static ss::future<small_fragment_vector<metadata_response::topic>>
-get_topic_metadata(
+static ss::future<chunked_vector<metadata_response::topic>> get_topic_metadata(
   request_context& ctx,
   metadata_request& request,
   const is_node_isolated_or_decommissioned is_node_isolated) {
-    small_fragment_vector<metadata_response::topic> res;
+    chunked_vector<metadata_response::topic> res;
 
     // request can be served from whatever happens to be in the cache
     if (request.list_all_topics) {
@@ -291,53 +308,106 @@ get_topic_metadata(
                   authz_quiet{true})) {
                 continue;
             }
-            res.push_back(
-              make_topic_response(ctx, request, md.metadata, is_node_isolated));
+            res.push_back(make_topic_response(
+              ctx, request, md.get_metadata(), is_node_isolated));
         }
 
-        return ss::make_ready_future<
-          small_fragment_vector<metadata_response::topic>>(std::move(res));
+        return ss::make_ready_future<chunked_vector<metadata_response::topic>>(
+          std::move(res));
     }
 
     std::vector<model::topic> topics_to_be_created;
     std::vector<ss::future<metadata_response::topic>> new_topics;
 
+    bool use_topic_ids = std::ranges::any_of(
+      *request.data.topics,
+      [](const auto& topic) { return topic.topic_id != model::topic_id{}; });
+
+    auto superuser_required_to_create = ctx.is_cluster_link_active()
+                                          ? superuser_required::yes
+                                          : superuser_required::no;
+
     for (auto& topic : *request.data.topics) {
-        /**
-         * Authorize source topic in case if we deal with materialized one
-         */
-        if (!ctx.authorized(security::acl_operation::describe, topic.name)) {
-            // not authorized, return authorization error
-            res.push_back(make_error_topic_response(
-              std::move(topic.name), error_code::topic_authorization_failed));
-            continue;
+        const auto move_topic_name = [&topic]() {
+            return std::move(topic.name).value_or(model::topic{});
+        };
+
+        const bool use_topic_name = !use_topic_ids && topic.name.has_value();
+        const bool use_topic_id = use_topic_ids
+                                  && topic.topic_id != model::topic_id{};
+
+        const bool should_describe = use_topic_name || use_topic_id;
+
+        if (use_topic_id) {
+            // Check if topic is not found by ID
+            auto name = ctx.metadata_cache().get_name_by_id(topic.topic_id);
+            if (!name.has_value()) {
+                res.push_back(make_error_topic_response(
+                  topic.topic_id, kafka::error_code::unknown_topic_id));
+                continue;
+            }
+            topic.name = std::move(name)->tp;
         }
-        if (auto md = ctx.metadata_cache().get_topic_metadata(
-              model::topic_namespace_view(model::kafka_namespace, topic.name));
-            md) {
-            auto src_topic_response = make_topic_response(
-              ctx, request, *md, is_node_isolated);
-            src_topic_response.name = std::move(topic.name);
-            res.push_back(std::move(src_topic_response));
-            continue;
+
+        if (should_describe) {
+            /**
+             * Authorize source topic in case if we deal with materialized one
+             */
+            if (!ctx.authorized(
+                  security::acl_operation::describe, topic.name.value())) {
+                // not authorized, return authorization error, without giving
+                // away the topic name or id if it wasn't provided.
+                const auto ec = error_code::topic_authorization_failed;
+                res.push_back(
+                  use_topic_id
+                    ? make_error_topic_response(topic.topic_id, ec)
+                    : make_error_topic_response(move_topic_name(), ec));
+                continue;
+            }
+            if (auto md = ctx.metadata_cache().get_topic_metadata(
+                  model::topic_namespace_view(
+                    model::kafka_namespace, *topic.name));
+                md) {
+                auto src_topic_response = make_topic_response(
+                  ctx, request, *md, is_node_isolated);
+                src_topic_response.name = move_topic_name();
+                res.push_back(std::move(src_topic_response));
+                continue;
+            }
         }
 
         if (
           !config::shard_local_cfg().auto_create_topics_enabled
           || !request.data.allow_auto_topic_creation) {
-            res.push_back(make_error_topic_response(
-              std::move(topic.name), error_code::unknown_topic_or_partition));
+            if (!use_topic_ids) {
+                bool valid = topic.name.has_value()
+                             && validate_kafka_topic_name(*topic.name)
+                                  == model::errc::success;
+                res.push_back(make_error_topic_response(
+                  move_topic_name(),
+                  valid ? error_code::unknown_topic_or_partition
+                        : error_code::invalid_topic_exception));
+            }
+            continue;
+        } else if (use_topic_ids) {
+            // Kafka doesn't allow autocreating topics if any of the requested
+            // topics had an id.
             continue;
         }
         /**
          * check if authorized to create
          */
-        if (!ctx.authorized(security::acl_operation::create, topic.name)) {
+        if (!ctx.authorized(
+              security::acl_operation::create,
+              *topic.name,
+              authz_quiet::no,
+              audit_authz_check::yes,
+              superuser_required_to_create)) {
             res.push_back(make_error_topic_response(
-              std::move(topic.name), error_code::topic_authorization_failed));
+              move_topic_name(), error_code::topic_authorization_failed));
             continue;
         }
-        topics_to_be_created.emplace_back(std::move(topic.name));
+        topics_to_be_created.emplace_back(move_topic_name());
     }
 
     if (!ctx.audit()) {
@@ -355,8 +425,8 @@ get_topic_metadata(
                 .name = std::move(t)};
           });
 
-        return ss::make_ready_future<
-          small_fragment_vector<metadata_response::topic>>(std::move(res));
+        return ss::make_ready_future<chunked_vector<metadata_response::topic>>(
+          std::move(res));
     }
 
     std::for_each(
@@ -461,9 +531,12 @@ guess_peer_listener(request_context& ctx, const cluster::node_metadata& nm) {
 // broker. For this we need to exclude isolated node from brokers list and
 // return -1 for controller_id, after it client will send metadata request to
 // another broker and will comunicate with it
-static ss::future<metadata_response> fill_info_about_brokers_and_controller_id(
+template<typename Api>
+ss::future<typename Api::response_type>
+fill_info_about_brokers_and_controller_id(
   request_context& ctx, is_node_isolated_or_decommissioned isolated_flag) {
-    metadata_response reply;
+    using response_type = Api::response_type;
+    response_type reply;
 
     std::vector<cluster::node_metadata> alive_brokers;
     if (isolated_flag) {
@@ -491,11 +564,12 @@ static ss::future<metadata_response> fill_info_about_brokers_and_controller_id(
         }
 
         if (peer_listener) {
-            reply.data.brokers.push_back(metadata_response::broker{
-              .node_id = nm.broker.id(),
-              .host = peer_listener->address.host(),
-              .port = peer_listener->address.port(),
-              .rack = nm.broker.rack()});
+            reply.data.brokers.push_back(
+              typename response_type::broker{
+                nm.broker.id(),
+                peer_listener->address.host(),
+                peer_listener->address.port(),
+                nm.broker.rack()});
         }
     }
 
@@ -509,13 +583,14 @@ static ss::future<metadata_response> fill_info_about_brokers_and_controller_id(
     co_return reply;
 }
 
-template<>
-ss::future<response_ptr> metadata_handler::handle(
-  request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
+template<typename T>
+ss::future<typename T::api::response_type> handle_metadata(
+  request_context& ctx, [[maybe_unused]] ss::smp_service_group g) {
+    using Api = typename T::api;
     is_node_isolated_or_decommissioned isolated_or_decommissioned{
       ctx.metadata_cache().is_node_isolated()};
 
-    auto reply = co_await fill_info_about_brokers_and_controller_id(
+    auto reply = co_await fill_info_about_brokers_and_controller_id<Api>(
       ctx, isolated_or_decommissioned);
 
     const auto cluster_id = config::shard_local_cfg().cluster_id();
@@ -528,23 +603,98 @@ ss::future<response_ptr> metadata_handler::handle(
         reply.data.cluster_id = "redpanda.initializing";
     }
 
-    metadata_request request;
+    typename Api::request_type request;
     request.decode(ctx.reader(), ctx.header().version);
-    log_request(ctx.header(), request);
+    T::log_request(ctx.header(), request);
 
-    reply.data.topics = co_await get_topic_metadata(
-      ctx, request, isolated_or_decommissioned);
+    if constexpr (std::same_as<T, metadata_handler>) {
+        auto version = ctx.header().version;
+        if (
+          !request.list_all_topics && version > api_version{9}
+          && version < api_version{12}) {
+            auto err = kafka::error_code::none;
+            for (auto& topic : *request.data.topics) {
+                // Check request validity
+                if (!topic.name.has_value()) {
+                    err = kafka::error_code::invalid_request;
+                    vlog(
+                      klog.info,
+                      "Topic name can not be null for version {}",
+                      version);
+                    break;
+                } else if (topic.topic_id != model::topic_id{}) {
+                    err = kafka::error_code::invalid_request;
+                    vlog(
+                      klog.info,
+                      "Topic IDs are not supported in requests for version {}",
+                      version);
+                    break;
+                }
+            }
+            if (err != kafka::error_code::none) {
+                // Don't include any other information in the response
+                metadata_response reply;
+                for (auto& topic : *request.data.topics) {
+                    reply.data.topics.push_back(
+                      metadata_response::topic{
+                        .error_code = err,
+                        .name = std::move(topic.name).value_or(model::topic{}),
+                        .topic_id = topic.topic_id});
+                }
+                co_return reply;
+            }
+        }
+        reply.data.topics = co_await get_topic_metadata(
+          ctx, request, isolated_or_decommissioned);
+    }
 
     if (
       request.data.include_cluster_authorized_operations
       && ctx.authorized(
         security::acl_operation::describe, security::default_cluster_name)) {
-        reply.data.cluster_authorized_operations = details::to_bit_field(
-          details::authorized_operations(ctx, security::default_cluster_name));
+        reply.data.cluster_authorized_operations
+          = kafka::cluster_authorized_operations{details::to_bit_field(
+            details::authorized_operations<security::acl_cluster_name>(
+              [&ctx](
+                security::acl_operation op,
+                const security::acl_cluster_name& resource,
+                authz_quiet q,
+                audit_authz_check c) {
+                  return ctx.authorized(op, resource, q, c);
+              },
+              security::default_cluster_name))};
     }
 
+    co_return reply;
+}
+
+template<>
+ss::future<response_ptr> metadata_handler::handle(
+  request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
+    auto reply = co_await handle_metadata<metadata_handler>(ctx, g);
     co_return co_await ctx.respond(std::move(reply));
 }
+
+template<>
+ss::future<response_ptr> describe_cluster_handler::handle(
+  request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
+    auto reply = co_await handle_metadata<describe_cluster_handler>(ctx, g);
+    co_return co_await ctx.respond(std::move(reply));
+}
+
+namespace {
+// Safety margin to account for overallocations by the chunked_vector.
+// This is meant to represent either the table-doubling before filling
+// the first fragment or the allocation for an extra fragment.
+template<typename T>
+size_t chunked_vector_overalloc(size_t n_elems) {
+    if (std::cmp_less(n_elems, chunked_vector<T>::elements_per_fragment())) {
+        return sizeof(T) * n_elems;
+    } else {
+        return chunked_vector<T>::max_frag_bytes();
+    }
+}
+} // namespace
 
 size_t
 metadata_memory_estimator(size_t request_size, connection_context& conn_ctx) {
@@ -608,7 +758,13 @@ metadata_memory_estimator(size_t request_size, connection_context& conn_ctx) {
 
         size_estimate += pcount
                          * (bytes_per_partition + bytes_per_replica * rcount);
+
+        size_estimate += chunked_vector_overalloc<partition>(pcount);
     }
+
+    const auto n_topics = md_cache.all_topics_metadata().size();
+    size_estimate += chunked_vector_overalloc<kafka::metadata_response_topic>(
+      n_topics);
 
     // Finally, we double the estimate, because the highwater mark for memory
     // use comes when the in-memory structures (metadata_response_data and
@@ -620,10 +776,7 @@ metadata_memory_estimator(size_t request_size, connection_context& conn_ctx) {
 
     // We still add on the default_estimate to handle the size of the request
     // itself and miscellaneous other procesing (this is a small adjustment,
-    // generally ~8000 bytes). Finally, we add max_frag_bytes to account for the
-    // worse-cast overshoot during vector re-allocation.
-    return default_memory_estimate(request_size) + size_estimate
-           + large_fragment_vector<
-             metadata_response_partition>::max_frag_bytes();
+    // generally ~8000 bytes).
+    return default_memory_estimate(request_size) + size_estimate;
 }
 } // namespace kafka

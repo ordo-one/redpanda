@@ -7,13 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.cluster import cluster
-from rptest.clients.types import TopicSpec
-
-from rptest.tests.redpanda_test import RedpandaTest
-from confluent_kafka.cimpl import KafkaException, KafkaError
 from confluent_kafka import Producer
+from confluent_kafka.cimpl import KafkaError, KafkaException
+
 from rptest.clients.rpk import RpkTool
+from rptest.clients.types import TopicSpec
+from rptest.services.cluster import cluster
+from rptest.tests.redpanda_test import RedpandaTest
 
 
 class TxOverflowTest(RedpandaTest):
@@ -23,12 +23,12 @@ class TxOverflowTest(RedpandaTest):
         extra_rp_conf = {
             "enable_leader_balancer": False,
             "partition_autobalancing_mode": "off",
-            "transaction_coordinator_partitions": 1
+            "transaction_coordinator_partitions": 1,
         }
 
-        super(TxOverflowTest, self).__init__(test_context=test_context,
-                                             extra_rp_conf=extra_rp_conf,
-                                             log_level="trace")
+        super(TxOverflowTest, self).__init__(
+            test_context=test_context, extra_rp_conf=extra_rp_conf, log_level="trace"
+        )
 
     def set_max_transactions_per_coordinator(self, n):
         rpk = RpkTool(self.redpanda)
@@ -38,10 +38,12 @@ class TxOverflowTest(RedpandaTest):
     def underflow_test(self):
         producers = []
         for i in range(20):
-            p = Producer({
-                'bootstrap.servers': self.redpanda.brokers(),
-                'transactional.id': f"tx_{i}",
-            })
+            p = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "transactional.id": f"tx_{i}",
+                }
+            )
             p.init_transactions()
             producers.append(p)
 
@@ -56,10 +58,12 @@ class TxOverflowTest(RedpandaTest):
 
         producers = []
         for i in range(20):
-            p = Producer({
-                'bootstrap.servers': self.redpanda.brokers(),
-                'transactional.id': f"tx_{i}",
-            })
+            p = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "transactional.id": f"tx_{i}",
+                }
+            )
             p.init_transactions()
             producers.append(p)
 
@@ -70,5 +74,6 @@ class TxOverflowTest(RedpandaTest):
             oldest_producer.commit_transaction()
             assert False, ""
         except KafkaException as e:
-            assert e.args[0].code(
-            ) == KafkaError.INVALID_PRODUCER_ID_MAPPING, f"observed code={e.args[0].code()}"
+            assert e.args[0].code() == KafkaError.INVALID_PRODUCER_ID_MAPPING, (
+                f"observed code={e.args[0].code()}"
+            )

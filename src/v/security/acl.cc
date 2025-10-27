@@ -10,15 +10,19 @@
  */
 #include "security/acl.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "security/acl_store.h"
 #include "security/logger.h"
+#include "serde/envelope.h"
+#include "serde/read_header.h"
+#include "serde/rw/rw.h"
 #include "utils/to_string.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-#include <container/fragmented_vector.h>
+#include <container/chunked_vector.h>
 #include <fmt/format.h>
 
 namespace security {
@@ -258,8 +262,8 @@ acl_store::acls(const acl_binding_filter& filter) const {
     return result;
 }
 
-ss::future<fragmented_vector<acl_binding>> acl_store::all_bindings() const {
-    fragmented_vector<acl_binding> result;
+ss::future<chunked_vector<acl_binding>> acl_store::all_bindings() const {
+    chunked_vector<acl_binding> result;
     for (const auto& acl : _acls) {
         for (const auto& entry : acl.second) {
             result.push_back(acl_binding{acl.first, entry});
@@ -270,7 +274,7 @@ ss::future<fragmented_vector<acl_binding>> acl_store::all_bindings() const {
 }
 
 ss::future<>
-acl_store::reset_bindings(const fragmented_vector<acl_binding>& bindings) {
+acl_store::reset_bindings(const chunked_vector<acl_binding>& bindings) {
     // NOTE: not coroutinized because otherwise clang-14 crashes.
     _acls.clear();
     return ss::do_for_each(
@@ -283,84 +287,127 @@ acl_store::reset_bindings(const fragmented_vector<acl_binding>& bindings) {
       });
 }
 
-std::ostream& operator<<(std::ostream& os, acl_operation op) {
-    switch (op) {
-    case acl_operation::all:
-        return os << "all";
-    case acl_operation::read:
-        return os << "read";
-    case acl_operation::write:
-        return os << "write";
-    case acl_operation::create:
-        return os << "create";
-    case acl_operation::remove:
-        return os << "remove";
-    case acl_operation::alter:
-        return os << "alter";
-    case acl_operation::describe:
-        return os << "describe";
-    case acl_operation::cluster_action:
-        return os << "cluster_action";
-    case acl_operation::describe_configs:
-        return os << "describe_configs";
-    case acl_operation::alter_configs:
-        return os << "alter_configs";
-    case acl_operation::idempotent_write:
-        return os << "idempotent_write";
+acl_principal acl_principal::from_string(std::string_view principal) {
+    constexpr std::string_view user_prefix{"User:"};
+    constexpr std::string_view role_prefix{"RedpandaRole:"};
+    auto usr = principal.starts_with(user_prefix);
+    auto rol = !usr && principal.starts_with(role_prefix);
+
+    if (unlikely(!usr && !rol)) {
+        throw acl_conversion_error(
+          fmt::format("Invalid principal name: {{{}}}", principal));
     }
-    __builtin_unreachable();
+
+    auto name = principal.substr(usr ? user_prefix.size() : role_prefix.size());
+    if (unlikely(name.empty())) {
+        throw acl_conversion_error(
+          fmt::format("Principal name cannot be empty"));
+    }
+    if (name == "*" && !usr) {
+        throw acl_conversion_error(
+          fmt::format("Illegal wildcard role: {{{}}}", principal));
+    }
+    return {
+      usr ? security::principal_type::user : security::principal_type::role,
+      ss::sstring{name}};
+}
+
+template<>
+std::optional<resource_type>
+from_string_view<resource_type>(std::string_view str) {
+    return string_switch<std::optional<resource_type>>(str)
+      .match(to_string_view(resource_type::topic), resource_type::topic)
+      .match(to_string_view(resource_type::group), resource_type::group)
+      .match(to_string_view(resource_type::cluster), resource_type::cluster)
+      .match(
+        to_string_view(resource_type::transactional_id),
+        resource_type::transactional_id)
+      .match(
+        to_string_view(resource_type::sr_subject), resource_type::sr_subject)
+      .match(
+        to_string_view(resource_type::sr_registry), resource_type::sr_registry)
+      .default_match(std::nullopt);
+}
+
+template<>
+std::optional<pattern_type>
+from_string_view<pattern_type>(std::string_view str) {
+    return string_switch<std::optional<pattern_type>>(str)
+      .match(to_string_view(pattern_type::literal), pattern_type::literal)
+      .match(to_string_view(pattern_type::prefixed), pattern_type::prefixed)
+      .default_match(std::nullopt);
+}
+
+template<>
+std::optional<acl_operation>
+from_string_view<acl_operation>(std::string_view str) {
+    return string_switch<std::optional<acl_operation>>(str)
+      .match(to_string_view(acl_operation::all), acl_operation::all)
+      .match(to_string_view(acl_operation::read), acl_operation::read)
+      .match(to_string_view(acl_operation::write), acl_operation::write)
+      .match(to_string_view(acl_operation::create), acl_operation::create)
+      .match(to_string_view(acl_operation::remove), acl_operation::remove)
+      .match(to_string_view(acl_operation::alter), acl_operation::alter)
+      .match(to_string_view(acl_operation::describe), acl_operation::describe)
+      .match(
+        to_string_view(acl_operation::cluster_action),
+        acl_operation::cluster_action)
+      .match(
+        to_string_view(acl_operation::describe_configs),
+        acl_operation::describe_configs)
+      .match(
+        to_string_view(acl_operation::alter_configs),
+        acl_operation::alter_configs)
+      .match(
+        to_string_view(acl_operation::idempotent_write),
+        acl_operation::idempotent_write)
+      .default_match(std::nullopt);
+}
+
+template<>
+std::optional<acl_permission>
+from_string_view<acl_permission>(std::string_view str) {
+    return string_switch<std::optional<acl_permission>>(str)
+      .match(to_string_view(acl_permission::deny), acl_permission::deny)
+      .match(to_string_view(acl_permission::allow), acl_permission::allow)
+      .default_match(std::nullopt);
+}
+
+template<>
+std::optional<principal_type>
+from_string_view<principal_type>(std::string_view str) {
+    return string_switch<std::optional<principal_type>>(str)
+      .match(to_string_view(principal_type::user), principal_type::user)
+      .match(
+        to_string_view(principal_type::ephemeral_user),
+        principal_type::ephemeral_user)
+      .match(to_string_view(principal_type::role), principal_type::role)
+      .default_match(std::nullopt);
+}
+
+std::ostream& operator<<(std::ostream& os, acl_operation op) {
+    return os << to_string_view(op);
 }
 
 std::ostream& operator<<(std::ostream& os, acl_permission perm) {
-    switch (perm) {
-    case acl_permission::deny:
-        return os << "deny";
-    case acl_permission::allow:
-        return os << "allow";
-    }
-    __builtin_unreachable();
+    return os << to_string_view(perm);
 }
 
 std::ostream& operator<<(std::ostream& os, resource_type type) {
-    switch (type) {
-    case resource_type::topic:
-        return os << "topic";
-    case resource_type::group:
-        return os << "group";
-    case resource_type::cluster:
-        return os << "cluster";
-    case resource_type::transactional_id:
-        return os << "transactional_id";
-    }
-    __builtin_unreachable();
+    return os << to_string_view(type);
 }
 
 std::ostream& operator<<(std::ostream& os, pattern_type type) {
-    switch (type) {
-    case pattern_type::literal:
-        return os << "literal";
-    case pattern_type::prefixed:
-        return os << "prefixed";
-    }
-    __builtin_unreachable();
+    return os << to_string_view(type);
 }
 
 std::ostream& operator<<(std::ostream& os, principal_type type) {
-    switch (type) {
-    case principal_type::user:
-        return os << "user";
-    case principal_type::ephemeral_user:
-        return os << "ephemeral user";
-    case principal_type::role:
-        return os << "role";
-    }
-    __builtin_unreachable();
+    return os << to_string_view(type);
 }
 
 std::ostream&
 operator<<(std::ostream& os, const acl_principal_base& principal) {
-    fmt::print(
-      os, "type {{{}}} name {{{}}}", principal.type(), principal.name_view());
+    fmt::print(os, "{:l}", principal);
     return os;
 }
 
@@ -407,13 +454,26 @@ operator<<(std::ostream& os, const resource_pattern_filter::pattern_match&) {
     return os;
 }
 
+std::ostream&
+operator<<(std::ostream& os, resource_pattern_filter::resource_subsystem s) {
+    using resource_subsystem = resource_pattern_filter::resource_subsystem;
+    switch (s) {
+    case resource_subsystem::kafka:
+        return os << "kafka";
+    case resource_subsystem::schema_registry:
+        return os << "schema_registry";
+    }
+    __builtin_unreachable();
+}
+
 std::ostream& operator<<(std::ostream& o, const resource_pattern_filter& f) {
     fmt::print(
       o,
-      "{{ resource: {} name: {} pattern: {} }}",
+      "{{ resource: {} name: {} pattern: {} subsystem: {}}}",
       f._resource,
       f._name,
-      f._pattern);
+      f._pattern,
+      f._subsystem);
     return o;
 }
 
@@ -498,6 +558,19 @@ bool resource_pattern_filter::matches(const resource_pattern& pattern) const {
         return false;
     }
 
+    switch (_subsystem) {
+    case resource_subsystem::kafka:
+        if (pattern.resource() > resource_type::transactional_id) {
+            return false;
+        }
+        break;
+    case resource_subsystem::schema_registry:
+        if (pattern.resource() < resource_type::sr_subject) {
+            return false;
+        }
+        break;
+    }
+
     if (
       _pattern && std::holds_alternative<pattern_type>(*_pattern)
       && std::get<pattern_type>(*_pattern) != pattern.pattern()) {
@@ -526,7 +599,7 @@ bool resource_pattern_filter::matches(const resource_pattern& pattern) const {
     __builtin_unreachable();
 }
 
-void read_nested(
+void read_nested_v0(
   iobuf_parser& in,
   resource_pattern_filter& filter,
   const size_t bytes_left_limit) {
@@ -560,7 +633,7 @@ void read_nested(
     }
 }
 
-void write(iobuf& out, resource_pattern_filter filter) {
+void write_v0(iobuf& out, resource_pattern_filter filter) {
     using serde::write;
 
     using serialized_pattern_type
@@ -582,5 +655,232 @@ void write(iobuf& out, resource_pattern_filter filter) {
     write(out, filter._name);
     write(out, pattern);
 }
+
+namespace {
+[[maybe_unused]] void write_v0_dummy_resource_pattern_filter(iobuf& out) {
+    using serde::write;
+
+    write<std::optional<resource_type>>(out, std::nullopt);
+    write<std::optional<ss::sstring>>(out, std::nullopt);
+    write<std::optional<resource_pattern_filter::serialized_pattern_type>>(
+      out, std::nullopt);
+}
+} // namespace
+
+void acl_binding_filter::serde_write(iobuf& out) const {
+    using serde::write;
+
+    // Wire format for backwards/forwards compatibility:
+    // clang-format off
+    // V0: | serde header | raw resource_pattern_filter | enveloped acl_entry_filter |
+    // V1: | serde header | raw resource_pattern_filter | enveloped acl_entry_filter | enveloped resource_pattern_filter |
+    // V?: | serde header | dummy resource_pattern_filter | enveloped acl_entry_filter | enveloped resource_pattern_filter |
+    // clang-format on
+    //
+    // V1 duplicates resource_pattern_filter (raw + enveloped) to support
+    // migration:
+    // - V0 readers can read the raw field and ignore the enveloped fields
+    // - V1+ readers ignore the raw field and use the enveloped fields
+    // Future version will replace raw field with 3-byte dummy once V0
+    // compatibility is dropped
+
+    // Write actual V0 data for backwards compatibility with old readers
+    write_v0(out, _pattern);
+    // TODO: Switch to dummy write once old readers are no longer supported
+    // (earliest_logical_version > 25.2.1):
+    // write_v0_dummy_resource_pattern_filter(out);
+
+    write(out, _acl);
+    write(out, _pattern);
+}
+
+void acl_binding_filter::serde_read(iobuf_parser& in, const serde::header& h) {
+    using serde::read_nested;
+
+    if (h._version == 0) {
+        // V0: read actual data from the V0 field
+        read_nested_v0(in, _pattern, h._bytes_left_limit);
+    } else {
+        // V1+: read and discard V0 field (written for old reader compatibility)
+        resource_pattern_filter ignored;
+        read_nested_v0(in, ignored, h._bytes_left_limit);
+    }
+
+    _acl = read_nested<decltype(_acl)>(in, h._bytes_left_limit);
+
+    if (h._version >= 1) {
+        // V1+: read actual data from new enveloped field
+        _pattern = read_nested<decltype(_pattern)>(in, h._bytes_left_limit);
+    }
+}
+
+namespace {
+template<typename Other, typename Writer>
+void write_other_version(iobuf& out, Writer writer) {
+    // This is a test-only, simplified version of:
+    // `void tag_invoke(tag_t<write_tag>, iobuf& out, T t)`
+
+    serde::write(out, Other::redpanda_serde_version);
+    serde::write(out, Other::redpanda_serde_compat_version);
+
+    auto size_placeholder = out.reserve(sizeof(serde::serde_size_t));
+
+    const auto size_before = out.size_bytes();
+
+    writer();
+
+    const auto written_size = out.size_bytes() - size_before;
+    if (unlikely(
+          written_size > std::numeric_limits<serde::serde_size_t>::max())) {
+        throw serde::serde_exception("envelope too big");
+    }
+    const auto size = ss::cpu_to_le(
+      static_cast<serde::serde_size_t>(written_size));
+    size_placeholder.write(
+      reinterpret_cast<const char*>(&size), sizeof(serde::serde_size_t));
+}
+} // namespace
+
+void acl_binding_filter::testing_serde_full_write_v0(iobuf& out) const {
+    write_other_version<testing::acl_binding_filter_v0>(out, [&]() {
+        using serde::write;
+
+        write_v0(out, _pattern);
+        write(out, _acl);
+    });
+}
+
+void acl_binding_filter::testing_serde_full_read_v0(
+  iobuf_parser& in, const std::size_t bytes_left_limit) {
+    // This follows the pattern of:
+    // `void tag_invoke(tag_t<read_tag>, iobuf_parser& in, T& t, const
+    // std::size_t bytes_left_limit)`
+
+    auto h = serde::read_header<testing::acl_binding_filter_v0>(
+      in, bytes_left_limit);
+
+    read_nested_v0(in, _pattern, h._bytes_left_limit);
+
+    if (unlikely(in.bytes_left() < h._bytes_left_limit)) {
+        throw serde::serde_exception(fmt_with_ctx(
+          ssx::sformat,
+          "field spill over in {}, field type {}: envelope_end={}, "
+          "in.bytes_left()={}",
+          serde::type_str<testing::acl_binding_filter_v0>(),
+          serde::type_str<decltype(_acl)>(),
+          h._bytes_left_limit,
+          in.bytes_left()));
+    }
+
+    if (h._bytes_left_limit != in.bytes_left()) {
+        _acl = serde::read_nested<decltype(_acl)>(in, h._bytes_left_limit);
+    }
+
+    if (in.bytes_left() > h._bytes_left_limit) {
+        in.skip(in.bytes_left() - h._bytes_left_limit);
+    }
+}
+
+void acl_binding_filter::testing_serde_full_write_v2(iobuf& out) const {
+    write_other_version<testing::acl_binding_filter_v2>(out, [&]() {
+        using serde::write;
+
+        write_v0_dummy_resource_pattern_filter(out);
+        write(out, _acl);
+        write(out, _pattern);
+    });
+}
+
+void acl_binding_filter::testing_serde_full_read_v2(
+  iobuf_parser& in, const std::size_t bytes_left_limit) {
+    // The V2 read path will be identical to the V0 read path, the only
+    // difference being the serde version and compat version
+    auto res = serde::read_nested<testing::acl_binding_filter_v2>(
+      in, bytes_left_limit);
+    *this = acl_binding_filter{res._pattern, res._acl};
+}
+
+template<typename T>
+const std::vector<acl_operation>& get_allowed_operations() {
+    static const std::vector<acl_operation> topic_resource_ops{
+      acl_operation::read,
+      acl_operation::write,
+      acl_operation::create,
+      acl_operation::describe,
+      acl_operation::remove,
+      acl_operation::alter,
+      acl_operation::describe_configs,
+      acl_operation::alter_configs,
+    };
+
+    static const std::vector<acl_operation> group_resource_ops{
+      acl_operation::read,
+      acl_operation::describe,
+      acl_operation::remove,
+    };
+
+    static const std::vector<acl_operation> transactional_id_resource_ops{
+      acl_operation::write,
+      acl_operation::describe,
+    };
+
+    static const std::vector<acl_operation> cluster_resource_ops{
+      acl_operation::create,
+      acl_operation::cluster_action,
+      acl_operation::describe_configs,
+      acl_operation::alter_configs,
+      acl_operation::idempotent_write,
+      acl_operation::alter,
+      acl_operation::describe,
+    };
+
+    static const std::vector<acl_operation> sr_subject_resource_ops{
+      acl_operation::read,
+      acl_operation::write,
+      acl_operation::remove,
+      acl_operation::describe,
+      acl_operation::alter_configs,
+      acl_operation::describe_configs,
+    };
+
+    static const std::vector<acl_operation> sr_registry_resource_ops{
+      acl_operation::read,
+      acl_operation::describe,
+      acl_operation::alter_configs,
+      acl_operation::describe_configs,
+    };
+
+    auto resource_type = get_resource_type<T>();
+
+    switch (resource_type) {
+    case resource_type::cluster:
+        return cluster_resource_ops;
+    case resource_type::group:
+        return group_resource_ops;
+    case resource_type::topic:
+        return topic_resource_ops;
+    case resource_type::transactional_id:
+        return transactional_id_resource_ops;
+    case resource_type::sr_subject:
+        return sr_subject_resource_ops;
+    case resource_type::sr_registry:
+        return sr_registry_resource_ops;
+    };
+
+    __builtin_unreachable();
+}
+
+template const std::vector<acl_operation>&
+get_allowed_operations<model::topic>();
+template const std::vector<acl_operation>&
+get_allowed_operations<kafka::group_id>();
+template const std::vector<acl_operation>&
+get_allowed_operations<acl_cluster_name>();
+template const std::vector<acl_operation>&
+get_allowed_operations<kafka::transactional_id>();
+template const std::vector<acl_operation>&
+get_allowed_operations<pandaproxy::schema_registry::subject>();
+template const std::vector<acl_operation>&
+get_allowed_operations<pandaproxy::schema_registry::registry_resource>();
 
 } // namespace security

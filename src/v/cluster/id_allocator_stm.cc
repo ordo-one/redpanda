@@ -11,12 +11,12 @@
 
 #include "bytes/iobuf.h"
 #include "cluster/logger.h"
-#include "cluster/types.h"
+#include "cluster/snapshot.h"
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "raft/consensus.h"
 #include "raft/errc.h"
-#include "raft/fundamental.h"
+#include "ssx/future-util.h"
 #include "storage/ntp_config.h"
 #include "storage/record_batch_builder.h"
 
@@ -105,9 +105,9 @@ ss::future<bool> id_allocator_stm::set_state(
     auto batch = serialize_cmd(
       state_cmd{.next_state = value}, model::record_batch_type::id_allocator);
     auto r = co_await _raft->replicate(
-      _insync_term,
       std::move(batch),
-      raft::replicate_options(raft::consistency_level::quorum_ack));
+      raft::replicate_options(
+        raft::consistency_level::quorum_ack, _insync_term));
     if (!r) {
         co_return false;
     }
@@ -246,7 +246,9 @@ bool id_allocator_stm_factory::is_applicable_for(
 }
 
 void id_allocator_stm_factory::create(
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config&) {
     builder.create_stm<id_allocator_stm>(clusterlog, raft);
 }
 

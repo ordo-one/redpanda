@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/read_path_probes.h"
@@ -19,6 +19,7 @@
 #include "cloud_storage/segment_chunk_api.h"
 #include "cloud_storage/types.h"
 #include "cloud_storage_clients/types.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "storage/parser.h"
@@ -27,10 +28,8 @@
 #include "storage/types.h"
 #include "utils/retry_chain_node.h"
 
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/expiring_fifo.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -52,7 +51,7 @@ class remote_segment final {
 public:
     remote_segment(
       remote& r,
-      cache& cache,
+      cloud_io::cache& cache,
       cloud_storage_clients::bucket_name bucket,
       const remote_segment_path& path,
       const model::ntp& ntp,
@@ -91,8 +90,7 @@ public:
 
     /// create an input stream _sharing_ the underlying file handle
     /// starting at position @pos
-    ss::future<storage::segment_reader_handle>
-    data_stream(size_t pos, ss::io_priority_class);
+    ss::future<storage::segment_reader_handle> data_stream(size_t pos);
 
     struct input_stream_with_offsets {
         ss::input_stream<char> stream;
@@ -105,8 +103,7 @@ public:
       kafka::offset start,
       kafka::offset end,
       std::optional<model::timestamp>,
-      ss::io_priority_class,
-      storage::opt_abort_source_t as);
+      model::opt_abort_source_t as);
 
     /// Hydrates the segment, index or tx-range depending on segment meta
     /// version, returning a future that the caller can use to wait for the
@@ -120,7 +117,7 @@ public:
     /// to old mode where the full segment is hydrated. For v3 or higher
     /// versions, the actual segment data is hydrated by the data source
     /// implementation, but the index is still required to be present first.
-    ss::future<> hydrate(storage::opt_abort_source_t as = std::nullopt);
+    ss::future<> hydrate(model::opt_abort_source_t as = std::nullopt);
 
     /// Hydrate a part of a segment, identified by the given range. The range
     /// can contain data for multiple contiguous chunks, in which case multiple
@@ -182,6 +179,12 @@ public:
 
     size_t concurrency() { return _api.concurrency(); }
 
+    template<class Fn>
+    auto with_scheduling_group(Fn&& fn) {
+        return ss::with_scheduling_group(
+          _api.resources().get_scheduling_group(), std::forward<Fn>(fn));
+    }
+
 private:
     /// get a file offset for the corresponding kafka offset
     /// if the index is available
@@ -209,15 +212,15 @@ private:
 
     /// Helper for do_hydrate_segment
     ss::future<uint64_t> put_segment_in_cache_and_create_index(
-      uint64_t, space_reservation_guard&, ss::input_stream<char>);
+      uint64_t, cloud_io::space_reservation_guard&, ss::input_stream<char>);
 
     ss::future<uint64_t> put_segment_in_cache(
-      uint64_t, space_reservation_guard&, ss::input_stream<char>);
+      uint64_t, cloud_io::space_reservation_guard&, ss::input_stream<char>);
 
     /// Stores a segment chunk in cache. The chunk is stored in a path derived
     /// from the segment path: <segment_path>_chunks/chunk_start_file_offset.
     ss::future<> put_chunk_in_cache(
-      space_reservation_guard&,
+      cloud_io::space_reservation_guard&,
       ss::input_stream<char>,
       chunk_start_offset_t chunk_start);
 
@@ -265,7 +268,7 @@ private:
 
     ss::gate _gate;
     remote& _api;
-    cache& _cache;
+    cloud_io::cache& _cache;
     cloud_storage_clients::bucket_name _bucket;
     const model::ntp& _ntp;
     remote_segment_path _path;
@@ -294,7 +297,7 @@ private:
     ss::file _data_file;
     std::optional<offset_index> _index;
 
-    using tx_range_vec = fragmented_vector<model::tx_range>;
+    using tx_range_vec = chunked_vector<model::tx_range>;
     std::optional<tx_range_vec> _tx_range;
 
     // For backing off on apparent thrash/saturation of the local cache
@@ -332,14 +335,14 @@ private:
     /// failed to materialize (possibly due to cache eviction), and returns the
     /// collected set of such failed requests. These should then be requeued by
     /// the caller.
-    ss::future<fragmented_vector<chunk_request>> service_chunk_requests();
+    ss::future<chunked_vector<chunk_request>> service_chunk_requests();
 
     /// Waiters pending chunk downloads. Only the first hydration request for a
     /// given chunk ends up here. All following requests for that chunk are
     /// stored by the chunk API in its own wait list. This way only a single
     /// file handle is created for a given chunk, and the chunk API distributes
     /// shared ptrs to that handle to consumers.
-    fragmented_vector<chunk_request> _chunk_waiters;
+    chunked_vector<chunk_request> _chunk_waiters;
 
     friend class remote_segment_test_helper;
 };
@@ -369,7 +372,7 @@ class remote_segment_batch_reader final {
 public:
     remote_segment_batch_reader(
       ss::lw_shared_ptr<remote_segment>,
-      const storage::log_reader_config& config,
+      const cloud_storage::cloud_log_reader_config& config,
       partition_probe& probe,
       ts_read_path_probe& ts_probe,
       ssx::semaphore_units) noexcept;
@@ -388,13 +391,15 @@ public:
       = delete;
     ~remote_segment_batch_reader() noexcept;
 
-    ss::future<result<ss::circular_buffer<model::record_batch>>> read_some(
+    ss::future<result<chunked_circular_buffer<model::record_batch>>> read_some(
       model::timeout_clock::time_point, storage::offset_translator_state&);
 
     ss::future<> stop();
 
-    const storage::log_reader_config& config() const { return _config; }
-    storage::log_reader_config& config() { return _config; }
+    const cloud_storage::cloud_log_reader_config& config() const {
+        return _config;
+    }
+    cloud_storage::cloud_log_reader_config& config() { return _config; }
 
     /// Get max offset (redpanda offset)
     model::offset max_rp_offset() const { return _seg->get_max_rp_offset(); }
@@ -431,13 +436,17 @@ private:
     friend class single_record_consumer;
     ss::future<std::unique_ptr<storage::continuous_batch_parser>> init_parser();
 
+    ss::future<result<chunked_circular_buffer<model::record_batch>>>
+    do_read_some(
+      model::timeout_clock::time_point, storage::offset_translator_state&);
+
     size_t produce(model::record_batch batch);
 
     ss::lw_shared_ptr<remote_segment> _seg;
-    storage::log_reader_config _config;
+    cloud_storage::cloud_log_reader_config _config;
     partition_probe& _probe;
     ts_read_path_probe& _ts_probe;
-    ss::circular_buffer<model::record_batch> _ringbuf;
+    chunked_circular_buffer<model::record_batch> _ringbuf;
     std::optional<std::reference_wrapper<storage::offset_translator_state>>
       _cur_ot_state;
     size_t _total_size{0};
@@ -470,7 +479,7 @@ struct hydration_request {
     using materialize_action_t = ss::noncopyable_function<ss::future<bool>()>;
 
     std::filesystem::path path;
-    cache_element_status current_status;
+    cloud_io::cache_element_status current_status;
     bool was_cached{false};
 
     hydrate_action_t hydrate_action;
@@ -486,7 +495,7 @@ struct hydration_loop_state {
     using materialize_action_t = hydration_request::materialize_action_t;
 
     explicit hydration_loop_state(
-      cache& c, remote_segment_path root, retry_chain_logger& ctxlog);
+      cloud_io::cache& c, remote_segment_path root, retry_chain_logger& ctxlog);
 
     // Add request for hydration for a path. The actions supplied are used to
     // hydrate and materialize the path.
@@ -516,7 +525,7 @@ struct hydration_loop_state {
     std::exception_ptr current_error();
 
 private:
-    cache& _cache;
+    cloud_io::cache& _cache;
     remote_segment_path _root;
     retry_chain_logger& _ctxlog;
     std::vector<hydration_request> _states;

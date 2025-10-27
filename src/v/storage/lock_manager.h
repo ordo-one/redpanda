@@ -14,6 +14,7 @@
 // important to keep dependencies small because this type is used
 // in the log readers and throughout the code where segment_set.h is used
 // if it becomes large, consider making it a pimpl class
+#include "container/chunked_vector.h"
 #include "storage/fwd.h"
 #include "storage/segment_set.h"
 
@@ -34,13 +35,14 @@ public:
         lease& operator=(const lease&) = delete;
 
         segment_set range;
-        std::vector<ss::rwlock::holder> locks;
+        chunked_vector<ss::rwlock::holder> locks;
 
         friend std::ostream& operator<<(std::ostream&, const lease&);
     };
 
     ss::future<std::unique_ptr<lease>> range_lock(const timequery_config& cfg);
-    ss::future<std::unique_ptr<lease>> range_lock(const log_reader_config& cfg);
+    ss::future<std::unique_ptr<lease>>
+    range_lock(const local_log_reader_config& cfg);
 
 private:
     segment_set& _set;

@@ -53,6 +53,7 @@
 #include "ssx/sformat.h"
 #include "topic_configuration.h"
 #include "topic_properties.h"
+#include "topic_rules.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -109,6 +110,11 @@ get_enterprise_features(const cluster::topic_configuration& cfg) {
     if (config::shard_local_cfg().iceberg_enabled.is_restricted()) {
         if (cfg.properties.iceberg_mode != model::iceberg_mode::disabled) {
             features.emplace_back("iceberg");
+        }
+    }
+    if (config::shard_local_cfg().cloud_topics_enabled.is_restricted()) {
+        if (cfg.properties.cloud_topic_enabled) {
+            features.emplace_back("cloud topics");
         }
     }
     return features;
@@ -210,6 +216,11 @@ std::vector<std::string_view> get_enterprise_features(
             features.emplace_back("iceberg");
         }
     }
+    if (config::shard_local_cfg().cloud_topics_enabled.is_restricted()) {
+        if (properties.cloud_topic_enabled) {
+            features.emplace_back("cloud topics");
+        }
+    }
     return features;
 }
 
@@ -290,7 +301,8 @@ topics_frontend::topics_frontend(
   metadata_cache& metadata_cache,
   config::binding<unsigned> hard_max_disk_usage_ratio,
   config::binding<int16_t> minimum_topic_replication,
-  config::binding<bool> partition_autobalancing_topic_aware)
+  config::binding<bool> partition_autobalancing_topic_aware,
+  config::binding<std::optional<uint32_t>> max_user_topics)
   : _self(self)
   , _stm(s)
   , _allocator(pal)
@@ -312,20 +324,26 @@ topics_frontend::topics_frontend(
   , _hard_max_disk_usage_ratio(hard_max_disk_usage_ratio)
   , _minimum_topic_replication(minimum_topic_replication)
   , _partition_autobalancing_topic_aware(
-      std::move(partition_autobalancing_topic_aware)) {
+      std::move(partition_autobalancing_topic_aware))
+  , _max_user_topics(std::move(max_user_topics)) {
     if (ss::this_shard_id() == 0) {
         _minimum_topic_replication.watch(
           [this]() { print_rf_warning_message(); });
     }
 }
 
-static bool
-needs_linearizable_barrier(const std::vector<topic_result>& results) {
+namespace {
+
+template<std::ranges::input_range R>
+requires std::same_as<std::ranges::range_value_t<R>, topic_result>
+bool needs_linearizable_barrier(const R& results) {
     return std::any_of(
       results.cbegin(), results.cend(), [](const topic_result& r) {
           return r.ec == errc::success;
       });
 }
+
+} // namespace
 
 ss::future<std::vector<topic_result>> topics_frontend::create_topics(
   custom_assignable_topic_configuration_vector topics,
@@ -421,14 +439,16 @@ cluster::errc map_errc(std::error_code ec) {
     return errc::replication_error;
 }
 
-ss::future<std::vector<topic_result>> topics_frontend::update_topic_properties(
+ss::future<chunked_vector<topic_result>>
+topics_frontend::update_topic_properties(
   topic_properties_update_vector updates,
   model::timeout_clock::time_point timeout) {
     auto cluster_leader = _leaders.local().get_leader(model::controller_ntp);
 
     // no leader available
     if (!cluster_leader) {
-        co_return make_error_topic_results(updates, errc::no_leader_controller);
+        co_return make_error_topic_results<chunked_vector>(
+          updates, errc::no_leader_controller);
     }
 
     if (!_features.local().is_active(features::feature::cloud_retention)) {
@@ -440,7 +460,8 @@ ss::future<std::vector<topic_result>> topics_frontend::update_topic_properties(
           clusterlog.info,
           "Refusing to update topics as not all cluster nodes are running "
           "v22.3");
-        co_return make_error_topic_results(updates, errc::feature_disabled);
+        co_return make_error_topic_results<chunked_vector>(
+          updates, errc::feature_disabled);
     }
 
     // current node is a leader, just replicate
@@ -448,11 +469,11 @@ ss::future<std::vector<topic_result>> topics_frontend::update_topic_properties(
         // replicate empty batch to make sure leader local state is up to date.
         auto result = co_await stm_linearizable_barrier(timeout);
         if (!result) {
-            co_return make_error_topic_results(
+            co_return make_error_topic_results<chunked_vector>(
               updates, map_errc(result.error()));
         }
 
-        auto results = co_await ssx::parallel_transform(
+        auto results = co_await ssx::parallel_transform<chunked_vector>(
           std::move(updates), [this, timeout](topic_properties_update update) {
               if (
                 _features.local().should_sanction()
@@ -500,7 +521,8 @@ ss::future<std::vector<topic_result>> topics_frontend::update_topic_properties(
       .then([updates{std::move(updates2)}](
               result<update_topic_properties_reply> r) {
           if (r.has_error()) {
-              return make_error_topic_results(updates, map_errc(r.error()));
+              return make_error_topic_results<chunked_vector>(
+                updates, map_errc(r.error()));
           }
           return std::move(r.value().results);
       });
@@ -624,7 +646,7 @@ topic_result topics_frontend::validate_topic_configuration(
 
     // the only way that cloud topics can be enabled on a topic is if the cloud
     // topics development feature is also enabled.
-    if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+    if (!config::shard_local_cfg().cloud_topics_enabled()) {
         if (assignable_config.cfg.properties.cloud_topic_enabled) {
             auto msg = ssx::sformat(
               "Cloud topic flag on {} is set but development feature is "
@@ -661,6 +683,30 @@ ss::future<topic_result> topics_frontend::do_create_topic(
         co_return topic_result(tp_ns, errc::topic_already_exists);
     }
 
+    // Enforce cluster-wide topic count limit only on user created topics.
+    if (auto max_user_topics_opt = _max_user_topics()) {
+        // This is intended to approximate the number of topics that are
+        // user-defined and may return a count slightly smaller than the actual
+        // amount.
+        auto user_topic_count = std::max(
+                                  _topics.local().all_topics_count(),
+                                  model::non_user_topics.size())
+                                - model::non_user_topics.size();
+        if (
+          user_topic_count >= *max_user_topics_opt
+          && model::is_user_topic(tp_ns)) {
+            vlog(
+              clusterlog.warn,
+              "unable to create topic {} as the number of user topics exceeds "
+              "the cluster limit",
+              tp_ns);
+            co_return make_error_result(
+              assignable_config.cfg.tp_ns,
+              make_error_code(errc::topic_operation_error),
+              "number of topics exceeds cluster limit");
+        }
+    }
+
     bool blocked = assignable_config.cfg.is_migrated
                      ? _migrated_resources.get_topic_state(tp_ns)
                          > data_migrations::migrated_resource_state::create_only
@@ -675,6 +721,15 @@ ss::future<topic_result> topics_frontend::do_create_topic(
           _migrated_resources.get_topic_state(tp_ns));
         co_return topic_result(
           assignable_config.cfg.tp_ns, errc::resource_is_being_migrated);
+    }
+
+    if (!assignable_config.cfg.tp_id.has_value()) {
+        assignable_config.cfg.tp_id = model::create_topic_id();
+        vlog(
+          clusterlog.debug,
+          "Configuring topic {} with id {}",
+          assignable_config.cfg.tp_ns,
+          assignable_config.cfg.tp_id.value());
     }
 
     auto result = validate_topic_configuration(assignable_config);
@@ -832,6 +887,7 @@ ss::future<topic_result> topics_frontend::do_create_topic(
     if (!units) {
         co_return make_error_result(assignable_config.cfg.tp_ns, units.error());
     }
+
     co_return co_await replicate_create_topic(
       std::move(assignable_config.cfg), std::move(units.value()), timeout);
 }
@@ -850,7 +906,7 @@ ss::future<topic_result> topics_frontend::replicate_create_topic(
         std::shuffle(
           p_as.replicas.begin(),
           p_as.replicas.end(),
-          random_generators::internal::gen);
+          random_generators::global().engine());
     }
 
     return replicate_and_wait(_stm, _as, std::move(cmd), timeout)
@@ -1109,6 +1165,10 @@ ss::future<topic_result> topics_frontend::do_purged_topic(
         marker_exists = _topics.local().get_iceberg_tombstones().contains(
           topic.nt);
         break;
+    case topic_purge_domain::cloud_topic:
+        marker_exists = _topics.local().get_cloud_topic_tombstones().contains(
+          topic);
+        break;
     }
 
     if (!marker_exists) {
@@ -1304,11 +1364,11 @@ ss::future<std::error_code> topics_frontend::force_update_partition_replicas(
       _stm, _as, std::move(cmd), tout, term);
 }
 
-ss::future<result<fragmented_vector<ntp_with_majority_loss>>>
+ss::future<result<chunked_vector<ntp_with_majority_loss>>>
 topics_frontend::partitions_with_lost_majority(
   std::vector<model::node_id> dead_nodes) {
     try {
-        fragmented_vector<ntp_with_majority_loss> result;
+        chunked_vector<ntp_with_majority_loss> result;
         const auto& topics = _topics.local();
         for (auto it = topics.topics_iterator_begin();
              it != topics.topics_iterator_end();
@@ -1326,17 +1386,6 @@ topics_frontend::partitions_with_lost_majority(
                     continue;
                 }
                 model::ntp ntp(tn.ns, tn.tp, assignment.id);
-                if (topics.updates_in_progress().contains(ntp)) {
-                    // force reconfiguration does not support in progress
-                    // moves. this check can be relaxed once the limitation
-                    // is fixed.
-                    vlog(
-                      clusterlog.debug,
-                      "{} lost majority but skipping as an update is in "
-                      "progress.",
-                      ntp);
-                    continue;
-                }
                 result.emplace_back(
                   std::move(ntp),
                   topic_revision,
@@ -1365,7 +1414,7 @@ topics_frontend::partitions_with_lost_majority(
 ss::future<std::error_code>
 topics_frontend::force_recover_partitions_from_nodes(
   std::vector<model::node_id> nodes,
-  fragmented_vector<ntp_with_majority_loss>
+  chunked_vector<ntp_with_majority_loss>
     user_approved_force_recovery_partitions,
   model::timeout_clock::time_point timeout) {
     auto result = co_await stm_linearizable_barrier(timeout);
@@ -1379,17 +1428,16 @@ topics_frontend::force_recover_partitions_from_nodes(
     for (const auto& entry : user_approved_force_recovery_partitions) {
         // check if there is an in progress movemement, reject if so.
         // this is a conservative check and can be relaxed.
-        auto in_progress_move = topics.is_update_in_progress(entry.ntp);
         auto current_assignment = topics.get_partition_assignment(entry.ntp);
         auto assignment_match = current_assignment
                                 && are_replica_sets_equal(
                                   current_assignment->replicas,
                                   entry.assignment);
-        if (in_progress_move || !assignment_match) {
+        if (!assignment_match) {
             vlog(
               clusterlog.info,
               "rejecting force recovery of partitions from brokers {}, ntp: "
-              "{}, move in progress: {}, expected replica set: {}, current "
+              "{}, expected replica set: {}, current "
               "assignment: {}, the state may have changed since the original "
               "request was made, try again.",
               nodes,
@@ -1558,7 +1606,13 @@ ss::future<std::error_code> topics_frontend::revert_cancel_partition_move(
 ss::future<result<model::offset>> topics_frontend::stm_linearizable_barrier(
   model::timeout_clock::time_point timeout) {
     return _stm.invoke_on(controller_stm_shard, [timeout](controller_stm& stm) {
-        return stm.insert_linearizable_barrier(timeout);
+        return stm.insert_linearizable_barrier(timeout).then([](auto r) {
+            if (r.has_error()) {
+                return ss::make_ready_future<result<model::offset>>(r.error());
+            }
+            return ss::make_ready_future<result<model::offset>>(
+              r.value().first);
+        });
     });
 }
 
@@ -1598,7 +1652,7 @@ ss::future<std::error_code> topics_frontend::set_topic_partitions_disabled(
         co_return errc::feature_disabled;
     }
 
-    if (!model::is_user_topic(ns_tp)) {
+    if (!topic_rules::can_be_disabled(ns_tp)) {
         co_return errc::invalid_partition_operation;
     }
 
@@ -1715,11 +1769,12 @@ ss::future<topic_result> topics_frontend::do_create_partition(
           const auto new_partitions_cnt = p_cfg.new_total_partition_count
                                           - current;
           const auto replication_factor = static_cast<int16_t>(rf);
-          return al.allocate(simple_allocation_request{
-            p_cfg.tp_ns,
-            new_partitions_cnt,
-            replication_factor,
-            std::move(existing_rc)});
+          return al.allocate(
+            simple_allocation_request{
+              p_cfg.tp_ns,
+              new_partitions_cnt,
+              replication_factor,
+              std::move(existing_rc)});
       });
 
     // no assignments, error
@@ -1924,7 +1979,7 @@ ss::future<topics_frontend::capacity_info> topics_frontend::get_health_info(
           32,
           [&info](const node_health_report::topics_t::value_type& status) {
               for (const auto& partition : status.second) {
-                  info.ntp_sizes[partition.id] = partition.size_bytes;
+                  info.ntp_sizes[partition.first] = partition.second.size_bytes;
               }
               return ss::now();
           });

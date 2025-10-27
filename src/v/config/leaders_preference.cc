@@ -54,17 +54,26 @@ leaders_preference leaders_preference::parse(std::string_view s) {
         for (auto& tok : tokens) {
             boost::algorithm::trim(tok);
             if (tok.empty()) {
-                throw std::runtime_error("couldn't parse leaders_preference: "
-                                         "empty rack token");
+                throw std::runtime_error(
+                  "couldn't parse leaders_preference: "
+                  "empty rack token");
             }
             ret.racks.emplace_back(std::move(tok));
         }
         ret.type = leaders_preference::type_t::racks;
         return ret;
     } else {
-        throw std::runtime_error("couldn't parse leaders_preference: should be "
-                                 "\"none\" or start with \"racks:\"");
+        throw std::runtime_error(
+          "couldn't parse leaders_preference: should be "
+          "\"none\" or start with \"racks:\"");
     }
+}
+
+std::istream& operator>>(std::istream& is, leaders_preference& res) {
+    std::stringstream ss;
+    ss << is.rdbuf();
+    res = leaders_preference::parse(ss.str());
+    return is;
 }
 
 } // namespace config

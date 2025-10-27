@@ -9,9 +9,13 @@
 
 #include "pandaproxy/schema_registry/api.h"
 
+#include "cluster/cluster_link/frontend.h"
+#include "cluster/controller.h"
 #include "config/configuration.h"
 #include "kafka/client/configuration.h"
+#include "kafka/data/rpc/deps.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/schema_id_cache.h"
@@ -26,12 +30,30 @@
 #include <memory>
 
 namespace pandaproxy::schema_registry {
+
+class sequence_state_checker_impl : public sequence_state_checker {
+public:
+    explicit sequence_state_checker_impl(
+      std::unique_ptr<cluster::controller>& c)
+      : _controller(c) {}
+
+    writes_disabled_t writes_disabled() const final {
+        return writes_disabled_t{_controller->get_cluster_link_frontend()
+                                   .local()
+                                   .schema_registry_shadowing_active()};
+    }
+
+private:
+    std::unique_ptr<cluster::controller>& _controller;
+};
+
 api::api(
   model::node_id node_id,
   ss::smp_service_group sg,
   size_t max_memory,
   kafka::client::configuration& client_cfg,
   configuration& cfg,
+  ss::sharded<cluster::metadata_cache>* metadata_cache,
   std::unique_ptr<cluster::controller>& c,
   ss::sharded<security::audit::audit_log_manager>& audit_mgr) noexcept
   : _node_id{node_id}
@@ -39,6 +61,7 @@ api::api(
   , _max_memory{max_memory}
   , _client_cfg{client_cfg}
   , _cfg{cfg}
+  , _metadata_cache(metadata_cache)
   , _controller(c)
   , _audit_mgr(audit_mgr) {}
 
@@ -60,14 +83,29 @@ ss::future<> api::start() {
           return _service.local().mitigate_error(ex);
       });
     co_await _sequencer.start(
-      _node_id, _sg, std::ref(_client), std::ref(*_store));
+      _node_id,
+      _sg,
+      std::ref(_client),
+      std::ref(*_store),
+      ss::sharded_parameter([this] {
+          return std::make_unique<sequence_state_checker_impl>(_controller);
+      }));
     co_await _service.start(
       config::to_yaml(_cfg, config::redact_secrets::no),
+      config::to_yaml(_client_cfg, config::redact_secrets::no),
       _sg,
       _max_memory,
       std::ref(_client),
       std::ref(*_store),
       std::ref(_sequencer),
+      ss::sharded_parameter([this]() {
+          return kafka::data::rpc::topic_metadata_cache::make_default(
+            _metadata_cache);
+      }),
+      ss::sharded_parameter([this]() {
+          return kafka::data::rpc::topic_creator::make_default(
+            _controller.get());
+      }),
       std::ref(_controller),
       std::ref(_audit_mgr));
 
@@ -75,22 +113,32 @@ ss::future<> api::start() {
 }
 
 ss::future<> api::stop() {
-    vlog(plog.debug, "Stopping schema registry API...");
-    co_await _client.stop();
+    vlog(srlog.debug, "Stopping schema registry API...");
+    co_await _client.invoke_on_all(&kafka::client::client::stop);
     co_await _service.stop();
     co_await _sequencer.stop();
+    co_await _client.stop();
     co_await _schema_id_cache.stop();
     co_await _schema_id_validation_probe.stop();
     if (_store) {
         co_await _store->stop();
     }
-    vlog(plog.debug, "Stopped schema registry API...");
+    vlog(srlog.debug, "Stopped schema registry API...");
 }
 
 ss::future<> api::restart() {
-    vlog(plog.info, "Restarting the schema registry");
+    vlog(srlog.info, "Restarting the schema registry");
     co_await stop();
     co_await start();
 }
 
+const configuration& api::get_config() const { return _cfg; }
+
+const kafka::client::configuration& api::get_client_config() const {
+    return _client_cfg;
+}
+
+bool api::has_ephemeral_credentials() const {
+    return _service.local().has_ephemeral_credentials();
+}
 } // namespace pandaproxy::schema_registry

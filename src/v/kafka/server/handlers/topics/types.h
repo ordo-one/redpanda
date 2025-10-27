@@ -10,8 +10,9 @@
  */
 
 #pragma once
+#include "absl/container/flat_hash_map.h"
 #include "cluster/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/schemata/create_topics_request.h"
 #include "kafka/protocol/schemata/create_topics_response.h"
 #include "kafka/protocol/topic_properties.h"
@@ -21,7 +22,6 @@
 #include "model/namespace.h"
 #include "utils/absl_sstring_hash.h"
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 
@@ -40,23 +40,13 @@ using config_map_t
  */
 inline constexpr std::string_view topic_property_compaction_strategy
   = "compaction.strategy";
-inline constexpr std::string_view topic_property_timestamp_type
-  = "message.timestamp.type";
 inline constexpr std::string_view topic_property_segment_size = "segment.bytes";
-inline constexpr std::string_view topic_property_max_message_bytes
-  = "max.message.bytes";
-inline constexpr std::string_view topic_property_recovery
-  = "redpanda.remote.recovery";
+
 inline constexpr std::string_view topic_property_remote_write
   = "redpanda.remote.write";
 inline constexpr std::string_view topic_property_remote_read
   = "redpanda.remote.read";
-inline constexpr std::string_view topic_property_read_replica
-  = "redpanda.remote.readreplica";
-inline constexpr std::string_view topic_property_remote_allow_gaps
-  = "redpanda.remote.allowgaps";
-inline constexpr std::string_view topic_property_replication_factor
-  = "replication.factor";
+
 inline constexpr std::string_view topic_property_remote_delete
   = "redpanda.remote.delete";
 inline constexpr std::string_view topic_property_segment_ms = "segment.ms";
@@ -65,9 +55,6 @@ inline constexpr std::string_view topic_property_write_caching
 
 inline constexpr std::string_view topic_property_flush_ms = "flush.ms";
 inline constexpr std::string_view topic_property_flush_bytes = "flush.bytes";
-
-inline constexpr std::string_view topic_property_delete_retention_ms
-  = "delete.retention.ms";
 
 // Server side schema id validation
 inline constexpr std::string_view topic_property_record_key_schema_id_validation
@@ -96,17 +83,8 @@ inline constexpr std::string_view
   topic_property_record_value_subject_name_strategy_compat
   = "confluent.value.subject.name.strategy";
 
-inline constexpr std::string_view topic_property_mpx_virtual_cluster_id
-  = "redpanda.virtual.cluster.id";
-
 inline constexpr std::string_view topic_property_iceberg_mode
   = "redpanda.iceberg.mode";
-
-inline constexpr std::string_view topic_property_leaders_preference
-  = "redpanda.leaders.preference";
-
-inline constexpr std::string_view topic_property_cloud_topic_enabled
-  = "redpanda.cloud_topic.enabled";
 
 inline constexpr std::string_view topic_property_iceberg_delete
   = "redpanda.iceberg.delete";
@@ -123,6 +101,12 @@ inline constexpr std::string_view topic_property_iceberg_target_lag_ms
 inline constexpr std::string_view topic_property_min_cleanable_dirty_ratio
   = "min.cleanable.dirty.ratio";
 
+inline constexpr std::string_view topic_property_message_timestamp_before_max_ms
+  = "message.timestamp.before.max.ms";
+
+inline constexpr std::string_view topic_property_message_timestamp_after_max_ms
+  = "message.timestamp.after.max.ms";
+
 // Kafka topic properties that is not relevant for Redpanda
 // Or cannot be altered with kafka alter handler
 inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
@@ -133,10 +117,8 @@ inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
   "segment.index.bytes",
   "segment.jitter.ms",
   "min.insync.replicas",
-  "min.compaction.lag.ms",
   "message.timestamp.difference.max.ms",
   "message.format.version",
-  "max.compaction.lag.ms",
   "leader.replication.throttled.replicas",
   "index.interval.bytes",
   "follower.replication.throttled.replicas",
@@ -168,6 +150,13 @@ config_map_t config_map(const std::vector<creatable_topic_configs>& config);
 
 cluster::custom_assignable_topic_configuration
 to_cluster_type(const creatable_topic& t);
+
+cluster::topic_configuration to_topic_config(
+  model::ns ns,
+  model::topic topic,
+  int32_t partition_count,
+  int16_t replication_factor,
+  const config_map_t& config_map);
 
 std::vector<kafka::creatable_topic_configs> report_topic_configs(
   const cluster::metadata_cache& metadata_cache,

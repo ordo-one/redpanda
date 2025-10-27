@@ -9,20 +9,21 @@
  */
 #include "datalake/record_translator.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "base/vlog.h"
-#include "datalake/conversion_outcome.h"
 #include "datalake/logger.h"
 #include "datalake/record_schema_resolver.h"
 #include "datalake/table_definition.h"
-#include "datalake/values_avro.h"
-#include "datalake/values_protobuf.h"
 #include "iceberg/avro_utils.h"
 #include "iceberg/compatibility_utils.h"
+#include "iceberg/conversion/conversion_outcome.h"
+#include "iceberg/conversion/values_avro.h"
+#include "iceberg/conversion/values_json.h"
+#include "iceberg/conversion/values_protobuf.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/values.h"
 #include "model/fundamental.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <avro/Generic.hh>
 #include <avro/GenericDatum.hh>
 
@@ -35,14 +36,26 @@ struct value_translating_visitor {
     iobuf parsable_buf;
     const iceberg::field_type& type;
 
-    ss::future<optional_value_outcome>
+    ss::future<iceberg::optional_value_outcome>
     operator()(const google::protobuf::Descriptor& d) {
-        return deserialize_protobuf(std::move(parsable_buf), d);
+        return iceberg::deserialize_protobuf(std::move(parsable_buf), d);
     }
-    ss::future<optional_value_outcome> operator()(const avro::ValidSchema& s) {
-        auto value = co_await deserialize_avro(std::move(parsable_buf), s);
+    ss::future<iceberg::optional_value_outcome>
+    operator()(const avro::ValidSchema& s) {
+        auto value = co_await iceberg::deserialize_avro(
+          std::move(parsable_buf), s);
         if (value.has_error()) {
-            co_return optional_value_outcome(value.error());
+            co_return iceberg::optional_value_outcome(value.error());
+        }
+        co_return std::move(value.value());
+    }
+
+    ss::future<iceberg::optional_value_outcome>
+    operator()(const iceberg::json_conversion_ir& s) {
+        auto value = co_await iceberg::deserialize_json(
+          std::move(parsable_buf), s);
+        if (value.has_error()) {
+            co_return iceberg::optional_value_outcome(value.error());
         }
         co_return std::move(value.value());
     }
@@ -65,6 +78,7 @@ std::unique_ptr<iceberg::struct_value> build_rp_struct(
   kafka::offset o,
   std::optional<iobuf> key,
   model::timestamp ts,
+  model::timestamp_type ts_t,
   const chunked_vector<std::pair<std::optional<iobuf>, std::optional<iobuf>>>&
     headers) {
     auto system_data = std::make_unique<iceberg::struct_value>();
@@ -72,7 +86,7 @@ std::unique_ptr<iceberg::struct_value> build_rp_struct(
     system_data->fields.emplace_back(iceberg::long_value(o));
     // NOTE: Kafka uses milliseconds, Iceberg uses microseconds.
     system_data->fields.emplace_back(
-      iceberg::timestamp_value(ts.value() * 1000));
+      iceberg::timestamptz_value(ts.value() * 1000));
 
     if (headers.empty()) {
         system_data->fields.emplace_back(std::nullopt);
@@ -82,7 +96,7 @@ std::unique_ptr<iceberg::struct_value> build_rp_struct(
             auto header_kv_struct = std::make_unique<iceberg::struct_value>();
             header_kv_struct->fields.emplace_back(
               k ? std::make_optional<iceberg::value>(
-                    iceberg::binary_value(k->copy()))
+                    iceberg::string_value(k->copy()))
                 : std::nullopt);
             header_kv_struct->fields.emplace_back(
               v ? std::make_optional<iceberg::value>(
@@ -97,6 +111,10 @@ std::unique_ptr<iceberg::struct_value> build_rp_struct(
       key ? std::make_optional<iceberg::value>(
               iceberg::binary_value(std::move(*key)))
           : std::nullopt);
+
+    system_data->fields.emplace_back(
+      iceberg::int_value{static_cast<int32_t>(ts_t)});
+
     return system_data;
 }
 
@@ -127,6 +145,7 @@ default_translator::translate_data(
   const std::optional<resolved_type>& val_type,
   std::optional<iobuf> parsable_val,
   model::timestamp ts,
+  model::timestamp_type ts_t,
   const chunked_vector<std::pair<std::optional<iobuf>, std::optional<iobuf>>>&
     headers) {
     if (val_type.has_value()) {
@@ -137,16 +156,25 @@ default_translator::translate_data(
           val_type,
           std::move(parsable_val),
           ts,
+          ts_t,
           headers);
     }
     co_return co_await kv_translator.translate_data(
-      pid, o, std::move(key), val_type, std::move(parsable_val), ts, headers);
+      pid,
+      o,
+      std::move(key),
+      val_type,
+      std::move(parsable_val),
+      ts,
+      ts_t,
+      headers);
 }
 
 record_type key_value_translator::build_type(std::optional<resolved_type>) {
     auto ret_type = schemaless_struct_type();
-    ret_type.fields.emplace_back(iceberg::nested_field::create(
-      10, "value", iceberg::field_required::no, iceberg::binary_type{}));
+    ret_type.fields.emplace_back(
+      iceberg::nested_field::create(
+        11, "value", iceberg::field_required::no, iceberg::binary_type{}));
     return record_type{
       .comps = record_schema_components{
           .key_identifier = std::nullopt,
@@ -164,6 +192,7 @@ key_value_translator::translate_data(
   const std::optional<resolved_type>& val_type,
   std::optional<iobuf> parsable_val,
   model::timestamp ts,
+  model::timestamp_type ts_t,
   const chunked_vector<std::pair<std::optional<iobuf>, std::optional<iobuf>>>&
     headers) {
     if (val_type.has_value()) {
@@ -174,7 +203,8 @@ key_value_translator::translate_data(
     }
     auto ret_data = iceberg::struct_value{};
 
-    auto system_data = build_rp_struct(pid, o, std::move(key), ts, headers);
+    auto system_data = build_rp_struct(
+      pid, o, std::move(key), ts, ts_t, headers);
     ret_data.fields.emplace_back(std::move(system_data));
     ret_data.fields.emplace_back(
       parsable_val ? std::make_optional<iceberg::value>(
@@ -221,8 +251,9 @@ structured_data_translator::build_type(std::optional<resolved_type> val_type) {
                 auto& system_fields = std::get<iceberg::struct_type>(
                   ret_type.fields[0]->type);
                 // Use the next id of the system defaults.
-                system_fields.fields.emplace_back(iceberg::nested_field::create(
-                  10, "data", field->required, std::move(field->type)));
+                system_fields.fields.emplace_back(
+                  iceberg::nested_field::create(
+                    10, "data", field->required, std::move(field->type)));
                 continue;
             }
             // Add the extra user-defined fields.
@@ -246,6 +277,7 @@ structured_data_translator::translate_data(
   const std::optional<resolved_type>& val_type,
   std::optional<iobuf> parsable_val,
   model::timestamp ts,
+  model::timestamp_type ts_t,
   const chunked_vector<std::pair<std::optional<iobuf>, std::optional<iobuf>>>&
     headers) {
     if (!val_type.has_value()) {
@@ -259,7 +291,8 @@ structured_data_translator::translate_data(
         co_return record_translator::errc::translation_error;
     }
     auto ret_data = iceberg::struct_value{};
-    auto system_data = build_rp_struct(pid, o, std::move(key), ts, headers);
+    auto system_data = build_rp_struct(
+      pid, o, std::move(key), ts, ts_t, headers);
     // Fill in the internal value field.
     ret_data.fields.emplace_back(std::move(system_data));
 
@@ -268,11 +301,9 @@ structured_data_translator::translate_data(
       val_type->schema.get_schema_ref());
     if (translated_val.has_error()) {
         vlog(
-          datalake_log.error,
+          datalake_log.warn,
           "Error converting buffer: {}",
           translated_val.error());
-        // TODO: metric for data translation errors.
-        // Either needs to drop the data or send it to a dead-letter queue.
         co_return errc::translation_error;
     }
 

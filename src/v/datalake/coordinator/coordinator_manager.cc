@@ -38,7 +38,8 @@ coordinator_manager::coordinator_manager(
   pandaproxy::schema_registry::api* sr_api,
   std::unique_ptr<catalog_factory> catalog_factory,
   ss::sharded<cloud_io::remote>& io,
-  cloud_storage_clients::bucket_name bucket)
+  cloud_storage_clients::bucket_name bucket,
+  features::feature_table* features)
   : self_(self)
   , storage_(storage.local())
   , gm_(gm.local())
@@ -46,6 +47,7 @@ coordinator_manager::coordinator_manager(
   , topics_(topics.local())
   , topics_fe_(topics_fe)
   , schema_registry_(schema::registry::make_default(sr_api))
+  , features_(features)
   , manifest_io_(io.local(), bucket)
   , catalog_factory_(std::move(catalog_factory))
   , type_resolver_(
@@ -54,8 +56,9 @@ coordinator_manager::coordinator_manager(
 coordinator_manager::~coordinator_manager() = default;
 
 ss::future<> coordinator_manager::start() {
-    catalog_ = co_await catalog_factory_->create_catalog();
-    schema_mgr_ = std::make_unique<catalog_schema_manager>(*catalog_);
+    catalog_ = co_await catalog_factory_->create_catalog(as_);
+    schema_mgr_ = std::make_unique<catalog_schema_manager>(
+      *catalog_, features_);
     file_committer_ = std::make_unique<iceberg_file_committer>(
       storage_,
       *catalog_,
@@ -66,7 +69,9 @@ ss::future<> coordinator_manager::start() {
 
     manage_notifications_ = pm_.register_manage_notification(
       model::datalake_coordinator_nt.ns,
-      [this](ss::lw_shared_ptr<cluster::partition> p) { start_managing(*p); });
+      [this](const ss::lw_shared_ptr<cluster::partition>& p) {
+          start_managing(*p);
+      });
     unmanage_notifications_ = pm_.register_unmanage_notification(
       model::datalake_coordinator_nt.ns,
       [this](model::topic_partition_view tp) {
@@ -89,6 +94,7 @@ ss::future<> coordinator_manager::start() {
 }
 
 ss::future<> coordinator_manager::shutdown() {
+    as_.request_abort();
     if (manage_notifications_) {
         pm_.unregister_manage_notification(*manage_notifications_);
     }
@@ -98,6 +104,7 @@ ss::future<> coordinator_manager::shutdown() {
     if (leadership_notifications_) {
         gm_.unregister_leadership_notification(*leadership_notifications_);
     }
+
     auto gate_close = gate_.close();
     ss::future catalog_stop = ss::now();
     if (catalog_) {
@@ -106,6 +113,7 @@ ss::future<> coordinator_manager::shutdown() {
     for (auto& [_, crd] : coordinators_) {
         co_await crd->stop_and_wait();
     }
+
     co_await std::move(catalog_stop);
     co_await std::move(gate_close);
 }

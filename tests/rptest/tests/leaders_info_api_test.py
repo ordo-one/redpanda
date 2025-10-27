@@ -7,22 +7,22 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.cluster import cluster
+from ducktape.utils.util import wait_until
+
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
-from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.rpk_producer import RpkProducer
+from rptest.services.cluster import cluster
 from rptest.tests.end_to_end import EndToEndTest
-
-from ducktape.utils.util import wait_until
+from rptest.tests.redpanda_test import RedpandaTest
 
 
 class LeadersInfoApiTest(RedpandaTest):
-    topics = (TopicSpec(partition_count=3, replication_factor=3), )
+    topics = (TopicSpec(partition_count=3, replication_factor=3),)
 
     def __init__(self, test_context):
-        super(LeadersInfoApiTest, self).__init__(test_context=test_context,
-                                                 num_brokers=3)
+        super(LeadersInfoApiTest, self).__init__(
+            test_context=test_context, num_brokers=3
+        )
 
         self.admin = Admin(self.redpanda)
 
@@ -34,19 +34,23 @@ class LeadersInfoApiTest(RedpandaTest):
 
             partition_without_leader = 0
             for partition in range(self.topics[0].partition_count):
-                leader = self.admin.get_partition_leader(namespace="kafka",
-                                                         topic=self.topics[0],
-                                                         partition=partition,
-                                                         node=node)
+                leader = self.admin.get_partition_leader(
+                    namespace="kafka",
+                    topic=self.topics[0],
+                    partition=partition,
+                    node=node,
+                )
                 if leader == -1:
                     partition_without_leader += 1
 
             return partition_without_leader >= 2
 
-        wait_until(check_reset_leaders,
-                   timeout_sec=180,
-                   backoff_sec=1,
-                   err_msg="Can not reset leaders_table for nodes")
+        wait_until(
+            check_reset_leaders,
+            timeout_sec=180,
+            backoff_sec=1,
+            err_msg="Can not reset leaders_table for nodes",
+        )
 
         def check_get_leaders():
             for partition in range(self.topics[0].partition_count):
@@ -54,20 +58,24 @@ class LeadersInfoApiTest(RedpandaTest):
                     namespace="kafka",
                     topic=self.topics[0],
                     partition=partition,
-                    node=self.redpanda.nodes[0])
+                    node=self.redpanda.nodes[0],
+                )
 
                 leader1 = self.admin.get_partition_leader(
                     namespace="kafka",
                     topic=self.topics[0],
                     partition=partition,
-                    node=self.redpanda.nodes[1])
+                    node=self.redpanda.nodes[1],
+                )
 
                 return leader0 == leader1
 
-        wait_until(check_get_leaders,
-                   timeout_sec=30,
-                   backoff_sec=1,
-                   err_msg="Can not refresh leaders")
+        wait_until(
+            check_get_leaders,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="Can not refresh leaders",
+        )
 
     @cluster(num_nodes=3)
     def get_leaders_info_test(self):
@@ -77,10 +85,12 @@ class LeadersInfoApiTest(RedpandaTest):
             leaders = self.admin.get_leaders_info(node)
             return len(leaders) == 0
 
-        wait_until(check_reset_leaders,
-                   timeout_sec=180,
-                   backoff_sec=1,
-                   err_msg="Can not reset leaders_table for nodes")
+        wait_until(
+            check_reset_leaders,
+            timeout_sec=180,
+            backoff_sec=1,
+            err_msg="Can not reset leaders_table for nodes",
+        )
 
         def check_get_leaders():
             def compare_key(e):
@@ -92,10 +102,12 @@ class LeadersInfoApiTest(RedpandaTest):
             leaders_node2.sort(key=compare_key)
             return leaders_node1 == leaders_node2
 
-        wait_until(check_get_leaders,
-                   timeout_sec=180,
-                   backoff_sec=1,
-                   err_msg="Can not refresh leaders")
+        wait_until(
+            check_get_leaders,
+            timeout_sec=180,
+            backoff_sec=1,
+            err_msg="Can not refresh leaders",
+        )
 
 
 class LeadersInfoApiEndToEndTest(EndToEndTest):
@@ -116,6 +128,6 @@ class LeadersInfoApiEndToEndTest(EndToEndTest):
         for node in self.redpanda.nodes:
             self.admin.reset_leaders_info(node)
 
-        self.run_validation(min_records=10000,
-                            producer_timeout_sec=180,
-                            consumer_timeout_sec=180)
+        self.run_validation(
+            min_records=10000, producer_timeout_sec=180, consumer_timeout_sec=180
+        )

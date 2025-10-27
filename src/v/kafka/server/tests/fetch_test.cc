@@ -7,13 +7,18 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "base/units.h"
+#include "cluster/tests/cluster_test_fixture.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/handlers/fetch.h"
 #include "model/fundamental.h"
+#include "model/limits.h"
 #include "redpanda/tests/fixture.h"
-#include "resource_mgmt/io_priority.h"
+#include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/smp.hh>
 
@@ -38,14 +43,14 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
           [&res](const kafka::fetch_request::const_iterator::value_type& v) {
               if (v.new_topic) {
                   if (!res.empty()) {
-                      BOOST_TEST(res.back().topic != v.topic->name);
+                      BOOST_TEST(res.back().topic != v.topic->topic);
                   }
               } else {
                   BOOST_TEST(!res.empty());
-                  BOOST_TEST(res.back().topic == v.topic->name);
+                  BOOST_TEST(res.back().topic == v.topic->topic);
               }
               return model::topic_partition(
-                v.topic->name, v.partition->partition_index);
+                v.topic->topic, v.partition->partition);
           });
         return res;
     };
@@ -60,7 +65,7 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
     {
         // 1 topic, no partitions -> empty
         kafka::fetch_request req;
-        req.data.topics.push_back({.name = model::topic("t0")});
+        req.data.topics.push_back({.topic = model::topic("t0")});
         auto parts = transform(req);
         BOOST_TEST(parts.empty());
     }
@@ -68,8 +73,8 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
     {
         // 2 topics, no partitions -> empty
         kafka::fetch_request req;
-        req.data.topics.push_back({.name = model::topic("t0")});
-        req.data.topics.push_back({.name = model::topic("t1")});
+        req.data.topics.push_back({.topic = model::topic("t0")});
+        req.data.topics.push_back({.topic = model::topic("t1")});
         auto parts = transform(req);
         BOOST_TEST(parts.empty());
     }
@@ -78,8 +83,8 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
         // 1 topic, 1 partition
         kafka::fetch_request req;
         req.data.topics.push_back({
-          .name = model::topic("t0"),
-          .fetch_partitions = {{.partition_index = model::partition_id(100)}},
+          .topic = model::topic("t0"),
+          .partitions = {{.partition = model::partition_id(100)}},
         });
         auto parts = transform(req);
         BOOST_TEST(parts.size() == 1);
@@ -91,10 +96,10 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
         // 1 topic, 2 partitions
         kafka::fetch_request req;
         req.data.topics.push_back(
-          {.name = model::topic("t0"),
-           .fetch_partitions = {
-             {.partition_index = model::partition_id(100)},
-             {.partition_index = model::partition_id(101)}}});
+          {.topic = model::topic("t0"),
+           .partitions = {
+             {.partition = model::partition_id(100)},
+             {.partition = model::partition_id(101)}}});
         auto parts = transform(req);
         BOOST_TEST(parts.size() == 2);
         BOOST_TEST(parts[0].topic == model::topic("t0"));
@@ -107,14 +112,13 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
         // 2 topics, 2/1 partition
         kafka::fetch_request req;
         req.data.topics.push_back(
-          {.name = model::topic("t0"),
-           .fetch_partitions = {
-             {.partition_index = model::partition_id(100)},
-             {.partition_index = model::partition_id(101)}}});
+          {.topic = model::topic("t0"),
+           .partitions = {
+             {.partition = model::partition_id(100)},
+             {.partition = model::partition_id(101)}}});
         req.data.topics.push_back(
-          {.name = model::topic("t1"),
-           .fetch_partitions = {
-             {.partition_index = model::partition_id(102)}}});
+          {.topic = model::topic("t1"),
+           .partitions = {{.partition = model::partition_id(102)}}});
         auto parts = transform(req);
         BOOST_TEST(parts.size() == 3);
         BOOST_TEST(parts[0].topic == model::topic("t0"));
@@ -129,17 +133,17 @@ SEASTAR_THREAD_TEST_CASE(partition_iterator) {
         // 4 topics, 2/{}/{}/2 partition
         kafka::fetch_request req;
         req.data.topics.push_back(
-          {.name = model::topic("t0"),
-           .fetch_partitions = {
-             {.partition_index = model::partition_id(100)},
-             {.partition_index = model::partition_id(101)}}});
-        req.data.topics.push_back({.name = model::topic("t1")});
-        req.data.topics.push_back({.name = model::topic("t2")});
+          {.topic = model::topic("t0"),
+           .partitions = {
+             {.partition = model::partition_id(100)},
+             {.partition = model::partition_id(101)}}});
+        req.data.topics.push_back({.topic = model::topic("t1")});
+        req.data.topics.push_back({.topic = model::topic("t2")});
         req.data.topics.push_back(
-          {.name = model::topic("t3"),
-           .fetch_partitions = {
-             {.partition_index = model::partition_id(102)},
-             {.partition_index = model::partition_id(103)}}});
+          {.topic = model::topic("t3"),
+           .partitions = {
+             {.partition = model::partition_id(102)},
+             {.partition = model::partition_id(103)}}});
         auto parts = transform(req);
         BOOST_TEST(parts.size() == 4);
         BOOST_TEST(parts[0].topic == model::topic("t0"));
@@ -162,6 +166,7 @@ FIXTURE_TEST(read_from_ntp_max_bytes, redpanda_thread_fixture) {
           .start_offset = model::offset(0),
           .max_offset = model::model_limits<model::offset>::max(),
           .max_bytes = max_bytes,
+          .max_batch_size = 1_MiB,
           .timeout = model::no_timeout,
           .isolation_level = model::isolation_level::read_uncommitted,
         };
@@ -176,14 +181,13 @@ FIXTURE_TEST(read_from_ntp_max_bytes, redpanda_thread_fixture) {
                 [&octx, ktp, config](cluster::partition_manager& pm) {
                     return kafka::testing::read_from_ntp(
                       pm,
+                      octx.rctx.metadata_cache(),
                       octx.rctx.server().local().get_replica_selector(),
                       ktp,
                       config,
-                      true,
                       model::no_timeout,
                       false,
-                      octx.rctx.server().local().memory(),
-                      octx.rctx.server().local().memory_fetch_sem());
+                      octx.rctx.server().local().fetch_units_manager());
                 })
               .get();
         BOOST_TEST_REQUIRE(res.has_data());
@@ -247,7 +251,14 @@ FIXTURE_TEST(fetch_one, redpanda_thread_fixture) {
           });
     }).get();
 
-    for (auto version : boost::irange<uint16_t>(
+    const auto& topic_id = app.metadata_cache.local()
+                             .get_topic_metadata_ref(
+                               model::topic_namespace_view(ntp))
+                             ->get()
+                             .get_configuration()
+                             .tp_id;
+
+    for (auto version : boost::irange<kafka::api_version>(
            kafka::fetch_handler::min_supported,
            kafka::fetch_handler::max_supported + int16_t(1))) {
         info("Checking fetch api v{}", version);
@@ -258,37 +269,46 @@ FIXTURE_TEST(fetch_one, redpanda_thread_fixture) {
         // disable incremental fetches
         req.data.session_id = kafka::invalid_fetch_session_id;
         req.data.session_epoch = kafka::final_fetch_session_epoch;
-        req.data.topics.emplace_back(kafka::fetch_topic{
-          .name = topic,
-          .fetch_partitions = {{
-            .partition_index = pid,
-            .fetch_offset = offset,
-          }},
-        });
+        req.data.topics.emplace_back(
+          kafka::fetch_topic{
+            .partitions = {{
+              .partition = pid,
+              .fetch_offset = offset,
+            }},
+          });
+        if (version >= kafka::api_version{13}) {
+            req.data.topics.back().topic_id = *topic_id;
+        } else {
+            req.data.topics.back().topic = topic;
+        }
 
         auto client = make_kafka_client().get();
         client.connect().get();
-        auto resp
-          = client.dispatch(std::move(req), kafka::api_version(version)).get();
+        auto resp = client.dispatch(std::move(req), version).get();
         client.stop().then([&client] { client.shutdown(); }).get();
 
-        BOOST_REQUIRE(resp.data.topics.size() == 1);
-        BOOST_REQUIRE(resp.data.topics[0].name == topic());
-        BOOST_REQUIRE(resp.data.topics[0].partitions.size() == 1);
+        BOOST_REQUIRE(resp.data.responses.size() == 1);
+        if (version >= kafka::api_version{13}) {
+            BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic_id, *topic_id);
+        } else {
+            BOOST_REQUIRE(resp.data.responses[0].topic == topic());
+        }
+        BOOST_REQUIRE(resp.data.responses[0].partitions.size() == 1);
         BOOST_REQUIRE(
-          resp.data.topics[0].partitions[0].error_code
+          resp.data.responses[0].partitions[0].error_code
           == kafka::error_code::none);
-        BOOST_REQUIRE(resp.data.topics[0].partitions[0].partition_index == pid);
-        BOOST_REQUIRE(resp.data.topics[0].partitions[0].records);
         BOOST_REQUIRE(
-          resp.data.topics[0].partitions[0].records->size_bytes() > 0);
+          resp.data.responses[0].partitions[0].partition_index == pid);
+        BOOST_REQUIRE(resp.data.responses[0].partitions[0].records);
+        BOOST_REQUIRE(
+          resp.data.responses[0].partitions[0].records->size_bytes() > 0);
     }
 }
 
 FIXTURE_TEST(fetch_response_iterator_test, redpanda_thread_fixture) {
     static auto make_partition = [](ss::sstring topic) {
         return kafka::fetch_response::partition{
-          .name = model::topic(std::move(topic))};
+          .topic = model::topic(std::move(topic))};
     };
 
     static auto make_partition_response = [](int id) {
@@ -301,23 +321,23 @@ FIXTURE_TEST(fetch_response_iterator_test, redpanda_thread_fixture) {
 
     auto make_test_fetch_response = []() {
         kafka::fetch_response response;
-        response.data.topics.push_back(make_partition("tp-1"));
-        response.data.topics.push_back(make_partition("tp-2"));
-        response.data.topics.push_back(make_partition("tp-3"));
+        response.data.responses.push_back(make_partition("tp-1"));
+        response.data.responses.push_back(make_partition("tp-2"));
+        response.data.responses.push_back(make_partition("tp-3"));
 
-        response.data.topics[0].partitions.push_back(
+        response.data.responses[0].partitions.push_back(
           make_partition_response(0));
-        response.data.topics[0].partitions.push_back(
+        response.data.responses[0].partitions.push_back(
           make_partition_response(1));
-        response.data.topics[0].partitions.push_back(
+        response.data.responses[0].partitions.push_back(
           make_partition_response(2));
 
-        response.data.topics[1].partitions.push_back(
+        response.data.responses[1].partitions.push_back(
           make_partition_response(0));
 
-        response.data.topics[2].partitions.push_back(
+        response.data.responses[2].partitions.push_back(
           make_partition_response(0));
-        response.data.topics[2].partitions.push_back(
+        response.data.responses[2].partitions.push_back(
           make_partition_response(1));
         return response;
     };
@@ -328,13 +348,13 @@ FIXTURE_TEST(fetch_response_iterator_test, redpanda_thread_fixture) {
 
     for (auto it = response.begin(); it != response.end(); ++it) {
         if (i < 3) {
-            BOOST_REQUIRE_EQUAL(it->partition->name(), "tp-1");
+            BOOST_REQUIRE_EQUAL(it->partition->topic(), "tp-1");
             BOOST_REQUIRE_EQUAL(it->partition_response->partition_index(), i);
         } else if (i == 3) {
-            BOOST_REQUIRE_EQUAL(it->partition->name(), "tp-2");
+            BOOST_REQUIRE_EQUAL(it->partition->topic(), "tp-2");
             BOOST_REQUIRE_EQUAL(it->partition_response->partition_index(), 0);
         } else {
-            BOOST_REQUIRE_EQUAL(it->partition->name(), "tp-3");
+            BOOST_REQUIRE_EQUAL(it->partition->topic(), "tp-3");
             BOOST_REQUIRE_EQUAL(
               it->partition_response->partition_index(), i - 4);
         }
@@ -351,13 +371,14 @@ FIXTURE_TEST(fetch_non_existent, redpanda_thread_fixture) {
     add_topic(model::topic_namespace_view(ntp)).get();
     kafka::fetch_request non_existent_ntp;
     non_existent_ntp.data.max_wait_ms = std::chrono::milliseconds(1000);
-    non_existent_ntp.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {{
-        .partition_index = model::partition_id{-1},
-        .current_leader_epoch = kafka::leader_epoch(0),
-        .fetch_offset = model::offset(0),
-      }}});
+    non_existent_ntp.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {{
+          .partition = model::partition_id{-1},
+          .current_leader_epoch = kafka::leader_epoch(0),
+          .fetch_offset = model::offset(0),
+        }}});
 
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -367,12 +388,44 @@ FIXTURE_TEST(fetch_non_existent, redpanda_thread_fixture) {
     auto resp = client
                   .dispatch(std::move(non_existent_ntp), kafka::api_version(6))
                   .get();
-    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 1);
-    BOOST_REQUIRE(resp.data.topics.at(0).errored());
-    BOOST_REQUIRE_EQUAL(resp.data.topics.at(0).partitions.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE(resp.data.responses.at(0).errored());
+    BOOST_REQUIRE_EQUAL(resp.data.responses.at(0).partitions.size(), 1);
     BOOST_REQUIRE_EQUAL(
-      resp.data.topics.at(0).partitions.at(0).error_code,
+      resp.data.responses.at(0).partitions.at(0).error_code,
       kafka::error_code::unknown_topic_or_partition);
+}
+
+FIXTURE_TEST(fetch_non_existent_v13, redpanda_thread_fixture) {
+    auto topic_id = model::topic_id{uuid_t::create()};
+    auto log_config = make_default_config();
+    wait_for_controller_leadership().get();
+    kafka::fetch_request non_existent_ntp;
+    non_existent_ntp.data.max_wait_ms = std::chrono::milliseconds(100);
+    non_existent_ntp.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic_id = topic_id,
+        .partitions = {{
+          .partition = model::partition_id{0},
+          .current_leader_epoch = kafka::leader_epoch(0),
+          .fetch_offset = model::offset(0),
+        }}});
+
+    auto client = make_kafka_client().get();
+    client.connect().get();
+    auto defer = ss::defer([&client] {
+        client.stop().then([&client] { client.shutdown(); }).get();
+    });
+    auto resp = client
+                  .dispatch(std::move(non_existent_ntp), kafka::api_version(13))
+                  .get();
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE(resp.data.responses.at(0).errored());
+    BOOST_REQUIRE_EQUAL(resp.data.responses.at(0).partitions.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses.at(0).topic_id, topic_id);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses.at(0).partitions.at(0).error_code,
+      kafka::error_code::unknown_topic_id);
 }
 
 FIXTURE_TEST(fetch_empty, redpanda_thread_fixture) {
@@ -396,14 +449,14 @@ FIXTURE_TEST(fetch_empty, redpanda_thread_fixture) {
     auto resp_1
       = client.dispatch(std::move(no_topics), kafka::api_version(6)).get();
 
-    BOOST_REQUIRE(resp_1.data.topics.empty());
+    BOOST_REQUIRE(resp_1.data.responses.empty());
 
     kafka::fetch_request no_partitions;
     no_partitions.data.max_bytes = std::numeric_limits<int32_t>::max();
     no_partitions.data.min_bytes = 1;
     no_partitions.data.max_wait_ms = std::chrono::milliseconds(1000);
     no_partitions.data.topics.emplace_back(
-      kafka::fetch_topic{.name = topic, .fetch_partitions = {}});
+      kafka::fetch_topic{.topic = topic, .partitions = {}});
 
     // NOTE(oren): this looks like it was ill-formed before? see surrounding
     // code
@@ -411,7 +464,7 @@ FIXTURE_TEST(fetch_empty, redpanda_thread_fixture) {
       = client.dispatch(std::move(no_partitions), kafka::api_version(6)).get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE(resp_2.data.topics.empty());
+    BOOST_REQUIRE(resp_2.data.responses.empty());
 }
 
 FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
@@ -437,7 +490,9 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
 
                 partition->raft()
                   ->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack))
                   .discard_result()
@@ -447,7 +502,9 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
             wait_for_leader(ntp, 10s).get();
             {
                 auto batches = chunked_vector<model::record_batch>(
-                  model::test::make_random_batches(model::offset(0), 5).get());
+                  std::from_range,
+                  model::test::make_random_batches(model::offset(0), 5).get()
+                    | std::views::as_rvalue);
 
                 partition->raft()
                   ->replicate(
@@ -464,13 +521,14 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
     req.data.max_bytes = std::numeric_limits<int32_t>::max();
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(1000);
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {{
-        .partition_index = pid,
-        .current_leader_epoch = kafka::leader_epoch(1),
-        .fetch_offset = model::offset(6),
-      }}});
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {{
+          .partition = pid,
+          .current_leader_epoch = kafka::leader_epoch(1),
+          .fetch_offset = model::offset(6),
+        }}});
 
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -478,9 +536,141 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
     client.stop().then([&client] { client.shutdown(); }).get();
 
     BOOST_REQUIRE_MESSAGE(
-      resp.data.topics[0].partitions[0].error_code
+      resp.data.responses[0].partitions[0].error_code
         == kafka::error_code::fenced_leader_epoch,
-      fmt::format("error: {}", resp.data.topics[0].partitions[0].error_code));
+      fmt::format(
+        "error: {}", resp.data.responses[0].partitions[0].error_code));
+}
+
+FIXTURE_TEST(fetch_current_leader_v12, cluster_test_fixture) {
+    // create a topic partition with some data
+    model::topic topic("foo");
+    model::partition_id pid(0);
+
+    create_node_application(model::node_id{0});
+    create_node_application(model::node_id{1});
+    create_node_application(model::node_id{2});
+    wait_for_all_members(3s).get();
+
+    model::ktp ktp(topic, pid);
+    auto ntp = ktp.to_ntp();
+    create_topic(ktp.as_tn_view(), 1, 3).get();
+
+    wait_for(10s, [&] {
+        auto [app_ptr, _] = get_leader(ntp);
+        return app_ptr != nullptr;
+    });
+
+    auto [app_ptr, partition] = get_leader(ntp);
+
+    auto publish_some = [ntp](redpanda_thread_fixture* app_ptr) {
+        app_ptr->app.partition_manager
+          .invoke_on(
+            *app_ptr->app.shard_table.local().shard_for(ntp),
+            [ntp](cluster::partition_manager& mgr) {
+                auto partition = mgr.get(ntp);
+
+                auto batches
+                  = model::test::make_random_batches(model::offset(0), 5).get();
+
+                BOOST_TEST_INFO("Replicating batches to leader");
+
+                partition->raft()
+                  ->replicate(
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
+                    raft::replicate_options(
+                      raft::consistency_level::quorum_ack))
+                  .discard_result()
+                  .get();
+            })
+          .get();
+    };
+
+    publish_some(app_ptr);
+
+    BOOST_TEST_INFO("Shuffling leadership");
+    shuffle_leadership(ntp).get();
+
+    BOOST_TEST_INFO("Waiting for new leader");
+    wait_for(10s, [&] {
+        auto [fixture, _] = get_leader(ntp);
+        return fixture != nullptr;
+    });
+
+    BOOST_TEST_INFO("Getting new leader");
+    auto [new_app_ptr, new_partition] = get_leader(ntp);
+
+    publish_some(new_app_ptr);
+
+    // This is in lieu of a linearizable_barrier.
+    BOOST_TEST_INFO("Waiting for metadata cache to update");
+    wait_for(10s, [&] {
+        cluster::leader_term expected{
+          new_app_ptr->app.controller->self(), new_partition->raft()->term()};
+        auto term = app_ptr->app.metadata_cache.local().get_leader_term(
+          ktp.as_tn_view(), ktp.get_partition());
+        return term == expected;
+    });
+
+    auto send_request =
+      [&](redpanda_thread_fixture* app_ptr, model::term_id term) {
+          kafka::fetch_request req;
+          req.data.max_bytes = std::numeric_limits<int32_t>::max();
+          req.data.min_bytes = 1;
+          req.data.max_wait_ms = std::chrono::milliseconds(1000);
+          req.data.topics.emplace_back(
+            kafka::fetch_topic{
+              .topic = topic,
+              .partitions = {{
+                .partition = pid,
+                .current_leader_epoch = kafka::leader_epoch_from_term(term),
+                .fetch_offset = model::offset(6),
+              }}});
+
+          auto client = instance(app_ptr->app.controller->self())
+                          ->make_kafka_client()
+                          .get();
+
+          client.connect().get();
+
+          auto response
+            = client.dispatch(std::move(req), kafka::api_version(12)).get();
+          client.stop().then([&client] { client.shutdown(); }).get();
+          return response;
+      };
+
+    auto expected = kafka::leader_id_and_epoch{
+      new_partition->raft()->get_leader_id().value_or(model::node_id{-1}),
+      kafka::leader_epoch_from_term(new_partition->raft()->term())};
+
+    {
+        BOOST_TEST_INFO("Dispatching old epoch to old leader");
+        auto resp = send_request(app_ptr, model::term_id{1});
+        const auto& part = resp.data.responses[0].partitions[0];
+        BOOST_REQUIRE_EQUAL(
+          part.error_code, kafka::error_code::not_leader_for_partition);
+        BOOST_REQUIRE_EQUAL(expected, part.current_leader);
+    }
+    {
+        BOOST_TEST_INFO("Dispatching old epoch to new leader");
+        auto resp = send_request(new_app_ptr, model::term_id{1});
+        const auto& part = resp.data.responses[0].partitions[0];
+        BOOST_REQUIRE_EQUAL(
+          part.error_code, kafka::error_code::fenced_leader_epoch);
+        BOOST_REQUIRE_EQUAL(expected, part.current_leader);
+    }
+    {
+        BOOST_TEST_INFO("Dispatching new epoch to new leader");
+        auto resp = send_request(new_app_ptr, model::term_id{2});
+        const auto& part = resp.data.responses[0].partitions[0];
+        BOOST_REQUIRE_EQUAL(part.error_code, kafka::error_code::none);
+        // When there is not an error, leader_id_and_epoch should not be set
+        BOOST_REQUIRE_EQUAL(model::node_id{-1}, part.current_leader.leader_id);
+        BOOST_REQUIRE_EQUAL(
+          kafka::leader_epoch{-1}, part.current_leader.leader_epoch);
+    }
 }
 
 FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
@@ -502,17 +692,18 @@ FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(3000);
     req.data.session_id = kafka::invalid_fetch_session_id;
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {},
-    });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {},
+      });
     for (int i = 0; i < 6; ++i) {
         kafka::fetch_request::partition p;
-        p.partition_index = model::partition_id(i);
+        p.partition = model::partition_id(i);
         p.log_start_offset = offset;
         p.fetch_offset = offset;
-        p.max_bytes = std::numeric_limits<int32_t>::max();
-        req.data.topics[0].fetch_partitions.push_back(p);
+        p.partition_max_bytes = std::numeric_limits<int32_t>::max();
+        req.data.topics[0].partitions.push_back(p);
     }
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -530,7 +721,9 @@ FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
                   .then([ntp, &mgr](auto batches) {
                       auto partition = mgr.get(ntp);
                       return partition->raft()->replicate(
-                        chunked_vector<model::record_batch>(std::move(batches)),
+                        chunked_vector<model::record_batch>(
+                          std::from_range,
+                          std::move(batches) | std::views::as_rvalue),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack));
                   });
@@ -541,20 +734,21 @@ FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
     auto resp = fresp.get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 1);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].name, topic());
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions.size(), 6);
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic, topic());
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].partitions.size(), 6);
     size_t total_size = 0;
     for (int i = 0; i < 6; ++i) {
         BOOST_REQUIRE_EQUAL(
-          resp.data.topics[0].partitions[i].error_code,
+          resp.data.responses[0].partitions[i].error_code,
           kafka::error_code::none);
         BOOST_REQUIRE_EQUAL(
-          resp.data.topics[0].partitions[i].partition_index,
+          resp.data.responses[0].partitions[i].partition_index,
           model::partition_id(i));
-        BOOST_REQUIRE(resp.data.topics[0].partitions[i].records);
+        BOOST_REQUIRE(resp.data.responses[0].partitions[i].records);
 
-        total_size += resp.data.topics[0].partitions[i].records->size_bytes();
+        total_size
+          += resp.data.responses[0].partitions[i].records->size_bytes();
     }
     BOOST_REQUIRE_GT(total_size, 0);
 }
@@ -577,13 +771,14 @@ FIXTURE_TEST(fetch_leader_ack, redpanda_thread_fixture) {
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(5000);
     req.data.session_id = kafka::invalid_fetch_session_id;
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {{
-        .partition_index = pid,
-        .fetch_offset = offset,
-      }},
-    });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {{
+          .partition = pid,
+          .fetch_offset = offset,
+        }},
+      });
 
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -597,7 +792,9 @@ FIXTURE_TEST(fetch_leader_ack, redpanda_thread_fixture) {
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
                   return partition->raft()->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::leader_ack));
               });
@@ -608,14 +805,16 @@ FIXTURE_TEST(fetch_leader_ack, redpanda_thread_fixture) {
     auto resp = fresp.get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE(resp.data.topics.size() == 1);
-    BOOST_REQUIRE(resp.data.topics[0].name == topic());
-    BOOST_REQUIRE(resp.data.topics[0].partitions.size() == 1);
+    BOOST_REQUIRE(resp.data.responses.size() == 1);
+    BOOST_REQUIRE(resp.data.responses[0].topic == topic());
+    BOOST_REQUIRE(resp.data.responses[0].partitions.size() == 1);
     BOOST_REQUIRE(
-      resp.data.topics[0].partitions[0].error_code == kafka::error_code::none);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].partition_index == pid);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].records);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].records->size_bytes() > 0);
+      resp.data.responses[0].partitions[0].error_code
+      == kafka::error_code::none);
+    BOOST_REQUIRE(resp.data.responses[0].partitions[0].partition_index == pid);
+    BOOST_REQUIRE(resp.data.responses[0].partitions[0].records);
+    BOOST_REQUIRE(
+      resp.data.responses[0].partitions[0].records->size_bytes() > 0);
 }
 
 FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
@@ -634,13 +833,14 @@ FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(5000);
     req.data.session_id = kafka::invalid_fetch_session_id;
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {{
-        .partition_index = pid,
-        .fetch_offset = offset,
-      }},
-    });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {{
+          .partition = pid,
+          .fetch_offset = offset,
+        }},
+      });
 
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -654,7 +854,9 @@ FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
                   return partition->raft()->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
               });
@@ -665,14 +867,16 @@ FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
     auto resp = fresp.get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE(resp.data.topics.size() == 1);
-    BOOST_REQUIRE(resp.data.topics[0].name == topic());
-    BOOST_REQUIRE(resp.data.topics[0].partitions.size() == 1);
+    BOOST_REQUIRE(resp.data.responses.size() == 1);
+    BOOST_REQUIRE(resp.data.responses[0].topic == topic());
+    BOOST_REQUIRE(resp.data.responses[0].partitions.size() == 1);
     BOOST_REQUIRE(
-      resp.data.topics[0].partitions[0].error_code == kafka::error_code::none);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].partition_index == pid);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].records);
-    BOOST_REQUIRE(resp.data.topics[0].partitions[0].records->size_bytes() > 0);
+      resp.data.responses[0].partitions[0].error_code
+      == kafka::error_code::none);
+    BOOST_REQUIRE(resp.data.responses[0].partitions[0].partition_index == pid);
+    BOOST_REQUIRE(resp.data.responses[0].partitions[0].records);
+    BOOST_REQUIRE(
+      resp.data.responses[0].partitions[0].records->size_bytes() > 0);
 }
 
 FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
@@ -701,23 +905,25 @@ FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(3000);
     req.data.session_id = kafka::invalid_fetch_session_id;
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic_1,
-      .fetch_partitions = {},
-    });
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic_2,
-      .fetch_partitions = {},
-    });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic_1,
+        .partitions = {},
+      });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic_2,
+        .partitions = {},
+      });
 
     for (auto& ntp : ntps) {
         kafka::fetch_request::partition p;
-        p.partition_index = model::partition_id(ntp.tp.partition);
+        p.partition = model::partition_id(ntp.tp.partition);
         p.log_start_offset = zero;
         p.fetch_offset = zero;
-        p.max_bytes = std::numeric_limits<int32_t>::max();
+        p.partition_max_bytes = std::numeric_limits<int32_t>::max();
         auto idx = ntp.tp.topic == topic_1 ? 0 : 1;
-        req.data.topics[idx].fetch_partitions.push_back(p);
+        req.data.topics[idx].partitions.push_back(p);
     }
 
     auto client = make_kafka_client().get();
@@ -733,7 +939,9 @@ FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
                   .then([ntp, &mgr](auto batches) {
                       auto partition = mgr.get(ntp);
                       return partition->raft()->replicate(
-                        chunked_vector<model::record_batch>(std::move(batches)),
+                        chunked_vector<model::record_batch>(
+                          std::from_range,
+                          std::move(batches) | std::views::as_rvalue),
                         raft::replicate_options(
                           raft::consistency_level::quorum_ack));
                   });
@@ -745,22 +953,23 @@ FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
     auto resp = client.dispatch(std::move(req), kafka::api_version(4)).get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 2);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].name, topic_1);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[1].name, topic_2);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions.size(), 6);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[1].partitions.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 2);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].topic, topic_1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[1].topic, topic_2);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].partitions.size(), 6);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[1].partitions.size(), 1);
     size_t total_size = 0;
     for (int i = 0; i < 6; ++i) {
         BOOST_REQUIRE_EQUAL(
-          resp.data.topics[0].partitions[i].error_code,
+          resp.data.responses[0].partitions[i].error_code,
           kafka::error_code::none);
         BOOST_REQUIRE_EQUAL(
-          resp.data.topics[0].partitions[i].partition_index,
+          resp.data.responses[0].partitions[i].partition_index,
           model::partition_id(i));
-        BOOST_REQUIRE(resp.data.topics[0].partitions[i].records);
+        BOOST_REQUIRE(resp.data.responses[0].partitions[i].records);
 
-        total_size += resp.data.topics[0].partitions[i].records->size_bytes();
+        total_size
+          += resp.data.responses[0].partitions[i].records->size_bytes();
     }
     BOOST_REQUIRE_GT(total_size, 0);
 }
@@ -784,7 +993,9 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
                   return partition->raft()->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
               });
@@ -797,13 +1008,14 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
         req.data.min_bytes = 1;
         req.data.max_wait_ms = std::chrono::milliseconds(0);
         req.data.session_id = kafka::invalid_fetch_session_id;
-        req.data.topics.emplace_back(kafka::fetch_topic{
-          .name = topic,
-          .fetch_partitions = {{
-            .partition_index = pid,
-            .fetch_offset = model::offset(0),
-          }},
-        });
+        req.data.topics.emplace_back(
+          kafka::fetch_topic{
+            .topic = topic,
+            .partitions = {{
+              .partition = pid,
+              .fetch_offset = model::offset(0),
+            }},
+          });
 
         auto client = make_kafka_client().get();
         client.connect().get();
@@ -817,17 +1029,17 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
     /**
      * At least one record has to be returned since KiP-74
      */
-    BOOST_REQUIRE(fetch_one_byte.data.topics.size() == 1);
-    BOOST_REQUIRE(fetch_one_byte.data.topics[0].name == topic());
-    BOOST_REQUIRE(fetch_one_byte.data.topics[0].partitions.size() == 1);
+    BOOST_REQUIRE(fetch_one_byte.data.responses.size() == 1);
+    BOOST_REQUIRE(fetch_one_byte.data.responses[0].topic == topic());
+    BOOST_REQUIRE(fetch_one_byte.data.responses[0].partitions.size() == 1);
     BOOST_REQUIRE(
-      fetch_one_byte.data.topics[0].partitions[0].error_code
+      fetch_one_byte.data.responses[0].partitions[0].error_code
       == kafka::error_code::none);
     BOOST_REQUIRE(
-      fetch_one_byte.data.topics[0].partitions[0].partition_index == pid);
-    BOOST_REQUIRE(fetch_one_byte.data.topics[0].partitions[0].records);
+      fetch_one_byte.data.responses[0].partitions[0].partition_index == pid);
+    BOOST_REQUIRE(fetch_one_byte.data.responses[0].partitions[0].records);
     BOOST_REQUIRE(
-      fetch_one_byte.data.topics[0].partitions[0].records->size_bytes() > 0);
+      fetch_one_byte.data.responses[0].partitions[0].records->size_bytes() > 0);
 }
 
 FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
@@ -849,7 +1061,9 @@ FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
               .then([ntp, &mgr](auto batches) {
                   auto partition = mgr.get(ntp);
                   return partition->raft()->replicate(
-                    chunked_vector<model::record_batch>(std::move(batches)),
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
                     raft::replicate_options(
                       raft::consistency_level::quorum_ack));
               });
@@ -887,13 +1101,14 @@ FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
     req.data.min_bytes = 1;
     req.data.max_wait_ms = std::chrono::milliseconds(0);
     req.data.session_id = kafka::invalid_fetch_session_id;
-    req.data.topics.emplace_back(kafka::fetch_topic{
-      .name = topic,
-      .fetch_partitions = {{
-        .partition_index = pid,
-        .fetch_offset = model::offset(0),
-      }},
-    });
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {{
+          .partition = pid,
+          .fetch_offset = model::offset(0),
+        }},
+      });
 
     auto client = make_kafka_client().get();
     client.connect().get();
@@ -902,18 +1117,95 @@ FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
     auto resp = fresp.get();
     client.stop().then([&client] { client.shutdown(); }).get();
 
-    BOOST_REQUIRE_EQUAL(resp.data.topics.size(), 1);
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(resp.data.responses[0].partitions.size(), 1);
     BOOST_REQUIRE_EQUAL(
-      resp.data.topics[0].partitions[0].error_code,
+      resp.data.responses[0].partitions[0].error_code,
       kafka::error_code::offset_out_of_range);
 
     // This is used by the clients to determine what should be done with the
     // offset out of range error. See
     // https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica
     BOOST_REQUIRE_EQUAL(
-      resp.data.topics[0].partitions[0].log_start_offset, model::offset(5));
-    BOOST_REQUIRE_EQUAL(resp.data.topics[0].partitions[0].high_watermark, hwm);
+      resp.data.responses[0].partitions[0].log_start_offset, model::offset(5));
     BOOST_REQUIRE_EQUAL(
-      resp.data.topics[0].partitions[0].last_stable_offset, hwm);
+      resp.data.responses[0].partitions[0].high_watermark, hwm);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].partitions[0].last_stable_offset, hwm);
+}
+
+FIXTURE_TEST(fetch_response_bytes_eq_units, redpanda_thread_fixture) {
+    // create topic with single partition
+    model::topic topic("foo");
+    model::partition_id pid(0);
+    auto ntp = make_default_ntp(topic, pid);
+    wait_for_controller_leadership().get();
+    add_topic(model::topic_namespace_view(ntp)).get();
+
+    wait_for_partition_offset(ntp, model::offset(0)).get();
+
+    // append some data
+    auto shard = app.shard_table.local().shard_for(ntp);
+    app.partition_manager
+      .invoke_on(
+        *shard,
+        [ntp](cluster::partition_manager& mgr) {
+            return model::test::make_random_batches(model::offset(0), 20)
+              .then([ntp, &mgr](auto batches) {
+                  auto partition = mgr.get(ntp);
+                  return partition->raft()->replicate(
+                    chunked_vector<model::record_batch>(
+                      std::from_range,
+                      std::move(batches) | std::views::as_rvalue),
+                    raft::replicate_options(
+                      raft::consistency_level::quorum_ack));
+              });
+        })
+      .get();
+    wait_for_partition_offset(ntp, model::offset(20)).get();
+
+    auto conn_context = make_connection_context();
+    conn_context->start().get();
+
+    auto make_rctx = [&] {
+        auto fetch_topics = chunked_vector<kafka::fetch_topic>{};
+
+        fetch_topics.push_back(
+          kafka::fetch_topic{
+            .topic = topic,
+            .partitions = {kafka::fetch_partition{
+              .partition = pid,
+              .current_leader_epoch = kafka::leader_epoch(-1),
+              .fetch_offset = model::offset(0),
+              .log_start_offset = model::offset(-1),
+              .partition_max_bytes = 10 * MiB,
+            }}});
+
+        // create a request
+        kafka::fetch_request_data frq_data{
+          .replica_id = kafka::client::consumer_replica_id,
+          .max_wait_ms = 500ms,
+          .min_bytes = 1,
+          .max_bytes = 50_MiB,
+          .isolation_level = model::isolation_level::read_uncommitted,
+          .session_id = kafka::invalid_fetch_session_id,
+          .session_epoch = kafka::final_fetch_session_epoch,
+          .topics = std::move(fetch_topics),
+        };
+
+        auto request = kafka::fetch_request{.data = std::move(frq_data)};
+
+        kafka::request_header header{
+          .key = kafka::fetch_handler::api::key,
+          .version = kafka::api_version{12}};
+
+        return make_request_context(std::move(request), header, conn_context);
+    };
+
+    auto octx = kafka::op_context(make_rctx(), ss::default_smp_service_group());
+    kafka::testing::do_fetch(octx).get();
+    conn_context->stop().get();
+
+    BOOST_REQUIRE(octx.response_size > 0);
+    BOOST_REQUIRE(octx.response_size == octx.total_response_memory_units());
 }

@@ -43,20 +43,17 @@ public:
     do_load_slice(model::timeout_clock::time_point t) final {
         if (!_batch_reader || _batch_reader->is_end_of_stream()) {
             vlog(
-              kclog.debug,
-              "{}fetch_batch_reader: fetch offset: {}",
-              _client,
+              _client.logger().debug,
+              "fetch_batch_reader: fetch offset: {}",
               _next_offset);
             auto res = co_await _client.fetch_partition(
               _tp,
               _next_offset,
-              _client.config().consumer_request_max_bytes,
               std::chrono::duration_cast<std::chrono::milliseconds>(
                 t - model::timeout_clock::now()));
             vlog(
-              kclog.debug,
-              "{}fetch_batch_reader: fetch result: {}",
-              _client,
+              _client.logger().debug,
+              "fetch_batch_reader: fetch result: {}",
               res);
             vassert(
               res.begin() != res.end() && ++res.begin() == res.end(),
@@ -80,9 +77,8 @@ public:
         }
         _next_offset = ++data.back().last_offset();
         vlog(
-          kclog.debug,
-          "{}fetch_batch_reader: next_offset: {}",
-          _client,
+          _client.logger().debug,
+          "fetch_batch_reader: next_offset: {}",
           _next_offset);
         co_return ret;
     }

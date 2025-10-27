@@ -30,6 +30,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/net/api.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/util/defer.hh>
 
@@ -43,6 +44,10 @@
 #include <stdexcept>
 
 namespace http {
+
+constexpr std::chrono::seconds tcp_keepalive_idle = 360s;
+constexpr std::chrono::seconds tcp_keepalive_interval = 120s;
+constexpr unsigned int tcp_keepalive_probes = 10;
 
 std::string_view content_type_string(content_type type) {
     switch (type) {
@@ -129,11 +134,19 @@ ss::future<client::request_response_t> client::make_request(
     if (is_valid()) {
         if (age < _max_idle_time) {
             // Reuse connection
-            vlog(ctxlog.debug, "reusing connection, age {}", age.count());
+            vlog(
+              ctxlog.debug,
+              "reusing connection, age {}, max idle time {}",
+              age.count(),
+              _max_idle_time.count());
             return ss::make_ready_future<request_response_t>(
               std::make_tuple(req, res));
         } else {
-            vlog(ctxlog.debug, "shutdown connection, age {}", age.count());
+            vlog(
+              ctxlog.debug,
+              "shutdown connection, age {}, max idle time {}",
+              age.count(),
+              _max_idle_time.count());
             // Connection is too old and likeley already received
             // RST packet from the server. If we will try to use
             // it the broken pipe (32) error will be triggered.
@@ -141,7 +154,7 @@ ss::future<client::request_response_t> client::make_request(
         }
     }
     return get_connected(timeout, ctxlog)
-      .then([req, res, target, ctxlog](reconnect_result_t r) {
+      .then([this, req, res, target, ctxlog](reconnect_result_t r) {
           if (r == reconnect_result_t::timed_out) {
               vlog(
                 ctxlog.warn,
@@ -150,6 +163,15 @@ ss::future<client::request_response_t> client::make_request(
               ss::timed_out_error err;
               return ss::make_exception_future<client::request_response_t>(err);
           }
+          // Set keepalive after connection is established and we have a
+          // connected socket.
+          set_keepalive_parameters(
+            ss::net::tcp_keepalive_params{
+              .idle = tcp_keepalive_idle,
+              .interval = tcp_keepalive_interval,
+              .count = tcp_keepalive_probes,
+            });
+          set_keepalive(true);
           return ss::make_ready_future<request_response_t>(
             std::make_tuple(req, res));
       })

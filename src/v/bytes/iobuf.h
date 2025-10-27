@@ -20,7 +20,9 @@
 
 #include <seastar/core/temporary_buffer.hh>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <string_view>
 #include <type_traits>
@@ -75,15 +77,11 @@ public:
 
     static iobuf from(std::string_view view) {
         iobuf i;
-        i.append(view.data(), view.size());
+        i.append_str(view);
         return i;
     }
 
-    // NOLINTNEXTLINE
-    iobuf() noexcept {
-        // nothing allocates memory, but boost intrusive list is not marked as
-        // noexcept
-    }
+    iobuf() noexcept = default;
     ~iobuf() noexcept;
     iobuf(iobuf&& x) noexcept
       : _frags(std::move(x._frags))
@@ -126,6 +124,7 @@ public:
      * Since this call performs zero-copy operations, the sharing-mutation
      * caveat in the class comment applies.
      */
+    iobuf share();
     iobuf share(size_t pos, size_t len);
 
     /**
@@ -160,6 +159,24 @@ public:
      * a copy of the source bytes.
      */
     void append(const uint8_t*, size_t);
+
+    /**
+     * A helper to append a container of uint8_t or char to this iobuf. This
+     * always makes a copy of the source bytes.
+     */
+    template<typename T, size_t S>
+    void append(const std::array<T, S>& a) {
+        static_assert(
+          std::is_same_v<std::remove_const_t<T>, uint8_t>
+          || std::is_same_v<std::remove_const_t<T>, char>);
+        append(a.data(), a.size());
+    }
+
+    /**
+     * A helper to append a string_view to this iobuf. This always makes a copy
+     * of the source bytes.
+     */
+    void append_str(std::string_view str) { append(str.data(), str.size()); }
 
     /**
      * Appends the contents of the passed buffer to this one.
@@ -209,6 +226,14 @@ public:
      */
     void append(std::unique_ptr<fragment>);
 
+    /**
+     * Share the last `size` bytes from the iobuf to create a new iobuf.
+     *
+     * This is an optimized version of:
+     * `iobuf::share(iobuf.size_bytes() - size, size)`
+     */
+    iobuf tail(size_t size);
+
     /// prepends the _the buffer_ as iobuf::details::io_fragment::full{}
     void prepend(ss::temporary_buffer<char>);
     /// prepends the arg to this as iobuf::details::io_fragment::full{}
@@ -231,6 +256,7 @@ public:
 
     bool operator==(std::string_view) const;
     bool operator!=(std::string_view) const;
+    std::strong_ordering operator<=>(std::string_view) const;
 
     iterator begin();
     iterator end();
@@ -242,6 +268,10 @@ public:
     const_iterator cend() const;
 
     std::string hexdump(size_t) const;
+
+    // Linearize this iobuf to a string. Note that if the iobuf is over 128KiB
+    // this method will throw as to not cause an oversized allocation.
+    ss::sstring linearize_to_string() const;
 
 private:
     void prepend(std::unique_ptr<fragment>);

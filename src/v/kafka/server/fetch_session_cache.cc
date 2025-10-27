@@ -6,6 +6,7 @@
 #include "kafka/server/logger.h"
 #include "metrics/prometheus_sanitize.h"
 #include "model/fundamental.h"
+#include "model/kitp.h"
 #include "model/timeout_clock.h"
 
 #include <seastar/core/metrics.hh>
@@ -18,25 +19,25 @@ void update_fetch_session(fetch_session& session, const fetch_request& req) {
     for (auto it = req.cbegin(); it != req.cend(); ++it) {
         auto& topic = *it->topic;
         auto& partition = *it->partition;
-        model::topic_partition tp(topic.name, partition.partition_index);
+        model::kitp_view kitp(topic.topic_id, topic.topic, partition.partition);
 
-        if (auto s_it = session.partitions().find(tp);
+        if (auto s_it = session.partitions().find(kitp);
             s_it != session.partitions().end()) {
-            s_it->second->partition.max_bytes = partition.max_bytes;
+            s_it->second->partition.max_bytes = partition.partition_max_bytes;
             s_it->second->partition.fetch_offset = partition.fetch_offset;
             s_it->second->partition.current_leader_epoch
               = partition.current_leader_epoch;
         } else {
             session.partitions().emplace(
-              fetch_session_partition(topic.name, partition));
+              fetch_session_partition(topic.topic_id, topic.topic, partition));
         }
     }
 
-    for (auto& ft : req.data.forgotten) {
-        for (auto& fp : ft.forgotten_partition_indexes) {
-            model::topic_partition tp(ft.name, model::partition_id(fp));
+    for (auto& ft : req.data.forgotten_topics_data) {
+        for (auto& fp : ft.partitions) {
+            model::topic_partition tp(ft.topic, model::partition_id(fp));
             session.partitions().erase(
-              model::topic_partition_view(ft.name, model::partition_id(fp)));
+              model::kitp_view(ft.topic_id, ft.topic, model::partition_id(fp)));
         }
     }
 }
@@ -164,7 +165,7 @@ void fetch_session_cache::gc_sessions() {
         } else {
             vlog(klog.debug, "evicting session {}", it->second->id());
             _sessions_mem_usage -= it->second->mem_usage();
-            _sessions.erase(it++);
+            it = _sessions.erase(it);
         }
     }
 }

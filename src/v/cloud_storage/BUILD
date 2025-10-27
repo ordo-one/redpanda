@@ -5,7 +5,6 @@ redpanda_cc_library(
     hdrs = [
         "remote_label.h",
     ],
-    include_prefix = "cloud_storage",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/model",
@@ -22,7 +21,6 @@ redpanda_cc_library(
     hdrs = [
         "topic_mount_manifest_path.h",
     ],
-    include_prefix = "cloud_storage",
     visibility = [
         "//visibility:public",
     ],
@@ -35,12 +33,11 @@ redpanda_cc_library(
 redpanda_cc_library(
     name = "cloud_storage",
     srcs = [
-        "access_time_tracker.cc",
         "anomalies_detector.cc",
+        "async_manifest_materializer.cc",
         "async_manifest_view.cc",
         "base_manifest.cc",
-        "cache_probe.cc",
-        "cache_service.cc",
+        "configuration.cc",
         "download_exception.cc",
         "inventory/aws_ops.cc",
         "inventory/inv_consumer.cc",
@@ -59,7 +56,6 @@ redpanda_cc_library(
         "recovery_errors.cc",
         "recovery_request.cc",
         "recovery_utils.cc",
-        "recursive_directory_walker.cc",
         "remote.cc",
         "remote_file.cc",
         "remote_partition.cc",
@@ -70,7 +66,6 @@ redpanda_cc_library(
         "segment_chunk.cc",
         "segment_chunk_api.cc",
         "segment_chunk_data_source.cc",
-        "segment_meta_cstore.cc",
         "segment_path_utils.cc",
         "segment_state.cc",
         "topic_manifest.cc",
@@ -79,15 +74,12 @@ redpanda_cc_library(
         "topic_mount_manifest.cc",
         "topic_path_utils.cc",
         "tx_range_manifest.cc",
-        "types.cc",
     ],
     hdrs = [
-        "access_time_tracker.h",
         "anomalies_detector.h",
+        "async_manifest_materializer.h",
         "async_manifest_view.h",
         "base_manifest.h",
-        "cache_probe.h",
-        "cache_service.h",
         "configuration.h",
         "download_exception.h",
         "fwd.h",
@@ -99,7 +91,6 @@ redpanda_cc_library(
         "inventory/types.h",
         "inventory/utils.h",
         "lifecycle_marker.h",
-        "logger.h",
         "materialized_manifest_cache.h",
         "materialized_resources.h",
         "offset_translation_layer.h",
@@ -110,7 +101,6 @@ redpanda_cc_library(
         "recovery_errors.h",
         "recovery_request.h",
         "recovery_utils.h",
-        "recursive_directory_walker.h",
         "remote.h",
         "remote_file.h",
         "remote_partition.h",
@@ -121,7 +111,6 @@ redpanda_cc_library(
         "segment_chunk.h",
         "segment_chunk_api.h",
         "segment_chunk_data_source.h",
-        "segment_meta_cstore.h",
         "segment_path_utils.h",
         "segment_state.h",
         "spillover_manifest.h",
@@ -131,13 +120,18 @@ redpanda_cc_library(
         "topic_mount_manifest.h",
         "topic_path_utils.h",
         "tx_range_manifest.h",
-        "types.h",
     ],
-    include_prefix = "cloud_storage",
+    implementation_deps = [
+        "//src/v/json",
+        "@rapidjson",
+    ],
     visibility = ["//visibility:public"],
     deps = [
+        ":logger",
         ":remote_label",
+        ":segment_meta_cstore",
         ":topic_mount_manifest_path",
+        ":types",
         "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
@@ -145,6 +139,7 @@ redpanda_cc_library(
         "//src/v/bytes:streambuf",
         "//src/v/cloud_io:auth_refresh_bg_op",
         "//src/v/cloud_io:basic_cache_service_api",
+        "//src/v/cloud_io:cache",
         "//src/v/cloud_io:io_resources",
         "//src/v/cloud_io:io_result",
         "//src/v/cloud_io:remote",
@@ -156,10 +151,10 @@ redpanda_cc_library(
         "//src/v/cluster:topic_configuration",
         "//src/v/compression",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/container:chunked_vector",
         "//src/v/container:intrusive",
         "//src/v/hashing:xx",
-        "//src/v/json",
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/net",
@@ -168,7 +163,6 @@ redpanda_cc_library(
         "//src/v/reflection:adl",
         "//src/v/reflection:to_tuple",
         "//src/v/reflection:type_traits",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/resource_mgmt:memory_groups",
         "//src/v/serde",
         "//src/v/serde:enum",
@@ -208,9 +202,65 @@ redpanda_cc_library(
         "@boost//:range",
         "@boost//:uuid",
         "@fmt",
-        "@rapidjson",
         "@re2",
         "@seastar",
         "@zlib",
+    ],
+)
+
+redpanda_cc_library(
+    name = "types",
+    srcs = [
+        "types.cc",
+    ],
+    hdrs = [
+        "types.h",
+    ],
+    implementation_deps = [
+        "//src/v/utils:to_string",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/cloud_io:io_result",
+        "//src/v/cloud_io:transfer_details",
+        "//src/v/model",
+        "//src/v/ssx:semaphore",
+        "//src/v/utils:named_type",
+        "@abseil-cpp//absl/container:node_hash_set",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "segment_meta_cstore",
+    srcs = [
+        "segment_meta_cstore.cc",
+    ],
+    hdrs = [
+        "segment_meta_cstore.h",
+    ],
+    implementation_deps = [
+        "//src/v/config",
+        "@abseil-cpp//absl/container:btree",
+    ],
+    visibility = [":__subpackages__"],
+    deps = [
+        ":types",
+        "//src/v/model",
+        "//src/v/utils:delta_for",
+        "@boost//:iterator",
+    ],
+)
+
+redpanda_cc_library(
+    name = "logger",
+    hdrs = [
+        "logger.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "@seastar",
     ],
 )

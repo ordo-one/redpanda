@@ -13,7 +13,6 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/later.hh>
 
-#include <absl/algorithm/container.h>
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test_log.hpp>
 

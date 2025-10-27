@@ -11,8 +11,10 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/remote_path_provider.h"
+#include "cloud_storage/types.h"
 #include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/ntp_callbacks.h"
@@ -29,9 +31,11 @@
 #include "raft/group_manager.h"
 #include "storage/api.h"
 
-#include <absl/container/flat_hash_map.h>
-
 #include <chrono>
+
+namespace cloud_topics {
+class state_accessors;
+}
 
 namespace cluster {
 class partition_manager
@@ -45,16 +49,17 @@ public:
       ss::sharded<raft::group_manager>&,
       ss::sharded<cloud_storage::partition_recovery_manager>&,
       ss::sharded<cloud_storage::remote>&,
-      ss::sharded<cloud_storage::cache>&,
+      ss::sharded<cloud_io::cache>&,
       ss::lw_shared_ptr<const archival::configuration>,
       ss::sharded<features::feature_table>&,
       ss::sharded<archival::upload_housekeeping_service>&,
-      config::binding<std::chrono::milliseconds>);
+      config::binding<std::chrono::milliseconds>,
+      ss::sharded<cloud_topics::state_accessors>*);
 
     ~partition_manager();
 
     using manage_cb_t
-      = ss::noncopyable_function<void(ss::lw_shared_ptr<partition>)>;
+      = ss::noncopyable_function<void(const ss::lw_shared_ptr<partition>&)>;
     using unmanage_cb_t
       = ss::noncopyable_function<void(model::topic_partition_view)>;
 
@@ -97,8 +102,7 @@ public:
       std::optional<xshard_transfer_state>,
       std::optional<remote_topic_properties> = std::nullopt,
       std::optional<cloud_storage_clients::bucket_name> = std::nullopt,
-      std::optional<cloud_storage::remote_label> = std::nullopt,
-      std::optional<model::topic_namespace> = std::nullopt);
+      const topic_configuration* = nullptr);
 
     ss::future<xshard_transfer_state> shutdown(const model::ntp& ntp);
 
@@ -119,9 +123,8 @@ public:
          * partitions.
          */
         ntp_callbacks<manage_cb_t> init;
-        init.register_notify(ns, topic, [&cb](ss::lw_shared_ptr<partition> p) {
-            cb(std::move(p));
-        });
+        init.register_notify(
+          ns, topic, [&cb](const ss::lw_shared_ptr<partition>& p) { cb(p); });
         for (auto& e : _ntp_table) {
             if (e.second->started()) {
                 init.notify(e.first, e.second);
@@ -135,7 +138,7 @@ public:
     register_manage_notification(const model::ns& ns, manage_cb_t cb) {
         ntp_callbacks<manage_cb_t> init;
         init.register_notify(
-          ns, [&cb](ss::lw_shared_ptr<partition> p) { cb(std::move(p)); });
+          ns, [&cb](const ss::lw_shared_ptr<partition>& p) { cb(p); });
         for (auto& e : _ntp_table) {
             if (e.second->started()) {
                 init.notify(e.first, e.second);
@@ -283,7 +286,7 @@ private:
     ss::sharded<cloud_storage::partition_recovery_manager>&
       _partition_recovery_mgr;
     ss::sharded<cloud_storage::remote>& _cloud_storage_api;
-    ss::sharded<cloud_storage::cache>& _cloud_storage_cache;
+    ss::sharded<cloud_io::cache>& _cloud_storage_cache;
     ss::lw_shared_ptr<const archival::configuration> _archival_conf;
     ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<archival::upload_housekeeping_service>& _upload_hks;
@@ -304,6 +307,9 @@ private:
     std::optional<raft::group_manager_notification_id> _leader_notify_handle;
 
     state_machine_registry _stm_registry;
+
+    // The sharded app may not be initialized if cloud topics isn't enabled.
+    ss::sharded<cloud_topics::state_accessors>* _cloud_topics_state;
 
     friend std::ostream& operator<<(std::ostream&, const partition_manager&);
     friend std::ostream& operator<<(

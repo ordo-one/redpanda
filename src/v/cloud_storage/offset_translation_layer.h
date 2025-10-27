@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/types.h"
 #include "model/record_batch_types.h"
@@ -19,8 +20,6 @@
 
 #include <seastar/core/iostream.hh>
 #include <seastar/core/shared_ptr.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace cloud_storage {
 
@@ -39,7 +38,7 @@ public:
     offset_translator(
       model::offset_delta initial_delta,
       ss::lw_shared_ptr<storage::offset_translator_state> ot_state,
-      storage::opt_abort_source_t as = std::nullopt)
+      model::opt_abort_source_t as = std::nullopt)
       : _initial_delta(initial_delta)
       , _ot_state(ot_state)
       , _as(as) {}
@@ -58,7 +57,7 @@ public:
 private:
     model::offset_delta _initial_delta;
     ss::lw_shared_ptr<storage::offset_translator_state> _ot_state;
-    storage::opt_abort_source_t _as;
+    model::opt_abort_source_t _as;
 };
 
 } // namespace cloud_storage

@@ -9,85 +9,91 @@
  * by the Apache License, Version 2.0
  */
 
-#include "base/type_traits.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "container/tests/bench_utils.h"
 #include "random/generators.h"
 
 #include <seastar/testing/perf_tests.hh>
 
 #include <algorithm>
+#include <concepts>
 #include <iterator>
 #include <vector>
 
 template<typename Vector, size_t Size>
-class VectorBenchTest {
+struct VectorBenchTest {
+    using value_type = typename Vector::value_type;
+
+    const value_type val = make_value();
+    const Vector filled = make_filled();
+
+    // copy overloads copy a T either via ctor (this one)
+    auto copy(const std::copy_constructible auto& t) { return t; }
+
+    // or a .copy method (this one)
+    template<typename T>
+    requires requires(const T& t) { t.copy(); }
+    auto copy(const T& t) {
+        return t.copy();
+    }
+
     static auto make_value() {
         return ::make_value<typename Vector::value_type>();
     }
-    static auto make_filled() {
+
+    static Vector make_filled() {
         Vector v;
         std::generate_n(std::back_inserter(v), Size, make_value);
         return v;
     }
 
-public:
+    std::vector<size_t> indexes = [] {
+        random_generators::rng rng{0};
+        std::vector<size_t> indexes;
+        std::generate_n(std::back_inserter(indexes), 1000, [&]() {
+            return rng.get_int(0uz, Size - 1);
+        });
+        return indexes;
+    }();
+
+    [[gnu::noinline]]
     void run_sort_test() {
-        auto v = make_filled();
-        perf_tests::start_measuring_time();
+        auto v = copy(filled);
         std::sort(v.begin(), v.end());
-        perf_tests::stop_measuring_time();
     }
 
+    [[gnu::noinline]]
     void run_fifo_test() {
         Vector v;
-        auto val = make_value();
-        perf_tests::start_measuring_time();
         for (size_t i = 0; i < Size; ++i) {
+            // NOLINTNEXTLINE(performance-inefficient-vector-operation)
             v.push_back(val);
         }
-        for (const auto& e : v) {
-            perf_tests::do_not_optimize(e);
-        }
-        perf_tests::stop_measuring_time();
+        perf_tests::do_not_optimize(v);
     }
 
+    [[gnu::noinline]]
     void run_lifo_test() {
         Vector v;
-        auto val = make_value();
-        perf_tests::start_measuring_time();
         for (size_t i = 0; i < Size; ++i) {
             v.push_back(val);
         }
         while (!v.empty()) {
             v.pop_back();
         }
-        perf_tests::stop_measuring_time();
     }
 
+    [[gnu::noinline]]
     void run_fill_test() {
-        Vector v;
-        auto val = make_value();
-        perf_tests::start_measuring_time();
-        std::fill_n(std::back_inserter(v), Size, val);
-        perf_tests::stop_measuring_time();
+        Vector v = make_filled();
+        perf_tests::do_not_optimize(v);
     }
 
+    [[gnu::noinline]]
     void run_random_access_test() {
-        auto v = make_filled();
-        std::vector<size_t> indexes;
-        std::generate_n(std::back_inserter(indexes), 1000, [&v]() {
-            return random_generators::get_int<size_t>(0, v.size() - 1);
-        });
-        perf_tests::start_measuring_time();
-        perf_tests::do_not_optimize(v.front());
-        perf_tests::do_not_optimize(v.back());
         for (size_t index : indexes) {
-            perf_tests::do_not_optimize(v[index]);
+            perf_tests::do_not_optimize(filled[index]);
         }
-        perf_tests::do_not_optimize(v.front());
-        perf_tests::do_not_optimize(v.back());
-        perf_tests::stop_measuring_time();
     }
 };
 
@@ -118,29 +124,22 @@ using std_vector = std::vector<T>;
 using ss::sstring;
 
 VECTOR_PERF_TEST(std_vector, int64_t, 64)
-VECTOR_PERF_TEST(fragmented_vector, int64_t, 64)
 VECTOR_PERF_TEST(chunked_vector, int64_t, 64)
 
 VECTOR_PERF_TEST(std_vector, sstring, 64)
-VECTOR_PERF_TEST(fragmented_vector, sstring, 64)
 VECTOR_PERF_TEST(chunked_vector, sstring, 64)
 
 VECTOR_PERF_TEST(std_vector, large_struct, 64)
-VECTOR_PERF_TEST(fragmented_vector, large_struct, 64)
 VECTOR_PERF_TEST(chunked_vector, large_struct, 64)
 
 VECTOR_PERF_TEST(std_vector, int64_t, 10000)
-VECTOR_PERF_TEST(fragmented_vector, int64_t, 10000)
 VECTOR_PERF_TEST(chunked_vector, int64_t, 10000)
 
 VECTOR_PERF_TEST(std_vector, sstring, 10000)
-VECTOR_PERF_TEST(fragmented_vector, sstring, 10000)
 VECTOR_PERF_TEST(chunked_vector, sstring, 10000)
 
 VECTOR_PERF_TEST(std_vector, large_struct, 10000)
-VECTOR_PERF_TEST(fragmented_vector, large_struct, 10000)
 VECTOR_PERF_TEST(chunked_vector, large_struct, 10000)
 
 VECTOR_PERF_TEST(std_vector, int64_t, 1048576)
-VECTOR_PERF_TEST(fragmented_vector, int64_t, 1048576)
 VECTOR_PERF_TEST(chunked_vector, int64_t, 1048576)

@@ -243,7 +243,7 @@ inline bool replicate_entries_stm::should_skip_follower_request(vnode id) {
 ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
     // first append lo leader log, no flushing
     auto cfg = _ptr->config();
-    cfg.for_each_broker_id([this](const vnode& rni) {
+    cfg.for_each_replica([this](const vnode& rni) {
         // suppress follower heartbeat, before appending to self log
         if (rni != _ptr->_self) {
             _inflight_appends.emplace(rni, _ptr->track_append_inflight(rni));
@@ -259,7 +259,7 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
     // store committed offset to check if it advanced
     _initial_committed_offset = _ptr->committed_offset();
     // dispatch requests to followers & leader flush
-    cfg.for_each_broker_id([this](const vnode& rni) {
+    cfg.for_each_replica([this](const vnode& rni) {
         // We are not dispatching request to followers that are
         // recovering
         if (should_skip_follower_request(rni)) {
@@ -301,7 +301,10 @@ result<replicate_result> replicate_entries_stm::build_replicate_result() const {
         return _append_result->error();
     }
 
-    return replicate_result{.last_offset = _append_result->value().last_offset};
+    return replicate_result{
+      .last_offset = _append_result->value().last_offset,
+      .last_term = _append_result->value().last_term,
+    };
 }
 
 ss::future<result<replicate_result>>
@@ -369,8 +372,9 @@ replicate_entries_stm::replicate_entries_stm(
   , _meta(r.metadata())
   , _is_flush_required(r.is_flush_required())
   , _batches_size(r.batches_size())
-  , _batches(std::make_unique<chunked_vector<model::record_batch>>(
-      std::move(r).release_batches()))
+  , _batches(
+      std::make_unique<chunked_vector<model::record_batch>>(
+        std::move(r).release_batches()))
   , _followers_seq(std::move(seqs))
   , _ctxlog(_ptr->_ctxlog) {}
 

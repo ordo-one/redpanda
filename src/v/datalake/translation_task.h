@@ -21,6 +21,10 @@
 #include "model/record_batch_reader.h"
 #include "utils/retry_chain_node.h"
 
+namespace features {
+class feature_table;
+}
+
 namespace datalake {
 /**
  * An abstraction representing a task of consuming data, translating them to
@@ -33,6 +37,7 @@ public:
       model::revision_id topic_revision,
       std::unique_ptr<parquet_file_writer_factory> writer_factory,
       cloud_data_io& uploader,
+      features::feature_table* features,
       schema_manager& schema_mgr,
       type_resolver& type_resolver,
       record_translator& record_translator,
@@ -48,6 +53,8 @@ public:
         oom_error,
         time_limit_exceeded,
         shutting_down,
+        out_of_disk,
+        type_resolution_error,
     };
 
     using custom_partitioning_enabled
@@ -86,7 +93,6 @@ public:
      */
     ss::future<checked<coordinator::translated_offset_range, errc>> finish(
       custom_partitioning_enabled is_custom_partitioning_enabled,
-      const remote_path& remote_path_prefix,
       retry_chain_node& parent_rcn,
       ss::abort_source&) &&;
 
@@ -106,6 +112,7 @@ private:
       chunked_vector<remote_path>, retry_chain_node& parent_rcn);
 
     static constexpr std::chrono::milliseconds _read_timeout{30000};
+    prefix_logger _log;
     cloud_data_io* _cloud_io;
     schema_manager* _schema_mgr;
     type_resolver* _type_resolver;

@@ -6,7 +6,6 @@ package(default_visibility = ["//src/v/raft:__subpackages__"])
 redpanda_cc_rpc_library(
     name = "raft_rpc",
     src = "raftgen.json",
-    include_prefix = "raft",
 )
 
 redpanda_cc_library(
@@ -14,7 +13,6 @@ redpanda_cc_library(
     hdrs = [
         "fundamental.h",
     ],
-    include_prefix = "raft",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -28,7 +26,6 @@ redpanda_cc_library(
     hdrs = [
         "broker_compat.h",
     ],
-    include_prefix = "raft",
     deps = [
         "//src/v/model",
         "//src/v/reflection:adl",
@@ -37,10 +34,22 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "voter_priority_tracker",
+    srcs = [
+        "voter_priority_tracker.cc",
+    ],
+    hdrs = [
+        "voter_priority_tracker.h",
+    ],
+    deps = [":fundamental"],
+)
+
+redpanda_cc_library(
     name = "raft",
     srcs = [
         "append_entries_buffer.cc",
         "buffered_protocol.cc",
+        "compaction_coordinator.cc",
         "configuration_bootstrap_state.cc",
         "configuration_manager.cc",
         "consensus.cc",
@@ -71,6 +80,7 @@ redpanda_cc_library(
     hdrs = [
         "append_entries_buffer.h",
         "buffered_protocol.h",
+        "compaction_coordinator.h",
         "configuration_bootstrap_state.h",
         "configuration_manager.h",
         "consensus.h",
@@ -110,18 +120,19 @@ redpanda_cc_library(
         "types.h",
         "vote_stm.h",
     ],
-    include_prefix = "raft",
     visibility = ["//visibility:public"],
     deps = [
         ":broker_compat",
         ":fundamental",
         ":raft_rpc",
+        ":voter_priority_tracker",
         "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
         "//src/v/bytes:iostream",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/container:chunked_vector",
         "//src/v/container:intrusive",
         "//src/v/features",
         "//src/v/hashing:crc32c",
@@ -130,7 +141,6 @@ redpanda_cc_library(
         "//src/v/random:generators",
         "//src/v/random:time_jitter",
         "//src/v/reflection:adl",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/resource_mgmt:memory_groups",
         "//src/v/rpc",
         "//src/v/serde",
@@ -140,10 +150,14 @@ redpanda_cc_library(
         "//src/v/serde:map",
         "//src/v/serde:optional",
         "//src/v/serde:vector",
+        "//src/v/ssx:abort_source",
         "//src/v/ssx:async_algorithm",
+        "//src/v/ssx:condition_variable",
         "//src/v/ssx:future_util",
         "//src/v/ssx:semaphore",
         "//src/v/ssx:sformat",
+        "//src/v/ssx:single_fiber_executor",
+        "//src/v/ssx:watchdog",
         "//src/v/storage",
         "//src/v/storage:record_batch_builder",
         "//src/v/storage:record_batch_utils",
@@ -155,6 +169,7 @@ redpanda_cc_library(
         "//src/v/utils:named_type",
         "//src/v/utils:notification_list",
         "//src/v/utils:prefix_logger",
+        "//src/v/utils:to_string",
         "@abseil-cpp//absl/container:btree",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",

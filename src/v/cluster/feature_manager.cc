@@ -22,6 +22,7 @@
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
 #include "config/node_config.h"
+#include "config/sasl_mechanisms.h"
 #include "config/tls_config.h"
 #include "config/types.h"
 #include "config/validators.h"
@@ -209,10 +210,6 @@ features::enterprise_feature_report
 feature_manager::report_enterprise_features() const {
     const auto& cfg = config::shard_local_cfg();
     const auto& node_cfg = config::node();
-    auto has_gssapi = [&cfg]() {
-        return std::ranges::any_of(
-          cfg.sasl_mechanisms(), [](const auto& m) { return m == "GSSAPI"; });
-    };
     auto has_oidc = []() {
         return config::oidc_is_enabled_kafka()
                || config::oidc_is_enabled_http();
@@ -260,7 +257,9 @@ feature_manager::report_enterprise_features() const {
     report.set(
       features::license_required_feature::core_balancing_continuous,
       cfg.core_balancing_continuous());
-    report.set(features::license_required_feature::gssapi, has_gssapi());
+    report.set(
+      features::license_required_feature::gssapi,
+      config::has_sasl_mechanism(config::gssapi));
     report.set(features::license_required_feature::oidc, has_oidc());
     report.set(
       features::license_required_feature::schema_id_validation,
@@ -273,6 +272,12 @@ feature_manager::report_enterprise_features() const {
     report.set(
       features::license_required_feature::leadership_pinning,
       leadership_pinning_enabled());
+    report.set(
+      features::license_required_feature::shadow_linking,
+      cfg.enable_shadow_linking());
+    report.set(
+      features::license_required_feature::cloud_topics,
+      cfg.cloud_topics_enabled());
     return report;
 }
 
@@ -321,9 +326,7 @@ void feature_manager::maybe_log_license_nag() {
 }
 
 void feature_manager::maybe_log_security_nag() {
-    if (std::ranges::any_of(
-          config::shard_local_cfg().sasl_mechanisms(),
-          [](const auto& m) { return m == "PLAIN"; })) {
+    if (config::has_sasl_mechanism(config::plain)) {
         const bool any_tls_disabled
           = std::ranges::any_of(
               config::node_config().kafka_api_tls.value(),
@@ -506,8 +509,9 @@ feature_manager::replicate_feature_update_cmd(feature_update_cmd_data data) {
         co_return;
     } else if (err) {
         // Raise exception to trigger backoff+retry
-        throw std::runtime_error(fmt::format(
-          "Error storing cluster version {}: {}", new_version, err));
+        throw std::runtime_error(
+          fmt::format(
+            "Error storing cluster version {}: {}", new_version, err));
     }
 }
 
@@ -631,9 +635,10 @@ ss::future<> feature_manager::do_maybe_update_active_version() {
           "Auto-activating feature {} (logical version {})",
           spec.get().name,
           max_version);
-        data.actions.push_back(cluster::feature_update_action{
-          .feature_name = ss::sstring(spec.get().name),
-          .action = feature_update_action::action_t::activate});
+        data.actions.push_back(
+          cluster::feature_update_action{
+            .feature_name = ss::sstring(spec.get().name),
+            .action = feature_update_action::action_t::activate});
     }
 
     co_await replicate_feature_update_cmd(std::move(data));
@@ -660,9 +665,10 @@ ss::future<> feature_manager::do_maybe_activate_features() {
               "Activating feature {} (logical version {})",
               spec.get().name,
               _feature_table.local().get_active_version());
-            data.actions.push_back(cluster::feature_update_action{
-              .feature_name = ss::sstring(spec.get().name),
-              .action = feature_update_action::action_t::activate});
+            data.actions.push_back(
+              cluster::feature_update_action{
+                .feature_name = ss::sstring(spec.get().name),
+                .action = feature_update_action::action_t::activate});
         }
 
         co_await replicate_feature_update_cmd(std::move(data));

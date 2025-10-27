@@ -10,11 +10,12 @@
 
 #include "kafka/server/handlers/alter_partition_reassignments.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/errc.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/topics_frontend.h"
 #include "config/node_config.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/alter_partition_reassignments_request.h"
 #include "kafka/protocol/schemata/alter_partition_reassignments_response.h"
@@ -24,7 +25,6 @@
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <fmt/format.h>
 
 #include <algorithm>
@@ -287,6 +287,18 @@ ss::future<reassignable_topic_response> do_handle_topic(
   alter_op_context& octx) {
     reassignable_topic_response topic_response{.name = topic.name};
     topic_response.partitions.reserve(topic.partitions.size());
+    if (!octx.rctx.is_topic_mutable(topic.name)) {
+        for (auto& partition : topic.partitions) {
+            topic_response.partitions.push_back(
+              reassignable_partition_response{
+                .partition_index = partition.partition_index,
+                .error_code = error_code::policy_violation,
+                .error_message
+                = "Topic is not mutable due an active cluster link.",
+              });
+        }
+        return ssx::now(std::move(topic_response));
+    };
     auto tp_metadata_ref = octx.rctx.metadata_cache().get_topic_metadata_ref(
       model::topic_namespace_view{model::kafka_namespace, topic.name});
 
@@ -296,7 +308,7 @@ ss::future<reassignable_topic_response> do_handle_topic(
       std::move(alive_nodes),
       tp_metadata_ref);
 
-    return ssx::async_transform(
+    return ssx::async_transform<std::vector<reassignable_partition_response>>(
              topic.partitions.begin(),
              valid_partitions_end,
              [&octx,

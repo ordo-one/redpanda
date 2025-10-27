@@ -8,10 +8,12 @@
 # by the Apache License, Version 2.0
 
 import random
-from rptest.services.cluster import cluster
-from ducktape.utils.util import wait_until
+
 from ducktape.mark import matrix
+from ducktape.utils.util import wait_until
+
 from rptest.clients.rpk import RpkTool
+from rptest.services.cluster import cluster
 from rptest.services.failure_injector import FailureInjector, FailureSpec
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
 from rptest.tests.redpanda_test import RedpandaTest
@@ -35,9 +37,8 @@ class MetadataTest(RedpandaTest):
         assert sorted(all_ids) == sorted(returned_node_ids)
 
     @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
-    @matrix(failure=['isolate', 'stop'], node=['follower', 'controller'])
-    def test_metadata_request_does_not_contain_failed_node(
-            self, failure, node):
+    @matrix(failure=["isolate", "stop"], node=["follower", "controller"])
+    def test_metadata_request_does_not_contain_failed_node(self, failure, node):
         """
         Check if broker list returned from metadata request does not contain node
         which is not alive
@@ -52,7 +53,7 @@ class MetadataTest(RedpandaTest):
         assert sorted(redpanda_ids) == sorted(node_ids)
 
         def get_node():
-            if node == 'controller':
+            if node == "controller":
                 return self.redpanda.controller()
             else:
                 n = self.redpanda.nodes[0]
@@ -67,8 +68,7 @@ class MetadataTest(RedpandaTest):
         )
         with FailureInjector(self.redpanda) as fi:
             if failure == "isolate":
-                fi.inject_failure(
-                    FailureSpec(FailureSpec.FAILURE_ISOLATE, node))
+                fi.inject_failure(FailureSpec(FailureSpec.FAILURE_ISOLATE, node))
             else:
                 self.redpanda.stop_node(node)
 

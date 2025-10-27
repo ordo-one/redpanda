@@ -9,29 +9,26 @@
 
 #include "cluster/rm_stm.h"
 
+#include "base/vassert.h"
 #include "bytes/iostream.h"
 #include "cluster/logger.h"
 #include "cluster/producer_state_manager.h"
 #include "cluster/rm_stm_types.h"
+#include "cluster/snapshot.h"
+#include "cluster/tx_errc.h"
 #include "cluster/tx_gateway_frontend.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
-#include "container/fragmented_vector.h"
-#include "kafka/protocol/wire.h"
+#include "container/chunked_vector.h"
 #include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/timestamp.h"
-#include "raft/consensus_utils.h"
-#include "raft/errc.h"
-#include "raft/fundamental.h"
 #include "raft/persisted_stm.h"
+#include "raft/replicate.h"
 #include "raft/state_machine_base.h"
 #include "ssx/future-util.h"
-#include "storage/parser_utils.h"
-#include "storage/record_batch_builder.h"
-#include "utils/human.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -66,8 +63,9 @@ ss::sstring abort_idx_name(model::offset first, model::offset last) {
     return fmt::format("abort.idx.{}.{}", first, last);
 }
 
-raft::replicate_options make_replicate_options() {
-    auto opts = raft::replicate_options(raft::consistency_level::quorum_ack);
+raft::replicate_options make_replicate_options(model::term_id synced_term) {
+    auto opts = raft::replicate_options(
+      raft::consistency_level::quorum_ack, synced_term);
     opts.set_force_flush();
     return opts;
 }
@@ -89,16 +87,15 @@ rm_stm::rm_stm(
   : raft::persisted_stm<>(rm_stm_snapshot, logger, c)
   , _sync_timeout(config::shard_local_cfg().rm_sync_timeout_ms.bind())
   , _tx_timeout_delay(config::shard_local_cfg().tx_timeout_delay_ms.value())
-  , _abort_interval_ms(config::shard_local_cfg()
-                         .abort_timed_out_transactions_interval_ms.value())
+  , _abort_interval_ms(
+      config::shard_local_cfg()
+        .abort_timed_out_transactions_interval_ms.value())
   , _abort_index_segment_size(
       config::shard_local_cfg().abort_index_segment_size.value())
   , _is_tx_enabled(config::shard_local_cfg().enable_transactions.value())
   , _tx_gateway_frontend(tx_gateway_frontend)
   , _abort_snapshot_mgr(
-      "abort.idx",
-      std::filesystem::path(c->log_config().work_directory()),
-      ss::default_priority_class())
+      "abort.idx", std::filesystem::path(c->log_config().work_directory()))
   , _feature_table(feature_table)
   , _ctx_log(txlog, ssx::sformat("[{}]", c->ntp()))
   , _producer_state_manager(producer_state_manager)
@@ -447,7 +444,7 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
       pid, tx_seq, transaction_timeout_ms, tm);
 
     auto r = co_await _raft->replicate(
-      synced_term, std::move(batch), make_replicate_options());
+      std::move(batch), make_replicate_options(synced_term));
 
     if (!r) {
         vlog(
@@ -611,7 +608,7 @@ ss::future<tx::errc> rm_stm::do_commit_tx(
       pid, model::control_record_type::tx_commit);
 
     auto r = co_await _raft->replicate(
-      synced_term, std::move(batch), make_replicate_options());
+      std::move(batch), make_replicate_options(synced_term));
 
     if (!r) {
         vlog(
@@ -780,7 +777,7 @@ ss::future<tx::errc> rm_stm::do_abort_tx(
     auto batch = make_tx_control_batch(
       pid, model::control_record_type::tx_abort);
     auto r = co_await _raft->replicate(
-      synced_term, std::move(batch), make_replicate_options());
+      std::move(batch), make_replicate_options(synced_term));
 
     if (!r) {
         vlog(
@@ -859,7 +856,10 @@ ss::future<result<kafka_result>> rm_stm::do_replicate(
     auto holder = _gate.hold();
     auto unit = co_await _state_lock.hold_read_lock();
     if (bid.is_transactional) {
-        co_return co_await transactional_replicate(bid, std::move(batch));
+        // NOTE: transactional replicate doesn't respect the timeout value from
+        // the replicate_options. Only the expected term is taken into account.
+        co_return co_await transactional_replicate(
+          bid, std::move(batch), opts.expected_term);
     } else if (bid.is_idempotent()) {
         co_return co_await idempotent_replicate(
           bid, std::move(batch), opts, enqueued);
@@ -934,12 +934,12 @@ ss::future<tx::errc> rm_stm::mark_expired(model::producer_identity pid) {
 }
 
 ss::future<result<kafka_result>> rm_stm::transactional_replicate(
-  model::term_id synced_term,
+  model::term_id expected_term,
   producer_ptr producer,
   model::batch_identity bid,
   model::record_batch batch) {
     auto result = co_await do_transactional_replicate(
-      synced_term, producer, bid, std::move(batch));
+      expected_term, producer, bid, std::move(batch));
     if (!result) {
         vlog(
           _ctx_log.trace,
@@ -953,7 +953,7 @@ ss::future<result<kafka_result>> rm_stm::transactional_replicate(
             if (!barrier) {
                 co_return cluster::errc::not_leader;
             }
-        } else if (_raft->is_leader() && _raft->term() == synced_term) {
+        } else if (_raft->is_leader() && _raft->term() == expected_term) {
             co_await _raft->step_down(
               "Failed replication during transactional replicate.");
         }
@@ -1010,7 +1010,7 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
     req_ptr->mark_request_in_progress();
 
     auto r = co_await _raft->replicate(
-      synced_term, std::move(batch), make_replicate_options());
+      std::move(batch), make_replicate_options(synced_term));
     if (!r) {
         vlog(
           _ctx_log.warn,
@@ -1035,13 +1035,17 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
         co_return tx::errc::timeout;
     }
     auto result = kafka_result{
-      .last_offset = from_log_offset(r.value().last_offset)};
+      .last_offset = from_log_offset(r.value().last_offset),
+      .last_term = r.value().last_term,
+    };
     req_ptr->set_value(result);
     co_return result;
 }
 
 ss::future<result<kafka_result>> rm_stm::transactional_replicate(
-  model::batch_identity bid, model::record_batch batch) {
+  model::batch_identity bid,
+  model::record_batch batch,
+  std::optional<model::term_id> expected_term) {
     if (!check_tx_permitted()) {
         co_return cluster::errc::generic_tx_error;
     }
@@ -1052,22 +1056,23 @@ ss::future<result<kafka_result>> rm_stm::transactional_replicate(
           bid.pid);
         co_return cluster::errc::not_leader;
     }
-    auto synced_term = _insync_term;
+    if (!expected_term.has_value()) {
+        expected_term = _insync_term;
+    }
     auto result = maybe_create_producer(bid.pid);
     if (result.has_error()) {
         co_return result.error();
     }
     auto producer = result.value().first;
     co_return co_await producer->run_with_lock(
-      [&, synced_term](ssx::semaphore_units units) {
+      [&, expected_term](ssx::semaphore_units units) {
           return do_transactional_replicate(
-                   synced_term, producer, bid, std::move(batch))
+                   expected_term.value(), producer, bid, std::move(batch))
             .finally([units = std::move(units)] {});
       });
 }
 
 ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
-  model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
   model::record_batch batch,
@@ -1075,8 +1080,8 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
   ss::lw_shared_ptr<available_promise<>> enqueued,
   ssx::semaphore_units units,
   producer_previously_known producer_known) {
+    vassert(opts.expected_term.has_value(), "expected term must be set");
     auto result = co_await do_idempotent_replicate(
-      synced_term,
       producer,
       bid,
       std::move(batch),
@@ -1109,7 +1114,9 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
             // if the request enqueue failed, its important to step down
             // under units scope so that the next request in the pipeline
             // fails on sync.
-            if (_raft->is_leader() && _raft->term() == synced_term) {
+            if (
+              _raft->is_leader()
+              && _raft->term() == opts.expected_term.value()) {
                 co_await _raft->step_down(
                   "Failed replication during idempotent replicate.");
             }
@@ -1120,7 +1127,6 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
 }
 
 ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
-  model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
   model::record_batch batch,
@@ -1128,6 +1134,7 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
   ss::lw_shared_ptr<available_promise<>> enqueued,
   ssx::semaphore_units& units,
   producer_previously_known known_producer) {
+    vassert(opts.expected_term.has_value(), "expected term must be set");
     // Check if the producer bumped the epoch and reset accordingly.
     if (bid.pid.epoch > producer->id().epoch()) {
         producer->reset_with_new_epoch(bid.pid.epoch);
@@ -1147,10 +1154,10 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
           "Accepting batch from unknown producer that likely got evicted: {}, "
           "term: {}",
           bid,
-          synced_term);
+          opts.expected_term.value());
     }
     auto request = producer->try_emplace_request(
-      bid, synced_term, skip_sequence_checks);
+      bid, opts.expected_term.value(), skip_sequence_checks);
     if (!request) {
         co_return request.error();
     }
@@ -1161,8 +1168,7 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
     }
 
     req_ptr->mark_request_in_progress();
-    auto stages = _raft->replicate_in_stages(
-      synced_term, std::move(batch), opts);
+    auto stages = _raft->replicate_in_stages(std::move(batch), opts);
     auto req_enqueued = co_await ss::coroutine::as_future(
       std::move(stages.request_enqueued));
     if (req_enqueued.failed()) {
@@ -1191,7 +1197,9 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
     }
     // translate to kafka offset.
     auto kafka_offset = from_log_offset(result.value().last_offset);
-    auto final_result = kafka_result{.last_offset = kafka_offset};
+    auto term = result.value().last_term;
+    auto final_result = kafka_result{
+      .last_offset = kafka_offset, .last_term = term};
     req_ptr->set_value(final_result);
     co_return final_result;
 }
@@ -1206,7 +1214,9 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
         // the safety check in replicate_in_stages sets it automatically
         co_return cluster::errc::not_leader;
     }
-    auto synced_term = _insync_term;
+    if (!opts.expected_term.has_value()) {
+        opts.expected_term = _insync_term;
+    }
     auto result = maybe_create_producer(bid.pid);
     if (result.has_error()) {
         co_return result.error();
@@ -1215,7 +1225,6 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
     co_return co_await producer->run_with_lock(
       [&, known_producer](ssx::semaphore_units units) {
           return idempotent_replicate(
-            synced_term,
             producer,
             bid,
             std::move(batch),
@@ -1236,7 +1245,11 @@ ss::future<result<kafka_result>> rm_stm::replicate_msg(
         co_return cluster::errc::not_leader;
     }
 
-    auto ss = _raft->replicate_in_stages(_insync_term, std::move(batch), opts);
+    if (!opts.expected_term.has_value()) {
+        opts.expected_term = _insync_term;
+    }
+
+    auto ss = _raft->replicate_in_stages(std::move(batch), opts);
     co_await std::move(ss.request_enqueued);
     enqueued->set_value();
     auto r = co_await std::move(ss.replicate_finished);
@@ -1245,8 +1258,9 @@ ss::future<result<kafka_result>> rm_stm::replicate_msg(
         co_return ret_t(r.error());
     }
     auto old_offset = r.value().last_offset;
+    auto term = r.value().last_term;
     auto new_offset = from_log_offset(old_offset);
-    co_return ret_t(kafka_result{new_offset});
+    co_return ret_t(kafka_result{new_offset, term});
 }
 
 model::offset rm_stm::last_stable_offset() {
@@ -1312,8 +1326,8 @@ model::offset rm_stm::last_stable_offset() {
 }
 
 static void filter_intersecting(
-  fragmented_vector<tx_range>& target,
-  const fragmented_vector<tx_range>& source,
+  chunked_vector<tx_range>& target,
+  const chunked_vector<tx_range>& source,
   model::offset from,
   model::offset to) {
     for (auto& range : source) {
@@ -1327,7 +1341,7 @@ static void filter_intersecting(
     }
 }
 
-ss::future<fragmented_vector<tx_range>>
+ss::future<chunked_vector<tx_range>>
 rm_stm::aborted_transactions(model::offset from, model::offset to) {
     return _state_lock.hold_read_lock().then(
       [from, to, this](ss::basic_rwlock<>::holder unit) mutable {
@@ -1340,13 +1354,13 @@ model::producer_id rm_stm::highest_producer_id() const {
     return _highest_producer_id;
 }
 
-ss::future<fragmented_vector<tx_range>>
+ss::future<chunked_vector<tx_range>>
 rm_stm::do_aborted_transactions(model::offset from, model::offset to) {
-    fragmented_vector<tx_range> result;
+    chunked_vector<tx_range> result;
     if (!_is_tx_enabled) {
         co_return result;
     }
-    fragmented_vector<abort_index> intersecting_idxes;
+    chunked_vector<abort_index> intersecting_idxes;
     for (const auto& idx : _aborted_tx_state.abort_indexes) {
         if (idx.last < from) {
             continue;
@@ -1500,7 +1514,7 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                 auto batch = make_tx_control_batch(
                   pid, model::control_record_type::tx_commit);
                 auto cr = co_await _raft->replicate(
-                  synced_term, std::move(batch), make_replicate_options());
+                  std::move(batch), make_replicate_options(synced_term));
                 if (!cr) {
                     vlog(
                       _ctx_log.warn,
@@ -1539,7 +1553,7 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                 auto batch = make_tx_control_batch(
                   pid, model::control_record_type::tx_abort);
                 auto cr = co_await _raft->replicate(
-                  synced_term, std::move(batch), make_replicate_options());
+                  std::move(batch), make_replicate_options(synced_term));
                 if (!cr) {
                     vlog(
                       _ctx_log.warn,
@@ -1592,7 +1606,7 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
           pid, model::control_record_type::tx_abort);
 
         auto cr = co_await _raft->replicate(
-          _insync_term, std::move(batch), make_replicate_options());
+          std::move(batch), make_replicate_options(_insync_term));
 
         if (!cr) {
             vlog(
@@ -1634,15 +1648,25 @@ void rm_stm::maybe_rearm_autoabort_timer(time_point_type deadline) {
 }
 
 ss::future<tx::errc> rm_stm::abort_all_txes() {
+    static constexpr uint max_concurrency = 5u;
     if (!co_await sync(_sync_timeout())) {
         co_return tx::errc::stale;
     }
 
     tx::errc last_err = tx::errc::none;
 
+    // snap the intrusive list produced_ids before yielding the cpu
+    chunked_vector<model::producer_identity> producer_ids_to_expire{
+      std::from_range,
+      std::ranges::views::transform(
+        _active_tx_producers,
+        [](const auto& producer) { return producer.id(); })};
+
     co_await ss::max_concurrent_for_each(
-      _active_tx_producers, 5, [this, &last_err](const auto& producer) {
-          return mark_expired(producer.id()).then([&last_err](tx::errc res) {
+      std::move(producer_ids_to_expire),
+      max_concurrency,
+      [this, &last_err](const auto producer_id) {
+          return mark_expired(producer_id).then([&last_err](tx::errc res) {
               if (res != tx::errc::none) {
                   last_err = res;
               }
@@ -1655,8 +1679,9 @@ ss::future<tx::errc> rm_stm::abort_all_txes() {
 void rm_stm::apply_fence(model::producer_identity pid, model::record_batch b) {
     auto result = maybe_create_producer(pid);
     if (result.has_error()) {
-        throw stm_apply_error(fmt::format(
-          "cannot apply batch: {}, error: {}", b.header(), result.error()));
+        throw stm_apply_error(
+          fmt::format(
+            "cannot apply batch: {}, error: {}", b.header(), result.error()));
     }
     auto producer = result.value().first;
     auto header = b.header();
@@ -1694,7 +1719,9 @@ ss::future<> rm_stm::do_apply(const model::record_batch& b) {
           "Ignored prepare batch at offset: {} from producer: {}",
           b.base_offset(),
           b.header().producer_id);
-    } else if (hdr.type == model::record_batch_type::raft_data) {
+    } else if (
+      hdr.type == model::record_batch_type::raft_data
+      || hdr.type == model::record_batch_type::ctp_placeholder) {
         if (hdr.attrs.is_control()) {
             apply_control(bid.pid, parse_control_batch(b));
         } else {
@@ -1710,11 +1737,12 @@ void rm_stm::apply_control(
       _ctx_log.trace, "applying control batch of type {}, pid: {}", crt, pid);
     auto result = maybe_create_producer(pid);
     if (result.has_error()) {
-        throw stm_apply_error(fmt::format(
-          "cannot apply control batch, type: {}, pid: {}, error: {}",
-          crt,
-          pid,
-          result.error()));
+        throw stm_apply_error(
+          fmt::format(
+            "cannot apply control batch, type: {}, pid: {}, error: {}",
+            crt,
+            pid,
+            result.error()));
     }
     auto producer = result.value().first;
     auto tx_range = producer->apply_transaction_end(crt);
@@ -1768,8 +1796,9 @@ void rm_stm::apply_data(
         const auto last_kafka_offset = from_log_offset(header.last_offset());
         auto result = maybe_create_producer(bid.pid);
         if (result.has_error()) {
-            throw stm_apply_error(fmt::format(
-              "cannot apply batch: {}, error: {}", header, result.error()));
+            throw stm_apply_error(
+              fmt::format(
+                "cannot apply batch: {}, error: {}", header, result.error()));
         }
         auto producer = result.value().first;
         producer->apply_data(header, last_kafka_offset);
@@ -1938,8 +1967,8 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
     // all the operations during snapshot creation are made against the two
     // local variables, after all garbage collection is done the internal stm
     // state is updated.
-    fragmented_vector<abort_index> final_abort_indexes;
-    fragmented_vector<abort_index> expired_abort_indexes;
+    chunked_vector<abort_index> final_abort_indexes;
+    chunked_vector<abort_index> expired_abort_indexes;
 
     // first, check if there are any indicies and aborted ranges to drop.
     // whatever is there to retain is moved to the `final_` local variables.
@@ -1954,7 +1983,7 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
         }
     }
 
-    fragmented_vector<tx::tx_range> preserved_aborted_ranges;
+    chunked_vector<tx::tx_range> preserved_aborted_ranges;
     // remove obsolete aborted ranges, this doesn't influence correctness as
     // logs start offset already advanced past those ranges.
     std::copy_if(
@@ -1984,7 +2013,7 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
 
         model::offset first = model::offset::max();
         model::offset last = model::offset::min();
-        fragmented_vector<tx::tx_range> aborted_ranges;
+        chunked_vector<tx::tx_range> aborted_ranges;
 
         for (const auto& entry : _aborted_tx_state.aborted) {
             first = std::min(first, entry.first);
@@ -1996,10 +2025,11 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
                 for (auto& r : aborted_ranges) {
                     ranges_offloaded_to_abort_snapshots.emplace(r);
                 }
-                aborted_snapshots.push_back(abort_snapshot{
-                  .first = first,
-                  .last = last,
-                  .aborted = std::move(aborted_ranges)});
+                aborted_snapshots.push_back(
+                  abort_snapshot{
+                    .first = first,
+                    .last = last,
+                    .aborted = std::move(aborted_ranges)});
                 final_abort_indexes.emplace_back(first, last);
                 // reset the current state
                 first = model::offset::max();
@@ -2032,7 +2062,7 @@ ss::future<raft::stm_snapshot> rm_stm::do_take_local_snapshot(
       });
 
     _aborted_tx_state.abort_indexes = std::move(final_abort_indexes);
-    fragmented_vector<tx::tx_range> cleaned_aborted_ranges;
+    chunked_vector<tx::tx_range> cleaned_aborted_ranges;
     cleaned_aborted_ranges.reserve(_aborted_tx_state.aborted.size());
     // preserve those aborted ranges which were not included in the snapshot
     std::copy_if(
@@ -2199,15 +2229,12 @@ void rm_stm::setup_metrics() {
         return;
     }
     namespace sm = ss::metrics;
-    auto ns_label = sm::label("namespace");
-    auto topic_label = sm::label("topic");
-    auto partition_label = sm::label("partition");
 
     const auto& ntp = _raft->ntp();
     const std::vector<sm::label_instance> labels = {
-      ns_label(ntp.ns()),
-      topic_label(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 
     _metrics.add_group(
@@ -2226,7 +2253,7 @@ void rm_stm::setup_metrics() {
           labels),
       },
       {},
-      {sm::shard_label, partition_label});
+      {sm::shard_label, metrics::partition_label});
 }
 
 rm_stm_factory::rm_stm_factory(
@@ -2234,14 +2261,12 @@ rm_stm_factory::rm_stm_factory(
   bool enable_idempotence,
   ss::sharded<tx_gateway_frontend>& tx_gateway_frontend,
   ss::sharded<cluster::producer_state_manager>& producer_state_manager,
-  ss::sharded<features::feature_table>& feature_table,
-  ss::sharded<topic_table>& topics)
+  ss::sharded<features::feature_table>& feature_table)
   : _enable_transactions(enable_transactions)
   , _enable_idempotence(enable_idempotence)
   , _tx_gateway_frontend(tx_gateway_frontend)
   , _producer_state_manager(producer_state_manager)
-  , _feature_table(feature_table)
-  , _topics(topics) {}
+  , _feature_table(feature_table) {}
 
 bool rm_stm_factory::is_applicable_for(const storage::ntp_config& cfg) const {
     const auto& ntp = cfg.ntp();
@@ -2252,20 +2277,17 @@ bool rm_stm_factory::is_applicable_for(const storage::ntp_config& cfg) const {
 }
 
 void rm_stm_factory::create(
-
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
-    auto topic_md = _topics.local().get_topic_metadata_ref(
-      model::topic_namespace_view(raft->ntp()));
-
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config& cfg) {
+    const auto tcfg = cfg.initial_topic_cfg;
     auto stm = builder.create_stm<cluster::rm_stm>(
       clusterlog,
       raft,
       _tx_gateway_frontend,
       _feature_table,
       _producer_state_manager,
-      topic_md.has_value()
-        ? topic_md->get().get_configuration().properties.mpx_virtual_cluster_id
-        : std::nullopt);
+      tcfg ? tcfg->properties.mpx_virtual_cluster_id : std::nullopt);
 
     raft->log()->stm_manager()->add_stm(stm);
 }

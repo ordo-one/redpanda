@@ -1,18 +1,17 @@
 import collections
-from enum import Enum
+import glob
+import logging
 import os
 import re
+import struct
+from enum import Enum
+from io import BytesIO
 from os.path import join
 
-import struct
 import crc32c
-import glob
-import re
-import logging
-from io import BytesIO
 from reader import Reader
 
-logger = logging.getLogger('rp')
+logger = logging.getLogger("rp")
 
 # https://docs.python.org/3.8/library/struct.html#format-strings
 #
@@ -35,12 +34,41 @@ HDR_FMT_RP = HDR_FMT_RP_PREFIX + HDR_FMT_CRC
 HEADER_SIZE = struct.calcsize(HDR_FMT_RP)
 
 Header = collections.namedtuple(
-    'Header', ('header_crc', 'batch_size', 'base_offset', 'type', 'crc',
-               'attrs', 'delta', 'first_ts', 'max_ts', 'producer_id',
-               'producer_epoch', 'base_seq', 'record_count'))
+    "Header",
+    (
+        "header_crc",
+        "batch_size",
+        "base_offset",
+        "type",
+        "crc",
+        "attrs",
+        "delta",
+        "first_ts",
+        "max_ts",
+        "producer_id",
+        "producer_epoch",
+        "base_seq",
+        "record_count",
+    ),
+)
 
 SEGMENT_NAME_PATTERN = re.compile(
-    "(?P<base_offset>\d+)-(?P<term>\d+)-v(?P<version>\d)\.log")
+    r"(?P<base_offset>\d+)-(?P<term>\d+)-v(?P<version>\d)\.log"
+)
+
+
+def human_bytes(bytes: int):
+    """Convert bytes to human readable MiB."""
+    if bytes < 1024:
+        return f"{bytes} B"
+    elif bytes < 1024**2:
+        return f"{bytes / 1024:.2f} KiB"
+    elif bytes < 1024**3:
+        return f"{bytes / 1024**2:.2f} MiB"
+    elif bytes < 1024**4:
+        return f"{bytes / 1024**3:.2f} GiB"
+    else:
+        return f"{bytes / 1024**4:.2f} TiB"
 
 
 class CorruptBatchError(Exception):
@@ -49,8 +77,9 @@ class CorruptBatchError(Exception):
 
 
 class Record:
-    def __init__(self, length, attrs, timestamp_delta, offset_delta, key,
-                 value, headers):
+    def __init__(
+        self, length, attrs, timestamp_delta, offset_delta, key, value, headers
+    ):
         self.length = length
         self.attrs = attrs
         self.timestamp_delta = timestamp_delta
@@ -108,12 +137,12 @@ class RecordIter:
         for i in range(0, hdr_size):
             headers.append(self._parse_header())
 
-        return Record(len, attrs, timestamp_delta, offset_delta, key, value,
-                      headers)
+        return Record(len, attrs, timestamp_delta, offset_delta, key, value, headers)
 
 
 class BatchType(Enum):
     """Keep this in sync with model/record_batch_types.h"""
+
     raft_data = 1
     raft_configuration = 2
     controller = 3
@@ -139,6 +168,19 @@ class BatchType(Enum):
     version_fence = 23
     tx_tm_hosted_trasactions = 24
     prefix_truncate = 25
+    plugin_update = 26
+    tx_registry = 27
+    cluster_recovery_cmd = 28
+    compaction_placeholder = 29
+    role_management_cmd = 30
+    client_quota = 31
+    data_migration_cmd = 32
+    group_fence_tx = 33
+    partition_properties_update = 34
+    datalake_coordinator = 35
+    ctp_placeholder = 36
+    ctp_stm_command = 37
+    datalake_translation_state = 38
     unknown = -1
 
     @classmethod
@@ -172,7 +214,8 @@ class Batch:
         self.type = BatchType(header[3])
 
         header_crc_bytes = struct.pack(
-            "<" + HDR_FMT_RP_PREFIX_NO_CRC + HDR_FMT_CRC, *self.header[1:])
+            "<" + HDR_FMT_RP_PREFIX_NO_CRC + HDR_FMT_CRC, *self.header[1:]
+        )
         header_crc = crc32c.crc32c(header_crc_bytes)
         if self.header.header_crc != header_crc:
             raise CorruptBatchError(self)
@@ -183,15 +226,15 @@ class Batch:
 
     def header_dict(self):
         header = self.header._asdict()
-        attrs = header['attrs']
+        attrs = header["attrs"]
         header["type_name"] = self.type.name
-        header['expanded_attrs'] = {
-            'compression':
-            Batch.CompressionType(attrs & Batch.compression_mask).name,
-            'transactional':
-            attrs & Batch.transactional_mask == Batch.transactional_mask,
-            'control_batch': attrs & Batch.control_mask == Batch.control_mask,
-            'timestamp_type': attrs & Batch.ts_type_mask == Batch.ts_type_mask
+        header["term"] = self.term
+        header["expanded_attrs"] = {
+            "compression": Batch.CompressionType(attrs & Batch.compression_mask).name,
+            "transactional": attrs & Batch.transactional_mask
+            == Batch.transactional_mask,
+            "control_batch": attrs & Batch.control_mask == Batch.control_mask,
+            "timestamp_type": attrs & Batch.ts_type_mask == Batch.ts_type_mask,
         }
         return header
 
@@ -210,6 +253,9 @@ class Batch:
             # it appears that we may have hit a truncation point if all of the
             # fields in the header are zeros
             if all(map(lambda v: v == 0, header)):
+                logger.info(
+                    f"Truncation point detected at {f.tell()} (all zeros in header)"
+                )
                 return
             records_size = header.batch_size - HEADER_SIZE
             data = f.read(records_size)
@@ -234,21 +280,24 @@ class Batch:
 
 
 class BatchIterator:
-    def __init__(self, path):
+    def __init__(self, path, term):
         self.path = path
+        self.term = term
         self.file = open(path, "rb")
         self.idx = 0
 
     def __next__(self):
         b = Batch.from_stream(self.file, self.idx)
+
         if b is None:
             fsize = os.stat(self.path).st_size
             if fsize != self.file.tell():
-                logger.warn(
-                    f"Incomplete read of {self.path}: {self.file.tell()}/{fsize}"
+                logger.warning(
+                    f"Incomplete read of {self.path}: {human_bytes(self.file.tell())}/{human_bytes(fsize)}"
                 )
             raise StopIteration()
         self.idx += 1
+        b.term = self.term
         return b
 
     def __del__(self):
@@ -258,9 +307,17 @@ class BatchIterator:
 class Segment:
     def __init__(self, path):
         self.path = path
+        self.term = self._parse_term()
+
+    def _parse_term(self):
+        m = SEGMENT_NAME_PATTERN.match(os.path.basename(self.path))
+        if m is None:
+            raise RuntimeError(f"Invalid segment path: {self.path}")
+
+        return int(m["term"])
 
     def __iter__(self):
-        return BatchIterator(self.path)
+        return BatchIterator(self.path, self.term)
 
 
 class Ntp:
@@ -270,14 +327,15 @@ class Ntp:
         self.topic = topic
         self.partition = partition
         self.ntp_id = ntp_id
-        self.path = os.path.join(self.base_dir, self.nspace, self.topic,
-                                 f"{self.partition}_{self.ntp_id}")
+        self.path = os.path.join(
+            self.base_dir, self.nspace, self.topic, f"{self.partition}_{self.ntp_id}"
+        )
         pattern = os.path.join(self.path, "*.log")
         self.segments = glob.iglob(pattern)
 
         def _base_offset(segment_path):
             m = SEGMENT_NAME_PATTERN.match(os.path.basename(segment_path))
-            return int(m['base_offset'])
+            return int(m["base_offset"])
 
         self.segments = sorted(self.segments, key=_base_offset)
 
@@ -300,12 +358,12 @@ class Store:
             if nspace == "cloud_storage_cache":
                 continue
             for topic in listdirs(join(self.base_dir, nspace)):
-                for part_ntp_id in listdirs(join(self.base_dir, nspace,
-                                                 topic)):
-                    assert re.match("^\\d+_\\d+$", part_ntp_id), \
-                        "ntp dir at {} does not match expected format. Wrong --path or extra directories present?"\
-                        .format(join(self.base_dir, nspace, topic, part_ntp_id))
+                for part_ntp_id in listdirs(join(self.base_dir, nspace, topic)):
+                    assert re.match("^\\d+_\\d+$", part_ntp_id), (
+                        "ntp dir at {} does not match expected format. Wrong --path or extra directories present?".format(
+                            join(self.base_dir, nspace, topic, part_ntp_id)
+                        )
+                    )
                     [part, ntp_id] = part_ntp_id.split("_")
-                    ntp = Ntp(self.base_dir, nspace, topic, int(part),
-                              int(ntp_id))
+                    ntp = Ntp(self.base_dir, nspace, topic, int(part), int(ntp_id))
                     self.ntps.append(ntp)

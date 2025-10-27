@@ -9,8 +9,13 @@
  */
 #pragma once
 #include "cloud_io/remote.h"
+#include "cloud_roles/apply_credentials.h"
 #include "iceberg/rest_client/credentials.h"
 #include "iceberg/rest_client/oauth_token.h"
+
+namespace datalake {
+class credential_manager;
+} // namespace datalake
 
 namespace iceberg {
 class catalog;
@@ -26,8 +31,10 @@ namespace datalake::coordinator {
 class catalog_factory {
 public:
     virtual ~catalog_factory() = default;
-    virtual ss::future<std::unique_ptr<iceberg::catalog>> create_catalog() = 0;
+    virtual ss::future<std::unique_ptr<iceberg::catalog>>
+    create_catalog(ss::abort_source&) = 0;
 };
+
 /**
  * Rest catalog factory, the catalog properties are set based on the
  * configuration provided.
@@ -35,10 +42,13 @@ public:
 class rest_catalog_factory : public catalog_factory {
 public:
     explicit rest_catalog_factory(
-      config::configuration& config, ss::metrics::label_instance);
+      config::configuration& config,
+      ss::metrics::label_instance,
+      datalake::credential_manager& cred_mgr);
     ~rest_catalog_factory() override;
 
-    ss::future<std::unique_ptr<iceberg::catalog>> create_catalog() final;
+    ss::future<std::unique_ptr<iceberg::catalog>>
+    create_catalog(ss::abort_source&) final;
 
 private:
     struct credentials_and_token {
@@ -51,6 +61,7 @@ private:
 
     config::configuration* config_;
     ss::shared_ptr<iceberg::rest_client::client_probe> client_probe_;
+    datalake::credential_manager& credential_manager_;
 };
 /**
  * Filesystem catalog factory, the will use provided cloud_io::remote and bucket
@@ -63,7 +74,8 @@ public:
       cloud_io::remote& remote,
       const cloud_storage_clients::bucket_name& bucket);
 
-    ss::future<std::unique_ptr<iceberg::catalog>> create_catalog() final;
+    ss::future<std::unique_ptr<iceberg::catalog>>
+    create_catalog(ss::abort_source&) final;
 
 private:
     config::configuration* config_;
@@ -80,6 +92,7 @@ std::unique_ptr<catalog_factory> get_catalog_factory(
   config::configuration& config,
   cloud_io::remote& remote,
   const cloud_storage_clients::bucket_name& bucket,
-  ss::metrics::label_instance label);
+  ss::metrics::label_instance label,
+  datalake::credential_manager& cred_mgr);
 
 } // namespace datalake::coordinator

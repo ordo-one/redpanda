@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 
+#include "absl/container/flat_hash_map.h"
 #include "base/vassert.h"
 #include "bytes/bytes.h"
 #include "kafka/client/client.h"
@@ -37,6 +38,7 @@
 #include "model/metadata.h"
 #include "redpanda/tests/fixture.h"
 #include "ssx/future-util.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/loop.hh>
@@ -47,7 +49,6 @@
 #include <seastar/util/log.hh>
 #include <seastar/util/noncopyable_function.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <algorithm>
@@ -58,9 +59,9 @@
 
 namespace {
 
-std::vector<kafka::offset_fetch_request_topic>
+chunked_vector<kafka::offset_fetch_request_topic>
 offset_request_from_assignment(kc::assignment assignment) {
-    auto topics = std::vector<kafka::offset_fetch_request_topic>{};
+    auto topics = chunked_vector<kafka::offset_fetch_request_topic>{};
     topics.reserve(assignment.size());
     std::transform(
       std::make_move_iterator(assignment.begin()),
@@ -84,8 +85,8 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
 
     info("Connecting client");
     auto client = make_connected_client();
-    client.config().retry_base_backoff.set_value(10ms);
-    client.config().retries.set_value(size_t(10));
+    client.set_retry_base_backoff(10ms);
+    client.set_max_retries(size_t(10));
     client.connect().get();
     auto stop_client = ss::defer([&client]() { client.stop().get(); });
 
@@ -290,8 +291,8 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
               auto res
                 = client.consumer_fetch(group_id, m_id, 200ms, 1_MiB).get();
               BOOST_REQUIRE_EQUAL(res.data.error_code, kafka::error_code::none);
-              BOOST_REQUIRE_EQUAL(res.data.topics.size(), 3);
-              for (const auto& p : res.data.topics) {
+              BOOST_REQUIRE_EQUAL(res.data.responses.size(), 3);
+              for (const auto& p : res.data.responses) {
                   BOOST_REQUIRE_EQUAL(p.partitions.size(), 1);
                   const auto& res = p.partitions[0];
                   BOOST_REQUIRE_EQUAL(res.error_code, kafka::error_code::none);
@@ -304,7 +305,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     // Commit 5 offsets, with metadata of the member id.
     for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
-        auto t = std::vector<kafka::offset_commit_request_topic>{};
+        auto t = chunked_vector<kafka::offset_commit_request_topic>{};
         t.reserve(3);
         std::transform(
           topics.begin(),
@@ -361,7 +362,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
     // empty list means commit all offsets
     for (size_t i = 0; i < sorted_members.size(); ++i) {
         auto m_id = sorted_members[i];
-        auto t = std::vector<kafka::offset_commit_request_topic>{};
+        auto t = chunked_vector<kafka::offset_commit_request_topic>{};
         auto res
           = client.consumer_offset_commit(group_id, m_id, std::move(t)).get();
         BOOST_REQUIRE_EQUAL(res.data.topics.size(), 3);
@@ -394,7 +395,7 @@ FIXTURE_TEST(consumer_group, kafka_client_fixture) {
                   fetch_responses[i].begin(),
                   fetch_responses[i].end(),
                   [&](const auto& res) {
-                      return res.partition->name == t.name
+                      return res.partition->topic == t.name
                              && res.partition_response->partition_index
                                   == p.partition_index;
                   });

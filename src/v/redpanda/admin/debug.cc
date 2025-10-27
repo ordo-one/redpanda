@@ -10,7 +10,7 @@
  */
 #include "base/vassert-register.h"
 #include "base/vassert.h"
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cluster/cloud_storage_size_reducer.h"
 #include "cluster/controller.h"
 #include "cluster/controller_stm.h"
@@ -33,6 +33,7 @@
 #include "utils/arch.h"
 #include "version/version.h"
 
+#include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
@@ -105,7 +106,8 @@ void fill_raft_state(
         ss::httpd::debug_json::stm_state state;
         state.name = stm.name;
         state.last_applied_offset = stm.last_applied_offset;
-        state.max_collectible_offset = stm.max_collectible_offset;
+        state.max_removable_local_log_offset
+          = stm.max_removable_local_log_offset;
         raft_state.stms.push(std::move(state));
     }
     if (src.recovery_state) {
@@ -116,6 +118,49 @@ void fill_raft_state(
     }
     replica.raft_state = std::move(raft_state);
 }
+
+// noinline because this is the characteristic frame we look for the backtrace
+// test
+[[gnu::noinline]] void log_backtrace(std::unique_ptr<ss::http::request> req) {
+    bool simple = admin::get_boolean_query_param(*req, "simple");
+    if (simple) {
+        vlog(adminlog.info, "Backtrace: {}", ss::current_backtrace_tasklocal());
+    } else {
+        vlog(adminlog.info, "Backtrace:\n{}", ss::current_backtrace());
+    }
+}
+// Trigger a variety of different crash types, used in ducktape testing.
+void trigger_crash(std::unique_ptr<ss::http::request> req) {
+    auto crash_type = req->get_query_param("type");
+
+    if (crash_type == "segfault") {
+        vlog(adminlog.info, "Triggering segfault from /trigger_crash API");
+        // This will cause a segmentation fault
+        volatile int* p = nullptr;
+        *p = 42;
+    } else if (crash_type == "abort") {
+        vlog(adminlog.info, "Triggering abort from /trigger_crash API");
+        std::abort();
+    } else if (crash_type == "assert") {
+        vlog(adminlog.info, "Triggering assert from /trigger_crash API");
+        vunreachable("Intentional assert triggered by admin request");
+    } else if (crash_type == "asan_crash") {
+        volatile char* p = new char[1];
+        p[1] = 42; // deliberate out-of-bounds write
+        delete[] p;
+    } else if (crash_type == "ubsan_crash") {
+        // triggers integer overflow
+        volatile int max_int = std::numeric_limits<int>::max(), one = 1, sink{};
+        sink = max_int + one + sink;
+    } else {
+        throw ss::httpd::bad_request_exception(
+          fmt::format("invalid crash type: {}", crash_type));
+    }
+
+    // if we get here, the crash failed, we will just return an empty json
+    // object
+}
+
 } // namespace
 
 void admin_server::register_debug_routes() {
@@ -140,8 +185,9 @@ void admin_server::register_debug_routes() {
                     try {
                         val = boost::lexical_cast<int>(e);
                     } catch (const boost::bad_lexical_cast&) {
-                        throw ss::httpd::bad_param_exception(fmt::format(
-                          "Invalid parameter '{}' value {{{}}}", param, e));
+                        throw ss::httpd::bad_param_exception(
+                          fmt::format(
+                            "Invalid parameter '{}' value {{{}}}", param, e));
                     }
                 } else {
                     val = std::nullopt;
@@ -183,29 +229,32 @@ void admin_server::register_debug_routes() {
             cfg.max_spins_per_scheduling_point.has_value()
             && cfg.max_spins_per_scheduling_point.value()
                  < cfg.min_spins_per_scheduling_point.value()) {
-              throw ss::httpd::bad_param_exception(fmt::format(
-                "Invalid parameter 'max_spins_per_scheduling_point' value "
-                "is too low: {} < {}",
-                cfg.max_spins_per_scheduling_point.value(),
-                cfg.min_spins_per_scheduling_point.value()));
+              throw ss::httpd::bad_param_exception(
+                fmt::format(
+                  "Invalid parameter 'max_spins_per_scheduling_point' value "
+                  "is too low: {} < {}",
+                  cfg.max_spins_per_scheduling_point.value(),
+                  cfg.min_spins_per_scheduling_point.value()));
           }
           if (
             cfg.max_ms_per_scheduling_point.has_value()
             && cfg.max_ms_per_scheduling_point.value()
                  < cfg.min_ms_per_scheduling_point.value()) {
-              throw ss::httpd::bad_param_exception(fmt::format(
-                "Invalid parameter 'max_ms_per_scheduling_point' value "
-                "is too low: {} < {}",
-                cfg.max_ms_per_scheduling_point.value(),
-                cfg.min_ms_per_scheduling_point.value()));
+              throw ss::httpd::bad_param_exception(
+                fmt::format(
+                  "Invalid parameter 'max_ms_per_scheduling_point' value "
+                  "is too low: {} < {}",
+                  cfg.max_ms_per_scheduling_point.value(),
+                  cfg.min_ms_per_scheduling_point.value()));
           }
           cfg.num_fibers = 1;
           if (auto e = req->get_query_param("num_fibers"); !e.empty()) {
               try {
                   cfg.num_fibers = boost::lexical_cast<int>(e);
               } catch (const boost::bad_lexical_cast&) {
-                  throw ss::httpd::bad_param_exception(fmt::format(
-                    "Invalid parameter 'num_fibers' value {{{}}}", e));
+                  throw ss::httpd::bad_param_exception(
+                    fmt::format(
+                      "Invalid parameter 'num_fibers' value {{{}}}", e));
               }
           }
           return _stress_fiber_manager
@@ -224,12 +273,12 @@ void admin_server::register_debug_routes() {
               [] { return ss::json::json_return_type(ss::json::json_void()); });
       });
 
-    register_route<user>(
+    register_route<superuser>(
       ss::httpd::debug_json::reset_leaders_info,
       [this](std::unique_ptr<ss::http::request>) {
           vlog(adminlog.info, "Request to reset leaders info");
           return _metadata_cache
-            .invoke_on_all([](auto& mc) { mc.reset_leaders(); })
+            .invoke_on_all([](auto& mc) { return mc.reset_leaders(); })
             .then(
               [] { return ss::json::json_return_type(ss::json::json_void()); });
       });
@@ -262,15 +311,9 @@ void admin_server::register_debug_routes() {
           vlog(adminlog.info, "Request to get leaders info");
           using result_t = ss::httpd::debug_json::leader_info;
           using leaders = cluster::partition_leaders_table::leaders_info_t;
-          using cme
-            = cluster::partition_leaders_table::concurrent_modification_error;
-          return _metadata_cache.local()
-            .get_leaders()
-            .handle_exception_type([](const cme& ex) -> ss::future<leaders> {
-                throw ss::httpd::base_exception(
-                  ex.what(), ss::http::reply::status_type::service_unavailable);
-            })
-            .then([](leaders leaders_info) {
+
+          return _metadata_cache.local().get_leaders().then(
+            [](leaders leaders_info) {
                 return ss::make_ready_future<ss::json::json_return_type>(
                   ss::json::stream_range_as_array(
                     lw_shared_container(std::move(leaders_info)),
@@ -444,10 +487,11 @@ void admin_server::register_debug_routes() {
       [](std::unique_ptr<ss::http::request> req) {
           auto value = req->get_query_param("value");
           if (value != "true" && value != "false") {
-              throw ss::httpd::bad_param_exception(fmt::format(
-                "Invalid parameter 'value' {{{}}}. Should be 'true' or "
-                "'false'",
-                value));
+              throw ss::httpd::bad_param_exception(
+                fmt::format(
+                  "Invalid parameter 'value' {{{}}}. Should be 'true' or "
+                  "'false'",
+                  value));
           }
 
           return ss::smp::invoke_on_all([value] {
@@ -507,6 +551,26 @@ void admin_server::register_debug_routes() {
           return get_node_uuid_handler();
       });
 
+    register_route<superuser>(
+      ss::httpd::debug_json::log_backtrace,
+      [](std::unique_ptr<ss::http::request> req)
+        -> ss::future<ss::json::json_return_type> {
+          log_backtrace(std::move(req));
+          co_return ss::json::json_void{};
+      });
+
+#ifndef NDEBUG
+    register_route<superuser>(
+      ss::httpd::debug_json::trigger_crash,
+      [](std::unique_ptr<ss::http::request> req)
+        -> ss::future<ss::json::json_return_type> {
+          trigger_crash(std::move(req));
+          co_return ss::json::json_void{};
+      });
+#else
+    std::ignore = trigger_crash; // silence unused function warning
+#endif
+
     if constexpr (admin_server::is_store_message_enabled()) {
         register_route_raw_async<superuser>(
           ss::httpd::debug_json::put_ctracker_va,
@@ -551,8 +615,9 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
         try {
             shard_id = boost::lexical_cast<size_t>(shard_param);
         } catch (const boost::bad_lexical_cast&) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "Invalid parameter 'shard_id' value {{{}}}", shard_param));
+            throw ss::httpd::bad_param_exception(
+              fmt::format(
+                "Invalid parameter 'shard_id' value {{{}}}", shard_param));
         }
         check_shard_id(*shard_id);
     }
@@ -563,8 +628,9 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
             wait_ms = std::chrono::milliseconds(
               boost::lexical_cast<uint64_t>(wait_param));
         } catch (const boost::bad_lexical_cast&) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "Invalid parameter 'wait_ms' value {{{}}}", wait_param));
+            throw ss::httpd::bad_param_exception(
+              fmt::format(
+                "Invalid parameter 'wait_ms' value {{{}}}", wait_param));
         }
         if (*wait_ms < 1ms || *wait_ms > 15min) {
             throw ss::httpd::bad_param_exception(
@@ -600,7 +666,7 @@ admin_server::cpu_profile_handler(std::unique_ptr<ss::http::request> req) {
         shard_samples.dropped_samples = shard_profile.dropped_samples;
 
         // build up the samples list
-        std::vector<cpu_profile_sample> samples;
+        seastar::chunked_fifo<cpu_profile_sample> samples;
         samples.reserve(shard_profile.samples.size());
         for (auto& sample : shard_profile.samples) {
             ss::httpd::debug_json::cpu_profile_sample json_sample;
@@ -629,10 +695,11 @@ admin_server::get_local_offsets_translated_handler(
     auto translate_to = to_kafka;
     if (auto e = req->get_query_param("translate_to"); !e.empty()) {
         if (e != to_kafka && e != to_rp) {
-            throw ss::httpd::bad_request_exception(fmt::format(
-              "'translate_to' parameter must be one of either {} or {}",
-              to_kafka,
-              to_rp));
+            throw ss::httpd::bad_request_exception(
+              fmt::format(
+                "'translate_to' parameter must be one of either {} or {}",
+                to_kafka,
+                to_rp));
         }
         translate_to = e;
     }
@@ -660,9 +727,10 @@ admin_server::get_local_offsets_translated_handler(
           auto partition = pm.get(ntp);
           if (!partition) {
               return ss::make_exception_future<ss::json::json_return_type>(
-                ss::httpd::not_found_exception(fmt::format(
-                  "partition with ntp {} could not be found on the node",
-                  ntp)));
+                ss::httpd::not_found_exception(
+                  fmt::format(
+                    "partition with ntp {} could not be found on the node",
+                    ntp)));
           }
           const auto& log = partition->log();
           std::vector<ss::httpd::debug_json::translated_offset> result;
@@ -678,9 +746,10 @@ admin_server::get_local_offsets_translated_handler(
                   }
                   result.push_back(std::move(to));
               } catch (const std::runtime_error&) {
-                  throw ss::httpd::bad_request_exception(fmt::format(
-                    "Offset provided {} was out of offset translator range",
-                    offset));
+                  throw ss::httpd::bad_request_exception(
+                    fmt::format(
+                      "Offset provided {} was out of offset translator range",
+                      offset));
               }
           }
           return ss::make_ready_future<ss::json::json_return_type>(
@@ -698,8 +767,9 @@ admin_server::cloud_storage_usage_handler(
         try {
             batch_size = std::stoi(batch_size_param);
         } catch (...) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "batch_size must be an integer: {}", batch_size_param));
+            throw ss::httpd::bad_param_exception(
+              fmt::format(
+                "batch_size must be an integer: {}", batch_size_param));
         }
     }
 
@@ -710,8 +780,9 @@ admin_server::cloud_storage_usage_handler(
         try {
             retries_allowed = std::stoi(retries_param);
         } catch (...) {
-            throw ss::httpd::bad_param_exception(fmt::format(
-              "retries_allowed must be an integer: {}", retries_param));
+            throw ss::httpd::bad_param_exception(
+              fmt::format(
+                "retries_allowed must be an integer: {}", retries_param));
         }
     }
 
@@ -729,8 +800,9 @@ admin_server::cloud_storage_usage_handler(
         co_return ss::json::json_return_type(res.value());
     } else {
         throw ss::httpd::base_exception(
-          fmt::format("Failed to generate total cloud storage usage. "
-                      "Please retry."),
+          fmt::format(
+            "Failed to generate total cloud storage usage. "
+            "Please retry."),
           ss::http::reply::status_type::service_unavailable);
     }
 }
@@ -809,7 +881,7 @@ admin_server::get_local_storage_usage_handler(
         auto [cache_bytes, cache_objects]
           = co_await _cloud_storage_cache.invoke_on(
             ss::shard_id{0},
-            [](cloud_storage::cache& cache) -> std::pair<uint64_t, size_t> {
+            [](cloud_io::cache& cache) -> std::pair<uint64_t, size_t> {
                 return {cache.get_usage_bytes(), cache.get_usage_objects()};
             });
 
@@ -829,10 +901,11 @@ admin_server::get_partition_state_handler(
     const model::ntp ntp = parse_ntp_from_request(req->param);
     auto result = co_await get_partition_state(ntp, *_controller);
     if (result.has_error()) {
-        throw ss::httpd::server_error_exception(fmt::format(
-          "Error {} processing partition state for ntp: {}",
-          result.error(),
-          ntp));
+        throw ss::httpd::server_error_exception(
+          fmt::format(
+            "Error {} processing partition state for ntp: {}",
+            result.error(),
+            ntp));
     }
 
     ss::httpd::debug_json::partition_state response;
@@ -884,8 +957,7 @@ admin_server::get_producers_state_handler(
     auto result = co_await _tx_gateway_frontend.local().get_producers(
       cluster::get_producers_request{ntp, timeout, limit});
     if (result.error_code != cluster::tx::errc::none) {
-        throw ss::httpd::server_error_exception(fmt::format(
-          "Error {} getting producers for ntp: {}", result.error_code, ntp));
+        co_await throw_on_error(*req, result.error_code, ntp);
     }
     vlog(
       adminlog.debug,
@@ -962,7 +1034,7 @@ ss::future<ss::json::json_return_type> admin_server::get_node_uuid_handler() {
 }
 
 static json::validator make_broker_id_override_validator() {
-    const std::string schema = R"(
+    const std::string_view schema = R"(
 {
     "type": "object",
     "properties": {
@@ -1026,27 +1098,30 @@ ss::future<ss::json::json_return_type> admin_server::override_node_uuid_handler(
         current_uuid = model::node_uuid(
           uuid_t::from_string(doc["current_node_uuid"].GetString()));
     } catch (const std::runtime_error& e) {
-        throw ss::httpd::bad_request_exception(ssx::sformat(
-          "failed parsing current_node_uuid: {} - {}",
-          doc["current_node_uuid"].GetString(),
-          e.what()));
+        throw ss::httpd::bad_request_exception(
+          ssx::sformat(
+            "failed parsing current_node_uuid: {} - {}",
+            doc["current_node_uuid"].GetString(),
+            e.what()));
     }
     auto& storage = _controller->get_storage().local();
     if (storage.node_uuid() != current_uuid) {
-        throw ss::httpd::bad_request_exception(ssx::sformat(
-          "Requested current node UUID: {} does not match node UUID: {}",
-          storage.node_uuid(),
-          current_uuid));
+        throw ss::httpd::bad_request_exception(
+          ssx::sformat(
+            "Requested current node UUID: {} does not match node UUID: {}",
+            storage.node_uuid(),
+            current_uuid));
     }
     model::node_uuid new_node_uuid;
     try {
         new_node_uuid = model::node_uuid(
           uuid_t::from_string(doc["new_node_uuid"].GetString()));
     } catch (const std::runtime_error& e) {
-        throw ss::httpd::bad_request_exception(ssx::sformat(
-          "failed parsing new_node_uuid: {} - {}",
-          doc["new_node_uuid"].GetString(),
-          e.what()));
+        throw ss::httpd::bad_request_exception(
+          ssx::sformat(
+            "failed parsing new_node_uuid: {} - {}",
+            doc["new_node_uuid"].GetString(),
+            e.what()));
     }
     model::node_id new_node_id;
     try {

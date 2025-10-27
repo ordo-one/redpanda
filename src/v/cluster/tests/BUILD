@@ -5,7 +5,6 @@ redpanda_test_cc_library(
     hdrs = [
         "randoms.h",
     ],
-    include_prefix = "cluster/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/cluster",
@@ -19,7 +18,6 @@ redpanda_test_cc_library(
     hdrs = [
         "topic_properties_generator.h",
     ],
-    include_prefix = "cluster/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -33,21 +31,9 @@ redpanda_test_cc_library(
     hdrs = [
         "partition_allocator_fixture.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         "//src/v/base",
         "//src/v/cluster",
-    ],
-)
-
-redpanda_test_cc_library(
-    name = "partition_balancer_planner_fixture",
-    hdrs = [
-        "partition_balancer_planner_fixture.h",
-    ],
-    include_prefix = "cluster/tests",
-    deps = [
-        ":utils",
     ],
 )
 
@@ -57,18 +43,64 @@ redpanda_test_cc_library(
         "cluster_test_fixture.h",
         "utils.h",
     ],
-    include_prefix = "cluster/tests",
+    visibility = ["//visibility:public"],
     deps = [
         "//src/v/cluster",
         "//src/v/config",
         "//src/v/model",
         "//src/v/random:generators",
-        "//src/v/redpanda",
+        "//src/v/redpanda:application",
         "//src/v/redpanda/tests:fixture",
         "//src/v/resource_mgmt:cpu_scheduling",
-        "//src/v/test_utils:fixture",
+        "//src/v/test_utils:async",
+        "//src/v/test_utils:test_macros",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "partition_balancer_planner_fixture",
+    hdrs = [
+        "partition_balancer_planner_fixture.h",
+    ],
+    deps = [
+        ":utils",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "rebalancing_tests_fixture",
+    hdrs = [
+        "rebalancing_tests_fixture.h",
+    ],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/model/tests:random",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "tx_compaction_utils_gtest",
+    hdrs = [
+        "tx_compaction_utils.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cluster",
+        "//src/v/storage/tests:batch_generators",
+        "//src/v/storage/tests:storage_test_fixture_gtest",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random",
     ],
 )
 
@@ -77,7 +109,6 @@ redpanda_test_cc_library(
     hdrs = [
         "rm_stm_test_fixture.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         "//src/v/cluster",
         "//src/v/raft/tests:simple_raft_fixture",
@@ -89,10 +120,12 @@ redpanda_test_cc_library(
     hdrs = [
         "utils.h",
     ],
-    include_prefix = "cluster/tests",
+    visibility = ["//visibility:public"],
     deps = [
         "//src/v/cluster",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/container:chunked_circular_buffer",
+        "//src/v/test_utils:async",
+        "@seastar",
     ],
 )
 
@@ -102,7 +135,6 @@ redpanda_test_cc_library(
         "leader_balancer_constraints_utils.h",
         "leader_balancer_test_utils.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         "//src/v/cluster",
     ],
@@ -113,11 +145,11 @@ redpanda_test_cc_library(
     hdrs = [
         "topic_table_fixture.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         ":utils",
         "//src/v/base",
         "//src/v/cluster",
+        "@boost//:test",
     ],
 )
 
@@ -146,7 +178,6 @@ redpanda_test_cc_library(
     hdrs = [
         "raft_fixture_retry_policy.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         "//src/v/cluster",
         "//src/v/raft",
@@ -167,6 +198,7 @@ redpanda_cc_gtest(
         "//src/v/bytes:random",
         "//src/v/cluster",
         "//src/v/config",
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/raft",
@@ -174,7 +206,6 @@ redpanda_cc_gtest(
         "//src/v/random:generators",
         "//src/v/serde",
         "//src/v/test_utils:gtest",
-        "//src/v/test_utils:seastar_boost",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@googletest//:gtest",
@@ -256,6 +287,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/cluster",
+        "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/test_utils:gtest",
@@ -306,6 +338,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/cluster",
+        "//src/v/config",
         "//src/v/model",
         "//src/v/raft:fundamental",
         "//src/v/random:generators",
@@ -328,11 +361,12 @@ redpanda_cc_gtest(
         "//src/v/cluster",
         "//src/v/container:chunked_hash_map",
         "//src/v/features",
+        "//src/v/random:generators",
         "//src/v/ssx:event",
+        "//src/v/ssx:future_util",
         "//src/v/storage",
         "//src/v/storage:resources",
         "//src/v/test_utils:gtest",
-        "//src/v/test_utils:random",
         "//src/v/utils:prefix_logger",
         "@seastar",
     ],
@@ -353,7 +387,6 @@ redpanda_cc_btest(
         "//src/v/model",
         "//src/v/raft",
         "//src/v/raft:fundamental",
-        "//src/v/random:fast_prng",
         "//src/v/random:generators",
         "//src/v/resource_mgmt:memory_groups",
         "//src/v/test_utils:seastar_boost",
@@ -371,13 +404,30 @@ redpanda_cc_btest(
         "partition_balancer_planner_test.cc",
     ],
     deps = [
+        ":partition_balancer_planner_fixture",
         "//src/v/base",
         "//src/v/cluster",
-        "//src/v/cluster/tests:partition_balancer_planner_fixture",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:stable_iterator",
         "@boost//:test",
         "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "partition_balancer_simulator_test",
+    timeout = "long",
+    srcs = [
+        "partition_balancer_simulator_test.cc",
+    ],
+    deps = [
+        ":partition_balancer_planner_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/test_utils:seastar_boost",
         "@seastar//:testing",
     ],
 )
@@ -390,11 +440,13 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/cluster",
+        "//src/v/container:chunked_circular_buffer",
         "//src/v/model",
         "//src/v/random:generators",
         "//src/v/reflection:adl",
         "//src/v/test_utils:logs",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:test_env",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -410,9 +462,7 @@ redpanda_cc_btest(
     deps = [
         "//src/v/cluster",
         "//src/v/model",
-        "//src/v/storage/tests:kvstore_fixture",
         "//src/v/test_utils:seastar_boost",
-        "//src/v/utils:prefix_logger",
         "//src/v/utils:unresolved_address",
         "@boost//:test",
         "@seastar",
@@ -573,20 +623,72 @@ redpanda_cc_btest(
     ],
 )
 
-redpanda_cc_btest(
+redpanda_cc_gtest(
     name = "crash_reporter_test",
     timeout = "short",
     srcs = [
         "crash_reporter_test.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/cluster",
         "//src/v/storage/tests:kvstore_fixture",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "create_partitions_test",
+    timeout = "short",
+    srcs = [
+        "create_partitions_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":rebalancing_tests_fixture",
+        "//src/v/cluster",
+        "//src/v/model",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
-        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "decommissioning_test",
+    timeout = "short",
+    srcs = [
+        "decommissioning_tests.cc",
+    ],
+    cpu = 1,
+    memory = "1GiB",
+    deps = [
+        ":rebalancing_tests_fixture",
+        "//src/v/cluster",
+        "//src/v/test_utils:seastar_boost",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "replicas_rebalancing_test",
+    timeout = "moderate",
+    srcs = [
+        "replicas_rebalancing_tests.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":rebalancing_tests_fixture",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:seastar_boost",
+        "@abseil-cpp//absl/container:node_hash_map",
+        "@boost//:test",
+        "@seastar",
     ],
 )
 
@@ -598,11 +700,12 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/cluster",
+        "//src/v/cluster:state_machine_registry",
         "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/raft/tests:raft_fixture",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "//src/v/utils:to_string",
         "@googletest//:gtest",
         "@seastar",
@@ -611,10 +714,10 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
-    name = "eviction_stm_test",
+    name = "log_eviction_stm_test",
     timeout = "short",
     srcs = [
-        "eviction_stm_test.cc",
+        "log_eviction_stm_test.cc",
     ],
     deps = [
         "//src/v/cluster",
@@ -622,8 +725,7 @@ redpanda_cc_gtest(
         "//src/v/model",
         "//src/v/raft",
         "//src/v/raft/tests:raft_fixture",
-        "//src/v/storage",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
         "//src/v/utils:to_string",
         "@googletest//:gtest",
         "@seastar",
@@ -644,12 +746,20 @@ redpanda_cc_bench(
     ],
 )
 
+redpanda_cc_bench(
+    name = "partition_balancer_rpbench",
+    srcs = ["partition_balancer_bench.cc"],
+    deps = [
+        ":partition_balancer_planner_fixture",
+        "@seastar//:benchmark",
+    ],
+)
+
 redpanda_test_cc_library(
     name = "health_monitor_test_utils",
     hdrs = [
         "health_monitor_test_utils.h",
     ],
-    include_prefix = "cluster/tests",
     deps = [
         "//src/v/cluster",
     ],
@@ -669,6 +779,167 @@ redpanda_cc_btest(
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "autocreate_test",
+    timeout = "short",
+    srcs = ["autocreate_test.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "cluster_tests",
+    timeout = "short",
+    srcs = ["cluster_tests.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "configuration_change_test",
+    timeout = "short",
+    srcs = ["configuration_change_test.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "controller_api_tests",
+    timeout = "short",
+    srcs = ["controller_api_tests.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "remake_partition_tests",
+    timeout = "short",
+    srcs = ["remake_partition_tests.cc"],
+    cpu = 1,
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/kafka/server/tests:kafka_test_utils",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "idempotency_tests",
+    timeout = "short",
+    srcs = ["idempotency_tests.cc"],
+    deps = [
+        ":rm_stm_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/raft",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "metadata_dissemination_test",
+    timeout = "short",
+    srcs = ["metadata_dissemination_test.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "tm_stm_tests",
+    timeout = "short",
+    srcs = ["tm_stm_tests.cc"],
+    deps = [
+        ":cluster_test_fixture",
+        ":raft_fixture_retry_policy",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/raft/tests:raft_fixture",
+        "//src/v/test_utils:gtest",
+        "@fmt",
+        "@googletest//:gtest",
         "@seastar",
         "@seastar//:testing",
     ],
@@ -746,22 +1017,297 @@ redpanda_cc_gtest(
     ],
     deps = [
         ":raft_fixture_retry_policy",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/raft/tests:raft_fixture",
+        "//src/v/test_utils:scoped_config",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "data_migration_table_test",
+    timeout = "short",
+    srcs = [
+        "data_migration_table_test.cc",
+    ],
+    deps = [
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "controller_state_test",
+    timeout = "short",
+    srcs = [
+        "controller_state_test.cc",
+    ],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "ephemeral_credential_test",
+    timeout = "short",
+    srcs = [
+        "ephemeral_credential_test.cc",
+    ],
+    deps = [
+        ":cluster_test_fixture",
+        "//src/v/cluster",
+        "//src/v/features",
+        "//src/v/model",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "local_monitor_fixture",
+    hdrs = [
+        "local_monitor_fixture.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cluster",
+        "//src/v/features",
+        "//src/v/storage:disk",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "local_monitor_test",
+    timeout = "short",
+    srcs = [
+        "local_monitor_test.cc",
+    ],
+    deps = [
+        ":local_monitor_fixture",
         "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/random:generators",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/storage",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@fmt",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "security_frontend_test",
+    timeout = "short",
+    srcs = [
+        "security_frontend_test.cc",
+    ],
+    deps = [
+        "//src/v/cluster",
+        "//src/v/cluster/tests:cluster_test_fixture",
+        "//src/v/container:zip",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:range",
+        "@boost//:test",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "serialization_rt_test",
+    timeout = "short",
+    srcs = [
+        "serialization_rt_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/cluster/tests:randoms",
+        "//src/v/cluster/tests:topic_properties_generator",
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/pandaproxy/schema_registry/test:random",
+        "//src/v/raft",
+        "//src/v/raft:fundamental",
+        "//src/v/random:generators",
+        "//src/v/reflection:adl",
+        "//src/v/security/tests:utils",
+        "//src/v/storage",
+        "//src/v/test_utils:random",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/test_utils:rpc",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:tristate",
+        "//src/v/v8_engine",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "tx_topic_test",
+    timeout = "short",
+    srcs = [
+        "tx_topic_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/kafka/protocol",
+        "//src/v/model",
+        "//src/v/redpanda:application",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "distributed_kv_stm_test",
+    timeout = "short",
+    srcs = [
+        "distributed_kv_stm_tests.cc",
+    ],
+    cpu = 3,
+    deps = [
+        ":raft_fixture_retry_policy",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/raft",
+        "//src/v/raft/tests:raft_fixture",
+        "//src/v/serde",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "rm_stm_test",
+    timeout = "short",
+    srcs = [
+        "rm_stm_tests.cc",
+    ],
+    cpu = 1,
+    deps = [
+        ":randoms",
+        ":rm_stm_test_fixture",
+        "//src/v/cluster",
+        "//src/v/config",
+        "//src/v/finjector",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/raft",
+        "//src/v/random:generators",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/storage/tests:disk_log_builder",
+        "//src/v/test_utils:random",
+        "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:directory_walker",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "tx_compaction_utils",
+    hdrs = [
+        "tx_compaction_utils.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cluster",
+        "//src/v/storage/tests:batch_generators",
+        "//src/v/test_utils:seastar_boost",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "tx_compaction_tests",
+    timeout = "short",
+    srcs = [
+        "tx_compaction_tests.cc",
+    ],
+    deps = [
+        ":rm_stm_test_fixture",
+        ":tx_compaction_utils",
         "//src/v/cluster",
         "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
-        "//src/v/raft/tests:raft_fixture",
-        "//src/v/random:generators",
-        "//src/v/reflection:adl",
-        "//src/v/storage",
-        "//src/v/storage:record_batch_builder",
-        "//src/v/storage/tests:disk_log_builder",
         "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
-        "//src/v/utils:to_string",
+        "//src/v/test_utils:test_env",
+        "@boost//:test",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "epoch_service_test",
+    timeout = "short",
+    srcs = [
+        "epoch_service_test.cc",
+    ],
+    cpu = 2,
+    deps = [
+        "//src/v/cluster",
+        "//src/v/ssx:abort_source",
+        "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",
         "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "controller_forced_reconfiguration_test",
+    timeout = "moderate",
+    srcs = [
+        "controller_forced_reconfiguration_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/cluster/tests:cluster_test_fixture",
+        "//src/v/config",
+        "//src/v/container:zip",
+        "//src/v/model",
+        "//src/v/raft:fundamental",
+        "//src/v/random:generators",
+        "//src/v/security",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
     ],
 )

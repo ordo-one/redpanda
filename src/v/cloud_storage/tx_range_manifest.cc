@@ -13,9 +13,11 @@
 #include "bytes/iostream.h"
 #include "bytes/streambuf.h"
 #include "cloud_storage/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "json/istreamwrapper.h"
 #include "json/ostreamwrapper.h"
+#include "json/reader.h"
+#include "json/writer.h"
 #include "model/record.h"
 
 #include <rapidjson/error/en.h>
@@ -45,14 +47,15 @@ struct tx_range_manifest_json_handler {
             if (
               compat_version
               > static_cast<int>(tx_range_manifest_version::current_version)) {
-                throw std::runtime_error(fmt::sprintf(
-                  "Can't deserialize tx manifest, supported version {}, "
-                  "manifest "
-                  "version {}, compatible version {}",
-                  static_cast<int32_t>(
-                    tx_range_manifest_version::current_version),
-                  version,
-                  compat_version));
+                throw std::runtime_error(
+                  fmt::format(
+                    "Can't deserialize tx manifest, supported version {}, "
+                    "manifest "
+                    "version {}, compatible version {}",
+                    static_cast<int32_t>(
+                      tx_range_manifest_version::current_version),
+                    version,
+                    compat_version));
             }
             _manifest_keys |= static_cast<uint8_t>(
               manifest_keys::compat_version);
@@ -224,7 +227,7 @@ struct tx_range_manifest_json_handler {
     // User data.
     int version{-1};
     int compat_version{-1};
-    fragmented_vector<model::tx_range> ranges;
+    chunked_vector<model::tx_range> ranges;
 };
 
 remote_manifest_path generate_remote_tx_path(const remote_segment_path& path) {
@@ -232,7 +235,7 @@ remote_manifest_path generate_remote_tx_path(const remote_segment_path& path) {
 }
 
 tx_range_manifest::tx_range_manifest(
-  remote_segment_path spath, fragmented_vector<model::tx_range> range)
+  remote_segment_path spath, chunked_vector<model::tx_range> range)
   : _path(std::move(spath))
   , _ranges(std::move(range)) {}
 

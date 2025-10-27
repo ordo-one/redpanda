@@ -9,13 +9,13 @@
  * by the Apache License, Version 2.0
  */
 
+#include "absl/container/btree_map.h"
 #include "container/contiguous_range_map.h"
 #include "container/tests/bench_utils.h"
 #include "random/generators.h"
 
 #include <seastar/testing/perf_tests.hh>
 
-#include <absl/container/btree_map.h>
 #include <boost/range/irange.hpp>
 
 #include <map>
@@ -65,7 +65,7 @@ public:
         auto val = make_value();
         auto keys = make_keys();
         std::shuffle(
-          keys.begin(), keys.end(), random_generators::internal::gen);
+          keys.begin(), keys.end(), random_generators::global().engine());
         perf_tests::start_measuring_time();
         for (auto& k : keys) {
             map.emplace(k, val);
@@ -103,8 +103,8 @@ public:
 // NOLINTBEGIN(*-macro-*)
 #define INT_KEY_MAP_PERF_TEST(                                                        \
   container, key, value, fill_factor, key_set_size)                                   \
-    class                                                                             \
-      IntMapBenchTest_##container##_##key##_##value##_##fill_factor##_##key_set_size  \
+    class IntMapBenchTest_##container##_##key##_##value##_##fill_factor##_##          \
+      key_set_size                                                                    \
       : public MapBenchTest<                                                          \
           container<key, value>,                                                      \
           key_set_size,                                                               \

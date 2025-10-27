@@ -9,10 +9,8 @@ redpanda_cc_bench(
     ],
     deps = [
         "//src/v/bytes:iobuf",
-        "//src/v/cluster",
-        "//src/v/model",
         "//src/v/serde",
-        "@boost//:container_hash",
+        "//src/v/serde:iobuf",
         "@seastar",
         "@seastar//:benchmark",
     ],
@@ -28,7 +26,7 @@ redpanda_cc_btest(
         "SERDE_TEST",
     ],
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/hashing:crc32c",
         "//src/v/model",
         "//src/v/random:generators",
@@ -70,7 +68,7 @@ py_binary(
 genrule(
     name = "generated_structs_genrule",
     outs = ["generated_structs.h"],
-    cmd = "$(PYTHON3) $(execpath :struct_gen) $@",
+    cmd = "$(execpath :struct_gen) $@",
     toolchains = ["@rules_python//python:current_py_toolchain"],
     tools = [":struct_gen"],
 )
@@ -78,7 +76,6 @@ genrule(
 redpanda_test_cc_library(
     name = "generated_structs",
     hdrs = [":generated_structs.h"],
-    include_prefix = "serde/test",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/serde",

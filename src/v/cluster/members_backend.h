@@ -1,5 +1,7 @@
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_set.h"
 #include "cluster/fwd.h"
 #include "cluster/members_manager.h"
 #include "cluster/scheduling/types.h"
@@ -8,9 +10,6 @@
 #include "model/metadata.h"
 
 #include <seastar/core/condition-variable.hh>
-
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_set.h>
 
 #include <chrono>
 #include <iosfwd>
@@ -64,7 +63,6 @@ public:
       ss::sharded<controller_api>&,
       ss::sharded<members_manager>&,
       ss::sharded<members_frontend>&,
-      ss::sharded<features::feature_table>&,
       consensus_ptr,
       ss::sharded<ss::abort_source>&);
 
@@ -115,7 +113,6 @@ private:
     ss::sharded<controller_api>& _api;
     ss::sharded<members_manager>& _members_manager;
     ss::sharded<members_frontend>& _members_frontend;
-    ss::sharded<features::feature_table>& _features;
     consensus_ptr _raft0;
     ss::sharded<ss::abort_source>& _as;
     ss::gate _bg;

@@ -10,7 +10,7 @@
 #include "datalake/coordinator/iceberg_file_committer.h"
 
 #include "base/vlog.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "datalake/coordinator/commit_offset_metadata.h"
 #include "datalake/coordinator/state.h"
 #include "datalake/coordinator/state_update.h"
@@ -154,8 +154,9 @@ checked<iceberg::struct_value, file_committer::errc> build_partition_key_struct(
         const auto& field_bytes = f.partition_key.at(i);
         if (field_bytes) {
             try {
-                pk.fields.push_back(iceberg::value_from_bytes(
-                  field_type->type, field_bytes.value()));
+                pk.fields.push_back(
+                  iceberg::value_from_bytes(
+                    field_type->type, field_bytes.value()));
             } catch (const std::invalid_argument& e) {
                 vlog(
                   datalake_log.error,
@@ -297,11 +298,12 @@ public:
                   = f.partition_spec_id >= 0
                       ? iceberg::partition_spec::id_t{f.partition_spec_id}
                       : table_.default_spec_id;
-                icb_files_.push_back(iceberg::file_to_append{
-                  .file = std::move(file),
-                  .schema_id = schema_id,
-                  .partition_spec_id = pspec_id,
-                });
+                icb_files_.push_back(
+                  iceberg::file_to_append{
+                    .file = std::move(file),
+                    .schema_id = schema_id,
+                    .partition_spec_id = pspec_id,
+                  });
             }
         }
 
@@ -461,34 +463,23 @@ iceberg_file_committer::commit_topic_files_to_catalog(
         auto main_table_id = table_id_provider::table_id(topic);
         auto main_table_res = co_await catalog_.load_table(main_table_id);
         if (main_table_res.has_error()) {
-            switch (main_table_res.error()) {
-            case iceberg::catalog::errc::not_found:
-                vlog(
-                  datalake_log.debug,
-                  "Main table {} not found for committing from topic {}",
-                  main_table_id,
-                  topic);
-                break;
-            default:
-                co_return log_and_convert_catalog_errc(
-                  main_table_res.error(),
-                  fmt::format(
-                    "Error loading table {} for committing from topic {}",
-                    main_table_id,
-                    topic));
-            }
-        } else {
-            auto main_table_commit_builder_res = table_commit_builder::create(
-              cluster,
-              std::move(main_table_id),
-              std::move(main_table_res.value()),
-              !disable_snapshot_tags_());
-            if (main_table_commit_builder_res.has_error()) {
-                co_return main_table_commit_builder_res.error();
-            }
-            main_table_commit_builder = std::move(
-              main_table_commit_builder_res.value());
+            co_return log_and_convert_catalog_errc(
+              main_table_res.error(),
+              fmt::format(
+                "Error loading table {} for committing from topic {}",
+                main_table_id,
+                topic));
         }
+        auto main_table_commit_builder_res = table_commit_builder::create(
+          cluster,
+          std::move(main_table_id),
+          std::move(main_table_res.value()),
+          !disable_snapshot_tags_());
+        if (main_table_commit_builder_res.has_error()) {
+            co_return main_table_commit_builder_res.error();
+        }
+        main_table_commit_builder = std::move(
+          main_table_commit_builder_res.value());
     }
 
     // DLQ table (optional):
@@ -497,45 +488,36 @@ iceberg_file_committer::commit_topic_files_to_catalog(
         auto dlq_table_id = table_id_provider::dlq_table_id(topic);
         auto dlq_table_res = co_await catalog_.load_table(dlq_table_id);
         if (dlq_table_res.has_error()) {
-            switch (dlq_table_res.error()) {
-            case iceberg::catalog::errc::not_found:
-                vlog(
-                  datalake_log.debug,
-                  "DLQ table {} not found for committing from topic {}",
-                  dlq_table_id,
-                  topic);
-                // We ignore the DLQ table not found error and continue under
-                // the assumption that there are will be no DLQ files to commit.
-                // If such a file is found we'll return an error. Ideally we
-                // would load the table conditionally but for now we can't
-                // suspend/co_await here.
-                break;
-            default:
-                co_return log_and_convert_catalog_errc(
-                  dlq_table_res.error(),
-                  fmt::format(
-                    "Error loading table {} for committing from topic {}",
-                    dlq_table_id,
-                    topic));
-            }
-        } else {
-            auto dlq_table_commit_builder_res = table_commit_builder::create(
-              cluster,
-              std::move(dlq_table_id),
-              std::move(dlq_table_res.value()),
-              !disable_snapshot_tags_());
-            if (dlq_table_commit_builder_res.has_error()) {
-                co_return dlq_table_commit_builder_res.error();
-            }
-            dlq_table_commit_builder = std::move(
-              dlq_table_commit_builder_res.value());
+            co_return log_and_convert_catalog_errc(
+              dlq_table_res.error(),
+              fmt::format(
+                "Error loading table {} for committing from topic {}",
+                dlq_table_id,
+                topic));
         }
+        auto dlq_table_commit_builder_res = table_commit_builder::create(
+          cluster,
+          std::move(dlq_table_id),
+          std::move(dlq_table_res.value()),
+          !disable_snapshot_tags_());
+        if (dlq_table_commit_builder_res.has_error()) {
+            co_return dlq_table_commit_builder_res.error();
+        }
+        dlq_table_commit_builder = std::move(
+          dlq_table_commit_builder_res.value());
     }
 
-    chunked_hash_map<model::partition_id, kafka::offset> pending_commits;
+    struct offset_and_bytes {
+        kafka::offset last_offset{};
+        size_t kafka_bytes_processed{0};
+    };
+
+    chunked_hash_map<model::partition_id, offset_and_bytes> pending_commits;
     for (const auto& [pid, p_state] : tp_state.pid_to_pending_files) {
         for (const auto& e : p_state.pending_entries) {
-            pending_commits[pid] = e.data.last_offset;
+            pending_commits[pid].last_offset = e.data.last_offset;
+            pending_commits[pid].kafka_bytes_processed
+              += e.data.kafka_bytes_processed;
 
             if (!e.data.files.empty()) {
                 vassert(
@@ -573,10 +555,14 @@ iceberg_file_committer::commit_topic_files_to_catalog(
         co_return chunked_vector<mark_files_committed_update>{};
     }
     chunked_vector<mark_files_committed_update> updates;
-    for (const auto& [pid, committed_offset] : pending_commits) {
+    for (const auto& [pid, entry] : pending_commits) {
         auto tp = model::topic_partition(topic, pid);
         auto update_res = mark_files_committed_update::build(
-          state, tp, topic_revision, committed_offset);
+          state,
+          tp,
+          topic_revision,
+          entry.last_offset,
+          entry.kafka_bytes_processed);
         if (update_res.has_error()) {
             vlog(
               datalake_log.warn,
@@ -612,8 +598,21 @@ iceberg_file_committer::commit_topic_files_to_catalog(
 
 ss::future<checked<std::nullopt_t, file_committer::errc>>
 iceberg_file_committer::drop_table(
-  const iceberg::table_identifier& table_id) const {
-    auto drop_res = co_await catalog_.drop_table(table_id, true);
+  const iceberg::table_identifier& table_id, purge_data should_purge) const {
+    auto load_res = co_await catalog_.load_table(table_id);
+    if (load_res.has_error()) {
+        if (load_res.error() == iceberg::catalog::errc::not_found) {
+            co_return std::nullopt;
+        }
+        log_and_convert_catalog_errc(
+          load_res.error(),
+          fmt::format(
+            "Failed to load {} before dropping, proceeding to attempt drop "
+            "anyway",
+            table_id));
+    }
+    auto drop_res = co_await catalog_.drop_table(
+      table_id, should_purge == purge_data::yes);
     if (
       drop_res.has_error()
       && drop_res.error() != iceberg::catalog::errc::not_found) {

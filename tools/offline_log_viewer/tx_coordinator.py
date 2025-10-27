@@ -1,8 +1,8 @@
-from storage import Segment
 from enum import Enum
 from io import BytesIO
+
 from reader import Reader
-import struct
+from storage import Segment
 
 
 class TxStatus(Enum):
@@ -48,8 +48,7 @@ class TxLog:
                     record_dict["value"]["pid"]["epoch"] = rdr.read_int16()
                     record_dict["value"]["tx_seq"] = rdr.read_int64()
                     record_dict["value"]["etag"] = rdr.read_int64()
-                    record_dict["value"]["status"] = TxStatus(
-                        rdr.read_int32()).name
+                    record_dict["value"]["status"] = TxStatus(rdr.read_int32()).name
                     record_dict["value"]["timeout_ms"] = rdr.read_int64()
                     record_dict["value"]["last_update_ts"] = rdr.read_int64()
                     record_dict["value"]["partitions"] = []

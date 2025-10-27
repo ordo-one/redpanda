@@ -15,6 +15,7 @@
 #include "serde/rw/iobuf.h"
 #include "serde/rw/rw.h"
 #include "serde/rw/vector.h"
+#include "ssx/future-util.h"
 
 using namespace std::chrono_literals;
 
@@ -26,7 +27,7 @@ static constexpr std::string_view buckets_key{"buckets"};
 struct persisted_state {
     std::chrono::seconds configured_period;
     size_t configured_windows;
-    fragmented_vector<usage_window> current_state;
+    chunked_vector<usage_window> current_state;
 };
 
 static ss::future<>
@@ -77,7 +78,7 @@ restore_from_disk(storage::kvstore& kvstore) {
       .configured_period = serde::from_iobuf<std::chrono::seconds>(
         std::move(*period)),
       .configured_windows = serde::from_iobuf<size_t>(std::move(*windows)),
-      .current_state = serde::from_iobuf<fragmented_vector<usage_window>>(
+      .current_state = serde::from_iobuf<chunked_vector<usage_window>>(
         std::move(*data))};
 }
 
@@ -118,6 +119,7 @@ void usage_window::reset(uint64_t now) {
     u.bytes_sent = 0;
     u.bytes_received = 0;
     u.bytes_cloud_storage = std::nullopt;
+    u.datalake_usage = {};
 }
 
 template<typename clock_type>
@@ -173,7 +175,7 @@ usage_aggregator<clock_type>::usage_aggregator(
         window_closed();
         rearm_window_timer();
     });
-    /// TODO: This should be refactored when fragmented_vector::resize is
+    /// TODO: This should be refactored when chunked_vector::resize is
     /// implemented
     for (size_t i = 0; i < _usage_num_windows; ++i) {
         _buckets.push_back(usage_window{});
@@ -320,6 +322,8 @@ ss::future<> usage_aggregator<clock_type>::grab_data(size_t idx) {
             _buckets[idx].u += usage_data;
             _buckets[idx].u.bytes_cloud_storage
               = usage_data.bytes_cloud_storage;
+            _buckets[idx].u.datalake_usage = std::move(
+              usage_data.datalake_usage);
         }
     } catch (const std::exception& e) {
         vlog(
@@ -373,7 +377,7 @@ void usage_aggregator<clock_type>::close_window() {
 
 template<typename clock_type>
 void usage_aggregator<clock_type>::reset_state(
-  fragmented_vector<usage_window> buckets) {
+  chunked_vector<usage_window> buckets) {
     /// called after restart to determine which bucket is the 'current' bucket
     _current_window = 0;
     if (!buckets.empty()) {

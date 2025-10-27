@@ -16,7 +16,7 @@
 #include "controller_stm.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
-#include "storage/types.h"
+#include "storage/disk.h"
 
 #include <seastar/core/sharded.hh>
 
@@ -93,6 +93,13 @@ public:
      * optional if the node is not present in node status table.
      */
     std::optional<alive> is_alive(model::node_id) const;
+    /**
+     * Returns partition high watermark from the replica that reports the
+     * highest value within the cluster.
+     */
+    ss::future<result<std::optional<kafka::offset>>>
+      get_partition_high_watermark(
+        model::topic_namespace_view, model::partition_id);
 
 private:
     template<typename Func>

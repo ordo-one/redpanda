@@ -10,11 +10,13 @@
  */
 
 #pragma once
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_map.h"
 #include "base/seastarx.h"
-#include "cluster/cloud_metadata/offsets_snapshot.h"
 #include "cluster/notification.h"
+#include "cluster/offsets_snapshot.h"
 #include "cluster/topic_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/heartbeat.h"
 #include "kafka/protocol/join_group.h"
@@ -27,6 +29,7 @@
 #include "kafka/protocol/schemata/list_groups_response.h"
 #include "kafka/protocol/sync_group.h"
 #include "kafka/protocol/txn_offset_commit.h"
+#include "kafka/protocol/types.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/group.h"
 #include "kafka/server/group_recovery_consumer.h"
@@ -35,16 +38,13 @@
 #include "raft/fwd.h"
 #include "raft/notification.h"
 #include "ssx/semaphore.h"
-#include "utils/rwlock.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/rwlock.hh>
 #include <seastar/core/sharded.hh>
-
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/node_hash_map.h>
 
 #include <system_error>
 
@@ -119,7 +119,7 @@ namespace kafka {
  *
  *     - This is not yet implemented.
  */
-class group_manager {
+class group_manager : public ss::peering_sharded_service<group_manager> {
 public:
     group_manager(
       model::topic_namespace,
@@ -128,8 +128,7 @@ public:
       ss::sharded<cluster::topic_table>&,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
       ss::sharded<features::feature_table>&,
-      ss::sharded<consumer_group_lag_metrics_frontend>&,
-      group_metadata_serializer_factory);
+      ss::sharded<cluster::health_monitor_frontend>& hm_frontend);
 
     ss::future<> start();
     ss::future<> stop();
@@ -170,7 +169,7 @@ public:
 
     /// \brief Handle a OffsetFetch request
     ss::future<offset_fetch_response>
-    offset_fetch(offset_fetch_request&& request);
+    offset_fetch(offset_fetch_request request);
 
     ss::future<offset_delete_response>
     offset_delete(offset_delete_request&& request);
@@ -185,19 +184,39 @@ public:
     using partition_producers = partition_response;
     partition_response describe_partition_producers(const model::ntp&);
 
-    ss::future<std::vector<deletable_group_result>>
-      delete_groups(std::vector<std::pair<model::ntp, group_id>>);
+    ss::future<std::error_code>
+    empty_and_delete_groups(const model::ntp&, const chunked_vector<group_id>&);
+
+    ss::future<chunked_vector<deletable_group_result>>
+      delete_groups(chunked_vector<std::pair<model::ntp, group_id>>);
 
     ss::future<> reload_groups();
 
+    /*
+     * May misbehave if called concurrently for intersecting sets of groups.
+     */
+    ss::future<result<model::offset>> set_blocked_for_groups(
+      const model::ntp& co_ntp,
+      const chunked_vector<kafka::group_id>&,
+      bool to_block);
+
+    using group_offsets_snapshot_result = result<
+      std::vector<cluster::group_offsets_snapshot>,
+      cluster::cloud_metadata::error_outcome>;
     // Returns the groups being managed by the attached partition of the given
     // NTP, returning an error if the partition is not serving groups on this
     // shard (e.g. not leader, still loading groups, etc).
-    ss::future<cluster::cloud_metadata::group_offsets_snapshot_result>
-    snapshot_groups(const model::ntp&, size_t max_num_groups_per_snap = 1000);
+    ss::future<group_offsets_snapshot_result> snapshot_groups_for_upload(
+      const model::ntp&, size_t max_num_groups_per_snap = 1000);
+
+    ss::future<cluster::get_group_offsets_reply>
+      get_group_offsets(cluster::get_group_offsets_request);
 
     ss::future<kafka::error_code>
-      recover_offsets(cluster::cloud_metadata::group_offsets_snapshot);
+      recover_offsets(cluster::group_offsets_snapshot);
+
+    ss::future<cluster::set_group_offsets_reply>
+      set_group_offsets(cluster::set_group_offsets_request);
 
     size_t attached_partitions_count() const { return _partitions.size(); }
 
@@ -206,7 +225,10 @@ public:
 
 public:
     error_code validate_group_status(
-      const model::ntp& ntp, const group_id& group, api_key api);
+      const model::ntp& ntp,
+      const group_id& group,
+      api_key api,
+      bool allow_blocked) const;
 
     static bool valid_group_id(const group_id& group, api_key api);
 
@@ -233,8 +255,9 @@ private:
         ssx::semaphore sem{1, "k/group-mgr"};
         ss::abort_source as;
         ss::lw_shared_ptr<cluster::partition> partition;
-        ss::lw_shared_ptr<ssx::rwlock> catchup_lock;
+        ss::lw_shared_ptr<ss::rwlock> catchup_lock;
         model::term_id term{-1};
+        chunked_hash_set<kafka::group_id> blocked_groups;
 
         explicit attached_partition(ss::lw_shared_ptr<cluster::partition> p);
         ~attached_partition() noexcept;
@@ -267,7 +290,7 @@ private:
       group_recovery_consumer_state);
 
     ss::future<size_t> delete_offsets(
-      group_ptr group, std::vector<model::topic_partition> offsets);
+      group_ptr group, const chunked_vector<model::topic_partition>& offsets);
 
     ss::future<> do_recover_group(
       model::term_id,
@@ -281,8 +304,22 @@ private:
       ss::lw_shared_ptr<cluster::partition> p,
       ss::lowres_clock::time_point timeout);
 
+    // If `group_filter` is provided the function will only succeed if all of
+    // them have been found in the partition.
+    ss::future<
+      result<std::vector<cluster::group_offsets_snapshot>, cluster::errc>>
+    do_snapshot_groups(
+      const model::ntp&,
+      size_t max_num_groups_per_snap,
+      std::optional<chunked_vector<group_id>> group_filter);
+
+    // if `merge` is true existing group offsets is saved with usual offset
+    // commit semantics, otherwise snapshot data for existing groups is ignored
+    ss::future<kafka::error_code>
+    do_bulk_write_offsets(cluster::group_offsets_snapshot, bool merge = false);
+
     ss::lw_shared_ptr<attached_partition>
-    get_attached_partition(model::ntp ntp) {
+    get_attached_partition(const model::ntp& ntp) {
         auto it = _partitions.find(ntp);
         if (it == _partitions.end()) {
             return nullptr;
@@ -309,8 +346,7 @@ private:
     ss::sharded<cluster::topic_table>& _topic_table;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_frontend;
     ss::sharded<features::feature_table>& _feature_table;
-    ss::sharded<consumer_group_lag_metrics_frontend>& _lag_metrics_frontend;
-    group_metadata_serializer_factory _serializer_factory;
+    ss::sharded<cluster::health_monitor_frontend>& _hm_frontend;
     config::configuration& _conf;
     absl::node_hash_map<group_id, group_ptr> _groups;
     absl::node_hash_map<model::ntp, ss::lw_shared_ptr<attached_partition>>

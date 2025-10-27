@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "base/outcome.h"
 #include "base/seastarx.h"
 #include "cluster/controller_backend.h"
@@ -22,8 +23,6 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sharded.hh>
-
-#include <absl/container/node_hash_map.h>
 
 #include <system_error>
 
@@ -39,7 +38,6 @@ public:
       ss::sharded<topic_table>&,
       ss::sharded<shard_table>&,
       ss::sharded<rpc::connection_cache>&,
-      ss::sharded<health_monitor_frontend>&,
       ss::sharded<members_table>&,
       ss::sharded<partition_balancer_backend>&,
       ss::sharded<partition_manager>&,
@@ -90,11 +88,15 @@ public:
     std::optional<ss::shard_id> shard_for(const raft::group_id& group) const;
     std::optional<ss::shard_id> shard_for(const model::ntp& ntp) const;
 
+    // Remakes the partition for the provided raft group.
+    ss::future<std::error_code> remake_partition(raft::group_id g);
+
 private:
     ss::future<std::optional<backend_operation>>
       get_current_op(model::ntp, ss::shard_id);
 
-    ss::future<result<ss::chunked_fifo<model::ntp>>>
+    ss::future<
+      result<chunked_hash_map<model::ntp, reallocation_failure_details>>>
       get_decommission_allocation_failures(model::node_id);
 
     model::node_id _self;
@@ -102,7 +104,6 @@ private:
     ss::sharded<topic_table>& _topics;
     ss::sharded<shard_table>& _shard_table;
     ss::sharded<rpc::connection_cache>& _connections;
-    ss::sharded<health_monitor_frontend>& _health_monitor;
     ss::sharded<members_table>& _members;
     ss::sharded<partition_balancer_backend>& _partition_balancer;
     ss::sharded<partition_manager>& _partition_manager;

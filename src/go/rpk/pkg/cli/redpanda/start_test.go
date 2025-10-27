@@ -18,6 +18,7 @@ import (
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/redpanda"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/iotune"
 	"github.com/spf13/afero"
 	"github.com/spf13/pflag"
@@ -87,6 +88,55 @@ func TestParseNamedAuthNAddress(t *testing.T) {
 	}
 }
 
+func TestCheckTunerConfigCpusetCompatibilityAndUpdateFlags(t *testing.T) {
+	tests := []struct {
+		name       string
+		finalFlags map[string]string
+		cpusets    *tuners.CpusetConfig
+		wantErr    bool
+		wantFlags  map[string]string
+	}{
+		{
+			name:       "conflict with existing cpuset flag",
+			finalFlags: map[string]string{cpuSetFlag: "0-1"},
+			cpusets:    &tuners.CpusetConfig{RedpandaCpuset: "0-2", RedpandaCpusetSize: 3},
+			wantErr:    true,
+		},
+		{
+			name:       "sets cpuset when none present",
+			finalFlags: map[string]string{},
+			cpusets:    &tuners.CpusetConfig{RedpandaCpuset: "0-2", RedpandaCpusetSize: 3},
+			wantErr:    false,
+			wantFlags:  map[string]string{cpuSetFlag: "0-2"},
+		},
+		{
+			name:       "lowers smp when larger than cpuset size",
+			finalFlags: map[string]string{smpFlag: "4"},
+			cpusets:    &tuners.CpusetConfig{RedpandaCpuset: "0-2", RedpandaCpusetSize: 3},
+			wantErr:    false,
+			wantFlags:  map[string]string{cpuSetFlag: "0-2", smpFlag: "3"},
+		},
+		{
+			name:       "smp parse error",
+			finalFlags: map[string]string{smpFlag: "notanint"},
+			cpusets:    &tuners.CpusetConfig{RedpandaCpuset: "0-2", RedpandaCpusetSize: 3},
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkTunerConfigCpusetCompatibilityAndUpdateFlags(tt.finalFlags, tt.cpusets)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantFlags, tt.finalFlags)
+		})
+	}
+}
+
 func TestParseSeeds(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -121,12 +171,12 @@ func TestParseSeeds(t *testing.T) {
 		{
 			name:           "it should fail for empty addresses",
 			arg:            []string{""},
-			expectedErrMsg: "Couldn't parse seed '': empty address",
+			expectedErrMsg: "unable to parse seed '': empty address",
 		},
 		{
 			name:           "it should fail if the host is empty",
 			arg:            []string{" :1234"},
-			expectedErrMsg: "Couldn't parse seed ' :1234': invalid host \" :1234\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+			expectedErrMsg: "unable to parse seed ' :1234': invalid host \" :1234\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 		},
 	}
 
@@ -760,13 +810,13 @@ func TestStartCommand(t *testing.T) {
 		args: []string{
 			"-s", "goodhost.com:54897,:33145",
 		},
-		expectedErrMsg: "Couldn't parse seed ':33145': invalid host \":33145\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+		expectedErrMsg: "unable to parse seed ':33145': invalid host \":33145\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 	}, {
 		name: "it should fail if the port isnt an int",
 		args: []string{
 			"-s", "host:port",
 		},
-		expectedErrMsg: "Couldn't parse seed 'host:port': invalid host \"host:port\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+		expectedErrMsg: "unable to parse seed 'host:port': invalid host \"host:port\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 	}, {
 		name: "it should parse the --rpc-addr and persist it",
 		args: []string{
@@ -1748,11 +1798,12 @@ func Test_buildRedpandaFlags(t *testing.T) {
 						ReadBandwidth:  3,
 						WriteIops:      4,
 						WriteBandwidth: 5,
+						Duplex:         true,
 					}, nil
 				},
 			},
 			exp: map[string]string{
-				"io-properties": `{"disks":[{"mountpoint":"/mnt/","read_iops":2,"read_bandwidth":3,"write_iops":4,"write_bandwidth":5}]}`,
+				"io-properties": `{"disks":[{"mountpoint":"/mnt/","read_iops":2,"read_bandwidth":3,"write_iops":4,"write_bandwidth":5,"duplex":true}]}`,
 				// These 2 are false because of the empty config
 				"overprovisioned": "false",
 				"lock-memory":     "false",
@@ -1786,7 +1837,7 @@ func Test_buildRedpandaFlags(t *testing.T) {
 			// We can safely pass 'skipCheck:true' to buildRedpandaFlags since
 			// this is only used for the ioResolver function, and we are mocking
 			// it.
-			rpArgs, err := buildRedpandaFlags(fs, tt.args.y, tt.args.args, tt.args.sFlags, cmdFlag, true, ioResolver)
+			rpArgs, err := buildRedpandaFlags(fs, tt.args.y, tt.args.args, tt.args.sFlags, cmdFlag, true, ioResolver, "")
 			if tt.expErr {
 				require.Error(t, err)
 				return
@@ -1797,37 +1848,6 @@ func Test_buildRedpandaFlags(t *testing.T) {
 			// field of the struct is the config file location which we are
 			// writing in a MemMap FS in the test
 			require.Equal(t, tt.exp, rpArgs.SeastarFlags)
-		})
-	}
-}
-
-func Test_ParseFlags(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		in   []string
-		exp  map[string]string
-	}{
-		{
-			name: "empty flags",
-			in:   []string{"", "-", "--"},
-			exp:  map[string]string{},
-		}, {
-			name: "bool flags - no value",
-			in:   []string{"--overprovisioned", "-true"},
-			exp:  map[string]string{"overprovisioned": "", "true": ""},
-		}, {
-			name: "flags with value",
-			in:   []string{"--smp=2", "--memory=4G", "--default-log-level=info"},
-			exp:  map[string]string{"smp": "2", "memory": "4G", "default-log-level": "info"},
-		}, {
-			name: "flags with value and quotes",
-			in:   []string{`--logger-log-level="rpc=debug"`},
-			exp:  map[string]string{"logger-log-level": "rpc=debug"},
-		},
-	} {
-		t.Run(tt.name, func(st *testing.T) {
-			got := parseFlags(tt.in)
-			require.Equal(st, tt.exp, got)
 		})
 	}
 }

@@ -48,6 +48,11 @@ public:
 
     const topics_state& state() const { return state_; }
 
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
+
 protected:
     ss::future<> stop() override;
 
@@ -55,7 +60,7 @@ protected:
 
     ss::future<> do_apply(const model::record_batch&) override;
 
-    model::offset max_collectible_offset() override;
+    model::offset max_removable_local_log_offset() override;
 
     ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&& bytes) override;
@@ -65,7 +70,7 @@ protected:
 
     ss::future<> apply_raft_snapshot(const iobuf&) final;
 
-    ss::future<iobuf> take_snapshot() final;
+    ss::future<iobuf> take_raft_snapshot() final;
 
 private:
     void rearm_snapshot_timer();
@@ -81,6 +86,9 @@ class stm_factory : public cluster::state_machine_factory {
 public:
     stm_factory() = default;
     bool is_applicable_for(const storage::ntp_config&) const final;
-    void create(raft::state_machine_manager_builder&, raft::consensus*) final;
+    void create(
+      raft::state_machine_manager_builder&,
+      raft::consensus*,
+      const cluster::stm_instance_config&) final;
 };
 } // namespace datalake::coordinator

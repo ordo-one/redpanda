@@ -10,10 +10,11 @@
 
 #include "kafka/server/handlers/create_partitions.h"
 
+#include "absl/container/node_hash_map.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/create_partitions_request.h"
 #include "kafka/protocol/schemata/create_partitions_response.h"
@@ -26,8 +27,6 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sstring.hh>
-
-#include <absl/container/node_hash_map.h>
 
 #include <algorithm>
 #include <chrono>
@@ -160,11 +159,12 @@ ss::future<response_ptr> create_partitions_handler::handle(
 
     if (ctx.recovery_mode_enabled()) {
         for (const auto& t : request.data.topics) {
-            resp.data.results.push_back(create_partitions_topic_result{
-              .name = t.name,
-              .error_code = error_code::policy_violation,
-              .error_message = "Forbidden in recovery mode",
-            });
+            resp.data.results.push_back(
+              create_partitions_topic_result{
+                .name = t.name,
+                .error_code = error_code::policy_violation,
+                .error_message = "Forbidden in recovery mode",
+              });
         }
 
         co_return co_await ctx.respond(std::move(resp));
@@ -219,8 +219,9 @@ ss::future<response_ptr> create_partitions_handler::handle(
       "Partition count must be greater then current number of partitions",
       [&ctx](const create_partitions_topic& tp) {
           return tp.count > ctx.metadata_cache()
-                              .get_topic_cfg(model::topic_namespace_view(
-                                model::kafka_namespace, tp.name))
+                              .get_topic_cfg(
+                                model::topic_namespace_view(
+                                  model::kafka_namespace, tp.name))
                               ->partition_count;
       });
 
@@ -262,19 +263,15 @@ ss::future<response_ptr> create_partitions_handler::handle(
             });
       });
 
-    if (request.data.validate_only) {
-        std::transform(
-          request.data.topics.begin(),
-          valid_range_end,
-          std::back_inserter(resp.data.results),
-          [](const create_partitions_topic& tp) {
-              return create_partitions_topic_result{
-                .name = tp.name,
-                .error_code = error_code::none,
-              };
-          });
-        co_return co_await ctx.respond(std::move(resp));
-    }
+    valid_range_end = validate_range(
+      request.data.topics.begin(),
+      valid_range_end,
+      std::back_inserter(resp.data.results),
+      error_code::policy_violation,
+      "Topic belongs to an active cluster link",
+      [&ctx](const create_partitions_topic& tp) {
+          return ctx.is_topic_mutable(tp.name);
+      });
 
     const auto now = quota_manager::clock::now();
     valid_range_end = co_await validate_range_async(
@@ -301,6 +298,20 @@ ss::future<response_ptr> create_partitions_handler::handle(
                 return delay == 0ms;
             });
       });
+
+    if (request.data.validate_only) {
+        std::transform(
+          request.data.topics.begin(),
+          valid_range_end,
+          std::back_inserter(resp.data.results),
+          [](const create_partitions_topic& tp) {
+              return create_partitions_topic_result{
+                .name = tp.name,
+                .error_code = error_code::none,
+              };
+          });
+        co_return co_await ctx.respond(std::move(resp));
+    }
 
     auto results = co_await do_create_partitions(
       ctx,

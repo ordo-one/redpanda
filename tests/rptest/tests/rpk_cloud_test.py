@@ -9,11 +9,10 @@
 
 import os
 
-from rptest.services.cluster import cluster
-
-from rptest.utils.rpk_config import read_rpk_cfg
-from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk_remote import RpkRemoteTool
+from rptest.services.cluster import cluster
+from rptest.tests.redpanda_test import RedpandaTest
+from rptest.utils.rpk_config import read_rpk_cfg
 
 
 def get_ci_env_var(env_var):
@@ -22,7 +21,8 @@ def get_ci_env_var(env_var):
         is_ci = os.environ.get("CI", "false")
         if is_ci == "true":
             raise RuntimeError(
-                f"Expected {env_var} variable to be set in this environment")
+                f"Expected {env_var} variable to be set in this environment"
+            )
 
     return out
 
@@ -42,8 +42,7 @@ class RpkCloudTest(RedpandaTest):
         id = get_ci_env_var("RPK_TEST_CLIENT_ID")
         secret = get_ci_env_var("RPK_TEST_CLIENT_SECRET")
         if id is None or secret is None:
-            self.logger.warn(
-                "Skipping test, client credentials env vars not found")
+            self.logger.warn("Skipping test, client credentials env vars not found")
             return
 
         node = self.redpanda.get_node(0)

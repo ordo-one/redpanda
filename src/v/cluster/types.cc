@@ -9,17 +9,13 @@
 
 #include "cluster/types.h"
 
-#include "cluster/fwd.h"
-#include "cluster/remote_topic_properties.h"
 #include "cluster/topic_properties.h"
-#include "config/configuration.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "reflection/adl.h"
 #include "security/acl.h"
-#include "utils/to_string.h"
 #include "utils/tristate.h"
 
 #include <seastar/core/chunked_fifo.hh>
@@ -30,9 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
-#include <type_traits>
 
 namespace cluster {
 
@@ -408,7 +402,8 @@ std::ostream& operator<<(std::ostream& o, const incremental_topic_updates& i) {
       "iceberg_partition_spec: {}, "
       "iceberg_invalid_record_action: {}, "
       "iceberg_target_lag_ms: {}, "
-      "remote_allow_gaps: {}",
+      "remote_allow_gaps: {}, "
+      "topic_id: {}}}",
       i.compression,
       i.cleanup_policy_bitflags,
       i.compaction_strategy,
@@ -443,7 +438,8 @@ std::ostream& operator<<(std::ostream& o, const incremental_topic_updates& i) {
       i.iceberg_partition_spec,
       i.iceberg_invalid_record_action,
       i.iceberg_target_lag_ms,
-      i.remote_allow_gaps);
+      i.remote_allow_gaps,
+      i.topic_id);
     return o;
 }
 
@@ -526,6 +522,17 @@ model::revision_id topic_metadata::get_revision() const {
 std::optional<model::initial_revision_id>
 topic_metadata::get_remote_revision() const {
     return _fields.remote_revision;
+}
+
+std::optional<ss::sstring> topic_metadata::get_remote_location_hint() const {
+    const auto& remote_label = get_configuration().properties.remote_label;
+    if (!remote_label) {
+        return std::nullopt;
+    }
+
+    model::initial_revision_id remote_rev = get_remote_revision().value_or(
+      model::initial_revision_id{get_revision()});
+    return fmt::format("{}/{}", remote_label->cluster_uuid, remote_rev);
 }
 
 const topic_configuration& topic_metadata::get_configuration() const {
@@ -877,6 +884,19 @@ bulk_force_reconfiguration_cmd_data::bulk_force_reconfiguration_cmd_data(
     user_approved_force_recovery_partitions
       = other.user_approved_force_recovery_partitions.copy();
 }
+
+std::ostream&
+operator<<(std::ostream& o, const cluster::feature_update_cmd_data& r) {
+    fmt::print(
+      o, "{{logical_version: {}, actions: {}}}", r.logical_version, r.actions);
+    return o;
+}
+
+fmt::iterator error_info::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "{{err: {}, message: {}}}", this->err, this->message);
+}
+
 } // namespace cluster
 
 namespace reflection {

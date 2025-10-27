@@ -16,6 +16,8 @@
 #include "iceberg/table_update.h"
 #include "model/timestamp.h"
 
+#include <seastar/core/coroutine.hh>
+
 namespace iceberg {
 
 namespace {
@@ -309,10 +311,11 @@ ss::future<action::action_outcome> remove_snapshots_action::build_updates() && {
           table_update::remove_snapshot_ref{.ref_name = std::move(r)});
     }
 
-    ret.requirements.emplace_back(table_requirement::assert_ref_snapshot_id{
-      .ref = "main",
-      .snapshot_id = table_.current_snapshot_id,
-    });
+    ret.requirements.emplace_back(
+      table_requirement::assert_ref_snapshot_id{
+        .ref = "main",
+        .snapshot_id = table_.current_snapshot_id,
+      });
     co_return ret;
 }
 

@@ -14,6 +14,9 @@ package tuners
 import (
 	"fmt"
 
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/ethtool"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/executors/commands"
@@ -21,10 +24,24 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/network"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
+
+type CpusetConfig struct {
+	IrqMode            irq.Mode `yaml:"irq_mode,omitempty" json:"irq_mode"`
+	RedpandaCpuset     string   `yaml:"redpanda_cpuset,omitempty" json:"redpanda_cpuset"`
+	RedpandaCpusetSize int      `yaml:"redpanda_cpuset_size,omitempty" json:"redpanda_cpuset_size"`
+	IrqCpuset          string   `yaml:"interrupts_cpuset,omitempty" json:"interrupts_cpuset"`
+	IrqCpusetSize      int      `yaml:"interrupts_cpuset_size,omitempty" json:"interrupts_cpuset_size"`
+}
+
+type NodeTunerState struct {
+	Cpusets *CpusetConfig `yaml:"cpusets,omitempty" json:"cpusets"`
+}
 
 func NewNetTuner(
 	mode irq.Mode,
+	rnc config.RpkNodeConfig,
 	cpuMask string,
 	interfaces []string,
 	fs afero.Fs,
@@ -34,15 +51,22 @@ func NewNetTuner(
 	irqProcFile irq.ProcFile,
 	ethtool ethtool.EthtoolWrapper,
 	executor executors.Executor,
+	proc os.Proc,
+	statePath string,
 ) Tunable {
 	factory := NewNetTunersFactory(
-		fs, irqProcFile, irqDeviceInfo, ethtool, irqBalanceService, cpuMasks, executor)
+		fs, rnc, irqProcFile, irqDeviceInfo, ethtool, irqBalanceService, cpuMasks, executor, proc, statePath)
 	return NewAggregatedTunable(
 		[]Tunable{
+			factory.NewAllNicsSameModeTuner(interfaces, mode, cpuMask),
+			// RX/TX queue count tuner should always be first in order as others will re-read queue counts
+			factory.NewRxTxQueueCountTuner(interfaces, mode, cpuMask),
 			factory.NewNICsBalanceServiceTuner(interfaces),
 			factory.NewNICsIRQsAffinityTuner(interfaces, mode, cpuMask),
+			// Write out net tuner interrupt config once we have successfully tuned IRQ config
+			factory.NewInterruptConfigFileTuner(interfaces, mode, cpuMask),
 			factory.NewNICsRpsTuner(interfaces, mode, cpuMask),
-			factory.NewNICsRfsTuner(interfaces),
+			factory.NewNICsRfsTuner(interfaces, mode, cpuMask),
 			factory.NewNICsNTupleTuner(interfaces),
 			factory.NewNICsXpsTuner(interfaces),
 			factory.NewRfsTableSizeTuner(),
@@ -52,10 +76,13 @@ func NewNetTuner(
 }
 
 type NetTunersFactory interface {
+	NewAllNicsSameModeTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
+	NewRxTxQueueCountTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
 	NewNICsBalanceServiceTuner(interfaces []string) Tunable
 	NewNICsIRQsAffinityTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
+	NewInterruptConfigFileTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
 	NewNICsRpsTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
-	NewNICsRfsTuner(interfaces []string) Tunable
+	NewNICsRfsTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable
 	NewNICsNTupleTuner(interfaces []string) Tunable
 	NewNICsXpsTuner(interfaces []string) Tunable
 	NewRfsTableSizeTuner() Tunable
@@ -65,6 +92,7 @@ type NetTunersFactory interface {
 
 type netTunersFactory struct {
 	fs              afero.Fs
+	rnc             config.RpkNodeConfig
 	irqProcFile     irq.ProcFile
 	irqDeviceInfo   irq.DeviceInfo
 	ethtool         ethtool.EthtoolWrapper
@@ -72,35 +100,133 @@ type netTunersFactory struct {
 	cpuMasks        irq.CPUMasks
 	checkersFactory NetCheckersFactory
 	executor        executors.Executor
+	proc            os.Proc
+	statePath       string
 }
 
 func NewNetTunersFactory(
 	fs afero.Fs,
+	rnc config.RpkNodeConfig,
 	irqProcFile irq.ProcFile,
 	irqDeviceInfo irq.DeviceInfo,
 	ethtool ethtool.EthtoolWrapper,
 	balanceService irq.BalanceService,
 	cpuMasks irq.CPUMasks,
 	executor executors.Executor,
+	proc os.Proc,
+	statePath string,
 ) NetTunersFactory {
 	return &netTunersFactory{
 		fs:             fs,
+		rnc:            rnc,
 		irqProcFile:    irqProcFile,
 		irqDeviceInfo:  irqDeviceInfo,
 		ethtool:        ethtool,
 		balanceService: balanceService,
 		cpuMasks:       cpuMasks,
 		executor:       executor,
+		proc:           proc,
+		statePath:      statePath,
 		checkersFactory: NewNetCheckersFactory(
-			fs, irqProcFile, irqDeviceInfo, ethtool, balanceService, cpuMasks),
+			fs, rnc, irqProcFile, irqDeviceInfo, ethtool, balanceService, cpuMasks),
 	}
+}
+
+type NicsEqualTunable struct {
+	f          *netTunersFactory
+	interfaces []string
+	mode       irq.Mode
+	cpuMask    string
+}
+
+func (*NicsEqualTunable) CheckIfSupported() (bool, string) {
+	return true, ""
+}
+
+func (net *NicsEqualTunable) Tune() TuneResult {
+	var currentEffectiveConfig *network.EffectiveNicConfig
+
+	for _, iface := range net.interfaces {
+		nic := network.NewNic(net.f.fs, net.f.irqProcFile, net.f.irqDeviceInfo, net.f.ethtool, iface)
+		if !nic.IsHwInterface() && !nic.IsBondIface() {
+			zap.L().Sugar().Debugf("Skipping tuning of '%s' virtual interface", nic.Name())
+			continue
+		}
+
+		effectiveConfig, err := network.GetEffectiveNicConfig(nic, net.mode, net.cpuMask, net.f.cpuMasks, net.f.rnc)
+		if err != nil {
+			return NewTuneError(err)
+		}
+
+		zap.L().Sugar().Debugf("interface %s: effective config: %v", nic.Name(), effectiveConfig)
+		if currentEffectiveConfig == nil {
+			currentEffectiveConfig = &effectiveConfig
+		} else {
+			if *currentEffectiveConfig != effectiveConfig {
+				return NewTuneError(fmt.Errorf("interfaces %s has different effective configuration than the rest: %v vs %v",
+					nic.Name(), *currentEffectiveConfig, effectiveConfig))
+			}
+		}
+	}
+	return NewTuneResult(false)
+}
+
+// This is a meta tuner that checks that all given NICs use the same mode and IRQ masks.
+// It's really only needed like this because of the way the different subtuners are implemented.
+// Once we rewrite everything to be a single function this can just be at the top and won't be a separate "tuner".
+func (f *netTunersFactory) NewAllNicsSameModeTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable {
+	tuneable := NicsEqualTunable{f: f, interfaces: interfaces, mode: mode, cpuMask: cpuMask}
+	return &tuneable
+}
+
+func (f *netTunersFactory) NewRxTxQueueCountTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable {
+	return f.tuneNonVirtualInterfaces(
+		interfaces,
+		func(nic network.Nic) Checker {
+			return f.checkersFactory.NewNicRxTxQueueCountChecker(nic, mode, cpuMask)
+		},
+		func(nic network.Nic) TuneResult {
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' queue counts", nic.Name()))
+			if !f.rnc.Tuners.GetAllowRxTxQueueTuner() {
+				zap.L().Sugar().Debugf("Skipping RX/TX Queue Tuner as it's disabled by configuration")
+				return NewTuneResult(false)
+			}
+
+			supportsIrqLowering, err := nic.SupportsRxTxQueueLowering()
+			if err != nil {
+				return NewTuneError(err)
+			}
+			if !supportsIrqLowering {
+				zap.L().Sugar().Debugf("Skipping RX/TX Queue Tuner as using an unknown driver")
+				return NewTuneResult(false)
+			}
+
+			_, targetChannels, err := network.GetCurrentAndTargetChannels(nic, mode, cpuMask, f.cpuMasks, f.rnc, f.ethtool)
+			if err != nil {
+				return NewTuneError(err)
+			}
+
+			_, err = f.ethtool.SetChannels(nic.Name(), targetChannels)
+			if err != nil {
+				return NewTuneError(err)
+			}
+
+			return NewTuneResult(false)
+		},
+		func() (bool, string) {
+			if !f.cpuMasks.IsSupported() {
+				return false, "Tuner is not supported as 'hwloc' is not installed"
+			}
+			return true, ""
+		},
+	)
 }
 
 func (f *netTunersFactory) NewNICsBalanceServiceTuner(
 	interfaces []string,
 ) Tunable {
 	return NewCheckedTunable(
-		f.checkersFactory.NewNicIRQAffinityStaticChecker(interfaces),
+		f.checkersFactory.NewNicIRQBalanceChecker(interfaces),
 		func() TuneResult {
 			var IRQs []int
 			for _, ifaceName := range interfaces {
@@ -134,8 +260,8 @@ func (f *netTunersFactory) NewNICsIRQsAffinityTuner(
 			return f.checkersFactory.NewNicIRQAffinityChecker(nic, mode, cpuMask)
 		},
 		func(nic network.Nic) TuneResult {
-			zap.L().Sugar().Debugf("Tuning '%s' IRQs affinity", nic.Name())
-			dist, err := network.GetHwInterfaceIRQsDistribution(nic, mode, cpuMask, f.cpuMasks)
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' IRQs affinity", nic.Name()))
+			dist, err := network.GetHwInterfaceIRQsDistribution(nic, mode, cpuMask, f.cpuMasks, f.rnc)
 			if err != nil {
 				return NewTuneError(err)
 			}
@@ -151,6 +277,173 @@ func (f *netTunersFactory) NewNICsIRQsAffinityTuner(
 	)
 }
 
+func (f *netTunersFactory) getNetTunerConfig(nic network.Nic, mode irq.Mode, cpuMask string) (NodeTunerState, error) {
+	networkConfig, err := network.GetEffectiveNicConfig(nic, mode, cpuMask, f.cpuMasks, f.rnc)
+	if err != nil {
+		return NodeTunerState{}, err
+	}
+
+	// All the below transformations we could also do in rpk:start but we just
+	// do them here to avoid having to invoke hwloc again then.
+
+	redpandaCpusetListForm, err := f.cpuMasks.MaskToListFormat(networkConfig.ComputationsCPUMask)
+	if err != nil {
+		return NodeTunerState{}, err
+	}
+	redpandaSize, err := f.cpuMasks.GetNumberOfPUs(networkConfig.ComputationsCPUMask)
+	if err != nil {
+		return NodeTunerState{}, err
+	}
+	irqCpusetListForm, err := f.cpuMasks.MaskToListFormat(networkConfig.IRQCPUMask)
+	if err != nil {
+		return NodeTunerState{}, err
+	}
+	irqSize, err := f.cpuMasks.GetNumberOfPUs(networkConfig.IRQCPUMask)
+	if err != nil {
+		return NodeTunerState{}, err
+	}
+
+	config := NodeTunerState{
+		Cpusets: &CpusetConfig{
+			IrqMode:            networkConfig.Mode,
+			RedpandaCpuset:     redpandaCpusetListForm,
+			RedpandaCpusetSize: int(redpandaSize),
+			IrqCpuset:          irqCpusetListForm,
+			IrqCpusetSize:      int(irqSize),
+		},
+	}
+	return config, nil
+}
+
+func maybeReadFile(fs afero.Fs, path string) ([]byte, error) {
+	exists, err := afero.Exists(fs, path)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	content, err := afero.ReadFile(fs, path)
+	if err != nil {
+		return nil, err
+	}
+	return content, nil
+}
+
+func (f *netTunersFactory) NewInterruptConfigFileTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable {
+	// In the AllNicsSameMode we have already checked that the mode and
+	// config for all NICs is the same so we can just use the first non-virtual one.
+	var nic network.Nic
+	for _, iface := range interfaces {
+		maybeNic := network.NewNic(f.fs, f.irqProcFile, f.irqDeviceInfo, f.ethtool, iface)
+		if maybeNic.IsHwInterface() || maybeNic.IsBondIface() {
+			nic = maybeNic
+			break
+		}
+	}
+
+	if nic == nil {
+		// No interfaces, nothing to do
+		return NewAggregatedTunable([]Tunable{})
+	}
+
+	tunable := checkedTunable{}
+	tunable.tuneAction = func() TuneResult {
+		zap.L().Sugar().Debugf(out.WithLogBanner("Creating tuner config file"))
+
+		config, err := f.getNetTunerConfig(nic, mode, cpuMask)
+		if err != nil {
+			return NewTuneError(err)
+		}
+
+		statePath := network.DefaultNodeTunerStateFile
+		if f.statePath != "" {
+			statePath = f.statePath
+		}
+
+		if config.Cpusets.IrqMode == irq.Mq {
+			// Only do in dedicated mode to keep legacy behaviour otherwise. Remove the file if it exists.
+			zap.L().Sugar().Debugf("Not writing net tuner config as irq mode is %s", config.Cpusets.IrqMode)
+
+			exists, err := afero.Exists(f.fs, statePath)
+			if err != nil {
+				return NewTuneError(err)
+			}
+			if exists {
+				// Empty file to avoid rpk:start from using it
+				err = f.executor.Execute(
+					commands.NewWriteFileCmd(f.fs, statePath, ""))
+				if err != nil {
+					return NewTuneError(fmt.Errorf("failed to empty existing net tuner config file %s: %w", statePath, err))
+				}
+			}
+
+			return NewTuneResult(false)
+		}
+
+		marshalled, err := yaml.Marshal(&config)
+		if err != nil {
+			return NewTuneError(err)
+		}
+
+		err = f.executor.Execute(
+			commands.NewWriteFileCmd(f.fs, statePath, string(marshalled)))
+		if err != nil {
+			return NewTuneError(fmt.Errorf("failed to write to net tuner config file %s: %w", statePath, err))
+		}
+
+		return NewTuneResult(false)
+	}
+	tunable.checker = NewEqualityChecker(
+		NetTunerConfigFileChecker,
+		"Net tuner config file correct",
+		Warning,
+		true,
+		func() (interface{}, error) {
+			targetConfig, err := f.getNetTunerConfig(nic, mode, cpuMask)
+			if err != nil {
+				return false, err
+			}
+
+			statePath := network.DefaultNodeTunerStateFile
+			if f.statePath != "" {
+				statePath = f.statePath
+			}
+
+			data, err := maybeReadFile(f.fs, statePath)
+			if err != nil {
+				return false, err
+			}
+
+			if targetConfig.Cpusets.IrqMode == irq.Mq {
+				// If in MQ mode we still need to run the tuner such that it empties the file if it exists and is not empty
+				return len(data) == 0, nil
+			}
+
+			if len(data) == 0 {
+				return false, nil
+			}
+
+			currentConfig := NodeTunerState{}
+			err = yaml.Unmarshal(data, &currentConfig)
+			if err != nil {
+				return false, err
+			}
+
+			if currentConfig.Cpusets == nil || *currentConfig.Cpusets != *targetConfig.Cpusets {
+				zap.L().Sugar().Debugf("Current config %+v is different than target %+v", currentConfig, targetConfig)
+				return false, nil
+			}
+
+			return true, nil
+		},
+	)
+	tunable.supportedAction = func() (bool, string) { return true, "" }
+	tunable.disablePostTuneCheck = f.executor.IsLazy()
+
+	return &tunable
+}
+
 func (f *netTunersFactory) NewNICsRpsTuner(
 	interfaces []string, mode irq.Mode, cpuMask string,
 ) Tunable {
@@ -160,12 +453,12 @@ func (f *netTunersFactory) NewNICsRpsTuner(
 			return f.checkersFactory.NewNicRpsSetChecker(nic, mode, cpuMask)
 		},
 		func(nic network.Nic) TuneResult {
-			zap.L().Sugar().Debugf("Tuning '%s' RPS", nic.Name())
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' RPS", nic.Name()))
 			rpsCPUs, err := nic.GetRpsCPUFiles()
 			if err != nil {
 				return NewTuneError(err)
 			}
-			rpsMask, err := network.GetRpsCPUMask(nic, mode, cpuMask, f.cpuMasks)
+			rpsMask, err := network.GetRpsCPUMask(nic, mode, cpuMask, f.cpuMasks, f.rnc)
 			if err != nil {
 				return NewTuneError(err)
 			}
@@ -186,19 +479,22 @@ func (f *netTunersFactory) NewNICsRpsTuner(
 	)
 }
 
-func (f *netTunersFactory) NewNICsRfsTuner(interfaces []string) Tunable {
+func (f *netTunersFactory) NewNICsRfsTuner(interfaces []string, mode irq.Mode, cpuMask string) Tunable {
 	return f.tuneNonVirtualInterfaces(
 		interfaces,
 		func(nic network.Nic) Checker {
-			return f.checkersFactory.NewNicRfsChecker(nic)
+			return f.checkersFactory.NewNicRfsChecker(nic, mode, cpuMask)
 		},
 		func(nic network.Nic) TuneResult {
-			zap.L().Sugar().Debugf("Tuning '%s' RFS", nic.Name())
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' RFS", nic.Name()))
 			limits, err := nic.GetRpsLimitFiles()
 			if err != nil {
 				return NewTuneError(err)
 			}
-			queueLimit := network.OneRPSQueueLimit(limits)
+			queueLimit, err := network.OneRPSQueueLimit(limits, nic, mode, cpuMask, f.cpuMasks, f.rnc)
+			if err != nil {
+				return NewTuneError(err)
+			}
 			for _, limitFile := range limits {
 				err := f.writeIntToFile(limitFile, queueLimit)
 				if err != nil {
@@ -208,6 +504,9 @@ func (f *netTunersFactory) NewNICsRfsTuner(interfaces []string) Tunable {
 			return NewTuneResult(false)
 		},
 		func() (bool, string) {
+			if !f.cpuMasks.IsSupported() {
+				return false, "Tuner is not supported as 'hwloc' is not installed"
+			}
 			return true, ""
 		},
 	)
@@ -220,7 +519,7 @@ func (f *netTunersFactory) NewNICsNTupleTuner(interfaces []string) Tunable {
 			return f.checkersFactory.NewNicNTupleChecker(nic)
 		},
 		func(nic network.Nic) TuneResult {
-			zap.L().Sugar().Debugf("Tuning '%s' NTuple", nic.Name())
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' NTuple", nic.Name()))
 			ntupleFeature := map[string]bool{"ntuple": true}
 			err := f.executor.Execute(
 				commands.NewEthtoolChangeCmd(f.ethtool, nic.Name(), ntupleFeature))
@@ -242,7 +541,7 @@ func (f *netTunersFactory) NewNICsXpsTuner(interfaces []string) Tunable {
 			return f.checkersFactory.NewNicXpsChecker(nic)
 		},
 		func(nic network.Nic) TuneResult {
-			zap.L().Sugar().Debugf("Tuning '%s' XPS", nic.Name())
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning '%s' XPS", nic.Name()))
 			xpsCPUFiles, err := nic.GetXpsCPUFiles()
 			if err != nil {
 				return NewTuneError(err)
@@ -269,7 +568,7 @@ func (f *netTunersFactory) NewRfsTableSizeTuner() Tunable {
 	return NewCheckedTunable(
 		f.checkersFactory.NewRfsTableSizeChecker(),
 		func() TuneResult {
-			zap.L().Sugar().Debug("Tuning RFS table size")
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning RFS table size"))
 			err := f.executor.Execute(
 				commands.NewSysctlSetCmd(
 					network.RfsTableSizeProperty, fmt.Sprint(network.RfsTableSize)))
@@ -289,7 +588,7 @@ func (f *netTunersFactory) NewListenBacklogTuner() Tunable {
 	return NewCheckedTunable(
 		f.checkersFactory.NewListenBacklogChecker(),
 		func() TuneResult {
-			zap.L().Sugar().Debug("Tuning connections listen backlog size")
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning connections listen backlog size"))
 			err := f.writeIntToFile(network.ListenBacklogFile, network.ListenBacklogSize)
 			if err != nil {
 				return NewTuneError(err)
@@ -307,7 +606,7 @@ func (f *netTunersFactory) NewSynBacklogTuner() Tunable {
 	return NewCheckedTunable(
 		f.checkersFactory.NewSynBacklogChecker(),
 		func() TuneResult {
-			zap.L().Sugar().Debug("Tuning SYN backlog size")
+			zap.L().Sugar().Debugf(out.WithLogBanner("Tuning SYN backlog size"))
 			err := f.writeIntToFile(network.SynBacklogFile, network.SynBacklogSize)
 			if err != nil {
 				return NewTuneError(err)
@@ -354,18 +653,25 @@ func (f *netTunersFactory) tuneNonVirtualInterfaces(
 func tuneInterface(
 	nic network.Nic, tuneAction func(network.Nic) TuneResult,
 ) TuneResult {
-	if nic.IsHwInterface() {
-		return tuneAction(nic)
-	}
-
+	// Need to check bond interface first as some HW interfaces might also be bonds
 	if nic.IsBondIface() {
 		slaves, err := nic.Slaves()
 		if err != nil {
 			return NewTuneError(err)
 		}
+		var res TuneResult
 		for _, slave := range slaves {
-			return tuneInterface(slave, tuneAction)
+			res = tuneInterface(slave, tuneAction)
+			if res.IsFailed() {
+				return res
+			}
 		}
+		// return the last
+		return res
+	}
+
+	if nic.IsHwInterface() {
+		return tuneAction(nic)
 	}
 
 	return NewTuneResult(false)

@@ -11,13 +11,12 @@ GOCMD=go
 GOLANGCILINTCMD=golangci-lint
 GOFUMPTCMD=gofumpt
 
+BAZEL_GAZELLE_CMD := run //:gazelle
 ifeq ($(shell uname),Darwin)
     BAZELCMD := bazelisk
-    BAZEL_GAZELLE_CMD := run --config system-clang //:gazelle
     GOFUMPT_OS_CMD := $(shell find . -type f -name '*.go' -print0 | xargs -0 -n 1 $(GOFUMPTCMD) -w)
 else
 	BAZELCMD := bazel
-    BAZEL_GAZELLE_CMD := run //:gazelle
     GOFUMPT_OS_CMD := 	$(shell find -type f -name '*.go' | xargs -n1 $(GOFUMPTCMD) -w)
 endif
 
@@ -65,7 +64,7 @@ run_gofumpt:
 	$(GOFUMPT_OS_CMD)
 
 install_golangci_lint:
-	@which $(GOLANGCILINTCMD) || (if [ $$? -eq 1 ]; then  echo "golangci-lint not found, installing..."; curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.62.0; fi)
+	@which $(GOLANGCILINTCMD) || (if [ $$? -eq 1 ]; then  echo "golangci-lint not found, installing..."; curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.64.8; fi)
 
 run_linter:
 	$(GOLANGCILINTCMD) run

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "cloud_storage/fwd.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
@@ -29,8 +30,6 @@
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/flat_hash_map.h>
 
 #include <chrono>
 #include <system_error>
@@ -74,7 +73,8 @@ public:
       metadata_cache&,
       config::binding<unsigned> hard_max_disk_usage_ratio,
       config::binding<int16_t> minimum_topic_replication,
-      config::binding<bool> partition_autobalancing_topic_aware);
+      config::binding<bool> partition_autobalancing_topic_aware,
+      config::binding<std::optional<uint32_t>> max_user_topics);
 
     ss::future<std::vector<topic_result>> create_topics(
       custom_assignable_topic_configuration_vector,
@@ -119,12 +119,12 @@ public:
      * Given a list of defunct nodes, generates a list of ntps that lost
      * majority due to unavailability of the nodes.
      */
-    ss::future<result<fragmented_vector<ntp_with_majority_loss>>>
+    ss::future<result<chunked_vector<ntp_with_majority_loss>>>
     partitions_with_lost_majority(std::vector<model::node_id> dead_nodes);
 
     ss::future<std::error_code> force_recover_partitions_from_nodes(
       std::vector<model::node_id> nodes,
-      fragmented_vector<ntp_with_majority_loss>
+      chunked_vector<ntp_with_majority_loss>
         user_approved_force_recovery_partitions,
       model::timeout_clock::time_point timeout);
 
@@ -169,7 +169,7 @@ public:
       model::timeout_clock::time_point,
       std::optional<model::term_id> = std::nullopt);
 
-    ss::future<std::vector<topic_result>> update_topic_properties(
+    ss::future<chunked_vector<topic_result>> update_topic_properties(
       topic_properties_update_vector, model::timeout_clock::time_point);
 
     ss::future<std::vector<topic_result>> create_partitions(
@@ -323,6 +323,7 @@ private:
     config::binding<unsigned> _hard_max_disk_usage_ratio;
     config::binding<int16_t> _minimum_topic_replication;
     config::binding<bool> _partition_autobalancing_topic_aware;
+    config::binding<std::optional<uint32_t>> _max_user_topics;
 
     static constexpr std::chrono::seconds _get_health_report_timeout = 10s;
 };

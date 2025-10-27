@@ -10,6 +10,7 @@
 
 #include "cluster/partition_balancer_state.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/controller_snapshot.h"
 #include "cluster/logger.h"
@@ -21,8 +22,6 @@
 #include "metrics/prometheus_sanitize.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
-
-#include <absl/container/flat_hash_set.h>
 
 namespace cluster {
 
@@ -157,8 +156,9 @@ void partition_balancer_state::probe::setup_metrics(
         sm::make_gauge(
           "num_with_broken_rack_constraint",
           [this] { return _parent.ntps_with_broken_rack_constraint().size(); },
-          sm::description("Number of partitions that don't satisfy the rack "
-                          "awareness constraint"))
+          sm::description(
+            "Number of partitions that don't satisfy the rack "
+            "awareness constraint"))
           .aggregate({sm::shard_label}),
       });
 }

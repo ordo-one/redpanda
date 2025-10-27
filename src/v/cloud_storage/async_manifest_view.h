@@ -11,14 +11,12 @@
 #pragma once
 
 #include "base/outcome.h"
+#include "cloud_storage/async_manifest_materializer.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/materialized_manifest_cache.h"
 #include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote_path_provider.h"
-#include "cloud_storage/remote_probe.h"
 #include "cloud_storage/types.h"
-#include "cloud_storage_clients/types.h"
-#include "model/metadata.h"
 #include "model/timestamp.h"
 #include "ssx/task_local_ptr.h"
 #include "utils/retry_chain_node.h"
@@ -31,11 +29,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/timed_out_error.hh>
 
-#include <algorithm>
 #include <chrono>
-#include <exception>
-#include <map>
-#include <type_traits>
 #include <variant>
 
 namespace cloud_storage {
@@ -81,9 +75,7 @@ struct stale_manifest {
 
 /// Type that represents section of full metadata. It can either contain
 /// a materialized spillover manifest or reference to main STM manifest.
-using manifest_section_t = std::variant<
-  std::monostate,
-  stale_manifest,
+using data_manifest = std::variant<
   ss::shared_ptr<materialized_manifest>,
   std::reference_wrapper<const partition_manifest>>;
 
@@ -99,7 +91,7 @@ class async_manifest_view {
 public:
     async_manifest_view(
       ss::sharded<remote>& remote,
-      ss::sharded<cache>& cache,
+      ss::sharded<cloud_io::cache>& cache,
       const partition_manifest& stm_manifest,
       cloud_storage_clients::bucket_name bucket,
       const remote_path_provider& path_provider);
@@ -158,7 +150,8 @@ public:
     ss::future<result<archive_start_offset_advance, error_outcome>>
     compute_retention(
       std::optional<size_t> size_limit,
-      std::optional<std::chrono::milliseconds> time_limit) noexcept;
+      std::optional<std::chrono::milliseconds> time_limit,
+      std::optional<kafka::offset> pinned_offset = std::nullopt) noexcept;
 
     const remote_path_provider& path_provider() const {
         return _remote_path_provider;
@@ -171,8 +164,11 @@ private:
     ss::future<result<archive_start_offset_advance, error_outcome>>
     size_based_retention(size_t size_limit) noexcept;
 
+    // Find the next possible start offset for the archive (spillover region).
+    // If the offset is in the STM manifest, returns start offset of the STM
+    // manifest.
     ss::future<result<archive_start_offset_advance, error_outcome>>
-    offset_based_retention() noexcept;
+      next_possible_start_offset_le(kafka::offset) noexcept;
 
     // Perform a term upper bound search within the spillover manifest list.
     // Returns the index of the first spillover manifest that contains a segment
@@ -181,37 +177,15 @@ private:
     std::optional<size_t>
     get_spillover_upper_bound_by_term(model::term_id term) noexcept;
 
-    ss::future<> run_bg_loop();
-
     /// Return true if the offset belongs to the archive
     bool in_archive(async_view_search_query_t o);
 
     /// Returns true if the offset belongs to the archival STM manifest
     bool in_stm(async_view_search_query_t o);
 
-    /// Get spillover manifest by offset/timestamp
-    ss::future<result<manifest_section_t, error_outcome>>
-    get_materialized_manifest(async_view_search_query_t q) noexcept;
-
-    /// Load manifest from the cloud
-    ///
-    /// On success put serialized copy into the cache. The method should only be
-    /// called if the manifest is not available in the cache. The state of the
-    /// view is not changed.
-    ss::future<result<spillover_manifest, error_outcome>>
-    hydrate_manifest(remote_manifest_path path) const noexcept;
-
-    /// Load manifest from the cache
-    ///
-    /// The method reads manifest from the cache or downloads from the cloud.
-    /// Local state is not changed. The returned manifest has to be stored
-    /// in the view after the call.
-    /// \throws
-    ///     - not_found if the manifest doesn't exist
-    ///     - repeat if the manifest is being downloaded already
-    ///     - TODO
-    ss::future<result<spillover_manifest, error_outcome>>
-    materialize_manifest(remote_manifest_path path) const noexcept;
+    /// Get manifest by offset/timestamp
+    ss::future<result<data_manifest, error_outcome>>
+    get_manifest(async_view_search_query_t q) noexcept;
 
     /// Find index of the spillover manifest
     ///
@@ -221,40 +195,17 @@ private:
     std::optional<segment_meta>
     search_spillover_manifests(async_view_search_query_t query) const;
 
-    /// Convert segment_meta to spillover manifest path
-    remote_manifest_path
-    get_spillover_manifest_path(const segment_meta& meta) const;
-
     mutable ss::gate _gate;
     ss::abort_source _as;
-    cloud_storage_clients::bucket_name _bucket;
     const remote_path_provider& _remote_path_provider;
-    ss::sharded<remote>& _remote;
-    ss::sharded<cache>& _cache;
-    ts_read_path_probe& _ts_probe;
 
     const partition_manifest& _stm_manifest;
     mutable retry_chain_node _rtcnode;
     retry_chain_logger _ctxlog;
-    config::binding<std::chrono::milliseconds> _timeout;
-    config::binding<std::chrono::milliseconds> _backoff;
-    config::binding<size_t> _read_buffer_size;
-    config::binding<int16_t> _readahead_size;
 
     config::binding<std::chrono::milliseconds> _manifest_meta_ttl;
 
-    materialized_manifest_cache& _manifest_cache;
-
-    // BG loop state
-
-    /// Materialization request which is sent to background fiber
-    struct materialization_request_t {
-        segment_meta search_vec;
-        ss::promise<result<manifest_section_t, error_outcome>> promise;
-        std::unique_ptr<ts_read_path_probe::hist_t::measurement> _measurement;
-    };
-    std::deque<materialization_request_t> _requests;
-    ss::condition_variable _cvar;
+    async_manifest_materializer _materializer;
 };
 
 enum class async_manifest_view_cursor_status {
@@ -369,12 +320,29 @@ private:
     using stm_manifest_t = std::reference_wrapper<const partition_manifest>;
     void on_timeout();
 
-    bool manifest_in_range(const manifest_section_t& m);
+    template<typename T>
+    void set_current(T&& m) {
+        _current = std::visit(
+          [](auto&& m) -> current_manifest_t { return m; }, std::forward<T>(m));
+    }
+
+    bool manifest_in_range(const data_manifest& m);
 
     /// Manifest view ref
     async_manifest_view& _view;
 
-    manifest_section_t _current;
+    using current_manifest_t = std::variant<
+      // Uninitialized state.
+      std::monostate,
+      // Cursor points to STM manifest.
+      std::reference_wrapper<const partition_manifest>,
+      // Cursor points to spillover manifest.
+      ss::shared_ptr<materialized_manifest>,
+      // Cursor pointed to a spillover manifest that was evicted on idle
+      // timeout.
+      stale_manifest>;
+
+    current_manifest_t _current;
 
     ss::lowres_clock::duration _idle_timeout;
     ss::timer<ss::lowres_clock> _timer;

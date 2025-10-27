@@ -57,6 +57,8 @@ struct reply_error_category final : std::error_category {
             return "HTTP 305 Use Proxy";
         case reply_error_code::temporary_redirect:
             return "HTTP 307 Temporary Redirect";
+        case reply_error_code::permanent_redirect:
+            return "HTTP 308 Permanent Redirect";
         case reply_error_code::bad_request:
             return "HTTP 400 Bad Request";
         case reply_error_code::unauthorized:
@@ -79,6 +81,8 @@ struct reply_error_category final : std::error_category {
             return "HTTP 410 Gone";
         case reply_error_code::length_required:
             return "HTTP 411 Length Required";
+        case reply_error_code::precondition_failed:
+            return "HTTP 412 Precondition Failed";
         case reply_error_code::payload_too_large:
             return "HTTP 413 Payload Too Large";
         case reply_error_code::uri_too_long:
@@ -87,12 +91,16 @@ struct reply_error_category final : std::error_category {
             return "HTTP 415 Unsupported Media Type";
         case reply_error_code::expectation_failed:
             return "HTTP 417 Expectation Failed";
+        case reply_error_code::page_expired:
+            return "HTTP 419 page_expired";
         case reply_error_code::unprocessable_entity:
             return "HTTP 422 Unprocesable Entity";
         case reply_error_code::upgrade_required:
             return "HTTP 426 Upgrade Required";
         case reply_error_code::too_many_requests:
             return "HTTP 429 Too Many Requests";
+        case reply_error_code::login_timeout:
+            return "HTTP 440 login_timeout";
         case reply_error_code::internal_server_error:
             return "HTTP 500 Internal Server Error";
         case reply_error_code::not_implemented:
@@ -107,6 +115,12 @@ struct reply_error_category final : std::error_category {
             return "HTTP 505 HTTP Version Not Supported";
         case reply_error_code::insufficient_storage:
             return "HTTP 507 Insufficient Storage";
+        case reply_error_code::bandwidth_limit_exceeded:
+            return "HTTP 509 bandwidth_limit_exceeded";
+        case reply_error_code::network_read_timeout:
+            return "HTTP 598 network_read_timeout";
+        case reply_error_code::network_connect_timeout:
+            return "HTTP 599 network_connect_timeout";
         case reply_error_code::kafka_bad_request:
             return "kafka_bad_request";
         case reply_error_code::kafka_authentication_error:
@@ -243,6 +257,9 @@ std::error_condition make_error_condition(std::error_code ec) {
         case kec::fenced_instance_id:
         case kec::invalid_record:
         case kec::transactional_id_not_found:
+        case kec::resource_not_found:
+        case kec::duplicate_resource:
+        case kec::unacceptable_credential:
             return rec::kafka_bad_request;
         case kec::not_enough_replicas:
         case kec::coordinator_not_available:
@@ -265,6 +282,7 @@ std::error_condition make_error_condition(std::error_code ec) {
         case kec::reassignment_in_progress:
             return rec::kafka_retriable_error;
         case kec::unknown_topic_or_partition:
+        case kec::unknown_topic_id:
             return rec::partition_not_found;
         case kec::unknown_member_id:
             return rec::consumer_instance_not_found;
@@ -310,7 +328,52 @@ std::error_condition make_error_condition(std::error_code ec) {
 std::error_condition make_error_condition(reply_error_code ec) {
     return {static_cast<int>(ec), reply_error_category};
 }
-
+// continue_ = 100,                      //!< continue
+//   switching_protocols = 101,          //!< switching_protocols
+//   ok = 200,                           //!< ok
+//   created = 201,                      //!< created
+//   accepted = 202,                     //!< accepted
+//   nonauthoritative_information = 203, //!< nonauthoritative_information
+//   no_content = 204,                   //!< no_content
+//   reset_content = 205,                //!< reset_content
+//   partial_content = 206,              //! partial_content
+//   multiple_choices = 300,             //!< multiple_choices
+//   moved_permanently = 301,            //!< moved_permanently
+//   moved_temporarily = 302,            //!< moved_temporarily
+//   see_other = 303,                    //!< see_other
+//   not_modified = 304,                 //!< not_modified
+//   use_proxy = 305,                    //!< use_proxy
+//   temporary_redirect = 307,           //!< temporary_redirect
+//   bad_request = 400,                  //!< bad_request
+//   unauthorized = 401,                 //!< unauthorized
+//   payment_required = 402,             //!< payment_required
+//   forbidden = 403,                    //!< forbidden
+//   not_found = 404,                    //!< not_found
+//   method_not_allowed = 405,           //!< method_not_allowed
+//   not_acceptable = 406,               //!< not_acceptable
+//   request_timeout = 408,              //!< request_timeout
+//   conflict = 409,                     //!< conflict
+//   gone = 410,                         //!< gone
+//   length_required = 411,              //!< length_required
+//   payload_too_large = 413,            //!< payload_too_large
+//   uri_too_long = 414,                 //!< uri_too_long
+//   unsupported_media_type = 415,       //!< unsupported_media_type
+//   expectation_failed = 417,           //!< expectation_failed
+//   page_expired = 419,                 //!< page_expired
+//   unprocessable_entity = 422,         //!< unprocessable_entity
+//   upgrade_required = 426,             //!< upgrade_required
+//   too_many_requests = 429,            //!< too_many_requests
+//   login_timeout = 440,                //!< login_timeout
+//   internal_server_error = 500,        //!< internal_server_error
+//   not_implemented = 501,              //!< not_implemented
+//   bad_gateway = 502,                  //!< bad_gateway
+//   service_unavailable = 503,          //!< service_unavailable
+//   gateway_timeout = 504,              //!< gateway_timeout
+//   http_version_not_supported = 505,   //!< http_version_not_supported
+//   insufficient_storage = 507,         //!< insufficient_storage
+//   bandwidth_limit_exceeded = 509,     //!< bandwidth_limit_exceeded
+//   network_read_timeout = 598,         //!< network_read_timeout
+//   network_connect_timeout = 599,      //!< network_connect_timeout
 std::error_condition make_error_condition(ss::http::reply::status_type st) {
     using rec = reply_error_code;
     using sec = ss::http::reply::status_type;
@@ -346,6 +409,8 @@ std::error_condition make_error_condition(ss::http::reply::status_type st) {
         return rec::use_proxy;
     case sec::temporary_redirect:
         return rec::temporary_redirect;
+    case sec::permanent_redirect:
+        return rec::permanent_redirect;
     case sec::bad_request:
         return rec::kafka_bad_request;
     case sec::unauthorized:
@@ -398,6 +463,16 @@ std::error_condition make_error_condition(ss::http::reply::status_type st) {
         return rec::insufficient_storage;
     case sec::partial_content:
         return rec::partial_content;
+    case sec::page_expired:
+        return rec::page_expired;
+    case sec::login_timeout:
+        return rec::login_timeout;
+    case sec::bandwidth_limit_exceeded:
+        return rec::bandwidth_limit_exceeded;
+    case sec::network_read_timeout:
+        return rec::network_read_timeout;
+    case sec::network_connect_timeout:
+        return rec::network_connect_timeout;
     }
     return rec::kafka_bad_request;
 }

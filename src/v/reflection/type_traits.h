@@ -11,17 +11,16 @@
 
 #pragma once
 
+#include "absl/container/btree_set.h"
 #include "base/seastarx.h"
 #include "base/type_traits.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "utils/named_type.h"
 #include "utils/tristate.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/btree_set.h>
 
 #include <array>
 #include <optional>
@@ -58,8 +57,7 @@ template<typename T>
 concept is_std_vector = ::detail::is_specialization_of_v<T, std::vector>;
 
 template<typename T>
-concept is_fragmented_vector
-  = ::detail::is_specialization_of_sized_v<T, fragmented_vector>;
+concept is_chunked_vector = ::detail::is_specialization_of_v<T, chunked_vector>;
 
 template<typename T>
 concept is_ss_chunked_fifo

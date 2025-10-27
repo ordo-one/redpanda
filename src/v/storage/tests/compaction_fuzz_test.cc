@@ -7,8 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/btree_map.h"
 #include "base/vlog.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/namespace.h"
 #include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
@@ -17,13 +18,9 @@
 #include "storage/tests/utils/disk_log_builder.h"
 #include "storage/types.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/testing/thread_test_case.hh>
 
-#include <absl/container/btree_map.h>
-#include <boost/test/tools/old/interface.hpp>
-#include <boost/test/unit_test.hpp>
+#include <gtest/gtest.h>
 
 #include <exception>
 
@@ -40,7 +37,7 @@ static model::record_batch make_random_batch(
   std::vector<std::optional<ss::sstring>> keys,
   std::vector<std::optional<ss::sstring>> values,
   int num_records) {
-    BOOST_REQUIRE(keys.size() == values.size());
+    EXPECT_EQ(keys.size(), values.size());
     storage::record_batch_builder builder(type, offset);
     auto to_iobuf = [](std::optional<ss::sstring> x) {
         std::optional<iobuf> result;
@@ -61,9 +58,9 @@ static model::record_batch make_random_batch(
     return std::move(builder).build();
 }
 
-static fragmented_vector<model::record_batch>
+static chunked_vector<model::record_batch>
 generate_random_record_batches(int num, int cardinality) {
-    fragmented_vector<model::record_batch> result;
+    chunked_vector<model::record_batch> result;
     std::vector<std::optional<ss::sstring>> keys;
     std::vector<std::optional<ss::sstring>> values;
     std::vector<model::record_batch_type> types{
@@ -75,10 +72,9 @@ generate_random_record_batches(int num, int cardinality) {
         if (i == 0) {
             keys.emplace_back(std::nullopt);
         } else {
-            keys.emplace_back(
-              random_generators::gen_alphanum_string(20, false));
+            keys.emplace_back(random_generators::gen_alphanum_string(20));
         }
-        values.emplace_back(random_generators::gen_alphanum_string(20, false));
+        values.emplace_back(random_generators::gen_alphanum_string(20));
     }
     // Generate actual batches
     model::offset current{0};
@@ -101,8 +97,7 @@ struct ot_state {
     std::deque<int64_t> gap_length;
 };
 
-/// Consumer that builds the map of all non-data
-/// batches!
+/// Consumer that builds the map of all non-data batches!
 struct ot_state_consumer {
     ss::future<ss::stop_iteration> operator()(model::record_batch rb) {
         static const auto translation_batches
@@ -129,7 +124,7 @@ struct ot_state_consumer {
 /// segment arrangement. The arrangement is defined
 /// by the set of segment base offset values.
 ss::future<ot_state> arrange_and_compact(
-  const fragmented_vector<model::record_batch>& batches,
+  const chunked_vector<model::record_batch>& batches,
   std::deque<model::offset> arrangement,
   bool simulate_internal_topic_compaction = false) {
     std::sort(arrangement.begin(), arrangement.end());
@@ -150,7 +145,8 @@ ss::future<ot_state> arrange_and_compact(
     co_await b1.start(log_ntp);
 
     // Must initialize translator state.
-    co_await b1.get_disk_log_impl().start(std::nullopt);
+    ss::abort_source as;
+    co_await b1.get_disk_log_impl().start(std::nullopt, as);
 
     try {
         for (const auto& b : batches) {
@@ -158,15 +154,14 @@ ss::future<ot_state> arrange_and_compact(
             if (
               !arrangement.empty() && b.base_offset() >= arrangement.front()) {
                 arrangement.pop_front();
-                co_await b1.get_disk_log_impl().force_roll(
-                  ss::default_priority_class());
+                co_await b1.get_disk_log_impl().force_roll();
             }
         }
-        ss::abort_source as;
-        auto compact_cfg = storage::compaction_config(
+        auto compact_cfg = compaction::compaction_config(
+          batches.back().last_offset(),
           batches.back().last_offset(),
           std::nullopt,
-          ss::default_priority_class(),
+          std::nullopt,
           as);
         std::ignore = co_await b1.apply_sliding_window_compaction(compact_cfg);
         co_await b1.apply_adjacent_merge_compaction(compact_cfg);
@@ -174,8 +169,7 @@ ss::future<ot_state> arrange_and_compact(
         error = std::current_exception();
     }
     auto reader = co_await b1.get_disk_log_impl().make_reader(
-      storage::log_reader_config(
-        model::offset{0}, model::offset::max(), ss::default_priority_class()));
+      storage::local_log_reader_config(model::offset{0}, model::offset::max()));
     ot_state st{};
     co_await std::move(reader).consume(
       ot_state_consumer{.st = &st}, model::no_timeout);
@@ -186,15 +180,15 @@ ss::future<ot_state> arrange_and_compact(
           "Error triggered while appending or compacting: {}",
           error);
     }
-    BOOST_REQUIRE(error == nullptr);
+    EXPECT_EQ(error, nullptr);
     co_return st;
 }
 
 /// This function generates random alignment based on the set of batches
 /// that will be written into the log.
 std::deque<model::offset> generate_random_arrangement(
-  const fragmented_vector<model::record_batch>& batches, size_t num_segments) {
-    BOOST_REQUIRE(num_segments <= batches.size());
+  const chunked_vector<model::record_batch>& batches, size_t num_segments) {
+    EXPECT_LE(num_segments, batches.size());
     std::deque<model::offset> arr;
     // User reservoir sample to produce num_segments
     for (size_t i = 0; i < num_segments; i++) {
@@ -209,7 +203,8 @@ std::deque<model::offset> generate_random_arrangement(
     return arr;
 }
 
-SEASTAR_THREAD_TEST_CASE(test_compaction_with_different_segment_arrangements) {
+TEST(
+  compaction_fuzz_test, test_compaction_with_different_segment_arrangements) {
 #ifdef NDEBUG
     static constexpr auto num_batches = 1000;
     std::vector<size_t> num_segments = {10, 100, 1000};
@@ -223,12 +218,13 @@ SEASTAR_THREAD_TEST_CASE(test_compaction_with_different_segment_arrangements) {
     for (auto num : num_segments) {
         auto arrangement = generate_random_arrangement(batches, num);
         auto actual_ot = arrange_and_compact(batches, arrangement, false).get();
-        BOOST_REQUIRE(expected_ot.gap_offset == actual_ot.gap_offset);
-        BOOST_REQUIRE(expected_ot.gap_length == actual_ot.gap_length);
+        ASSERT_EQ(expected_ot.gap_offset, actual_ot.gap_offset);
+        ASSERT_EQ(expected_ot.gap_length, actual_ot.gap_length);
     }
 }
 
-SEASTAR_THREAD_TEST_CASE(
+TEST(
+  compaction_fuzz_test,
   test_compaction_with_different_segment_arrangements_simulate_internal_topic) {
 #ifdef NDEBUG
     static constexpr auto num_batches = 1000;
@@ -243,7 +239,7 @@ SEASTAR_THREAD_TEST_CASE(
     for (auto num : num_segments) {
         auto arrangement = generate_random_arrangement(batches, num);
         auto actual_ot = arrange_and_compact(batches, arrangement, true).get();
-        BOOST_REQUIRE(expected_ot.gap_offset == actual_ot.gap_offset);
-        BOOST_REQUIRE(expected_ot.gap_length == actual_ot.gap_length);
+        ASSERT_EQ(expected_ot.gap_offset, actual_ot.gap_offset);
+        ASSERT_EQ(expected_ot.gap_length, actual_ot.gap_length);
     }
 }

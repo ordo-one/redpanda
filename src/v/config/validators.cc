@@ -11,7 +11,10 @@
 
 #include "config/validators.h"
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_set.h"
 #include "config/configuration.h"
+#include "config/sasl_mechanisms.h"
 #include "config/types.h"
 #include "datalake/partition_spec_parser.h"
 #include "model/namespace.h"
@@ -20,11 +23,9 @@
 #include "ssx/sformat.h"
 #include "utils/inet_address_wrapper.h"
 
-#include <absl/algorithm/container.h>
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/node_hash_set.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <unordered_map>
@@ -85,25 +86,35 @@ validate_connection_rate(const std::vector<ss::sstring>& ips_with_limit) {
 
 std::optional<ss::sstring>
 validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
-    constexpr auto supported = std::to_array<std::string_view>(
-      {"GSSAPI", "SCRAM", "OAUTHBEARER", "PLAIN"});
-
     // Validate results
     for (const auto& m : mechanisms) {
-        if (absl::c_none_of(
-              supported, [&m](const auto& s) { return s == m; })) {
+        if (!std::ranges::contains(supported_sasl_mechanisms, m)) {
             return ssx::sformat("'{}' is not a supported SASL mechanism", m);
         }
     }
 
     const auto contains = [&mechanisms](const std::string_view& s) {
-        return absl::c_find(mechanisms, s) != mechanisms.end();
+        return std::ranges::contains(mechanisms, s);
     };
 
-    if (contains("PLAIN") && !contains("SCRAM")) {
-        return "SCRAM mechanism must be enabled if PLAIN is enabled";
+    if (contains(plain) && !contains(scram)) {
+        return ssx::sformat(
+          "{} mechanism must be enabled if {} is enabled", scram, plain);
     }
+    return std::nullopt;
+}
 
+std::optional<ss::sstring> validate_sasl_mechanisms_overrides(
+  const std::vector<config::sasl_mechanisms_override>& overrides) {
+    for (const auto& overide : overrides) {
+        const auto error = validate_sasl_mechanisms(overide.sasl_mechanisms);
+        if (error.has_value()) {
+            return ssx::sformat(
+              "Invalid sasl mechanisms override for listener '{}'. Error: {}",
+              overide.listener,
+              error.value());
+        }
+    }
     return std::nullopt;
 }
 
@@ -114,7 +125,7 @@ validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms) {
 
     // Validate results
     for (const auto& m : mechanisms) {
-        if (absl::c_none_of(
+        if (std::ranges::none_of(
               supported, [&m](const auto& s) { return s == m; })) {
             return ssx::sformat(
               "'{}' is not a supported HTTP authentication mechanism", m);
@@ -124,16 +135,12 @@ validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms) {
 }
 
 bool oidc_is_enabled_http() {
-    return absl::c_any_of(
+    return std::ranges::any_of(
       config::shard_local_cfg().http_authentication(),
       [](const auto& m) { return m == "OIDC"; });
 }
 
-bool oidc_is_enabled_kafka() {
-    return absl::c_any_of(
-      config::shard_local_cfg().sasl_mechanisms(),
-      [](const auto& m) { return m == "OAUTHBEARER"; });
-}
+bool oidc_is_enabled_kafka() { return has_sasl_mechanism(oauthbearer); }
 
 std::optional<ss::sstring> validate_0_to_1_ratio(const double d) {
     if (d < 0 || d > 1) {
@@ -257,6 +264,14 @@ validate_iceberg_partition_spec(const ss::sstring& value) {
     return std::nullopt;
 }
 
+std::optional<ss::sstring> validate_iceberg_topic_name_dot_replacement(
+  const std::optional<ss::sstring>& value) {
+    if (value.has_value() && value->find('.') != ss::sstring::npos) {
+        return "iceberg_topic_name_dot_replacement cannot contain dots";
+    }
+    return std::nullopt;
+}
+
 std::optional<ss::sstring>
 validate_iceberg_rest_catalog_auth_mode(const config::configuration& config) {
     auto auth_mode = config.iceberg_rest_catalog_authentication_mode();
@@ -288,6 +303,76 @@ validate_iceberg_rest_catalog_auth_mode(const config::configuration& config) {
         }
         break;
     }
+    case datalake_catalog_auth_mode::aws_sigv4: {
+        // Determine effective credentials source
+        auto effective_creds_source
+          = config.iceberg_rest_catalog_aws_credentials_source().has_value()
+              ? config.iceberg_rest_catalog_aws_credentials_source().value()
+              : config.cloud_storage_credentials_source();
+
+        // When using aws_instance_metadata, AWS credentials are not required
+        if (
+          effective_creds_source
+          == model::cloud_credentials_source::aws_instance_metadata) {
+            // We still require the region of the Glue endpoint.
+            auto effective_region
+              = config.iceberg_rest_catalog_aws_region().has_value()
+                  ? config.iceberg_rest_catalog_aws_region()
+                  : config.cloud_storage_region();
+            if (!effective_region.has_value()) {
+                return fmt::format(
+                  "Must set AWS region when using SigV4 authentication with "
+                  "aws_instance_metadata credentials source.");
+            }
+        } else {
+            auto effective_access_key
+              = config.iceberg_rest_catalog_aws_access_key().has_value()
+                  ? config.iceberg_rest_catalog_aws_access_key()
+                  : config.cloud_storage_access_key();
+            auto effective_secret_key
+              = config.iceberg_rest_catalog_aws_secret_key().has_value()
+                  ? config.iceberg_rest_catalog_aws_secret_key()
+                  : config.cloud_storage_secret_key();
+            auto effective_region
+              = config.iceberg_rest_catalog_aws_region().has_value()
+                  ? config.iceberg_rest_catalog_aws_region()
+                  : config.cloud_storage_region();
+
+            if (!(effective_region.has_value()
+                  && effective_access_key.has_value()
+                  && effective_secret_key.has_value())) {
+                return fmt::format(
+                  "Must set AWS region, access key, and secret key when "
+                  "iceberg_rest_catalog_authentication_mode is set to {} with "
+                  "config_file credentials source. Configure either "
+                  "iceberg-specific "
+                  "parameters (iceberg_rest_catalog_aws_region, "
+                  "iceberg_rest_catalog_aws_access_key, "
+                  "iceberg_rest_catalog_aws_secret_key) or cloud storage "
+                  "parameters).",
+                  auth_mode);
+            }
+        }
+        break;
+    }
+    case datalake_catalog_auth_mode::gcp: {
+        // We implicitly use instance metadata when GCP auth mode is chosen.
+        break;
+    }
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_iceberg_rest_catalog_config(const config::configuration& config) {
+    auto catalog_type = config.iceberg_catalog_type();
+    if (catalog_type == datalake_catalog_type::rest) {
+        const auto& endpoint = config.iceberg_rest_catalog_endpoint;
+        if (!endpoint().has_value()) {
+            return fmt::format(
+              "Must set {} when iceberg_catalog_type is set to 'rest'",
+              endpoint.name());
+        }
     }
     return std::nullopt;
 }
@@ -302,6 +387,36 @@ validate_consumer_group_metrics(const std::vector<ss::sstring>& metrics) {
         if (std::ranges::none_of(
               supported, [&m](const auto& s) { return s == m; })) {
             return ssx::sformat("'{}' is not a valid consumer group metric", m);
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_cloud_storage_cluster_name(const std::optional<ss::sstring>& input) {
+    // Long enough to be useful, short enough not to hit object storage name
+    // length limits in most cases.
+    constexpr size_t max_cluster_name_length = 64;
+
+    if (!input.has_value()) {
+        return std::nullopt;
+    }
+
+    if (auto non_empty_string_opt = validate_non_empty_string_opt(input);
+        non_empty_string_opt.has_value()) {
+        return non_empty_string_opt;
+    }
+
+    if (input->length() > max_cluster_name_length) {
+        return fmt::format(
+          "Length must be at most {} characters", max_cluster_name_length);
+    }
+
+    for (char c : *input) {
+        if (!std::isalnum(c) && !(c == '-' || c == '_')) {
+            return "Only alphanumeric characters, hyphens, and underscores are "
+                   "allowed";
         }
     }
 

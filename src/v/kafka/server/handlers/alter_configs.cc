@@ -9,6 +9,7 @@
 
 #include "kafka/server/handlers/alter_configs.h"
 
+#include "absl/container/node_hash_set.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
@@ -18,6 +19,7 @@
 #include "kafka/protocol/schemata/alter_configs_response.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/handlers/configs/config_utils.h"
+#include "kafka/server/handlers/details/alter_config_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
@@ -32,7 +34,6 @@
 #include <seastar/core/smp.hh>
 #include <seastar/util/log.hh>
 
-#include <absl/container/node_hash_set.h>
 #include <fmt/ostream.h>
 
 #include <string_view>
@@ -69,6 +70,16 @@ create_topic_properties_update(
     model::topic_namespace tp_ns(
       model::kafka_namespace, model::topic(resource.resource_name));
     cluster::topic_properties_update update(tp_ns);
+
+    if (!ctx.is_topic_mutable(tp_ns.tp)) {
+        return make_error_alter_config_resource_response<
+          alter_configs_resource_response>(
+          resource,
+          error_code::policy_violation,
+          fmt::format(
+            "Topic cannot be altered because it belongs to an active "
+            "shadow link."));
+    }
     /**
      * Alter topic configuration should override topic properties with values
      * sent in the request, if given resource value isn't set in the request,
@@ -84,12 +95,12 @@ create_topic_properties_update(
     std::apply(apply_op(op_t::none), update.custom_properties.serde_fields());
 
     static_assert(
-      std::tuple_size_v<decltype(update.properties.serde_fields())> == 37,
-      "If you added a property, please decide on it's default alter config "
+      std::tuple_size_v<decltype(update.properties.serde_fields())> == 42,
+      "If you add a property, decide on its default alter config "
       "policy, and handle the update in the loop below");
     static_assert(
       std::tuple_size_v<decltype(update.custom_properties.serde_fields())> == 2,
-      "If you added a property, please decide on it's default alter config "
+      "If you add a property, decide on its default alter config "
       "policy, and handle the update in the loop below");
 
     /*
@@ -247,7 +258,8 @@ create_topic_properties_update(
                 parse_and_set_optional(
                   update.properties.batch_max_bytes,
                   cfg.value,
-                  kafka::config_resource_operation::set);
+                  kafka::config_resource_operation::set,
+                  batch_max_bytes_limits_validator{});
                 continue;
             }
             if (cfg.name == topic_property_retention_local_target_ms) {
@@ -318,7 +330,7 @@ create_topic_properties_update(
                   update.properties.flush_ms,
                   cfg.value,
                   kafka::config_resource_operation::set,
-                  flush_ms_validator{},
+                  flush_ms_validator,
                   true);
                 continue;
             }
@@ -349,8 +361,7 @@ create_topic_properties_update(
                 continue;
             }
             if (cfg.name == topic_property_cloud_topic_enabled) {
-                if (config::shard_local_cfg()
-                      .development_enable_cloud_topics()) {
+                if (config::shard_local_cfg().cloud_topics_enabled()) {
                     throw validation_error(
                       "Cloud topics property cannot be changed");
                 }
@@ -360,8 +371,7 @@ create_topic_properties_update(
                 parse_and_set_tristate(
                   update.properties.delete_retention_ms,
                   cfg.value,
-                  kafka::config_resource_operation::set,
-                  delete_retention_ms_validator{});
+                  kafka::config_resource_operation::set);
                 continue;
             }
             if (cfg.name == topic_property_iceberg_delete) {
@@ -395,7 +405,7 @@ create_topic_properties_update(
                   update.properties.iceberg_target_lag_ms,
                   cfg.value,
                   kafka::config_resource_operation::set,
-                  iceberg_target_lag_ms_validator{},
+                  iceberg_target_lag_ms_validator,
                   [](const ss::sstring& v) {
                       auto parsed
                         = boost::lexical_cast<std::chrono::milliseconds::rep>(
@@ -414,11 +424,51 @@ create_topic_properties_update(
                 continue;
             }
 
+            if (cfg.name == topic_property_min_compaction_lag_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.min_compaction_lag_ms,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  min_compaction_lag_ms_validator,
+                  /*clamp_to_duration_max=*/true);
+                continue;
+            }
+
+            if (cfg.name == topic_property_max_compaction_lag_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.max_compaction_lag_ms,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  max_compaction_lag_ms_validator,
+                  /*clamp_to_duration_max=*/true);
+                continue;
+            }
+
             if (cfg.name == topic_property_remote_allow_gaps) {
                 parse_and_set_optional_bool_alpha(
                   update.properties.remote_allow_gaps,
                   cfg.value,
                   kafka::config_resource_operation::set);
+                continue;
+            }
+
+            if (cfg.name == topic_property_message_timestamp_before_max_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.message_timestamp_before_max_ms,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  message_timestamp_before_max_ms_validator,
+                  /*clamp_to_duration_max=*/true);
+                continue;
+            }
+
+            if (cfg.name == topic_property_message_timestamp_after_max_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.message_timestamp_after_max_ms,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  message_timestamp_after_max_ms_validator,
+                  /*clamp_to_duration_max=*/true);
                 continue;
             }
 

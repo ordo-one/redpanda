@@ -10,7 +10,7 @@
 
 #include "base/units.h"
 #include "bytes/iobuf.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "iceberg/avro_utils.h"
 #include "iceberg/manifest.h"
 #include "iceberg/manifest_avro.h"
@@ -312,11 +312,7 @@ TEST(ManifestSerializationTest, TestSerializeManifestData) {
     ss::engine().set_strict_dma(false);
     auto manifest_path = test_utils::get_runfile_path(
       "src/v/iceberg/tests/testdata/nested_manifest.avro");
-    if (!manifest_path.has_value()) {
-        manifest_path = "nested_manifest.avro";
-    }
-    auto orig_buf = iobuf{
-      ss::util::read_entire_file(manifest_path.value()).get()};
+    auto orig_buf = iobuf{ss::util::read_entire_file(manifest_path).get()};
     auto m = parse_manifest(orig_buf.copy());
     ASSERT_EQ(100, m.entries.size());
     ASSERT_EQ(m.metadata.manifest_content_type, manifest_content_type::data);
@@ -326,6 +322,17 @@ TEST(ManifestSerializationTest, TestSerializeManifestData) {
     ASSERT_EQ(
       m.metadata.schema.schema_struct,
       std::get<struct_type>(test_nested_schema_type()));
+    const auto& first_entry = m.entries[0];
+    ASSERT_EQ(first_entry.status, manifest_entry_status::existing);
+    ASSERT_EQ(first_entry.snapshot_id, snapshot_id{0});
+    ASSERT_EQ(first_entry.sequence_number, sequence_number{0});
+    ASSERT_EQ(first_entry.file_sequence_number, file_sequence_number{0});
+    ASSERT_EQ(first_entry.data_file.file_path, "data/path/file-0.parquet");
+    ASSERT_EQ(first_entry.data_file.file_format, data_file_format::parquet);
+    ASSERT_EQ(first_entry.data_file.column_sizes.size(), 0);
+    ASSERT_EQ(first_entry.data_file.value_counts.size(), 0);
+    ASSERT_EQ(first_entry.data_file.null_value_counts.size(), 0);
+    ASSERT_EQ(first_entry.data_file.nan_value_counts.size(), 0);
 
     auto serialized_buf = serialize_avro(m);
     for (int i = 0; i < 10; i++) {

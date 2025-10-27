@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0
 
 #include "base/seastarx.h"
+#include "container/chunked_vector.h"
 #include "ssx/future-util.h"
 
 #include <seastar/core/sstring.hh>
@@ -30,10 +31,12 @@ SEASTAR_THREAD_TEST_CASE(async_transform_iter_test) {
     std::vector<int> expected(10);
     std::iota(expected.begin(), expected.end(), 2);
 
-    std::vector<int> out_iter
-      = ssx::async_transform(input.begin(), input.end(), plus(2)).get();
-    BOOST_TEST(std::equal(
-      out_iter.begin(), out_iter.end(), expected.begin(), expected.end()));
+    std::vector<int> out_iter = ssx::async_transform<std::vector<int>>(
+                                  input.begin(), input.end(), plus(2))
+                                  .get();
+    BOOST_TEST(
+      std::equal(
+        out_iter.begin(), out_iter.end(), expected.begin(), expected.end()));
 }
 
 SEASTAR_THREAD_TEST_CASE(async_transform_range_test) {
@@ -43,19 +46,20 @@ SEASTAR_THREAD_TEST_CASE(async_transform_range_test) {
     std::vector<int> expected(10);
     std::iota(expected.begin(), expected.end(), 2);
 
-    std::vector<int> out_range = ssx::async_transform(input, plus(2)).get();
-    BOOST_TEST(std::equal(
-      out_range.begin(), out_range.end(), expected.begin(), expected.end()));
+    std::vector<int> out_range
+      = ssx::async_transform<std::vector<int>>(input, plus(2)).get();
+    BOOST_TEST(
+      std::equal(
+        out_range.begin(), out_range.end(), expected.begin(), expected.end()));
 }
 
 SEASTAR_THREAD_TEST_CASE(async_transform_move_test) {
     std::vector<ss::sstring> input{"hello", "world", "this", "is", "FUN"};
     std::vector<ss::sstring> input_copy = input;
-    std::vector<ss::sstring> expected = ssx::async_transform(
-                                          input_copy.begin(),
-                                          input_copy.end(),
-                                          [](ss::sstring s) { return s; })
-                                          .get();
+    std::vector<ss::sstring> expected
+      = ssx::async_transform<std::vector<ss::sstring>>(
+          input_copy.begin(), input_copy.end(), [](ss::sstring s) { return s; })
+          .get();
     BOOST_TEST(
       std::equal(input.begin(), input.end(), expected.begin(), expected.end()));
 }
@@ -77,13 +81,12 @@ SEASTAR_THREAD_TEST_CASE(async_transform_noncopyable_test) {
     foos.emplace_back(1);
     foos.emplace_back(2);
     foos.emplace_back(3);
-    std::vector<noncopyable_foo> results = ssx::async_transform(
-                                             foos.begin(),
-                                             foos.end(),
-                                             [](noncopyable_foo& ncf) {
-                                                 return std::move(ncf);
-                                             })
-                                             .get();
+    std::vector<noncopyable_foo> results
+      = ssx::async_transform<std::vector<noncopyable_foo>>(
+          foos.begin(),
+          foos.end(),
+          [](noncopyable_foo& ncf) { return std::move(ncf); })
+          .get();
     BOOST_TEST(results[0].value() == 1);
     BOOST_TEST(results[1].value() == 2);
     BOOST_TEST(results[2].value() == 3);
@@ -98,8 +101,9 @@ SEASTAR_THREAD_TEST_CASE(parallel_transform_iter_test) {
 
     std::vector<int> out_iter
       = ssx::parallel_transform(input.begin(), input.end(), plus(2)).get();
-    BOOST_TEST(std::equal(
-      out_iter.begin(), out_iter.end(), expected.begin(), expected.end()));
+    BOOST_TEST(
+      std::equal(
+        out_iter.begin(), out_iter.end(), expected.begin(), expected.end()));
 }
 
 SEASTAR_THREAD_TEST_CASE(parallel_transform_range_test) {
@@ -111,6 +115,23 @@ SEASTAR_THREAD_TEST_CASE(parallel_transform_range_test) {
 
     std::vector<int> out_range
       = ssx::parallel_transform(std::move(input), plus(2)).get();
-    BOOST_TEST(std::equal(
-      out_range.begin(), out_range.end(), expected.begin(), expected.end()));
+    BOOST_TEST(
+      std::equal(
+        out_range.begin(), out_range.end(), expected.begin(), expected.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(parallel_transform_chunked_range_test) {
+    std::vector<int> input(10);
+    std::iota(input.begin(), input.end(), 0);
+
+    std::vector<int> expected(10);
+    std::iota(expected.begin(), expected.end(), 2);
+
+    auto out_range = ssx::parallel_transform<chunked_vector>(
+                       std::move(input), plus(2))
+                       .get();
+    static_assert(std::is_same_v<decltype(out_range), chunked_vector<int>>);
+    BOOST_TEST(
+      std::equal(
+        out_range.begin(), out_range.end(), expected.begin(), expected.end()));
 }

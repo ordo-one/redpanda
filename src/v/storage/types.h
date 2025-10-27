@@ -11,17 +11,17 @@
 
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "base/format_to.h"
+#include "base/units.h"
+#include "compaction/types.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
-#include "model/limits.h"
 #include "model/record.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "storage/file_sanitizer_types.h"
 #include "storage/fwd.h"
-#include "storage/key_offset_map.h"
 #include "storage/scoped_file_tracker.h"
-#include "utils/tristate.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file.hh> //io_priority
@@ -34,47 +34,6 @@
 namespace storage {
 using log_clock = ss::lowres_clock;
 using jitter_percents = named_type<int, struct jitter_percents_tag>;
-
-enum class disk_space_alert { ok = 0, low_space = 1, degraded = 2 };
-
-inline disk_space_alert max_severity(disk_space_alert a, disk_space_alert b) {
-    return std::max(a, b);
-}
-
-inline std::ostream& operator<<(std::ostream& o, const disk_space_alert d) {
-    switch (d) {
-    case disk_space_alert::ok:
-        o << "ok";
-        break;
-    case disk_space_alert::low_space:
-        o << "low_space";
-        break;
-    case disk_space_alert::degraded:
-        o << "degraded";
-        break;
-    }
-    return o;
-}
-
-struct disk
-  : serde::envelope<disk, serde::version<1>, serde::compat_version<0>> {
-    static constexpr int8_t current_version = 0;
-
-    ss::sstring path;
-    uint64_t free{0};
-    uint64_t total{0};
-    disk_space_alert alert{disk_space_alert::ok};
-
-    auto serde_fields() { return std::tie(path, free, total, alert); }
-
-    // this value is _not_ serialized, but having it in this structure is useful
-    // for passing the filesystem id around as the structure is used internally
-    // to represent a disk not only for marshalling data to disk/network.
-    unsigned long int fsid;
-
-    friend std::ostream& operator<<(std::ostream&, const disk&);
-    friend bool operator==(const disk&, const disk&) = default;
-};
 
 // Helps to identify transactional stms in the registered list of stms.
 // Avoids an ugly dynamic cast to the base class.
@@ -95,9 +54,27 @@ public:
     virtual ss::future<> ensure_local_snapshot_exists(model::offset) = 0;
     // hints stm_manager that now it's a good time to make a snapshot
     virtual void write_local_snapshot_in_background() = 0;
-    // lets the stm control snapshotting and log eviction by limiting
-    // log eviction attempts to offsets not greater than this.
-    virtual model::offset max_collectible_offset() = 0;
+
+    // Lets the STM control snapshotting and local data removal by limiting
+    // local log eviction and compaction attempts to offsets not greater than
+    // this.
+    //
+    // For example, this can be used to ensure local data is not removed before
+    // first uploading it to tiered storage.
+    virtual model::offset max_removable_local_log_offset() = 0;
+
+    // Lets the STM limit application-facing removal or compaction of data by
+    // limiting GC or compaction attempts to offsets exclusively below this
+    // offset. For data that is in both tiered storage and local storage, the
+    // pin will not prevent removal of the local data because applications will
+    // still see the data from tiered storage.
+    //
+    // For example, this can be used to ensure data is written to Iceberg
+    // before being removed from the Kafka-application-facing log.
+    //
+    // May refer to a Kafka offset that does not exist, i.e. it may be up to or
+    // equal to the high watermark.
+    virtual std::optional<kafka::offset> lowest_pinned_data_offset() const = 0;
 
     virtual model::offset last_applied() const = 0;
 
@@ -105,7 +82,7 @@ public:
 
     // Only valid for state machines maintaining transactional state.
     // Returns aborted transactions in range [from, to] offsets.
-    virtual ss::future<fragmented_vector<model::tx_range>>
+    virtual ss::future<chunked_vector<model::tx_range>>
       aborted_tx_ranges(model::offset, model::offset) = 0;
 
     virtual model::control_record_type
@@ -168,11 +145,14 @@ public:
         }
     }
 
-    model::offset max_collectible_offset();
+    model::offset max_removable_local_log_offset();
+    std::optional<kafka::offset> lowest_pinned_data_offset() const;
+    model::offset max_tombstone_remove_offset() const;
+    void set_max_tombstone_remove_offset(model::offset);
 
-    ss::future<fragmented_vector<model::tx_range>>
+    ss::future<chunked_vector<model::tx_range>>
     aborted_tx_ranges(model::offset to, model::offset from) {
-        fragmented_vector<model::tx_range> r;
+        chunked_vector<model::tx_range> r;
         if (_tx_stm) {
             r = co_await _tx_stm->aborted_tx_ranges(to, from);
         }
@@ -205,6 +185,7 @@ public:
 private:
     ss::shared_ptr<snapshotable_stm> _tx_stm;
     std::vector<ss::shared_ptr<snapshotable_stm>> _stms;
+    model::offset _max_tombstone_remove_offset{};
 };
 
 /// returns base_offset's from batches. Not max_offsets
@@ -223,7 +204,6 @@ struct offset_stats {
 struct log_append_config {
     using fsync = ss::bool_class<class skip_tag>;
     fsync should_fsync;
-    ss::io_priority_class io_priority;
     model::timeout_clock::time_point timeout;
 };
 struct append_result {
@@ -236,11 +216,6 @@ struct append_result {
     friend std::ostream& operator<<(std::ostream& o, const append_result&);
 };
 
-using opt_abort_source_t
-  = std::optional<std::reference_wrapper<ss::abort_source>>;
-
-using opt_client_address_t = std::optional<model::client_address_t>;
-
 /// A timequery configuration specifies the range of offsets to search for a
 /// record with a timestamp equal to or greater than the specified time.
 struct timequery_config {
@@ -248,44 +223,45 @@ struct timequery_config {
       model::offset min_offset,
       model::timestamp t,
       model::offset max_offset,
-      ss::io_priority_class iop,
       std::optional<model::record_batch_type> type_filter,
-      opt_abort_source_t as = std::nullopt,
-      opt_client_address_t client_addr = std::nullopt) noexcept
+      model::opt_abort_source_t as = std::nullopt,
+      model::opt_client_address_t client_addr = std::nullopt) noexcept
       : min_offset(min_offset)
       , time(t)
       , max_offset(max_offset)
-      , prio(iop)
       , type_filter(type_filter)
       , abort_source(as)
       , client_address(std::move(client_addr)) {}
     model::offset min_offset;
     model::timestamp time;
     model::offset max_offset;
-    ss::io_priority_class prio;
     std::optional<model::record_batch_type> type_filter;
-    opt_abort_source_t abort_source;
-    opt_client_address_t client_address;
+    model::opt_abort_source_t abort_source;
+    model::opt_client_address_t client_address;
 
     friend std::ostream& operator<<(std::ostream& o, const timequery_config&);
 };
 struct timequery_result {
-    timequery_result(model::offset o, model::timestamp t) noexcept
-      : offset(o)
+    timequery_result(
+      model::term_id term, model::offset o, model::timestamp t) noexcept
+      : term(term)
+      , offset(o)
       , time(t) {}
+
+    model::term_id term;
     model::offset offset;
     model::timestamp time;
+
+    bool operator==(const timequery_result& other) const = default;
 
     friend std::ostream& operator<<(std::ostream& o, const timequery_result&);
 };
 
 struct truncate_config {
-    truncate_config(model::offset o, ss::io_priority_class p)
-      : base_offset(o)
-      , prio(p) {}
+    truncate_config(model::offset o)
+      : base_offset(o) {}
     // Lowest offset to remove.
     model::offset base_offset;
-    ss::io_priority_class prio;
     friend std::ostream& operator<<(std::ostream&, const truncate_config&);
 };
 
@@ -301,13 +277,10 @@ struct truncate_config {
 struct truncate_prefix_config {
     truncate_prefix_config(
       model::offset o,
-      ss::io_priority_class p,
       std::optional<model::offset_delta> force_truncate_delta = std::nullopt)
       : start_offset(o)
-      , prio(p)
       , force_truncate_delta(force_truncate_delta) {}
     model::offset start_offset;
-    ss::io_priority_class prio;
 
     // When supplied and `start_offset` is ahead of the log's end offset,
     // indicates that truncation should proceed and this delta should be the
@@ -321,10 +294,8 @@ struct truncate_prefix_config {
     operator<<(std::ostream&, const truncate_prefix_config&);
 };
 
-using translate_offsets = ss::bool_class<struct translate_tag>;
-
 /**
- * Log reader configuration.
+ * Log reader configuration. Operates on Raft offsets.
  *
  * The default reader configuration will read all batch types. To filter batches
  * by type add the types of interest to the type_filter set.
@@ -350,39 +321,75 @@ using translate_offsets = ss::bool_class<struct translate_tag>;
  *           |                                        |
  * The reader will actually return whole batches: [10, 14], [15, 15], [16, 22].
  */
-struct log_reader_config {
+struct local_log_reader_config {
+    local_log_reader_config(
+      model::offset start_offset,
+      model::offset max_offset,
+      size_t max_bytes,
+      std::optional<model::record_batch_type> type_filter,
+      std::optional<model::timestamp> time,
+      model::opt_abort_source_t as,
+      model::opt_client_address_t client_addr = std::nullopt,
+      bool strict_max_bytes = false)
+      : start_offset(start_offset)
+      , max_offset(max_offset)
+      , max_bytes(max_bytes)
+      , type_filter(type_filter)
+      , timestamp(time)
+      , abort_source(as)
+      , client_address(std::move(client_addr))
+      , strict_max_bytes(strict_max_bytes) {}
+
+    /**
+     * Read offsets [start, end].
+     */
+    local_log_reader_config(
+      model::offset start_offset,
+      model::offset max_offset,
+      model::opt_abort_source_t as = std::nullopt,
+      model::opt_client_address_t client_addr = std::nullopt)
+      : local_log_reader_config(
+          start_offset,
+          max_offset,
+          std::numeric_limits<size_t>::max(),
+          std::nullopt,
+          std::nullopt,
+          as,
+          std::move(client_addr),
+          false) {}
+
     model::offset start_offset;
     model::offset max_offset;
-    size_t min_bytes;
     size_t max_bytes;
-    ss::io_priority_class prio;
+
+    // Batch type to filter for (i.e specified type will be the only one
+    // observed in read).
     std::optional<model::record_batch_type> type_filter;
 
-    /// \brief gurantees first_timestamp >= record_batch.first_timestamp
-    /// it is the std::lower_bound
-    std::optional<model::timestamp> first_timestamp;
+    /// For timequeries: this timestamp allows us to skip all such batches where
+    /// `timestamp > batch.header().max_timestamp`.
+    std::optional<model::timestamp> timestamp;
 
     /// abort source for read operations
-    opt_abort_source_t abort_source;
+    model::opt_abort_source_t abort_source;
 
-    // used by log reader
+    model::opt_client_address_t client_address;
+
+    // Tracks number of consumed bytes in lower level readers
     size_t bytes_consumed{0};
 
-    // skipping consumer sets this bit if a read would cause max_bytes to be
-    // violated.  its used to signal to the log reader that even though consumed
-    // bytes hasn't reached max bytes that reading should still stop.
+    // Used to signal to the log reader that consumed bytes has exceeded
+    // max_bytes and that reading should stop
     bool over_budget{false};
 
-    // do not let the reader go over budget even when that means that the reader
-    // will return no batches.
+    // do not let the lower level readers go over budget even when that means
+    // that the reader will return no batches.
     bool strict_max_bytes{false};
 
     // allow cache reads, but skip lru promotion and cache insertions on miss.
     // use this option when a reader shouldn't perturb the cache (e.g.
     // historical read-once workloads like compaction).
     bool skip_batch_cache{false};
-
-    opt_client_address_t client_address;
 
     // do not reuse cached readers. if this field is set to true the make_reader
     // method will proceed with creating a new reader without checking the
@@ -404,55 +411,21 @@ struct log_reader_config {
     // NOTE: the translation refers only to the returned batches, not to the
     // input min/max offset bounds. Callers are expected to account for inputs
     // separately.
-    translate_offsets translate_offsets{false};
+    model::translate_offsets translate_offsets{false};
 
-    log_reader_config(
-      model::offset start_offset,
-      model::offset max_offset,
-      size_t min_bytes,
-      size_t max_bytes,
-      ss::io_priority_class prio,
-      std::optional<model::record_batch_type> type_filter,
-      std::optional<model::timestamp> time,
-      opt_abort_source_t as,
-      opt_client_address_t client_addr = std::nullopt)
-      : start_offset(start_offset)
-      , max_offset(max_offset)
-      , min_bytes(min_bytes)
-      , max_bytes(max_bytes)
-      , prio(prio)
-      , type_filter(type_filter)
-      , first_timestamp(time)
-      , abort_source(as)
-      , client_address(std::move(client_addr)) {}
+    // Timeout for segment range lock acquisition
+    std::optional<ss::semaphore::clock::time_point> read_lock_deadline{};
 
-    /**
-     * Read offsets [start, end].
-     */
-    log_reader_config(
-      model::offset start_offset,
-      model::offset max_offset,
-      ss::io_priority_class prio,
-      opt_abort_source_t as = std::nullopt,
-      opt_client_address_t client_addr = std::nullopt)
-      : log_reader_config(
-          start_offset,
-          max_offset,
-          0,
-          std::numeric_limits<size_t>::max(),
-          prio,
-          std::nullopt,
-          std::nullopt,
-          as,
-          std::move(client_addr)) {}
+    fmt::iterator format_to(fmt::iterator it) const;
 
-    friend std::ostream& operator<<(std::ostream& o, const log_reader_config&);
+    // The amount of data accumulated when reading from a segment before
+    // returning results to the reader.
+    static constexpr size_t segment_reader_max_buffer_size{32_KiB};
 };
 
 // Empty, invalid reader config which is sometimes useful as a placeholder
-// since log_reader_config doesn't have a default constructor.
-static const log_reader_config empty_reader_config{
-  {}, {}, ss::default_priority_class()};
+// since local_log_reader_config doesn't have a default constructor.
+inline const local_log_reader_config empty_local_reader_config{{}, {}};
 
 struct gc_config {
     gc_config(model::timestamp upper, std::optional<size_t> max_bytes_in_log)
@@ -467,62 +440,6 @@ struct gc_config {
     friend std::ostream& operator<<(std::ostream&, const gc_config&);
 };
 
-struct compaction_config {
-    compaction_config(
-      model::offset max_collect_offset,
-      std::optional<std::chrono::milliseconds> tombstone_ret_ms,
-      ss::io_priority_class p,
-      ss::abort_source& as,
-      std::optional<ntp_sanitizer_config> san_cfg = std::nullopt,
-      std::optional<size_t> max_keys = std::nullopt,
-      hash_key_offset_map* key_map = nullptr,
-      scoped_file_tracker::set_t* to_clean = nullptr)
-      : max_collectible_offset(max_collect_offset)
-      , tombstone_retention_ms(tombstone_ret_ms)
-      , iopc(p)
-      , sanitizer_config(std::move(san_cfg))
-      , key_offset_map_max_keys(max_keys)
-      , hash_key_map(key_map)
-      , files_to_cleanup(to_clean)
-      , asrc(&as) {}
-
-    // Cannot delete or compact past this offset (i.e. for unresolved txn
-    // records): that is, only offsets <= this may be compacted.
-    model::offset max_collectible_offset;
-
-    // The retention time for tombstones. Tombstone removal occurs only for
-    // "clean" compacted segments past the tombstone deletion horizon timestamp,
-    // which is a segment's clean_compact_timestamp + tombstone_retention_ms.
-    // This means tombstones take at least two rounds of compaction to remove a
-    // tombstone: at least one pass to make a segment clean, and another pass
-    // some time after tombstone_retention_ms to remove tombstones.
-    //
-    // Tombstone removal is only supported for topics with remote writes
-    // disabled. As a result, this field will only have a value for compaction
-    // ran on non-archival topics.
-    std::optional<std::chrono::milliseconds> tombstone_retention_ms;
-
-    // priority for all IO in compaction
-    ss::io_priority_class iopc;
-    // use proxy fileops with assertions and/or failure injection
-    std::optional<ntp_sanitizer_config> sanitizer_config;
-
-    // Limit the number of keys stored by a compaction's key-offset map.
-    std::optional<size_t> key_offset_map_max_keys;
-
-    // Hash key-offset map to reuse across compactions.
-    hash_key_offset_map* hash_key_map;
-
-    // Set of intermediary files added by compactions that need to be removed,
-    // e.g. because they were leftover from an aborted compaction.
-    scoped_file_tracker::set_t* files_to_cleanup;
-
-    // abort source for compaction task
-    ss::abort_source* asrc;
-
-    friend std::ostream& operator<<(std::ostream&, const compaction_config&);
-};
-
 /*
  * Compaction and garbage collection are two distinct processes with their own
  * configuration. However, the vast majority of the time they are invoked
@@ -534,22 +451,26 @@ struct housekeeping_config {
       model::timestamp upper,
       std::optional<size_t> max_bytes_in_log,
       model::offset max_collect_offset,
+      model::offset max_tombstone_remove_offset,
       std::optional<std::chrono::milliseconds> tombstone_retention_ms,
-      ss::io_priority_class p,
+      std::optional<std::chrono::milliseconds> tx_retention_ms,
+      std::chrono::milliseconds min_lag_ms,
       ss::abort_source& as,
       std::optional<ntp_sanitizer_config> san_cfg = std::nullopt,
-      hash_key_offset_map* key_map = nullptr)
+      compaction::hash_key_offset_map* key_map = nullptr)
       : compact(
           max_collect_offset,
+          max_tombstone_remove_offset,
           tombstone_retention_ms,
-          p,
+          tx_retention_ms,
           as,
           std::move(san_cfg),
           std::nullopt,
+          min_lag_ms,
           key_map)
       , gc(upper, max_bytes_in_log) {}
 
-    compaction_config compact;
+    compaction::compaction_config compact;
     gc_config gc;
 
     friend std::ostream& operator<<(std::ostream&, const housekeeping_config&);
@@ -561,10 +482,14 @@ struct compaction_result {
       , size_before(sz)
       , size_after(sz) {}
 
-    compaction_result(size_t before, size_t after)
+    compaction_result(
+      size_t before,
+      size_t after,
+      std::optional<size_t> cmp_idx_size_after = std::nullopt)
       : executed_compaction(true)
       , size_before(before)
-      , size_after(after) {}
+      , size_after(after)
+      , cmp_idx_size_after(cmp_idx_size_after) {}
 
     bool did_compact() const { return executed_compaction; }
 
@@ -576,6 +501,8 @@ struct compaction_result {
     bool executed_compaction;
     size_t size_before;
     size_t size_after;
+    // The size of the new compacted index, if one was made.
+    std::optional<size_t> cmp_idx_size_after{std::nullopt};
     friend std::ostream& operator<<(std::ostream&, const compaction_result&);
 };
 

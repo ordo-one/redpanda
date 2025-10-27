@@ -9,14 +9,19 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
 #include "base/seastarx.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
+#include "kafka/protocol/types.h"
 #include "kafka/server/fwd.h"
+#include "kafka/server/handlers/details/security.h"
 #include "kafka/server/handlers/handler_probe.h"
 #include "kafka/server/logger.h"
 #include "net/connection.h"
 #include "net/server_probe.h"
+#include "proto/redpanda/core/admin/v2/kafka_connections.proto.h"
 #include "security/acl.h"
 #include "security/authorizer.h"
 #include "security/mtls.h"
@@ -26,6 +31,7 @@
 #include "utils/log_hist.h"
 #include "utils/mutex.h"
 #include "utils/named_type.h"
+#include "utils/windowed_sum_tracker.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -35,9 +41,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/net/socket_defs.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -46,6 +50,9 @@
 namespace kafka {
 
 using response_ptr = ss::foreign_ptr<std::unique_ptr<response>>;
+
+using closed_connections_t
+  = std::deque<ss::lw_shared_ptr<const proto::admin::kafka_connection>>;
 
 class kafka_api_version_not_supported_exception : public std::runtime_error {
 public:
@@ -58,13 +65,6 @@ public:
     explicit sasl_session_expired_exception(const std::string& m)
       : std::runtime_error(m) {}
 };
-
-/*
- * authz failures should be quiet or logged at a reduced severity level.
- */
-using authz_quiet = ss::bool_class<struct authz_quiet_tag>;
-
-using audit_authz_check = ss::bool_class<struct audit_authz_check_tag>;
 
 struct request_header;
 class request_context;
@@ -114,8 +114,8 @@ struct request_data {
 // The resources in particular should be not be destroyed until
 // the request is complete (e.g., all the information written to
 // the socket so that no userspace buffers remain).
-struct session_resources {
-    using pointer = ss::lw_shared_ptr<session_resources>;
+struct request_resources {
+    using pointer = ss::lw_shared_ptr<request_resources>;
 
     ss::lowres_clock::duration backpressure_delay;
     ssx::semaphore_units memlocks;
@@ -124,6 +124,7 @@ struct session_resources {
     std::unique_ptr<handler_probe::hist_t::measurement> handler_latency;
     std::unique_ptr<request_tracker> tracker;
     request_data request_data;
+    ss::deleter response_resource_deleter;
 };
 using vcluster_connection_id
   = named_type<uint32_t, struct vcluster_connection_id_tag>;
@@ -147,6 +148,92 @@ struct virtual_connection_id {
     friend std::ostream&
     operator<<(std::ostream& o, const virtual_connection_id& id);
 };
+
+class last_value {
+public:
+    void update(std::optional<std::string_view> new_value);
+    template<typename Tag>
+    void update(const named_type<ss::sstring, Tag>& new_value) {
+        update(new_value());
+    }
+    template<typename Tag>
+    void update(const std::optional<named_type<ss::sstring, Tag>>& new_value) {
+        if (new_value) {
+            update((*new_value)());
+        }
+    }
+    const std::optional<ss::sstring>& get() const { return value; }
+
+private:
+    std::optional<ss::sstring> value{std::nullopt};
+};
+
+struct connection_attributes {
+    using sys_clock = ss::lowres_system_clock;
+    struct request_state {
+        constexpr static auto bucket_count = size_t{4};
+        constexpr static auto window_ns = std::chrono::minutes(1)
+                                          / std::chrono::nanoseconds(1);
+        using tracker_t = windowed_sum_tracker<bucket_count, window_ns>;
+        tracker_t recent_stat{};
+        uint64_t total_stat{0};
+
+        void record(uint64_t val) {
+            total_stat += val;
+            recent_stat.record(val);
+        }
+    };
+
+    class in_flight_request_tracker {
+    public:
+        using clock = ss::lowres_clock;
+        constexpr static auto max_count = size_t{5};
+
+        explicit in_flight_request_tracker(
+          std::optional<clock::time_point> idle_since = clock::now())
+          : _idle_since(idle_since) {}
+
+        void record_begin_request(api_key key);
+        void record_end_request();
+
+        proto::admin::in_flight_requests to_proto(clock::time_point now) const;
+        clock::duration get_idle_duration(clock::time_point now) const {
+            return _idle_since ? (now - *_idle_since) : clock::duration::zero();
+        }
+
+    private:
+        struct in_flight_request {
+            api_key key;
+            clock::time_point recv_time;
+        };
+        using queue_t = std::deque<in_flight_request>;
+
+        queue_t _in_flight_request_samples{};
+        size_t _total_in_flight_count{0};
+        std::optional<clock::time_point> _idle_since;
+    };
+
+    void record_api_version(api_key key, api_version);
+
+    request_state request_count;
+    request_state produce_bytes;
+    request_state produce_batch_count;
+    request_state fetch_bytes;
+
+    uuid_t connection_id{uuid_t::create()};
+    sys_clock::time_point open_time{sys_clock::now()};
+    last_value last_client_id{};
+    last_value last_client_software_name{};
+    last_value last_client_software_version{};
+    last_value last_transactional_id{};
+    last_value last_group_id{};
+    last_value last_group_instance_id{};
+    last_value last_group_member_id{};
+
+    chunked_hash_map<api_key, api_version> api_versions{};
+    in_flight_request_tracker in_flight_requests;
+};
+
 class connection_context final
   : public ss::enable_lw_shared_from_this<connection_context>
   , public boost::intrusive::list_base_hook<> {
@@ -154,6 +241,7 @@ public:
     connection_context(
       std::optional<std::reference_wrapper<
         boost::intrusive::list<connection_context>>> hook,
+      std::optional<std::reference_wrapper<closed_connections_t>> closed_list,
       server& s,
       ss::lw_shared_ptr<net::connection> conn,
       std::optional<security::sasl_server> sasl,
@@ -184,11 +272,17 @@ public:
 
     template<typename T>
     security::auth_result authorized(
-      security::acl_operation operation, const T& name, authz_quiet quiet);
+      security::acl_operation operation,
+      const T& name,
+      authz_quiet quiet,
+      superuser_required superuser_required);
 
     bool authorized_auditor() const {
         return get_principal() == security::audit_principal;
     }
+
+    // Returns true if the user is a superuser or if authz is disabled
+    bool has_superuser_access() const;
 
     ss::future<> process();
     ss::future<> process_one_request();
@@ -200,18 +294,23 @@ public:
 
     bool tls_enabled() const { return conn->tls_enabled(); }
 
+    proto::admin::kafka_connection to_proto() const;
+
+    connection_attributes& attributes() { return _attributes; }
+
 private:
     template<typename T>
     security::auth_result authorized_user(
       security::acl_principal principal,
       security::acl_operation operation,
       const T& name,
-      authz_quiet quiet);
+      authz_quiet quiet,
+      superuser_required superuser_required);
 
     security::acl_principal get_principal() const {
         if (_mtls_state) {
             return _mtls_state->principal();
-        } else if (_sasl) {
+        } else if (_sasl && _sasl->complete()) {
             return _sasl->principal();
         }
         // anonymous user
@@ -252,8 +351,8 @@ private:
     // currently.
     // When the returned future resolves, the throttling period is over and
     // the associated resouces have been obtained and are tracked by the
-    // contained session_resources object.
-    ss::future<session_resources>
+    // contained request_resources object.
+    ss::future<request_resources>
     throttle_request(request_data r_data, size_t sz);
 
     ss::future<> do_process(request_context);
@@ -266,7 +365,7 @@ private:
      */
     struct response_and_resources {
         response_ptr response;
-        session_resources::pointer resources;
+        request_resources::pointer resources;
     };
 
     using sequence_id = named_type<uint64_t, struct kafka_protocol_sequence>;
@@ -286,6 +385,8 @@ private:
     // Returns handler specific connection override if available.
     std::optional<ss::scheduling_group>
       get_scheduling_group_override(api_key) const;
+
+    proto::admin::kafka_connection to_closed_proto() const;
 
     class ctx_log {
     public:
@@ -354,7 +455,7 @@ private:
         ss::future<> process_request(
           ss::lw_shared_ptr<connection_context>,
           request_context,
-          ss::lw_shared_ptr<session_resources>);
+          ss::lw_shared_ptr<request_resources>);
 
         /**
          * Checks if the request that currently is being processed is the first
@@ -384,7 +485,7 @@ private:
         ss::future<> handle_response(
           ss::lw_shared_ptr<connection_context>,
           ss::future<response_ptr>,
-          ss::lw_shared_ptr<session_resources>,
+          ss::lw_shared_ptr<request_resources>,
           sequence_id,
           correlation_id);
 
@@ -423,7 +524,7 @@ private:
         ss::future<> process_request(
           ss::lw_shared_ptr<connection_context>,
           request_context,
-          ss::lw_shared_ptr<session_resources>);
+          ss::lw_shared_ptr<request_resources>);
 
     private:
         client_protocol_state _state;
@@ -469,6 +570,7 @@ private:
     std::optional<
       std::reference_wrapper<boost::intrusive::list<connection_context>>>
       _hook;
+    std::optional<std::reference_wrapper<closed_connections_t>> _closed_list;
     class server& _server;
     ss::lw_shared_ptr<net::connection> conn;
 
@@ -507,6 +609,8 @@ private:
     /// Used to enforce client quotas and ingress/egress quotas broker-side
     /// if the client does not obey the ThrottleTimeMs in the response
     throttling_state _throttling_state;
+
+    connection_attributes _attributes;
 };
 
 } // namespace kafka

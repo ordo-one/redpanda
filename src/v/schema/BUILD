@@ -14,11 +14,10 @@ redpanda_cc_library(
     hdrs = [
         "registry.h",
     ],
-    include_prefix = "schema",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:registry",
         "@seastar",
     ],
 )

@@ -7,7 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "container/fragmented_vector.h"
+#include "absl/container/flat_hash_map.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/delete_topics.h"
@@ -22,11 +23,11 @@
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/sleep.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <algorithm>
@@ -40,22 +41,32 @@ using namespace std::chrono_literals; // NOLINT
 class recreate_test_fixture : public redpanda_thread_fixture {
 public:
     void create_topic(ss::sstring tp, int32_t partitions, int16_t rf) {
-        kafka::creatable_topic topic{
-          .name = model::topic(tp),
-          .num_partitions = partitions,
-          .replication_factor = rf,
-        };
+        for (int current_retry = 0; current_retry < 5; ++current_retry) {
+            kafka::creatable_topic topic{
+              .name = model::topic(tp),
+              .num_partitions = partitions,
+              .replication_factor = rf,
+            };
 
-        auto req = kafka::create_topics_request{.data{
-          .topics = {topic},
-          .timeout_ms = 10s,
-          .validate_only = false,
-        }};
+            auto req = kafka::create_topics_request{.data{
+              .topics = {topic},
+              .timeout_ms = 10s,
+              .validate_only = false,
+            }};
 
-        auto client = make_kafka_client().get();
-        client.connect().get();
-        auto resp
-          = client.dispatch(std::move(req), kafka::api_version(2)).get();
+            auto client = make_kafka_client().get();
+            auto deferred_close = ss::defer([&client] { client.stop().get(); });
+            client.connect().get();
+
+            auto resp
+              = client.dispatch(std::move(req), kafka::api_version(2)).get();
+            if (
+              resp.data.topics.begin()->error_code == kafka::error_code::none) {
+                return;
+            }
+            // wait before retrying
+            ss::sleep(500ms).get();
+        }
     }
     kafka::delete_topics_request make_delete_topics_request(
       chunked_vector<model::topic> topics, std::chrono::milliseconds timeout) {
@@ -77,6 +88,7 @@ public:
     kafka::delete_topics_response
     send_delete_topics_request(kafka::delete_topics_request req) {
         auto client = make_kafka_client().get();
+        auto deferred_close = ss::defer([&client] { client.stop().get(); });
         client.connect().get();
 
         return client.dispatch(std::move(req), kafka::api_version(2)).get();
@@ -89,10 +101,11 @@ public:
                 std::move(client),
                 [f = std::forward<Func>(f)](
                   kafka::client::transport& client) mutable {
-                    return client.connect().then(
-                      [&client, f = std::forward<Func>(f)]() mutable {
+                    return client.connect()
+                      .then([&client, f = std::forward<Func>(f)]() mutable {
                           return f(client);
-                      });
+                      })
+                      .finally([&client] { return client.stop(); });
                 });
           });
     }
@@ -101,12 +114,12 @@ public:
     get_topic_metadata(const model::topic& tp) {
         return do_with_client([tp](kafka::client::transport& client) {
             chunked_vector<kafka::metadata_request_topic> topics;
-            topics.push_back(kafka::metadata_request_topic{tp});
+            topics.push_back(kafka::metadata_request_topic{.name{tp}});
             kafka::metadata_request md_req{
               .data
               = {.topics = std::make_optional(std::move(topics)), .allow_auto_topic_creation = false},
               .list_all_topics = false};
-            return client.dispatch(std::move(md_req));
+            return client.dispatch(std::move(md_req), kafka::api_version(8));
         });
     }
 
@@ -264,7 +277,8 @@ FIXTURE_TEST(test_recreated_topic_does_not_lose_data, recreate_test_fixture) {
                       return p->raft()
                         ->replicate(
                           chunked_vector<model::record_batch>(
-                            std::move(batches)),
+                            std::from_range,
+                            std::move(batches) | std::views::as_rvalue),
                           raft::replicate_options(
                             raft::consistency_level::quorum_ack))
                         .then([p](auto) { return p->committed_offset(); });

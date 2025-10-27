@@ -17,11 +17,14 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/logger.h"
 #include "kafka/protocol/timeout.h"
+#include "kafka/protocol/types.h"
+#include "kafka/server/connection_context.h"
 #include "kafka/server/handlers/configs/config_response_utils.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/handlers/topics/validators.h"
 #include "kafka/server/quota_manager.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "security/acl.h"
 #include "utils/to_string.h"
@@ -81,7 +84,11 @@ bool is_supported(std::string_view name) {
        topic_property_iceberg_invalid_record_action,
        topic_property_iceberg_target_lag_ms,
        topic_property_min_cleanable_dirty_ratio,
-       topic_property_remote_allow_gaps});
+       topic_property_min_compaction_lag_ms,
+       topic_property_max_compaction_lag_ms,
+       topic_property_remote_allow_gaps,
+       topic_property_message_timestamp_before_max_ms,
+       topic_property_message_timestamp_after_max_ms});
 
     if (std::any_of(
           supported_configs.begin(),
@@ -95,7 +102,7 @@ bool is_supported(std::string_view name) {
      * enabled, the system should behave as if the feature does not exist.
      */
 
-    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+    if (config::shard_local_cfg().cloud_topics_enabled()) {
         if (name == topic_property_cloud_topic_enabled) {
             return true;
         }
@@ -125,8 +132,8 @@ using validators = make_validator_types<
   iceberg_config_validator,
   iceberg_invalid_record_action_validator,
   cloud_topic_config_validator,
-  delete_retention_ms_validator,
-  iceberg_target_lag_ms_validator>;
+  iceberg_target_lag_ms_validator,
+  min_max_compaction_lag_ms_validator>;
 
 static void
 append_topic_configs(request_context& ctx, create_topics_response& response) {
@@ -251,15 +258,28 @@ ss::future<response_ptr> create_topics_handler::handle(
         return topics;
     };
 
+    auto superuser_required = ctx.is_cluster_link_active()
+                                ? superuser_required::yes
+                                : superuser_required::no;
+
     const auto has_cluster_auth = ctx.authorized(
       security::acl_operation::create,
       security::default_cluster_name,
-      std::move(additional_resources_func));
+      std::move(additional_resources_func),
+      authz_quiet::no,
+      superuser_required);
 
     if (!has_cluster_auth) {
         auto unauthorized_it = std::partition(
-          begin, valid_range_end, [&ctx](const creatable_topic& t) {
-              return ctx.authorized(security::acl_operation::create, t.name);
+          begin,
+          valid_range_end,
+          [&ctx, superuser_required](const creatable_topic& t) {
+              return ctx.authorized(
+                security::acl_operation::create,
+                t.name,
+                authz_quiet::no,
+                audit_authz_check::yes,
+                superuser_required);
           });
         std::transform(
           unauthorized_it,
@@ -342,8 +362,9 @@ ss::future<response_ptr> create_topics_handler::handle(
           std::back_inserter(response.data.topics),
           [&ctx](const creatable_topic& t) {
               auto result = generate_successfull_result(t);
-              if (ctx.metadata_cache().contains(model::topic_namespace_view{
-                    model::kafka_namespace, t.name})) {
+              if (ctx.metadata_cache().contains(
+                    model::topic_namespace_view{
+                      model::kafka_namespace, t.name})) {
                   result.error_code = error_code::topic_already_exists;
                   return result;
               }
@@ -426,6 +447,23 @@ ss::future<response_ptr> create_topics_handler::handle(
     append_topic_properties(ctx, response);
     if (ctx.header().version >= api_version(5)) {
         append_topic_configs(ctx, response);
+    }
+
+    if (ctx.header().version >= api_version(7)) {
+        for (auto& topic : response.data.topics) {
+            if (topic.errored()) {
+                continue;
+            }
+
+            topic.topic_id = ctx.metadata_cache()
+                               .get_topic_metadata_ref(
+                                 model::topic_namespace_view{
+                                   model::kafka_namespace, topic.name})
+                               .transform([](const auto& md) {
+                                   return md.get().get_configuration().tp_id;
+                               })
+                               ->value_or(model::topic_id{});
+        }
     }
 
     log_topic_status(c_res);

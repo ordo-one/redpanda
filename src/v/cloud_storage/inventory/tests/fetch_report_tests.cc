@@ -58,8 +58,9 @@ void setup_and_validate_list_call(
         t::Eq(std::nullopt)))
       .Times(1)
       .WillOnce(
-        t::Return(ss::make_ready_future<cst::cloud_storage_api::list_result>(
-          std::move(result))));
+        t::Return(
+          ss::make_ready_future<cst::cloud_storage_api::list_result>(
+            std::move(result))));
 }
 
 TEST(FindLatestReport, NoReportsExist) {
@@ -80,11 +81,11 @@ TEST(FindLatestReport, NonDatePathsIgnored) {
     ss::abort_source as;
     retry_chain_node parent{as};
 
-    const auto dates = cl::client::list_bucket_result{
+    auto dates = cl::client::list_bucket_result{
       .common_prefixes = {"1215-06/", "133701Z/"}};
 
     csi::MockRemote remote;
-    setup_and_validate_list_call(remote, parent, dates);
+    setup_and_validate_list_call(remote, parent, std::move(dates));
 
     csi::aws_ops ops{bucket, id, prefix};
     const auto result = ops.fetch_latest_report_metadata(remote, parent).get();
@@ -113,7 +114,7 @@ void run_test(csi::MockRemote& remote, retry_chain_node& parent, T... ts) {
     // We expect the following prefixes to be checked, in order from latest to
     // earliest.
     // The scanning will stop once the first manifest checksum is found
-    auto common_prefixes = std::vector<ss::sstring>{
+    auto common_prefixes = chunked_vector<ss::sstring>{
       "1215-06-15T01-02Z/",
       latest_date_which_has_report,
       latest_date,
@@ -121,10 +122,10 @@ void run_test(csi::MockRemote& remote, retry_chain_node& parent, T... ts) {
     for (auto& p : common_prefixes) {
         p = fmt::format("{}{}", list_prefix, p);
     }
-    const auto dates = cl::client::list_bucket_result{
-      .common_prefixes = common_prefixes};
+    auto dates = cl::client::list_bucket_result{
+      .common_prefixes = std::move(common_prefixes)};
 
-    setup_and_validate_list_call(remote, parent, dates);
+    setup_and_validate_list_call(remote, parent, std::move(dates));
 
     // The latest date does not have a manifest checksum, so it will be checked
     // and then discarded
@@ -136,21 +137,28 @@ void run_test(csi::MockRemote& remote, retry_chain_node& parent, T... ts) {
         t::Ref(parent),
         t::Eq(cst::existence_check_type::object)))
       .Times(1)
-      .WillOnce(t::Return(ss::make_ready_future<cst::download_result>(
-        cst::download_result::notfound)));
+      .WillOnce(
+        t::Return(
+          ss::make_ready_future<cst::download_result>(
+            cst::download_result::notfound)));
 
     // The next latest date does have a checksum file, so it becomes the result
     EXPECT_CALL(
       remote,
       object_exists(
         t::Eq(bucket),
-        t::Eq(fmt::format(
-          "{}{}manifest.checksum", list_prefix, latest_date_which_has_report)),
+        t::Eq(
+          fmt::format(
+            "{}{}manifest.checksum",
+            list_prefix,
+            latest_date_which_has_report)),
         t::Ref(parent),
         t::Eq(cst::existence_check_type::object)))
       .Times(1)
-      .WillOnce(t::Return(ss::make_ready_future<cst::download_result>(
-        cst::download_result::success)));
+      .WillOnce(
+        t::Return(
+          ss::make_ready_future<cst::download_result>(
+            cst::download_result::success)));
 
     // Return a valid manifest on being called
     EXPECT_CALL(remote, download_object(t::_))
@@ -204,8 +212,10 @@ test_manifest_parse(std::string_view manifest) {
 
     EXPECT_CALL(remote, object_exists(t::_, t::_, t::_, t::_))
       .Times(1)
-      .WillOnce(t::Return(ss::make_ready_future<cst::download_result>(
-        cst::download_result::success)));
+      .WillOnce(
+        t::Return(
+          ss::make_ready_future<cst::download_result>(
+            cst::download_result::success)));
 
     auto return_manifest = [&manifest](auto r) {
         r.payload.append(manifest.data(), manifest.size());

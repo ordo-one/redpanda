@@ -43,8 +43,7 @@ public:
       ss::sharded<topics_frontend>&,
       ss::sharded<members_frontend>&,
       config::binding<std::chrono::seconds>&& availability_timeout,
-      config::binding<unsigned>&& max_disk_usage_percent,
-      config::binding<unsigned>&& storage_space_alert_free_threshold_percent,
+      config::binding<unsigned> max_disk_usage_percent,
       config::binding<std::chrono::milliseconds>&& tick_interval,
       config::binding<size_t>&& max_concurrent_actions,
       config::binding<double>&& moves_drop_threshold,
@@ -104,7 +103,6 @@ private:
       _mode;
     config::binding<std::chrono::seconds> _availability_timeout;
     config::binding<unsigned> _max_disk_usage_percent;
-    config::binding<unsigned> _storage_space_alert_free_threshold_percent;
     config::binding<std::chrono::milliseconds> _tick_interval;
     config::binding<size_t> _max_concurrent_actions;
     config::binding<double> _concurrent_moves_drop_threshold;
@@ -139,8 +137,8 @@ private:
           = partition_balancer_status::starting;
         size_t last_tick_in_progress_updates = 0;
 
-        absl::flat_hash_map<model::node_id, absl::btree_set<model::ntp>>
-          last_tick_decommission_realloc_failures;
+        chunked_hash_map<model::ntp, reallocation_failure_details>
+          last_tick_reallocation_failures;
 
         bool _ondemand_rebalance_requested = false;
         bool _force_health_report_refresh = false;

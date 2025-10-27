@@ -7,11 +7,10 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-import os
 
+from rptest.clients.rpk_remote import RpkRemoteTool
 from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.clients.rpk_remote import RpkRemoteTool
 
 
 class RpkTunerTest(RedpandaTest):
@@ -35,11 +34,11 @@ class RpkTunerTest(RedpandaTest):
     def test_tune_fstrim(self):
         """
         Validate fstrim tuner execution,
-        fstrim was disabled in production mode https://github.com/redpanda-data/redpanda/issues/3068 
+        fstrim was disabled in production mode https://github.com/redpanda-data/redpanda/issues/3068
         """
         node = self.redpanda.nodes[0]
         rpk = RpkRemoteTool(self.redpanda, node)
-        rpk.config_set('rpk.tune_fstrim', 'true')
+        rpk.config_set("rpk.tune_fstrim", "true")
 
         rpk.tune("fstrim")
 
@@ -51,7 +50,7 @@ class RpkTunerTest(RedpandaTest):
         """
         node = self.redpanda.nodes[0]
         rpk = RpkRemoteTool(self.redpanda, node)
-        rpk.config_set('rpk.tune_transparent_hugepages', 'true')
+        rpk.config_set("rpk.tune_transparent_hugepages", "true")
 
         rpk.tune("transparent_hugepages")
 
@@ -66,11 +65,11 @@ class RpkTunerTest(RedpandaTest):
         rpk = RpkRemoteTool(self.redpanda, node)
         # Set all tuners:
         rpk.mode_set("prod")
-        rpk.config_set('rpk.tune_fstrim', 'true')
-        rpk.config_set('rpk.tune_transparent_hugepages', 'true')
-        rpk.config_set('rpk.tune_coredump', 'true')
+        rpk.config_set("rpk.tune_fstrim", "true")
+        rpk.config_set("rpk.tune_transparent_hugepages", "true")
+        rpk.config_set("rpk.tune_coredump", "true")
 
-        expected = '''TUNER                  ENABLED  SUPPORTED  UNSUPPORTED-REASON
+        expected = """TUNER                  ENABLED  SUPPORTED  UNSUPPORTED-REASON
 aio_events             true     true       
 ballast_file           true     true       
 clocksource            true     true       
@@ -84,7 +83,7 @@ fstrim                 true     true
 net                    true     true       
 swappiness             true     true       
 transparent_hugepages  true     true       
-'''
+"""
 
         uname = str(node.account.ssh_output("uname -m"))
         # either x86-64 or i386.
@@ -93,19 +92,15 @@ transparent_hugepages  true     true
         r = str(node.account.ssh_output("dmidecode -s system-product-name"))
         isGCP = "Google Compute Engine" in r
 
-        # Clocksource is only available for x86 architectures.
-        expected = expected.replace(
-            "clocksource            true     true       ",
-            "clocksource            true     false      Clocksource setting not available for this architecture"
-        ) if is_not_x86 else expected
+        expected = (
+            expected.replace(
+                "disk_write_cache       true     false      Disk write cache tuner is only supported in GCP",
+                "disk_write_cache       true     true       ",
+            )
+            if isGCP
+            else expected
+        )
 
-        expected = expected.replace(
-            "disk_write_cache       true     false      Disk write cache tuner is only supported in GCP",
-            "disk_write_cache       true     true       "
-        ) if isGCP else expected
+        output = rpk.tune("list", verbose=False)
 
-        output = rpk.tune("list")
-        if output != expected:
-            self.logger.debug(f"expected:\n{expected}\ngot:\n{output}")
-
-        assert output == expected
+        assert output == expected, f"expected:\n{expected}\ngot:\n{output}"

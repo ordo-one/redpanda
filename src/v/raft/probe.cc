@@ -10,6 +10,7 @@
 #include "raft/probe.h"
 
 #include "config/configuration.h"
+#include "metrics/metrics.h"
 #include "metrics/prometheus_sanitize.h"
 #include "model/fundamental.h"
 
@@ -19,14 +20,10 @@ namespace raft {
 
 std::vector<ss::metrics::label_instance>
 probe::create_metric_labels(const model::ntp& ntp) {
-    namespace sm = ss::metrics;
-    auto ns_label = sm::label("namespace");
-    auto topic_label = sm::label("topic");
-    auto partition_label = sm::label("partition");
     return {
-      ns_label(ntp.ns()),
-      topic_label(ntp.tp.topic()),
-      partition_label(ntp.tp.partition()),
+      metrics::namespace_label(ntp.ns()),
+      metrics::topic_label(ntp.tp.topic()),
+      metrics::partition_label(ntp.tp.partition()),
     };
 }
 
@@ -49,8 +46,9 @@ void probe::setup_public_metrics(const model::ntp& ntp) {
       {sm::make_counter(
          "leadership_changes",
          [this] { return _leadership_changes; },
-         sm::description("Number of won leader elections across all partitions "
-                         "in given topic"),
+         sm::description(
+           "Number of won leader elections across all partitions "
+           "in given topic"),
          labels)
          .aggregate(aggregate_labels)});
 }
@@ -80,14 +78,16 @@ void probe::setup_metrics(const model::ntp& ntp) {
         sm::make_counter(
           "replicate_ack_all_requests",
           [this] { return _replicate_requests_ack_all_with_flush; },
-          sm::description("Number of replicate requests with quorum ack "
-                          "consistency and explicit flush."),
+          sm::description(
+            "Number of replicate requests with quorum ack "
+            "consistency and explicit flush."),
           labels),
         sm::make_counter(
           "replicate_ack_all_requests_no_flush",
           [this] { return _replicate_requests_ack_all_without_flush; },
-          sm::description("Number of replicate requests with quorum ack "
-                          "consistency but without an explicit flush."),
+          sm::description(
+            "Number of replicate requests with quorum ack "
+            "consistency but without an explicit flush."),
           labels),
         sm::make_counter(
           "replicate_ack_leader_requests",
@@ -165,13 +165,21 @@ void probe::setup_metrics(const model::ntp& ntp) {
         sm::make_counter(
           "offset_translator_inconsistency_errors",
           [this] { return _offset_translator_inconsistency_error; },
-          sm::description("Number of append entries requests that failed the "
-                          "offset translator consistency check"),
+          sm::description(
+            "Number of append entries requests that failed the "
+            "offset translator consistency check"),
           labels),
         sm::make_counter(
           "append_entries_buffer_flushes",
           [this] { return _append_entries_buffer_flush; },
           sm::description("Number of append entries buffer flushes"),
+          labels),
+        sm::make_gauge(
+          "recovery_resets",
+          [this] { return _recovery_resets; },
+          sm::description(
+            "Number of times that a learner was forcefully reset "
+            "during recovery due to potential divergence"),
           labels),
       },
       {},

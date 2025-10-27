@@ -9,26 +9,50 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "base/seastarx.h"
 #include "base/type_traits.h"
 #include "kafka/protocol/types.h"
 #include "model/fundamental.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "serde/envelope.h"
 #include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/inet_address.h"
+#include "serde/rw/named_type.h"
 #include "serde/rw/optional.h"
 #include "serde/rw/rw.h"
+#include "serde/rw/variant.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/net/inet_address.hh>
 
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_set.h>
+#include <fmt/core.h>
 
 #include <iosfwd>
 #include <variant>
 
 namespace security {
+
+/*
+ * Conversions throw acl_conversion_error and the exception message via (what())
+ * is generally what should be returned as the error message in kafka responses.
+ *
+ * Using an exception here eliminates the need to write c/go-style error
+ * handling for the large number of fields that need to be converted.
+ */
+struct acl_conversion_error : std::exception {
+    explicit acl_conversion_error(ss::sstring msg)
+      : msg{std::move(msg)} {}
+    const char* what() const noexcept final { return msg.c_str(); }
+    ss::sstring msg;
+};
+
+template<typename E>
+std::enable_if_t<std::is_enum_v<E>, std::optional<E>>
+  from_string_view(std::string_view);
 
 // cluster is a resource type and the acl data model requires that resources
 // have names, so this is a fixed name for that resource.
@@ -50,10 +74,35 @@ enum class resource_type : int8_t {
     group = 1,
     cluster = 2,
     transactional_id = 3,
+    sr_subject = 4,
+    sr_registry = 5,
 };
+
+constexpr std::string_view to_string_view(resource_type type) {
+    switch (type) {
+    case resource_type::topic:
+        return "topic";
+    case resource_type::group:
+        return "group";
+    case resource_type::cluster:
+        return "cluster";
+    case resource_type::transactional_id:
+        return "transactional_id";
+    case resource_type::sr_subject:
+        return "subject";
+    case resource_type::sr_registry:
+        return "registry";
+    }
+    __builtin_unreachable();
+}
+
+template<>
+std::optional<resource_type>
+from_string_view<resource_type>(std::string_view str);
 
 template<typename T>
 consteval resource_type get_resource_type() {
+    namespace ppsr = pandaproxy::schema_registry;
     if constexpr (std::is_same_v<T, model::topic>) {
         return resource_type::topic;
     } else if constexpr (std::is_same_v<T, kafka::group_id>) {
@@ -62,6 +111,10 @@ consteval resource_type get_resource_type() {
         return resource_type::cluster;
     } else if constexpr (std::is_same_v<T, kafka::transactional_id>) {
         return resource_type::transactional_id;
+    } else if constexpr (std::is_same_v<T, ppsr::subject>) {
+        return resource_type::sr_subject;
+    } else if constexpr (std::is_same_v<T, ppsr::registry_resource>) {
+        return resource_type::sr_registry;
     } else {
         static_assert(base::unsupported_type<T>::value, "Unsupported type");
     }
@@ -76,6 +129,20 @@ enum class pattern_type : int8_t {
     literal = 0,
     prefixed = 1,
 };
+
+constexpr std::string_view to_string_view(pattern_type type) {
+    switch (type) {
+    case pattern_type::literal:
+        return "literal";
+    case pattern_type::prefixed:
+        return "prefixed";
+    }
+    __builtin_unreachable();
+}
+
+template<>
+std::optional<pattern_type>
+from_string_view<pattern_type>(std::string_view str);
 
 /*
  * An operation on a resource.
@@ -96,7 +163,38 @@ enum class acl_operation : int8_t {
     idempotent_write = 10,
 };
 
+constexpr std::string_view to_string_view(acl_operation op) {
+    switch (op) {
+    case acl_operation::all:
+        return "all";
+    case acl_operation::read:
+        return "read";
+    case acl_operation::write:
+        return "write";
+    case acl_operation::create:
+        return "create";
+    case acl_operation::remove:
+        return "delete";
+    case acl_operation::alter:
+        return "alter";
+    case acl_operation::describe:
+        return "describe";
+    case acl_operation::cluster_action:
+        return "cluster_action";
+    case acl_operation::describe_configs:
+        return "describe_configs";
+    case acl_operation::alter_configs:
+        return "alter_configs";
+    case acl_operation::idempotent_write:
+        return "idempotent_write";
+    }
+    __builtin_unreachable();
+}
+
 std::ostream& operator<<(std::ostream&, acl_operation);
+template<>
+std::optional<acl_operation>
+from_string_view<acl_operation>(std::string_view str);
 
 /*
  * Grant or deny access.
@@ -108,7 +206,20 @@ enum class acl_permission : int8_t {
     allow = 1,
 };
 
+constexpr std::string_view to_string_view(acl_permission perm) {
+    switch (perm) {
+    case acl_permission::deny:
+        return "deny";
+    case acl_permission::allow:
+        return "allow";
+    }
+    __builtin_unreachable();
+}
+
 std::ostream& operator<<(std::ostream&, acl_permission);
+template<>
+std::optional<acl_permission>
+from_string_view<acl_permission>(std::string_view str);
 
 /*
  * Principal type
@@ -123,6 +234,22 @@ enum class principal_type : int8_t {
     ephemeral_user = 1,
     role = 2,
 };
+
+constexpr std::string_view to_string_view(principal_type type) {
+    switch (type) {
+    case principal_type::user:
+        return "user";
+    case principal_type::ephemeral_user:
+        return "ephemeral user";
+    case principal_type::role:
+        return "role";
+    }
+    __builtin_unreachable();
+}
+
+template<>
+std::optional<principal_type>
+from_string_view<principal_type>(std::string_view str);
 
 std::ostream& operator<<(std::ostream&, resource_type);
 std::ostream& operator<<(std::ostream&, pattern_type);
@@ -179,6 +306,8 @@ public:
       : _type(type)
       , _name(std::move(name)) {}
 
+    static acl_principal from_string(std::string_view principal);
+
     /**
      * Get a view to the principal name.
      */
@@ -212,6 +341,60 @@ private:
     principal_type _type;
     ss::sstring _name;
 };
+
+} // namespace security
+
+template<>
+struct fmt::formatter<security::acl_principal_base> {
+    constexpr auto parse(fmt::format_parse_context& ctx)
+      -> decltype(ctx.begin()) {
+        auto it = ctx.begin();
+        auto end = ctx.end();
+
+        // Parse format specifiers:
+        // 'l' - logging and audit logging
+        // 'a' - kafka and schema registry API
+        if (it != end && (*it == 'l' || *it == 'a')) {
+            presentation = *it++;
+        }
+
+        if (it != end && *it != '}') {
+            throw fmt::format_error("invalid format specifier for principal");
+        }
+
+        return it;
+    }
+
+    template<typename FormatContext>
+    auto format(const security::acl_principal_base& p, FormatContext& ctx) const
+      -> decltype(ctx.out()) {
+        switch (presentation) {
+        case 'a': // User:Alice
+            switch (p.type()) {
+            case security::principal_type::user:
+                return fmt::format_to(ctx.out(), "User:{}", p.name_view());
+            case security::principal_type::ephemeral_user:
+                return fmt::format_to(
+                  ctx.out(), "Ephemeral user:{}", p.name_view());
+            case security::principal_type::role:
+                return fmt::format_to(
+                  ctx.out(), "RedpandaRole:{}", p.name_view());
+            }
+        case 'l': // type {user} name {Alice}
+        default:
+            return fmt::format_to(
+              ctx.out(), "type {{{}}} name {{{}}}", p.type(), p.name_view());
+        }
+    }
+
+    char presentation{'l'};
+};
+
+template<>
+struct fmt::formatter<security::acl_principal>
+  : fmt::formatter<security::acl_principal_base> {};
+
+namespace security {
 
 /**
  * Concrete instance of a Kafka principal.
@@ -292,8 +475,8 @@ class acl_host
       envelope<acl_host, serde::version<0>, serde::compat_version<0>> {
 public:
     acl_host() = default;
-    explicit acl_host(const ss::sstring& host)
-      : _addr(host) {}
+    explicit acl_host(ss::sstring host)
+      : _addr(std::move(host)) {}
 
     explicit acl_host(ss::net::inet_address host)
       : _addr(host) {}
@@ -403,17 +586,25 @@ private:
 
 /*
  * A filter for matching resources.
+ *
+ * Note: See acl_binding_filter::serde_write or write_v0 for history on how
+ * serde version 0 of this field was serialized
  */
 class resource_pattern_filter
   : public serde::envelope<
       resource_pattern_filter,
-      serde::version<0>,
-      serde::compat_version<0>> {
+      serde::version<1>,
+      serde::compat_version<1>> {
 public:
     enum class serialized_pattern_type {
         literal = 0,
         prefixed = 1,
         match = 2,
+    };
+
+    enum class resource_subsystem : uint8_t {
+        kafka = 0,
+        schema_registry = 1,
     };
 
     static serialized_pattern_type to_pattern(security::pattern_type from) {
@@ -426,23 +617,29 @@ public:
         __builtin_unreachable();
     }
 
-    struct pattern_match {
+    struct pattern_match
+      : public serde::
+          envelope<pattern_match, serde::version<0>, serde::compat_version<0>> {
         friend bool operator==(const pattern_match&, const pattern_match&)
           = default;
 
         friend std::ostream& operator<<(std::ostream&, const pattern_match&);
+
+        auto serde_fields() { return std::tie(); }
     };
-    using pattern_filter_type = std::variant<pattern_type, pattern_match>;
+    using pattern_filter_type = serde::variant<pattern_type, pattern_match>;
 
     resource_pattern_filter() = default;
 
     resource_pattern_filter(
       std::optional<resource_type> type,
       std::optional<ss::sstring> name,
-      std::optional<pattern_filter_type> pattern)
+      std::optional<pattern_filter_type> pattern,
+      resource_subsystem subsystem = resource_subsystem::kafka)
       : _resource(type)
       , _name(std::move(name))
-      , _pattern(pattern) {}
+      , _pattern(pattern)
+      , _subsystem(subsystem) {}
 
     // NOLINTNEXTLINE(hicpp-explicit-conversions)
     resource_pattern_filter(const resource_pattern& resource)
@@ -452,10 +649,16 @@ public:
     /*
      * A filter that matches any resource.
      */
-    static const resource_pattern_filter& any() {
-        static const resource_pattern_filter filter(
-          std::nullopt, std::nullopt, std::nullopt);
-        return filter;
+    static const resource_pattern_filter&
+    any(resource_subsystem subsystem = resource_subsystem::kafka) {
+        static const resource_pattern_filter k_filter(
+          std::nullopt, std::nullopt, std::nullopt, resource_subsystem::kafka);
+        static const resource_pattern_filter sr_filter(
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          resource_subsystem::schema_registry);
+        return subsystem == resource_subsystem::kafka ? k_filter : sr_filter;
     }
 
     bool matches(const resource_pattern& pattern) const;
@@ -464,6 +667,7 @@ public:
     std::optional<resource_type> resource() const { return _resource; }
     const std::optional<ss::sstring>& name() const { return _name; }
     std::optional<pattern_filter_type> pattern() const { return _pattern; }
+    resource_subsystem subsystem() const { return _subsystem; }
 
     template<typename H>
     friend H AbslHashValue(H h, const pattern_match&) {
@@ -474,12 +678,12 @@ public:
         return H::combine(std::move(h), f._resource, f._name, f._pattern);
     }
 
-    friend void read_nested(
+    friend void read_nested_v0(
       iobuf_parser& in,
       resource_pattern_filter& filter,
       const size_t bytes_left_limit);
 
-    friend void write(iobuf& out, resource_pattern_filter filter);
+    friend void write_v0(iobuf& out, resource_pattern_filter filter);
 
     friend bool
     operator==(const resource_pattern_filter&, const resource_pattern_filter&)
@@ -488,10 +692,15 @@ public:
     friend std::ostream&
     operator<<(std::ostream&, const resource_pattern_filter&);
 
+    auto serde_fields() {
+        return std::tie(_resource, _name, _pattern, _subsystem);
+    }
+
 private:
     std::optional<resource_type> _resource;
     std::optional<ss::sstring> _name;
     std::optional<pattern_filter_type> _pattern;
+    resource_subsystem _subsystem{resource_subsystem::kafka};
 };
 
 std::ostream&
@@ -563,11 +772,14 @@ private:
 
 /*
  * A filter for matching ACL bindings.
+ *
+ * Note: see acl_binding_filter::serde_write for context on serde version
+ * history
  */
 class acl_binding_filter
   : public serde::envelope<
       acl_binding_filter,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
 public:
     acl_binding_filter() = default;
@@ -581,12 +793,23 @@ public:
     }
 
     /*
-     * A filter that matches any ACL binding.
+     * A filter that matches any ACL binding for the given subsystem.
      */
-    static const acl_binding_filter& any() {
-        static const acl_binding_filter filter(
-          resource_pattern_filter::any(), acl_entry_filter::any());
-        return filter;
+    static const acl_binding_filter& any(
+      resource_pattern_filter::resource_subsystem subsystem
+      = resource_pattern_filter::resource_subsystem::kafka) {
+        static const acl_binding_filter k_filter(
+          resource_pattern_filter::any(
+            resource_pattern_filter::resource_subsystem::kafka),
+          acl_entry_filter::any());
+        static const acl_binding_filter sr_filter(
+          resource_pattern_filter::any(
+            resource_pattern_filter::resource_subsystem::schema_registry),
+          acl_entry_filter::any());
+
+        return subsystem == resource_pattern_filter::resource_subsystem::kafka
+                 ? k_filter
+                 : sr_filter;
     }
 
     bool matches(const acl_binding& binding) const {
@@ -602,7 +825,15 @@ public:
 
     friend std::ostream& operator<<(std::ostream&, const acl_binding_filter&);
 
-    auto serde_fields() { return std::tie(_pattern, _acl); }
+    void serde_write(iobuf&) const;
+    void serde_read(iobuf_parser&, const serde::header&);
+
+    // Helpers for serde compatibility testing
+    // They read/write the full object, including the header
+    void testing_serde_full_write_v0(iobuf&) const;
+    void testing_serde_full_read_v0(iobuf_parser&, const std::size_t);
+    void testing_serde_full_write_v2(iobuf&) const;
+    void testing_serde_full_read_v2(iobuf_parser&, const std::size_t);
 
 private:
     resource_pattern_filter _pattern;
@@ -612,5 +843,28 @@ private:
 /// Name of the principal the kafka client for auditing will be using
 inline const acl_principal audit_principal{
   principal_type::ephemeral_user, "__auditing"};
+
+inline const acl_principal schema_registry_principal{
+  principal_type::ephemeral_user, "__schema_registry"};
+
+namespace testing {
+
+struct acl_binding_filter_v0 : public acl_binding_filter {
+    static constexpr auto redpanda_serde_version = serde::version_t{0};
+    static constexpr auto redpanda_serde_compat_version = serde::version_t{0};
+};
+
+struct acl_binding_filter_v2 : public acl_binding_filter {
+    static constexpr auto redpanda_serde_version = serde::version_t{2};
+    static constexpr auto redpanda_serde_compat_version = serde::version_t{0};
+};
+
+} // namespace testing
+
+/**
+ *  list of acl operations for specific resource
+ */
+template<typename T>
+const std::vector<acl_operation>& get_allowed_operations();
 
 } // namespace security

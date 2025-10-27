@@ -17,12 +17,10 @@
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/tmp_dir.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
 
-#include <boost/test/tools/old/interface.hpp>
+#include <gtest/gtest.h>
 
 #include <memory>
 #include <stdexcept>
@@ -40,7 +38,8 @@ struct round_robin_consumer : storage::batch_consumer {
                 accept_cnt++;
                 return consume_result::stop_parser;
             } else {
-                BOOST_FAIL("Unexpected accept_batch_start");
+                EXPECT_TRUE(false) << "Unexpected accept_batch_start";
+                return consume_result::stop_parser;
             }
         }
         if ((static_cast<size_t>(h.base_offset()) % 2) == side) {
@@ -53,7 +52,7 @@ struct round_robin_consumer : storage::batch_consumer {
     void consume_batch_start(
       model::record_batch_header hdr, size_t, size_t) override {
         if (expect_close) {
-            BOOST_FAIL("Unexpected consume_batch_start");
+            FAIL() << "Unexpected consume_batch_start";
         }
         consumed->push_back(hdr);
     }
@@ -61,20 +60,21 @@ struct round_robin_consumer : storage::batch_consumer {
     void
     skip_batch_start(model::record_batch_header hdr, size_t, size_t) override {
         if (expect_close) {
-            BOOST_FAIL("Unexpected skip_batch_start");
+            FAIL() << "Unexpected skip_batch_start";
         }
         skipped->push_back(hdr);
     }
 
     void consume_records(iobuf&&) override {
         if (expect_close) {
-            BOOST_FAIL("Unexpected consume_records");
+            FAIL() << "Unexpected consume_records";
         }
     }
 
     ss::future<stop_parser> consume_batch_end() override {
         if (expect_close) {
-            BOOST_FAIL("Unexpected consume_batch_end");
+            EXPECT_TRUE(false) << "Unexpected consume_batch_end";
+            co_return stop_parser::yes;
         }
         if (consumed->size() < size_limit) {
             co_return stop_parser::no;
@@ -102,23 +102,21 @@ struct throwing_consumer : storage::batch_consumer {
 
     void
     consume_batch_start(model::record_batch_header, size_t, size_t) override {
-        BOOST_FAIL("Unexpected consume_batch_start");
-        __builtin_unreachable();
+        FAIL() << "Unexpected consume_batch_start";
     }
 
     void skip_batch_start(model::record_batch_header, size_t, size_t) override {
-        BOOST_FAIL("Unexpected skip_batch_start");
-        __builtin_unreachable();
+        FAIL() << "Unexpected skip_batch_start";
     }
 
     void consume_records(iobuf&&) override {
-        BOOST_FAIL("Unexpected consume_records");
+        FAIL() << "Unexpected consume_records";
         __builtin_unreachable();
     }
 
     ss::future<stop_parser> consume_batch_end() override {
-        BOOST_FAIL("Unexpected consume_batch_end");
-        __builtin_unreachable();
+        ADD_FAILURE() << "Unexpected consume_batch_end";
+        co_return stop_parser::yes;
     }
 
     void print(std::ostream& o) const override {
@@ -126,16 +124,13 @@ struct throwing_consumer : storage::batch_consumer {
     }
 };
 
-SEASTAR_THREAD_TEST_CASE(test_chained_consumers_round_robin) {
+TEST(batch_consumer_utils_test, test_chained_consumers_round_robin) {
     temporary_dir tmp_dir("chained_consumers");
     auto tmp_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      tmp_path.string(),
-      1024 * 1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      tmp_path.string(), 1024 * 1024, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"kafka", "panda-topic", 0}, {tmp_path}})
       | add_segment(0);
@@ -162,9 +157,7 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_round_robin) {
     auto cc = std::make_unique<chained_batch_consumer<2>>(
       std::move(c1), std::move(c2));
     auto s = b.get_log_segments().front();
-    auto str = s->offset_data_stream(
-                  s->offsets().get_base_offset(), ss::default_priority_class())
-                 .get();
+    auto str = s->offset_data_stream(s->offsets().get_base_offset()).get();
 
     auto parser = ss::make_lw_shared<storage::continuous_batch_parser>(
       std::move(cc), storage::segment_reader_handle(std::move(str)));
@@ -172,23 +165,20 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_round_robin) {
     auto close = ss::defer([parser] { parser->close().get(); });
 
     auto cnt = parser->consume().get();
-    BOOST_REQUIRE(cnt.has_value());
-    BOOST_REQUIRE(cnt.value() > 0);
-    BOOST_REQUIRE(consumed.size() > 0);
-    BOOST_REQUIRE(consumed.size() == skipped.size());
-    BOOST_REQUIRE(consumed == skipped);
+    ASSERT_TRUE(cnt.has_value());
+    ASSERT_GT(cnt.value(), 0);
+    ASSERT_GT(consumed.size(), 0);
+    ASSERT_EQ(consumed.size(), skipped.size());
+    ASSERT_EQ(consumed, skipped);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_chained_consumers_early_stop) {
+TEST(batch_consumer_utils_test, test_chained_consumers_early_stop) {
     temporary_dir tmp_dir("chained_consumers");
     auto tmp_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      tmp_path.string(),
-      1024 * 1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      tmp_path.string(), 1024 * 1024, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"kafka", "panda-topic", 0}, {tmp_path}})
       | add_segment(0);
@@ -221,9 +211,7 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_early_stop) {
     auto cc = std::make_unique<chained_batch_consumer<3>>(
       std::move(c_stopped), std::move(c1), std::move(c2));
     auto s = b.get_log_segments().front();
-    auto str = s->offset_data_stream(
-                  s->offsets().get_base_offset(), ss::default_priority_class())
-                 .get();
+    auto str = s->offset_data_stream(s->offsets().get_base_offset()).get();
 
     auto parser = ss::make_lw_shared<storage::continuous_batch_parser>(
       std::move(cc), storage::segment_reader_handle(std::move(str)));
@@ -232,23 +220,20 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_early_stop) {
 
     auto cnt = parser->consume().get();
     // Check that stopped consumer does not affect the remaining consumers
-    BOOST_REQUIRE(cnt.has_value());
-    BOOST_REQUIRE(cnt.value() > 0);
-    BOOST_REQUIRE(consumed.size() > 0);
-    BOOST_REQUIRE(consumed.size() == skipped.size());
-    BOOST_REQUIRE(consumed == skipped);
+    ASSERT_TRUE(cnt.has_value());
+    ASSERT_GT(cnt.value(), 0);
+    ASSERT_GT(consumed.size(), 0);
+    ASSERT_EQ(consumed.size(), skipped.size());
+    ASSERT_EQ(consumed, skipped);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_chained_consumers_stop_all) {
+TEST(batch_consumer_utils_test, test_chained_consumers_stop_all) {
     temporary_dir tmp_dir("chained_consumers");
     auto tmp_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      tmp_path.string(),
-      1024 * 1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      tmp_path.string(), 1024 * 1024, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"kafka", "panda-topic", 0}, {tmp_path}})
       | add_segment(0);
@@ -278,9 +263,7 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_stop_all) {
       std::move(c1), std::move(c2));
 
     auto s = b.get_log_segments().front();
-    auto str = s->offset_data_stream(
-                  s->offsets().get_base_offset(), ss::default_priority_class())
-                 .get();
+    auto str = s->offset_data_stream(s->offsets().get_base_offset()).get();
 
     auto parser = ss::make_lw_shared<storage::continuous_batch_parser>(
       std::move(cc), storage::segment_reader_handle(std::move(str)));
@@ -290,22 +273,19 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_stop_all) {
     auto cnt = parser->consume().get();
 
     // Check that nothing is consumed
-    BOOST_REQUIRE(cnt.has_value());
-    BOOST_REQUIRE(cnt.value() == 0);
-    BOOST_REQUIRE(consumed.size() == 0);
-    BOOST_REQUIRE(consumed.size() == skipped.size());
+    ASSERT_TRUE(cnt.has_value());
+    ASSERT_EQ(cnt.value(), 0);
+    ASSERT_EQ(consumed.size(), 0);
+    ASSERT_EQ(consumed.size(), skipped.size());
 }
 
-SEASTAR_THREAD_TEST_CASE(test_chained_consumers_skip_all) {
+TEST(batch_consumer_utils_test, test_chained_consumers_skip_all) {
     temporary_dir tmp_dir("chained_consumers");
     auto tmp_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      tmp_path.string(),
-      1024 * 1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      tmp_path.string(), 1024 * 1024, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"kafka", "panda-topic", 0}, {tmp_path}})
       | add_segment(0);
@@ -334,9 +314,7 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_skip_all) {
       std::move(c1), std::move(c2));
 
     auto s = b.get_log_segments().front();
-    auto str = s->offset_data_stream(
-                  s->offsets().get_base_offset(), ss::default_priority_class())
-                 .get();
+    auto str = s->offset_data_stream(s->offsets().get_base_offset()).get();
 
     auto parser = ss::make_lw_shared<storage::continuous_batch_parser>(
       std::move(cc), storage::segment_reader_handle(std::move(str)));
@@ -346,23 +324,20 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_skip_all) {
     auto cnt = parser->consume().get();
 
     // Check that nothing is consumed
-    BOOST_REQUIRE(cnt.has_value());
-    BOOST_REQUIRE(cnt.value() > 0);
-    BOOST_REQUIRE(consumed.size() == 0);
-    BOOST_REQUIRE(skipped.size() > 0);
-    BOOST_REQUIRE_EQUAL(skipped.size(), 2 * 20); // 2 consumers 20 batches
+    ASSERT_TRUE(cnt.has_value());
+    ASSERT_GT(cnt.value(), 0);
+    ASSERT_EQ(consumed.size(), 0);
+    ASSERT_GT(skipped.size(), 0);
+    ASSERT_EQ(skipped.size(), 2 * 20); // 2 consumers 20 batches
 }
 
-SEASTAR_THREAD_TEST_CASE(test_chained_consumers_exception_propagation) {
+TEST(batch_consumer_utils_test, test_chained_consumers_exception_propagation) {
     temporary_dir tmp_dir("chained_consumers");
     auto tmp_path = tmp_dir.get_path();
     using namespace storage;
 
     disk_log_builder b{log_config{
-      tmp_path.string(),
-      1024 * 1024,
-      ss::default_priority_class(),
-      storage::make_sanitized_file_config()}};
+      tmp_path.string(), 1024 * 1024, storage::make_sanitized_file_config()}};
 
     b | start(ntp_config{{"kafka", "panda-topic", 0}, {tmp_path}})
       | add_segment(0);
@@ -386,19 +361,17 @@ SEASTAR_THREAD_TEST_CASE(test_chained_consumers_exception_propagation) {
       std::move(c1), std::move(c_throw));
 
     auto s = b.get_log_segments().front();
-    auto str = s->offset_data_stream(
-                  s->offsets().get_base_offset(), ss::default_priority_class())
-                 .get();
+    auto str = s->offset_data_stream(s->offsets().get_base_offset()).get();
 
     auto parser = ss::make_lw_shared<storage::continuous_batch_parser>(
       std::move(cc), storage::segment_reader_handle(std::move(str)));
 
     auto close = ss::defer([parser] { parser->close().get(); });
 
-    BOOST_REQUIRE_THROW(parser->consume().get(), std::runtime_error);
+    ASSERT_THROW(parser->consume().get(), std::runtime_error);
     // other consumers in the chain shouldn't get result
     // because we stop the batch parser before any batches are
     // consumed
-    BOOST_REQUIRE_EQUAL(consumed.size(), 0);
-    BOOST_REQUIRE_EQUAL(skipped.size(), 0);
+    ASSERT_EQ(consumed.size(), 0);
+    ASSERT_EQ(skipped.size(), 0);
 }

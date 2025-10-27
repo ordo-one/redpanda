@@ -9,13 +9,15 @@
 
 import random
 import threading
+
 from ducktape.utils.util import wait_until
-from rptest.services.cluster import cluster
+
 from rptest.clients.types import TopicSpec
-from rptest.tests.end_to_end import EndToEndTest
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, make_redpanda_service
 from rptest.services.admin import Admin
+from rptest.services.cluster import cluster
 from rptest.services.failure_injector import FailureInjector, FailureSpec
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, make_redpanda_service
+from rptest.tests.end_to_end import EndToEndTest
 from rptest.util import wait_until_result
 
 
@@ -32,30 +34,32 @@ class ShutdownTest(EndToEndTest):
 
     @cluster(num_nodes=5, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_timely_shutdown_with_failures(self):
-        '''
+        """
         Validates that a leader node can shutdown in a timely manner when
         a follower node is unresponsive. Specifically the test targets
         timely cleanup of the consensus class in flaky conditions.
-        '''
+        """
         self.topic = TopicSpec(partition_count=1, replication_factor=3)
-        rp_conf = {
-            'enable_leader_balancer': False,
-            'auto_create_topics_enabled': True
-        }
-        self.redpanda = make_redpanda_service(self.test_context,
-                                              3,
-                                              extra_rp_conf=rp_conf)
+        rp_conf = {"enable_leader_balancer": False, "auto_create_topics_enabled": True}
+        self.redpanda = make_redpanda_service(
+            self.test_context, 3, extra_rp_conf=rp_conf
+        )
         admin = Admin(self.redpanda)
 
         def checked_get_leader():
             try:
-                leader = admin.get_partition_leader(namespace="kafka",
-                                                    topic=self.topic.name,
-                                                    partition=0)
-                return (True,
-                        next(
-                            filter(lambda n: self.redpanda.idx(n) == leader,
-                                   self.redpanda.nodes)))
+                leader = admin.get_partition_leader(
+                    namespace="kafka", topic=self.topic.name, partition=0
+                )
+                return (
+                    True,
+                    next(
+                        filter(
+                            lambda n: self.redpanda.idx(n) == leader,
+                            self.redpanda.nodes,
+                        )
+                    ),
+                )
             except:
                 return False
 
@@ -63,10 +67,12 @@ class ShutdownTest(EndToEndTest):
         # Background load generation
         self.start_producer(2)
         # Wait until a leader is available.
-        wait_until(lambda: checked_get_leader(),
-                   timeout_sec=10,
-                   backoff_sec=2,
-                   err_msg=f"Leader not found for ntp: {self.topic}/0")
+        wait_until(
+            lambda: checked_get_leader(),
+            timeout_sec=10,
+            backoff_sec=2,
+            err_msg=f"Leader not found for ntp: {self.topic}/0",
+        )
 
         def pause_non_leader_node():
             """Picks a non leader node for the ntp and isolates it repeatedly"""
@@ -82,12 +88,14 @@ class ShutdownTest(EndToEndTest):
 
                     # Suspend for longer than send timeouts
                     finjector.inject_failure(
-                        FailureSpec(node=node, type=failure, length=timeout_s))
+                        FailureSpec(node=node, type=failure, length=timeout_s)
+                    )
                     self.stopped.wait(timeout=period_s)
 
         # Inject failures in the background.
         self.background_failures = threading.Thread(
-            target=pause_non_leader_node, args=(), daemon=True)
+            target=pause_non_leader_node, args=(), daemon=True
+        )
         self.background_failures.start()
         try:
             pending_attempts = 10
@@ -97,11 +105,13 @@ class ShutdownTest(EndToEndTest):
                     lambda: checked_get_leader(),
                     timeout_sec=30,
                     backoff_sec=2,
-                    err_msg=f"Leader not found for ntp: {self.topic}/0")
+                    err_msg=f"Leader not found for ntp: {self.topic}/0",
+                )
 
                 assert leader
                 self.redpanda.logger.info(
-                    f"Restarting leader node {leader.account.hostname}")
+                    f"Restarting leader node {leader.account.hostname}"
+                )
                 self.redpanda.restart_nodes(leader)
                 pending_attempts -= 1
         finally:

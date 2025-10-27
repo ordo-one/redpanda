@@ -29,7 +29,8 @@ public:
     ss::future<> stop() override;
 
     ss::future<> do_apply(const model::record_batch&) override;
-    model::offset max_collectible_offset() override;
+    model::offset max_removable_local_log_offset() override;
+    std::optional<kafka::offset> lowest_pinned_data_offset() const override;
     ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&& bytes) override;
 
@@ -37,7 +38,7 @@ public:
       take_local_snapshot(ssx::semaphore_units) override;
 
     ss::future<> apply_raft_snapshot(const iobuf&) final;
-    ss::future<iobuf> take_snapshot(model::offset) final;
+    ss::future<iobuf> take_raft_snapshot(model::offset) final;
 
     raft::consensus* raft() const { return _raft; }
 
@@ -90,6 +91,11 @@ public:
       model::timeout_clock::duration timeout,
       ss::abort_source&);
 
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::skip_to_end;
+    }
+
 private:
     struct snapshot
       : serde::envelope<snapshot, serde::version<1>, serde::compat_version<0>> {
@@ -103,6 +109,9 @@ private:
 
     void update_highest_translated_offset(kafka::offset new_offset);
 
+    // The offset one below the starting point of the next translation.
+    // When this is kafka::offset::min() (the default), this indicates that it
+    // is not initialized.
     kafka::offset _highest_translated_offset{};
 
     // approximate system time at which _highest_translated_offset became
@@ -115,7 +124,10 @@ class stm_factory : public cluster::state_machine_factory {
 public:
     explicit stm_factory(bool is_iceberg_enabled);
     bool is_applicable_for(const storage::ntp_config&) const final;
-    void create(raft::state_machine_manager_builder&, raft::consensus*) final;
+    void create(
+      raft::state_machine_manager_builder&,
+      raft::consensus*,
+      const cluster::stm_instance_config&) final;
 
 private:
     bool _iceberg_enabled;

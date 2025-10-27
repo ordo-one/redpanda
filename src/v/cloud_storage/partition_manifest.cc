@@ -223,12 +223,23 @@ partition_manifest::full_log_start_kafka_offset() const {
     if (_archive_start_offset != model::offset{}) {
         // The archive start offset is guaranteed to be smaller than
         // the manifest start offset.
-        vassert(
-          _archive_start_offset <= _start_offset,
-          "[{}] Archive start offset {} is greater than the start offset {}",
-          display_name(),
-          _archive_start_offset,
-          _start_offset);
+        if (_archive_start_offset > _start_offset) {
+            vlog(
+              cst_log.error,
+              "[{}] Archive start offset {} is greater than the start offset "
+              "{}",
+              display_name(),
+              _archive_start_offset,
+              _start_offset);
+            throw std::runtime_error(
+              fmt::format(
+                "{} Archive start offset {} is greater than the "
+                "start offset {}",
+                display_name(),
+                _archive_start_offset,
+                _start_offset));
+        }
+
         return _archive_start_offset - _archive_start_offset_delta;
     }
 
@@ -269,7 +280,8 @@ std::optional<kafka::offset>
 partition_manifest::compute_start_kafka_offset_local() const {
     std::optional<kafka::offset> local_start_offset;
     auto iter = _segments.find(_start_offset);
-    if (iter != _segments.end()) {
+    auto segments_end = _segments.end();
+    if (iter != segments_end) {
         auto delta = iter->delta_offset;
         local_start_offset = _start_offset - delta;
     } else {
@@ -277,7 +289,7 @@ partition_manifest::compute_start_kafka_offset_local() const {
         // translate it.  If there are any segments ahead of it, then
         // those may be considered the start of the remote log.
         if (auto front_it = _segments.begin();
-            front_it != _segments.end()
+            front_it != segments_end
             && front_it->base_offset >= _start_offset) {
             local_start_offset = front_it->base_offset - front_it->delta_offset;
         }
@@ -369,12 +381,13 @@ segment_name partition_manifest::generate_remote_segment_name(
         [[fallthrough]];
     case segment_name_format::v3:
         // Use new style format ".../base-committed-term-size-v1.log"
-        return segment_name(ssx::sformat(
-          "{}-{}-{}-{}-v1.log",
-          val.base_offset(),
-          val.committed_offset(),
-          val.size_bytes,
-          val.segment_term()));
+        return segment_name(
+          ssx::sformat(
+            "{}-{}-{}-{}-v1.log",
+            val.base_offset(),
+            val.committed_offset(),
+            val.size_bytes,
+            val.segment_term()));
     }
     __builtin_unreachable();
 }
@@ -513,6 +526,16 @@ model::offset partition_manifest::get_archive_clean_offset() const {
 
 void partition_manifest::set_archive_start_offset(
   model::offset start_rp_offset, model::offset_delta start_delta) {
+    if (start_rp_offset > _start_offset) {
+        vlog(
+          cst_log.error,
+          "{} archive start is not moved to {} because start offset is {}. "
+          "Command is ignored.",
+          display_name(),
+          start_rp_offset,
+          _start_offset);
+        return;
+    }
     if (_archive_start_offset < start_rp_offset) {
         _archive_start_offset = start_rp_offset;
         _archive_start_offset_delta = start_delta;
@@ -714,25 +737,32 @@ bool partition_manifest::advance_start_offset(model::offset new_start_offset) {
             subtract_from_cloud_log_size(it->size_bytes);
         }
 
-        // The new start offset has moved past the user-requested start offset,
-        // so there's no point in tracking it further.
-        if (
-          highest_removed_offset != kafka::offset{}
-          && highest_removed_offset >= _start_kafka_offset_override) {
-            _start_kafka_offset_override = kafka::offset{};
+        if (_archive_start_offset == model::offset{}) {
+            // This method is used by spillover (archive) mechanism to advance
+            // the start offset of the manifest and by STM retention mechanism.
+            // We should touch _start_kafka_offset_override only if the archive
+            // is not used. Otherwise, the override should be managed by the
+            // archive logic (apply_archive_retention, etc).
+            if (
+              highest_removed_offset != kafka::offset{}
+              && highest_removed_offset >= _start_kafka_offset_override) {
+                // The new start offset has moved past the user-requested start
+                // offset, so there's no point in tracking it further.
+                _start_kafka_offset_override = kafka::offset{};
+            }
         }
         return true;
     }
     return false;
 }
 
-fragmented_vector<partition_manifest::lw_segment_meta>
+chunked_vector<partition_manifest::lw_segment_meta>
 partition_manifest::lw_replaced_segments() const {
     return _replaced.copy();
 }
 
-fragmented_vector<segment_meta> partition_manifest::replaced_segments() const {
-    fragmented_vector<segment_meta> res;
+chunked_vector<segment_meta> partition_manifest::replaced_segments() const {
+    chunked_vector<segment_meta> res;
     for (const auto& s : _replaced) {
         res.push_back(lw_segment_meta::convert(s));
     }
@@ -850,6 +880,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
       .last_segment = last_segment(),
     };
 
+    auto segments_end = _segments.end();
     for (const auto& m : meta_list) {
         if (_segments.empty() && !subst.last_segment.has_value()) {
             // The empty manifest can be started from any offset. If we deleted
@@ -895,7 +926,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
               };
 
             auto it = _segments.find(m.base_offset);
-            if (it == _segments.end()) {
+            if (it == segments_end) {
                 // Segment added to tip of the log
                 const auto last_seg = subst.last_segment;
                 vassert(
@@ -967,7 +998,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                 // *not valid*.
                 ++it;
                 bool boundary_found = false;
-                while (it != _segments.end()) {
+                while (it != segments_end) {
                     if (it->committed_offset == m.committed_offset) {
                         boundary_found = true;
                         break;
@@ -1035,9 +1066,9 @@ partition_manifest partition_manifest::clone() const {
         segment_name name;
         segment_meta meta;
     };
-    fragmented_vector<segment_name_meta> segments;
-    fragmented_vector<segment_name_meta> replaced;
-    fragmented_vector<segment_name_meta> spillover;
+    chunked_vector<segment_name_meta> segments;
+    chunked_vector<segment_name_meta> replaced;
+    chunked_vector<segment_name_meta> spillover;
     for (const auto& m : _segments) {
         segments.push_back(
           {.name = generate_local_segment_name(m.base_offset, m.segment_term),
@@ -2322,7 +2353,8 @@ void partition_manifest::serialize_segments(
     }
     if (!_segments.empty()) {
         auto it = _segments.lower_bound(cursor->next_offset);
-        for (; it != _segments.end(); ++it) {
+        auto end_it = _segments.end();
+        for (; it != end_it; ++it) {
             serialize_segment_meta(*it, cursor);
             cursor->segments_serialized++;
             if (cursor->segments_serialized >= cursor->max_segments_per_call) {
@@ -2331,7 +2363,7 @@ void partition_manifest::serialize_segments(
                 break;
             }
         }
-        if (it == _segments.end()) {
+        if (it == end_it) {
             cursor->next_offset = _last_offset;
         } else {
             // We hit the limit on number of serialized segment
@@ -2383,7 +2415,8 @@ void partition_manifest::serialize_spillover(
 
     if (!_spillover_manifests.empty()) {
         auto it = _spillover_manifests.lower_bound(cursor->next_spill_offset);
-        for (; it != _spillover_manifests.end(); ++it) {
+        auto end_it = _spillover_manifests.end();
+        for (; it != end_it; ++it) {
             serialize_spillover_manifest_meta(*it, cursor);
             cursor->spills_serialized++;
             if (cursor->spills_serialized >= cursor->max_segments_per_call) {
@@ -2392,7 +2425,7 @@ void partition_manifest::serialize_spillover(
                 break;
             }
         }
-        if (it == _spillover_manifests.end()) {
+        if (it == end_it) {
             cursor->next_spill_offset = _last_offset;
         } else {
             cursor->next_spill_offset = it->base_offset;
@@ -2501,6 +2534,52 @@ partition_manifest::timequery(model::timestamp t) const {
     return *_segments.at_index(target_ix);
 }
 
+size_t partition_manifest::estimate_size_between(
+  kafka::offset begin, kafka::offset end) const {
+    if (begin > end) {
+        return 0;
+    }
+    auto stm_start_offset = get_start_kafka_offset();
+    auto stm_next_offset = get_next_kafka_offset();
+    if (!stm_start_offset.has_value() || !stm_next_offset.has_value()) {
+        // The manifest is empty, implying the cloud log is empty.
+        return 0;
+    }
+    size_t spillover_sz = 0;
+    if (begin < *stm_start_offset) {
+        // 'begin' falls below the STM manifest, meaning the range includes
+        // part of the spillover region: aggregate them.
+        for (const auto& m : _spillover_manifests) {
+            if (
+              m.base_kafka_offset() <= end && m.last_kafka_offset() >= begin) {
+                spillover_sz += m.size_bytes;
+            }
+        }
+    }
+    if (end < *stm_start_offset) {
+        // 'end' falls below the STM manifest, mening the entire range was in
+        // the spillover region and we can just return what we have.
+        return spillover_sz;
+    }
+    // At this point we know there is overlap between the input range and the
+    // the STM manifest.
+
+    size_t stm_sz = 0;
+    auto stm_end_offset = kafka::prev_offset(*stm_next_offset);
+    if (begin <= *stm_start_offset && end >= stm_end_offset) {
+        // The range covers the entire STM manifest -- no need to iterate.
+        stm_sz = stm_region_size_bytes();
+    } else {
+        for (const auto& s : _segments) {
+            if (
+              s.base_kafka_offset() <= end && s.last_kafka_offset() >= begin) {
+                stm_sz += s.size_bytes;
+            }
+        }
+    }
+    return stm_sz + spillover_sz;
+}
+
 // this class is a serde-enabled version of partition_manifest. it's needed
 // because segment_meta_cstore is not copyable, and moving it would empty out
 // partition_manifest
@@ -2574,8 +2653,9 @@ static_assert(
 
 // construct partition_manifest_serde while keeping
 // std::is_aggregate<partition_manifest_serde> true
-static auto partition_manifest_serde_from_partition_manifest(
-  const partition_manifest& m) -> partition_manifest_serde {
+static auto
+partition_manifest_serde_from_partition_manifest(const partition_manifest& m)
+  -> partition_manifest_serde {
     partition_manifest_serde tmp{};
     // copy every field that is not segment_meta_cstore in
     // partition_manifest_serde, and uses to_iobuf for segment_meta_cstore
@@ -2585,7 +2665,7 @@ static auto partition_manifest_serde_from_partition_manifest(
         (([&]<typename Src>(auto& dest, const Src& src) {
              if constexpr (std::is_same_v<Src, segment_meta_cstore>) {
                  dest = src.to_iobuf();
-             } else if constexpr (reflection::is_fragmented_vector<Src>) {
+             } else if constexpr (reflection::is_chunked_vector<Src>) {
                  dest = src.copy();
              } else {
                  dest = src;
@@ -2658,13 +2738,14 @@ void partition_manifest::process_anomalies(
 
     const auto archive_start_offset = get_archive_start_offset();
     absl::erase_if(
-      missing_spills, [this, &archive_start_offset](const auto& spill_comp) {
+      missing_spills,
+      [this, &archive_start_offset, end_it = _spillover_manifests.end()](
+        const auto& spill_comp) {
           // Remove the missing spill if lies below the start offset of the
           // archive or if it doesn't match with any of the entries in the
           // manifest.
           return spill_comp.last < archive_start_offset
-                 || _spillover_manifests.find(spill_comp.base)
-                      == _spillover_manifests.end();
+                 || _spillover_manifests.find(spill_comp.base) == end_it;
       });
 
     auto first_kafka_offset = full_log_start_kafka_offset();

@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
@@ -18,8 +19,6 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace datalake::translation::scheduling {
 
@@ -59,12 +58,30 @@ public:
     virtual void notify_memory_exhausted() = 0;
 };
 
+/*
+ * Interface for scheduler to interact with the global disk manager.
+ */
+class disk_manager {
+public:
+    disk_manager() = default;
+    disk_manager(const disk_manager&) = delete;
+    disk_manager& operator=(const disk_manager&) = delete;
+    disk_manager(disk_manager&& other) noexcept;
+    disk_manager& operator=(disk_manager&&) noexcept;
+    virtual ~disk_manager() = default;
+
+    /*
+     * Request additional disk reservation from the global pool. This method
+     * will return zero units if the request cannot be satisfied immediately.
+     */
+    virtual ss::future<size_t> reserve() = 0;
+};
+
 using reservation = ssx::semaphore_units;
 
 /**
  * Tracks the resources needed by translators. Translators work with a
- * reservation tracker to reserve resources needed for translation. Currently
- * tracks memory but can be extended to other resources like disk usage.
+ * reservation tracker to reserve resources needed for translation.
  *
  * note: All reservations must be destroyed before destroying the tracker.
  */
@@ -86,8 +103,25 @@ public:
 
     virtual size_t allocated_memory() const = 0;
 
+    /**
+     * Returns a reservation of disk space. The reservation may be any size,
+     * with the passed-in size being a hint. If more units are reserved than are
+     * needed, then release the unused units if they will not be used in the
+     * near term (e.g. a translator leaving the running state).
+     *
+     * Returning the unused units is important because disk space reservations
+     * are held across all translator states, including the idle state. Because
+     * of this persistence, even small amounts of unused reservation can add up
+     * to large reservations across hundreds or thousands of translators.
+     */
+    virtual ss::future<reservation> reserve_disk(size_t, ss::abort_source&) = 0;
+    virtual size_t release_unused_disk_units() = 0;
+
     static std::unique_ptr<reservations_tracker> make_default(
-      size_t total_memory, size_t memory_block_size, scheduling_notifications&);
+      size_t total_memory,
+      size_t memory_block_size,
+      scheduling_notifications&,
+      disk_manager&);
 };
 
 /**
@@ -152,11 +186,6 @@ public:
     virtual ss::future<> close() noexcept = 0;
 
     /**
-     * Invoked when any of the translation related properties are altered.
-     */
-    virtual void reconcile_properties() noexcept = 0;
-
-    /**
      * Current status of the translation.
      */
     virtual translation_status status() const = 0;
@@ -183,7 +212,12 @@ public:
      * resources should be released and the translator should invoke \ref
      * scheduling_notifications::notify_done when done.
      */
-    virtual void stop_translation() = 0;
+    enum class stop_reason {
+        oom,
+        out_of_disk,
+    };
+
+    virtual void stop_translation(stop_reason) = 0;
 
     /**
      * Request that the translator finish and upload its data. This is distinct
@@ -191,7 +225,7 @@ public:
      * matter what stat it is in (e.g. running, waiting, idle). The translator
      * is free to clear the request after taking action.
      */
-    virtual void set_finish_translation() {}
+    virtual void set_finish_translation() = 0;
 
     /**
      * Return true if the translator is still in the progress of satisfying the
@@ -251,7 +285,7 @@ public:
     void mark_waiting();
     void mark_running();
     void mark_idle();
-    void mark_stopping();
+    void mark_stopping(translator::stop_reason);
 
     // hook into the waiting queue
     intrusive_list_hook _waiting_hook;
@@ -310,7 +344,7 @@ using translators = chunked_hash_map<translator_id, translator_executable>;
  */
 struct executor {
     void start_translation(translator_executable&, clock::duration time_slice);
-    void stop_translation(translator_executable&);
+    void stop_translation(translator_executable&, translator::stop_reason);
     translators translators{};
     intrusive_list<translator_executable, &translator_executable::_running_hook>
       running;
@@ -322,7 +356,15 @@ struct executor {
      * finished with lowest value being highest priority.
      */
     using finish_priority = size_t;
-    absl::btree_map<finish_priority, translator_id>
+    struct finish_request {
+        translator_id id;
+        translator::stop_reason reason;
+
+        finish_request(translator_id id, translator::stop_reason reason)
+          : id(std::move(id))
+          , reason(reason) {}
+    };
+    absl::btree_map<finish_priority, finish_request>
       translators_for_immediate_finish;
 
     ss::gate gate;
@@ -365,7 +407,8 @@ public:
     explicit scheduler(
       size_t total_memory,
       size_t memory_block_size,
-      std::unique_ptr<scheduling_policy>);
+      std::unique_ptr<scheduling_policy>,
+      disk_manager&);
     scheduler(const scheduler&) = delete;
     scheduler& operator=(const scheduler&) = delete;
     scheduler(scheduler&&) = delete;
@@ -406,14 +449,29 @@ public:
      * the total size of the translator which can be used to avoid requerying
      * for the same information from the translator status API.
      */
-    void request_immediate_finish(
-      chunked_vector<std::pair<translator_id, size_t>>);
+    struct finish_request {
+        translator_id id;
+        translator::stop_reason reason;
+
+        finish_request(translator_id id, translator::stop_reason reason)
+          : id(std::move(id))
+          , reason(reason) {}
+    };
+    void request_immediate_finish(chunked_vector<finish_request>);
+
+    /*
+     * Consume and return unused disk reservation units. This interface is used
+     * by the global disk manager to harvest units from cores in order to
+     * redistribute them.
+     */
+    size_t release_unused_disk_units();
 
 private:
     ss::future<> main();
     bool requires_scheduling_actions() const;
     ss::condition_variable _state_changed_cvar;
     std::unique_ptr<scheduling_policy> _scheduling_policy;
+    disk_manager& _disk_monitor;
     std::unique_ptr<reservations_tracker> _mem_tracker;
     executor _executor;
 };

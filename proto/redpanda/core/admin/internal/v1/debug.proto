@@ -1,0 +1,74 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package redpanda.core.admin.v2.internal;
+
+import "proto/redpanda/core/pbgen/options.proto";
+import "proto/redpanda/core/pbgen/rpc.proto";
+
+option (pbgen.cpp_namespace) = "proto::admin";
+
+message StartStressFiberRequest {
+    int32 min_spins_per_scheduling_point = 1;
+    int32 max_spins_per_scheduling_point = 2;
+    int32 stack_depth = 3;
+    int32 min_ms_per_scheduling_point = 4;
+    int32 max_ms_per_scheduling_point = 5;
+    int32 fiber_count = 6;
+}
+
+message StartStressFiberResponse {}
+
+message StopStressFiberRequest {}
+
+message StopStressFiberResponse {}
+
+message ThrowStructuredExceptionRequest {
+    int32 node_id = 1;
+    string reason = 2;
+    map<string, string> metadata = 3;
+}
+message ThrowStructuredExceptionResponse {}
+
+// The DebugService provides access to internal debugging information and debug
+// operations for the cluster or node.
+//
+// NOTE: if you're adding a larger group of RPCs here, please consider splitting
+// it out into another service.
+service DebugService {
+    // This RPC throws a structured exception with the given reason and
+    // metadata, it should be accessible as an exception in the RPC protocol.
+    //
+    // This is used to test the RPC framework itself.
+    rpc ThrowStructuredException(ThrowStructuredExceptionRequest)
+        returns (ThrowStructuredExceptionResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER,
+        };
+    }
+    rpc StartStressFiber(StartStressFiberRequest)
+        returns (StartStressFiberResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER,
+        };
+    }
+    rpc StopStressFiber(StopStressFiberRequest)
+        returns (StopStressFiberResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER,
+        };
+    }
+}

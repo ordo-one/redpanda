@@ -8,24 +8,24 @@
 // by the Apache License, Version 2.0
 
 #define BOOST_TEST_MODULE random
-#include "random/fast_prng.h"
+#include "absl/container/flat_hash_set.h"
 #include "random/generators.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <boost/test/unit_test.hpp>
 
 #include <set>
 #include <utility>
 
-BOOST_AUTO_TEST_CASE(fast_prng_basic_gen_100_unique_rands) {
-    fast_prng rng;
+BOOST_AUTO_TEST_CASE(rng_basic_gen_100_unique_rands) {
+    random_generators::rng rng;
     std::set<uint32_t> test;
     for (auto i = 0; i < 100; ++i) {
-        uint32_t x = rng();
+        auto x = rng.get_int<uint32_t>();
         BOOST_CHECK(!test.count(x));
         test.insert(x);
     }
 }
+
 BOOST_AUTO_TEST_CASE(alphanum_generator) {
     for (auto i = 0; i < 100; ++i) {
         auto s = random_generators::gen_alphanum_string(i);

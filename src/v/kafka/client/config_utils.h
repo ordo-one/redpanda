@@ -14,32 +14,20 @@
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "config/fwd.h"
-#include "kafka/client/fwd.h"
-#include "model/compression.h"
+#include "kafka/client/configuration.h"
 #include "security/acl.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 
-#include <vector>
-
 namespace kafka::client {
 
-ss::future<std::unique_ptr<kafka::client::configuration>>
+bool is_scram_configured(const configuration& client_cfg);
+
+ss::future<std::optional<kafka::client::sasl_configuration>>
 create_client_credentials(
-  cluster::controller& controller,
-  const config::configuration& cluster_cfg,
+  ::cluster::controller& controller,
   const kafka::client::configuration& client_cfg,
   security::acl_principal principal);
-
-void set_client_credentials(
-  const kafka::client::configuration& client_cfg,
-  kafka::client::client& client);
-
-ss::future<> set_client_credentials(
-  const kafka::client::configuration& client_cfg,
-  ss::sharded<kafka::client::client>& client);
-
-model::compression compression_from_str(std::string_view v);
 
 } // namespace kafka::client

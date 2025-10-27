@@ -15,6 +15,7 @@
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "kafka/protocol/errors.h"
+#include "model/batch_compression.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
@@ -29,7 +30,6 @@
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "pandaproxy/schema_registry/validation_metrics.h"
-#include "storage/parser_utils.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
@@ -37,8 +37,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/coroutine/exception.hh>
 
-#include <absl/algorithm/container.h>
-
+#include <algorithm>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -104,7 +103,7 @@ std::vector<int32_t> get_proto_offsets(iobuf_parser& p) {
 ss::future<std::optional<ss::sstring>> get_record_name(
   pandaproxy::schema_registry::sharded_store& store,
   subject_name_strategy sns,
-  canonical_schema_definition schema,
+  schema_definition schema,
   std::optional<std::vector<int32_t>>& offsets) {
     if (sns == subject_name_strategy::topic_name) {
         // Result is successfully nothing
@@ -188,15 +187,13 @@ public:
           subject_name_strategy::topic_name)} {}
 
     auto validate_field(
-      field field,
-      model::topic topic,
-      subject_name_strategy sns,
-      iobuf buf) -> ss::future<bool> {
+      field field, model::topic topic, subject_name_strategy sns, iobuf buf)
+      -> ss::future<bool> {
         iobuf_parser parser(std::move(buf));
 
         if (parser.bytes_left() < 5) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: topic: {}, field: {}, not enough bytes: {}",
               topic(),
               to_string_view(field),
@@ -207,7 +204,7 @@ public:
         auto magic = parser.consume_type<int8_t>();
         if (magic != 0) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: topic: {}, field: {}, invalid magic: {}",
               topic(),
               to_string_view(field),
@@ -222,7 +219,7 @@ public:
         if (_api->_schema_id_cache.local().has(
               topic, field, sns, id, std::nullopt)) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: topic: {}, field: {}, cache hit",
               topic(),
               to_string_view(field));
@@ -231,12 +228,12 @@ public:
         }
 
         // Determine the schema type
-        std::optional<canonical_schema_definition> schema;
+        std::optional<schema_definition> schema;
         try {
             schema.emplace(co_await _api->_store->get_schema_definition(id));
         } catch (const exception& ex) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: topic: {}, field: {}, schema not found: {}",
               topic(),
               to_string_view(field),
@@ -249,7 +246,7 @@ public:
             auto offsets = get_proto_offsets(parser);
             if (offsets.empty()) {
                 vlog(
-                  plog.debug,
+                  srlog.debug,
                   "validating: topic: {}, field: {}, invalid protobuf offsets",
                   topic(),
                   to_string_view(field));
@@ -259,7 +256,7 @@ public:
             if (_api->_schema_id_cache.local().has(
                   topic, field, sns, id, offsets)) {
                 vlog(
-                  plog.debug,
+                  srlog.debug,
                   "validating: topic: {}, field: {}, cache hit",
                   topic(),
                   to_string_view(field));
@@ -274,7 +271,7 @@ public:
           *_api->_store, sns, *std::move(schema), proto_offsets);
         if (!record_name) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: topic: {}, field: {}, unable to extract record_name",
               topic(),
               to_string_view(field));
@@ -287,7 +284,7 @@ public:
           sub, id, include_deleted::yes);
         if (!has_id) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: sub: {}, id: {}, has_id: {}",
               sub,
               id,
@@ -336,8 +333,7 @@ public:
         std::optional<const model::record_batch> u;
         bool compressed = batch.compressed();
         if (compressed) {
-            u.emplace(
-              co_await storage::internal::decompress_batch(batch.copy()));
+            u.emplace(co_await model::decompress_batch(batch));
             _api->_schema_id_validation_probe.local().decompressed();
         }
 
@@ -377,7 +373,7 @@ public:
 
         if (!valid) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "validating: _topic: {}, _record_key_schema_id_validation: {}, "
               "_record_key_subject_name_strategy: {}, "
               "_record_value_schema_id_validation: {}, "
@@ -438,7 +434,7 @@ std::optional<schema_id_validator> maybe_make_schema_id_validator(
     if (should_validate_schema_id(props, mode)) {
         if (!api) {
             vlog(
-              plog.error,
+              srlog.error,
               "{} requires schema_registry to be enabled in redpanda.yaml",
               config::shard_local_cfg().enable_schema_id_validation.name());
         }
@@ -452,7 +448,7 @@ ss::future<kafka::error_code> schema_id_validator::operator()(
     using futurator = ss::futurize<kafka::error_code>;
     return (*_impl)(batch)
       .handle_exception([](std::exception_ptr e) {
-          vlog(plog.warn, "Invalid record due to exception: {}", e);
+          vlog(srlog.warn, "Invalid record due to exception: {}", e);
           return futurator::convert(kafka::error_code::invalid_record);
       })
       .then([probe](futurator::value_type res) {

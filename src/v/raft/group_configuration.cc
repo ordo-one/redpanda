@@ -9,6 +9,7 @@
 
 #include "raft/group_configuration.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "config/config_store.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
@@ -18,7 +19,6 @@
 #include "raft/consensus_utils.h"
 #include "serde/rw/rw.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <bits/stdint-uintn.h>
 #include <boost/range/join.hpp>
 
@@ -257,6 +257,26 @@ find_by_id(const std::vector<vnode>& nodes, model::node_id id) {
     }
     return std::nullopt;
 }
+void erase_id(std::vector<vnode>& v, model::node_id id) {
+    std::erase_if(v, [id](const vnode& rni) { return id == rni.id(); });
+}
+
+std::vector<vnode>
+unique_ids(const std::vector<vnode>& current, const std::vector<vnode>& old) {
+    absl::flat_hash_set<vnode> unique_ids;
+    unique_ids.reserve(current.size());
+
+    for (auto& id : current) {
+        unique_ids.insert(id);
+    }
+    for (auto& id : old) {
+        unique_ids.insert(id);
+    }
+    std::vector<vnode> ret;
+    ret.reserve(unique_ids.size());
+    std::copy(unique_ids.begin(), unique_ids.end(), std::back_inserter(ret));
+    return ret;
+}
 
 } // namespace
 
@@ -307,6 +327,7 @@ group_configuration::group_configuration(
       _brokers.cend(),
       std::back_inserter(_current.voters),
       [revision](const model::broker& br) { return vnode(br.id(), revision); });
+    update_all_replicas();
 }
 
 group_configuration::group_configuration(
@@ -320,6 +341,7 @@ group_configuration::group_configuration(
   : _revision(rev) {
     _current.voters = std::move(voters);
     _current.learners = std::move(learners);
+    update_all_replicas();
 }
 
 group_configuration::group_configuration(
@@ -333,7 +355,9 @@ group_configuration::group_configuration(
   , _current(std::move(current))
   , _configuration_update(std::move(update))
   , _old(std::move(old))
-  , _revision(revision) {}
+  , _revision(revision) {
+    update_all_replicas();
+}
 
 group_configuration::group_configuration(
   group_nodes current,
@@ -345,8 +369,27 @@ group_configuration::group_configuration(
   , _current(std::move(current))
   , _configuration_update(std::move(update))
   , _old(std::move(old))
-  , _revision(revision) {}
+  , _revision(revision) {
+    update_all_replicas();
+}
+void group_configuration::update_all_replicas() {
+    _all_replicas.clear();
 
+    const auto copy_unique = [this](const std::vector<vnode>& source) {
+        std::ranges::copy_if(
+          source, std::back_inserter(_all_replicas), [this](const vnode& vn) {
+              return std::ranges::find(_all_replicas, vn)
+                     == _all_replicas.end();
+          });
+    };
+
+    copy_unique(_current.voters);
+    copy_unique(_current.learners);
+    if (_old) {
+        copy_unique(_old->voters);
+        copy_unique(_old->learners);
+    }
+}
 std::unique_ptr<group_configuration::configuration_change_strategy>
 group_configuration::make_change_strategy() {
     if (_version >= v_7) {
@@ -438,25 +481,8 @@ configuration_state group_configuration::get_state() const {
     return configuration_state::simple;
 };
 
-std::vector<vnode>
-unique_ids(const std::vector<vnode>& current, const std::vector<vnode>& old) {
-    absl::flat_hash_set<vnode> unique_ids;
-    unique_ids.reserve(current.size());
-
-    for (auto& id : current) {
-        unique_ids.insert(id);
-    }
-    for (auto& id : old) {
-        unique_ids.insert(id);
-    }
-    std::vector<vnode> ret;
-    ret.reserve(unique_ids.size());
-    std::copy(unique_ids.begin(), unique_ids.end(), std::back_inserter(ret));
-    return ret;
-}
-
 bool group_configuration::contains(vnode id) const {
-    return _current.contains(id) || (_old && _old->contains(id));
+    return std::ranges::find(_all_replicas, id) != _all_replicas.end();
 }
 
 std::vector<vnode> group_configuration::unique_voter_ids() const {
@@ -467,16 +493,6 @@ std::vector<vnode> group_configuration::unique_learner_ids() const {
     auto old_learners = _old ? _old->learners : std::vector<vnode>();
     return unique_ids(_current.learners, old_learners);
 }
-
-void erase_id(std::vector<vnode>& v, model::node_id id) {
-    auto it = std::find_if(
-      v.cbegin(), v.cend(), [id](const vnode& rni) { return id == rni.id(); });
-
-    if (it != v.cend()) {
-        v.erase(it);
-    }
-}
-
 void group_configuration::add_broker(
   model::broker broker, model::revision_id rev) {
     vassert(
@@ -485,6 +501,7 @@ void group_configuration::add_broker(
       *this);
 
     make_change_strategy()->add_broker(std::move(broker), rev);
+    update_all_replicas();
 }
 
 void group_configuration::remove_broker(model::node_id id) {
@@ -493,6 +510,7 @@ void group_configuration::remove_broker(model::node_id id) {
       "can not remove node from configuration when update is in progress - {}",
       *this);
     make_change_strategy()->remove_broker(id);
+    update_all_replicas();
 }
 
 void group_configuration::replace_brokers(
@@ -502,6 +520,7 @@ void group_configuration::replace_brokers(
       "can not replace configuration when update is in progress - {}",
       *this);
     make_change_strategy()->replace_brokers(std::move(brokers), rev);
+    update_all_replicas();
 }
 
 void group_configuration::add(
@@ -514,6 +533,7 @@ void group_configuration::add(
       *this);
 
     make_change_strategy()->add(node, rev, learner_start_offset);
+    update_all_replicas();
 }
 
 void group_configuration::remove(vnode node, model::revision_id rev) {
@@ -522,6 +542,7 @@ void group_configuration::remove(vnode node, model::revision_id rev) {
       "can not remove node from configuration when update is in progress - {}",
       *this);
     make_change_strategy()->remove(node, rev);
+    update_all_replicas();
 }
 
 void group_configuration::replace(
@@ -534,6 +555,7 @@ void group_configuration::replace(
       *this);
     make_change_strategy()->replace(
       std::move(nodes), rev, learner_start_offset);
+    update_all_replicas();
 }
 
 void group_configuration::discard_old_config() {
@@ -542,6 +564,7 @@ void group_configuration::discard_old_config() {
       "can only discard old configuration when in joint state - {}",
       *this);
     make_change_strategy()->discard_old_config();
+    update_all_replicas();
 }
 
 void group_configuration::abort_configuration_change(model::revision_id rev) {
@@ -550,6 +573,7 @@ void group_configuration::abort_configuration_change(model::revision_id rev) {
       "can not abort configuration change if it is of simple type - {}",
       *this);
     make_change_strategy()->abort_configuration_change(rev);
+    update_all_replicas();
 }
 
 void group_configuration::cancel_configuration_change(model::revision_id rev) {
@@ -558,10 +582,12 @@ void group_configuration::cancel_configuration_change(model::revision_id rev) {
       "can not cancel configuration change if it is of simple type - {}",
       *this);
     make_change_strategy()->cancel_configuration_change(rev);
+    update_all_replicas();
 }
 
 void group_configuration::finish_configuration_transition() {
     make_change_strategy()->finish_configuration_transition();
+    update_all_replicas();
 }
 
 void group_configuration::promote_to_voter(vnode id) {
@@ -610,8 +636,11 @@ void group_configuration::update(model::broker broker) {
       });
 
     if (it == _brokers.end()) {
-        throw std::invalid_argument(fmt::format(
-          "broker {} does not exists in configuration {}", broker.id(), *this));
+        throw std::invalid_argument(
+          fmt::format(
+            "broker {} does not exists in configuration {}",
+            broker.id(),
+            *this));
     }
 
     *it = std::move(broker);
@@ -619,49 +648,11 @@ void group_configuration::update(model::broker broker) {
 
 std::optional<vnode>
 group_configuration::find_by_node_id(model::node_id id) const {
-    auto res = find_by_id(_current.voters, id);
-    if (res) {
-        return res;
-    }
-    res = find_by_id(_current.learners, id);
-    if (res) {
-        return res;
-    }
-    if (_old) {
-        res = find_by_id(_old->voters, id);
-        if (res) {
-            return res;
-        }
-        res = find_by_id(_old->learners, id);
-        if (res) {
-            return res;
-        }
-    }
-
-    return std::nullopt;
+    return find_by_id(_all_replicas, id);
 }
 
-std::vector<vnode> group_configuration::all_nodes() const {
-    std::vector<vnode> ret;
-
-    const auto copy_unique = [&ret](const std::vector<vnode>& source) {
-        std::copy_if(
-          source.begin(),
-          source.end(),
-          std::back_inserter(ret),
-          [&ret](const vnode& vn) {
-              return std::find(ret.begin(), ret.end(), vn) == ret.end();
-          });
-    };
-
-    copy_unique(_current.voters);
-    copy_unique(_current.learners);
-    if (_old) {
-        copy_unique(_old->voters);
-        copy_unique(_old->learners);
-    }
-
-    return ret;
+const std::vector<vnode>& group_configuration::all_nodes() const {
+    return _all_replicas;
 }
 
 /**
@@ -677,10 +668,11 @@ void configuration_change_strategy_v3::add_broker(
       _cfg._brokers.cend(),
       [id = broker.id()](const model::broker& n) { return id == n.id(); });
     if (unlikely(it != _cfg._brokers.cend())) {
-        throw std::invalid_argument(fmt::format(
-          "broker {} already present in current configuration {}",
-          broker.id(),
-          _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "broker {} already present in current configuration {}",
+            broker.id(),
+            _cfg));
     }
 
     _cfg._old = _cfg._current;
@@ -696,8 +688,9 @@ void configuration_change_strategy_v3::remove_broker(model::node_id id) {
       [id](const model::broker& n) { return id == n.id(); });
 
     if (unlikely(broker_it == _cfg._brokers.cend())) {
-        throw std::invalid_argument(fmt::format(
-          "broker {} not found in current configuration {}", id, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "broker {} not found in current configuration {}", id, _cfg));
     }
 
     auto new_cfg = _cfg._current;
@@ -861,10 +854,11 @@ void configuration_change_strategy_v4::add_broker(
       _cfg._brokers.cend(),
       [id = broker.id()](const model::broker& n) { return id == n.id(); });
     if (unlikely(it != _cfg._brokers.cend())) {
-        throw std::invalid_argument(fmt::format(
-          "broker {} already present in current configuration {}",
-          broker.id(),
-          _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "broker {} already present in current configuration {}",
+            broker.id(),
+            _cfg));
     }
 
     _cfg._configuration_update = configuration_update{};
@@ -880,8 +874,9 @@ void configuration_change_strategy_v4::remove_broker(model::node_id id) {
       _cfg._brokers.cend(),
       [id](const model::broker& n) { return id == n.id(); });
     if (unlikely(broker_it == _cfg._brokers.cend())) {
-        throw std::invalid_argument(fmt::format(
-          "broker {} not found in current configuration {}", id, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "broker {} not found in current configuration {}", id, _cfg));
     }
 
     auto new_cfg = _cfg._current;
@@ -1114,8 +1109,9 @@ void configuration_change_strategy_v5::add(
     _cfg._revision = rev;
 
     if (unlikely(_cfg.contains(node))) {
-        throw std::invalid_argument(fmt::format(
-          "node {} already present in current configuration {}", node, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "node {} already present in current configuration {}", node, _cfg));
     }
 
     _cfg._configuration_update = configuration_update{};
@@ -1128,8 +1124,9 @@ void configuration_change_strategy_v5::add(
 void configuration_change_strategy_v5::remove(
   vnode id, model::revision_id rev) {
     if (!_cfg._current.contains(id)) {
-        throw std::invalid_argument(fmt::format(
-          "node {} not found in current configuration {}", id, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "node {} not found in current configuration {}", id, _cfg));
     }
 
     auto new_cfg = _cfg._current;
@@ -1287,8 +1284,11 @@ void configuration_change_strategy_v6::add(
   model::revision_id rev,
   std::optional<model::offset> learner_start_offset) {
     if (_cfg._current.contains(node)) {
-        throw std::invalid_argument(fmt::format(
-          "replica {} already found in current configuration {}", node, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "replica {} already found in current configuration {}",
+            node,
+            _cfg));
     }
     auto new_replicas = _cfg.all_nodes();
     new_replicas.push_back(node);
@@ -1298,8 +1298,9 @@ void configuration_change_strategy_v6::add(
 void configuration_change_strategy_v6::remove(
   vnode node, model::revision_id rev) {
     if (!_cfg._current.contains(node)) {
-        throw std::invalid_argument(fmt::format(
-          "replica {} not found in current configuration {}", node, _cfg));
+        throw std::invalid_argument(
+          fmt::format(
+            "replica {} not found in current configuration {}", node, _cfg));
     }
     auto new_replicas = _cfg.all_nodes();
     std::erase_if(new_replicas, [node](const vnode& v) { return v == node; });
@@ -1456,6 +1457,7 @@ void group_configuration::maybe_set_initial_revision(
             _old->learners = with_revisions_assigned(_old->learners, new_rev);
         }
     }
+    update_all_replicas();
 }
 
 std::ostream& operator<<(std::ostream& o, const group_configuration& c) {

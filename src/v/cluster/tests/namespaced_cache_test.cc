@@ -6,6 +6,7 @@
 // As of the Change Date specified in that file, in accordance with
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
+#include "absl/container/flat_hash_map.h"
 #include "cluster/namespaced_cache.h"
 #include "config/config_store.h"
 #include "config/property.h"
@@ -16,7 +17,6 @@
 #include <seastar/core/manual_clock.hh>
 #include <seastar/core/sstring.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <gtest/gtest.h>
 
 struct fixture : public seastar_test {};
@@ -24,6 +24,29 @@ struct fixture : public seastar_test {};
 struct entry {
     explicit entry(ss::sstring k)
       : key(std::move(k)) {}
+
+    // typically elements with intrusive lists should not have copy
+    // constructors, fine here because this is simply used to populate a
+    // vector with n copies of an entry
+    entry(const entry& other) noexcept
+      : pinned{other.pinned}
+      , key{other.key} {}
+
+    entry(entry&& other) noexcept
+      : pinned{other.pinned}
+      , key{std::move(other.key)} {
+        _hook.swap_nodes(other._hook);
+    }
+
+    entry& operator=(const entry&) = delete;
+
+    entry& operator=(entry&& other) noexcept {
+        pinned = other.pinned;
+        key = std::move(other.key);
+        _hook.swap_nodes(other._hook);
+        return *this;
+    }
+    ~entry() = default;
     bool pinned = false;
     ss::sstring key;
     safe_intrusive_list_hook _hook;
@@ -461,6 +484,16 @@ struct entry_with_ts {
     clock_type::time_point get_last_update_timestamp() const {
         return last_update_ts;
     }
+
+    entry_with_ts() = default;
+    entry_with_ts& operator=(const entry_with_ts& other) {
+        if (this != &other) {
+            last_update_ts = other.last_update_ts;
+        }
+        return *this;
+    }
+
+    entry_with_ts(const entry_with_ts& other) { *this = other; }
 
     void touch() { last_update_ts = clock_type::now(); }
 

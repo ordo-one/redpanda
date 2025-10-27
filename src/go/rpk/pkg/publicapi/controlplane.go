@@ -17,8 +17,10 @@ import (
 	"sync"
 	"time"
 
+	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/byocplugin/v1alpha1/byocpluginv1alpha1connect"
 	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/controlplane/v1/controlplanev1connect"
 	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/iam/v1/iamv1connect"
+	byocpluginv1alpha1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/byocplugin/v1alpha1"
 	controlplanev1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1"
 	iamv1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/iam/v1"
 	"connectrpc.com/connect"
@@ -27,10 +29,25 @@ import (
 // CloudClientSet holds the respective service clients to interact with
 // the control plane endpoints of the Public API.
 type CloudClientSet struct {
-	Cluster       controlplanev1connect.ClusterServiceClient
-	Organization  iamv1connect.OrganizationServiceClient
-	ResourceGroup controlplanev1connect.ResourceGroupServiceClient
-	Serverless    controlplanev1connect.ServerlessClusterServiceClient
+	// Controlplane
+	Region           controlplanev1connect.RegionServiceClient
+	Cluster          controlplanev1connect.ClusterServiceClient
+	Network          controlplanev1connect.NetworkServiceClient
+	Organization     iamv1connect.OrganizationServiceClient
+	ResourceGroup    controlplanev1connect.ResourceGroupServiceClient
+	Serverless       controlplanev1connect.ServerlessClusterServiceClient
+	Operations       controlplanev1connect.OperationServiceClient
+	ServerlessRegion controlplanev1connect.ServerlessRegionServiceClient
+	BYOCPlugin       byocpluginv1alpha1connect.BYOCPluginServiceClient
+
+	m         sync.RWMutex
+	authToken string
+}
+
+func (cpCl *CloudClientSet) Token() string {
+	cpCl.m.RLock()
+	defer cpCl.m.RUnlock()
+	return cpCl.authToken
 }
 
 // NewCloudClientSet creates a Public API client set with the service
@@ -39,9 +56,11 @@ func NewCloudClientSet(host, authToken string, opts ...connect.ClientOption) *Cl
 	if host == "" {
 		host = ControlPlaneProdURL
 	}
+	ccs := &CloudClientSet{}
+	ccs.authToken = authToken
 	opts = append([]connect.ClientOption{
 		connect.WithInterceptors(
-			newAuthInterceptor(authToken),              // Add the Bearer token.
+			newReloadingAuthInterceptor(ccs.Token),     // Add the Bearer token.
 			newLoggerInterceptor(),                     // Add logs to every request.
 			newAgentInterceptor(defaultRpkUserAgent()), // Add the User-Agent.
 		),
@@ -49,12 +68,22 @@ func NewCloudClientSet(host, authToken string, opts ...connect.ClientOption) *Cl
 
 	httpCl := &http.Client{Timeout: 30 * time.Second}
 
-	return &CloudClientSet{
-		Cluster:       controlplanev1connect.NewClusterServiceClient(httpCl, host, opts...),
-		Organization:  iamv1connect.NewOrganizationServiceClient(httpCl, host, opts...),
-		ResourceGroup: controlplanev1connect.NewResourceGroupServiceClient(httpCl, host, opts...),
-		Serverless:    controlplanev1connect.NewServerlessClusterServiceClient(httpCl, host, opts...),
-	}
+	ccs.Cluster = controlplanev1connect.NewClusterServiceClient(httpCl, host, opts...)
+	ccs.Region = controlplanev1connect.NewRegionServiceClient(httpCl, host, opts...)
+	ccs.Network = controlplanev1connect.NewNetworkServiceClient(httpCl, host, opts...)
+	ccs.Organization = iamv1connect.NewOrganizationServiceClient(httpCl, host, opts...)
+	ccs.ResourceGroup = controlplanev1connect.NewResourceGroupServiceClient(httpCl, host, opts...)
+	ccs.Serverless = controlplanev1connect.NewServerlessClusterServiceClient(httpCl, host, opts...)
+	ccs.Operations = controlplanev1connect.NewOperationServiceClient(httpCl, host, opts...)
+	ccs.ServerlessRegion = controlplanev1connect.NewServerlessRegionServiceClient(httpCl, host, opts...)
+	ccs.BYOCPlugin = byocpluginv1alpha1connect.NewBYOCPluginServiceClient(httpCl, host, opts...)
+	return ccs
+}
+
+func (cpCl *CloudClientSet) UpdateAuthToken(authToken string) {
+	cpCl.m.Lock()
+	defer cpCl.m.Unlock()
+	cpCl.authToken = authToken
 }
 
 // ResourceGroupForID gets the resource group for a given ID and handles the
@@ -230,4 +259,28 @@ func Paginate[T any](
 	}
 
 	return nil, fmt.Errorf("pagination exceeded %d pages", maxPages)
+}
+
+func OSToBYOCPluginOS(os string) byocpluginv1alpha1.OS {
+	switch os {
+	case "linux":
+		return byocpluginv1alpha1.OS_OS_LINUX
+	case "darwin":
+		return byocpluginv1alpha1.OS_OS_DARWIN
+	case "windows":
+		return byocpluginv1alpha1.OS_OS_WINDOWS
+	default:
+		return byocpluginv1alpha1.OS_OS_UNSPECIFIED
+	}
+}
+
+func ArchToBYOCPluginArch(arch string) byocpluginv1alpha1.Arch {
+	switch arch {
+	case "amd64":
+		return byocpluginv1alpha1.Arch_ARCH_AMD64
+	case "arm64":
+		return byocpluginv1alpha1.Arch_ARCH_ARM64
+	default:
+		return byocpluginv1alpha1.Arch_ARCH_UNSPECIFIED
+	}
 }

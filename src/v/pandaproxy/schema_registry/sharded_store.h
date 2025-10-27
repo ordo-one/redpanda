@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "pandaproxy/schema_registry/schema_getter.h"
 #include "pandaproxy/schema_registry/types.h"
 
@@ -31,72 +31,72 @@ public:
     ss::future<> stop();
 
     ///\brief Make the canonical form of the schema
-    ss::future<canonical_schema> make_canonical_schema(
-      unparsed_schema schema, normalize norm = normalize::no);
+    ss::future<subject_schema> make_canonical_schema(
+      subject_schema schema,
+      normalize norm = normalize::no,
+      bool consider_always_normalize_config = true);
 
     ///\brief Check the schema parses with the native format
-    ss::future<void> validate_schema(canonical_schema schema);
+    ss::future<void> validate_schema(subject_schema schema);
+
+    ///\brief Reformat schema to the output format
+    ss::future<schema_definition>
+    format_schema(schema_definition schema, output_format format);
 
     ///\brief Construct a schema in the native format
-    ss::future<valid_schema> make_valid_schema(canonical_schema schema);
-
-    struct has_schema_result {
-        std::optional<schema_id> id;
-        std::optional<schema_version> version;
-    };
-    ss::future<has_schema_result>
-    get_schema_version(subject_schema schema, normalize norm = normalize::no);
+    ss::future<valid_schema> make_valid_schema(subject_schema schema);
 
     struct insert_result {
         schema_version version;
         schema_id id;
         bool inserted;
     };
-    ss::future<insert_result> project_ids(subject_schema schema);
+    ss::future<insert_result> project_ids(stored_schema schema);
 
     ss::future<bool> upsert(
       seq_marker marker,
-      unparsed_schema schema,
+      subject_schema schema,
       schema_id id,
       schema_version version,
       is_deleted deleted);
 
+    // This function will try to compile all marked schemas.
+    // It should be called every time new schemas are loaded from
+    // the topic into the store.
+    ss::future<> process_marked_schemas();
+
     ss::future<bool> has_schema(schema_id id);
-    ss::future<subject_schema> has_schema(
-      canonical_schema schema,
-      include_deleted inc_del = include_deleted::no,
-      normalize norm = normalize::no);
+    ss::future<stored_schema> has_schema(
+      subject_schema schema, include_deleted inc_del = include_deleted::no);
 
     ///\brief Return a schema definition by id.
-    ss::future<canonical_schema_definition>
-    get_schema_definition(schema_id id) override;
+    ss::future<schema_definition> get_schema_definition(schema_id id) override;
 
-    ///\brief Return a schema definition by id, without any processing.
-    ss::future<unparsed_schema_definition>
-    get_unparsed_schema_definition(schema_id id);
+    ///\brief Return a schema definition by id.
+    ss::future<schema_definition>
+    get_schema_definition(schema_id id, output_format format);
 
-    ss::future<std::optional<canonical_schema_definition>>
+    ss::future<std::optional<schema_definition>>
     maybe_get_schema_definition(schema_id id) override;
 
     ///\brief Return a list of subject-versions for the shema id.
     ss::future<chunked_vector<subject_version>>
     get_schema_subject_versions(schema_id id);
 
+    ///\brief Return a list of subject-versions for the subject. Returns an
+    /// empty vector if the subject does not exist.
+    ss::future<std::vector<subject_version_entry>>
+    get_subject_versions(subject sub, include_deleted inc_del);
+
     ///\brief Return a list of subjects for the schema id.
     ss::future<chunked_vector<subject>>
     get_schema_subjects(schema_id id, include_deleted inc_del);
 
     ///\brief Return a schema by subject and version (or latest).
-    ss::future<subject_schema> get_subject_schema(
+    ss::future<stored_schema> get_subject_schema(
       subject sub,
       std::optional<schema_version> version,
       include_deleted inc_dec) final;
-
-    ss::future<subject_schema> get_subject_schema(
-      subject sub,
-      std::optional<schema_version> version,
-      include_deleted inc_dec,
-      normalize norm);
 
     ///\brief Return the id of a schema by subject and version (or latest).
     ss::future<schema_id>
@@ -193,7 +193,7 @@ public:
     /// If the compatibility level is transitive, then all versions are checked,
     /// otherwise checks are against the version provided and newer.
     ss::future<bool>
-    is_compatible(schema_version version, canonical_schema new_schema);
+    is_compatible(schema_version version, subject_schema new_schema);
 
     ///\brief Check if the provided schema is compatible with the subject and
     /// version, according the the current compatibility, with the result
@@ -202,19 +202,23 @@ public:
     /// If the compatibility level is transitive, then all versions are checked,
     /// otherwise checks are against the version provided and newer.
     ss::future<compatibility_result> is_compatible(
-      schema_version version, canonical_schema new_schema, verbose is_verbose);
+      schema_version version, subject_schema new_schema, verbose is_verbose);
 
     ss::future<bool> has_version(const subject&, schema_id, include_deleted);
 
     //// \brief Throw if the store is not mutable
     void check_mode_mutability(force f) const;
 
+    ///\brief Look up the id of a schema by definition
+    ss::future<std::optional<schema_id>>
+    get_schema_id(schema_definition def) const;
+
 private:
     ss::future<compatibility_result> do_is_compatible(
-      schema_version version, canonical_schema new_schema, verbose is_verbose);
+      schema_version version, subject_schema new_schema, verbose is_verbose);
 
     ss::future<bool>
-    upsert_schema(schema_id id, unparsed_schema_definition def);
+    upsert_schema(schema_id id, schema_definition def, bool mark_schema);
     ss::future<> delete_schema(schema_id id);
 
     struct insert_subject_result {

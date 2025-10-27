@@ -10,7 +10,7 @@
 
 #include "cloud_storage/materialized_manifest_cache.h"
 
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/read_path_probes.h"
@@ -21,7 +21,6 @@
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
 #include "ssx/sformat.h"
@@ -33,7 +32,6 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
-#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/defer.hh>
 
 #include <boost/algorithm/string/classification.hpp>

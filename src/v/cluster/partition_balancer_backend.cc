@@ -54,8 +54,7 @@ partition_balancer_backend::partition_balancer_backend(
   ss::sharded<topics_frontend>& topics_frontend,
   ss::sharded<members_frontend>& members_frontend,
   config::binding<std::chrono::seconds>&& availability_timeout,
-  config::binding<unsigned>&& max_disk_usage_percent,
-  config::binding<unsigned>&& storage_space_alert_free_threshold_percent,
+  config::binding<unsigned> max_disk_usage_percent,
   config::binding<std::chrono::milliseconds>&& tick_interval,
   config::binding<size_t>&& max_concurrent_actions,
   config::binding<double>&& moves_drop_threshold,
@@ -72,13 +71,12 @@ partition_balancer_backend::partition_balancer_backend(
   , _partition_allocator(partition_allocator.local())
   , _topics_frontend(topics_frontend.local())
   , _members_frontend(members_frontend.local())
-  , _mode(features::make_sanctioning_binding<
-          features::license_required_feature::
-            partition_auto_balancing_continuous>())
+  , _mode(
+      features::make_sanctioning_binding<
+        features::license_required_feature::
+          partition_auto_balancing_continuous>())
   , _availability_timeout(std::move(availability_timeout))
   , _max_disk_usage_percent(std::move(max_disk_usage_percent))
-  , _storage_space_alert_free_threshold_percent(
-      std::move(storage_space_alert_free_threshold_percent))
   , _tick_interval(std::move(tick_interval))
   , _max_concurrent_actions(std::move(max_concurrent_actions))
   , _concurrent_moves_drop_threshold(std::move(moves_drop_threshold))
@@ -186,8 +184,9 @@ void partition_balancer_backend::on_members_update(
       state == model::membership_state::active
       || state == model::membership_state::draining) {
         if (_tick_in_progress) {
-            _tick_in_progress->request_abort_ex(balancer_tick_aborted_exception{
-              fmt::format("new membership update: {}", state)});
+            _tick_in_progress->request_abort_ex(
+              balancer_tick_aborted_exception{
+                fmt::format("new membership update: {}", state)});
         }
     }
 
@@ -247,10 +246,22 @@ void partition_balancer_backend::on_topic_table_update() {
 void partition_balancer_backend::on_health_monitor_update(
   const node_health_report& report,
   std::optional<ss::lw_shared_ptr<const node_health_report>> old_report) {
+    auto has_log_data_size = [](const node_health_report& r) {
+        return r.local_state.log_data_size.has_value();
+    };
+
     if (!old_report) {
         vlog(
           clusterlog.debug,
           "health report for node {} appeared, scheduling tick",
+          report.id);
+
+        maybe_rearm_timer(/*now=*/true);
+    } else if (
+      !has_log_data_size(*old_report.value()) && has_log_data_size(report)) {
+        vlog(
+          clusterlog.debug,
+          "log data size for node {} appeared, scheduling tick",
           report.id);
 
         maybe_rearm_timer(/*now=*/true);
@@ -358,9 +369,7 @@ ss::future<> partition_balancer_backend::do_tick() {
         co_return;
     }
 
-    double soft_max_disk_usage_ratio = _max_disk_usage_percent() / 100.0;
-    double hard_max_disk_usage_ratio
-      = (100 - _storage_space_alert_free_threshold_percent()) / 100.0;
+    double max_disk_usage_ratio = _max_disk_usage_percent() / 100.0;
     // claim node unresponsive it doesn't responded to at least 7
     // status requests by default 700ms
     const auto node_responsiveness_timeout = _node_status_interval() * 7;
@@ -378,11 +387,15 @@ ss::future<> partition_balancer_backend::do_tick() {
           mode);
     }
 
+    const bool space_management_enabled = config::shard_local_cfg().space_management_enable()
+     && (
+      config::shard_local_cfg().retention_local_target_capacity_percent() > 0
+      || config::shard_local_cfg().retention_local_target_capacity_bytes() > 0);
+
     partition_balancer_planner planner(
       planner_config{
         .mode = mode,
-        .soft_max_disk_usage_ratio = soft_max_disk_usage_ratio,
-        .hard_max_disk_usage_ratio = hard_max_disk_usage_ratio,
+        .max_disk_usage_ratio = max_disk_usage_ratio,
         .max_concurrent_actions = _max_concurrent_actions(),
         .node_availability_timeout_sec = _availability_timeout(),
         .ondemand_rebalance_requested
@@ -391,6 +404,7 @@ ss::future<> partition_balancer_backend::do_tick() {
         .min_partition_size_threshold = get_min_partition_size_threshold(),
         .node_responsiveness_timeout = node_responsiveness_timeout,
         .topic_aware = _topic_aware(),
+        .space_management_enabled = space_management_enabled,
       },
       _state,
       _partition_allocator);
@@ -400,8 +414,8 @@ ss::future<> partition_balancer_backend::do_tick() {
 
     _cur_term->last_tick_time = clock_t::now();
     _cur_term->last_violations = std::move(plan_data.violations);
-    _cur_term->last_tick_decommission_realloc_failures = std::move(
-      plan_data.decommission_realloc_failures);
+    _cur_term->last_tick_reallocation_failures = std::move(
+      plan_data.reallocation_failures);
     if (
       _state.topics().has_updates_in_progress()
       || plan_data.status == planner_status::actions_planned) {
@@ -557,8 +571,7 @@ partition_balancer_overview_reply partition_balancer_backend::overview() const {
 
     ret.status = _cur_term->last_status;
     ret.violations = _cur_term->last_violations;
-    ret.decommission_realloc_failures
-      = _cur_term->last_tick_decommission_realloc_failures;
+    ret.set_reallocation_failures(_cur_term->last_tick_reallocation_failures);
     ret.partitions_pending_force_recovery_count
       = _state.topics().partitions_to_force_recover().size();
     if (ret.partitions_pending_force_recovery_count > 0) {
@@ -595,17 +608,17 @@ size_t partition_balancer_backend::get_min_partition_size_threshold() const {
         return _min_partition_size_threshold().value();
     }
 
-    // TODO: replace partition_autobalancing_concurrent_moves after we have it
-    // as a field in balancer backend
-    const auto min_rate
-      = _raft_learner_recovery_rate()
-        / config::shard_local_cfg().partition_autobalancing_concurrent_moves();
+    auto num_concurrent_moves = _max_concurrent_actions();
+    if (num_concurrent_moves == 0) {
+        return 0;
+    }
 
     /**
      * We use a heuristic to calculate the minimum size of of partition, we
      * want that the partition with the threshold size to have enough data that
      * it will move for at least ten seconds.
      */
+    const auto min_rate = _raft_learner_recovery_rate() / num_concurrent_moves;
     return min_rate * 10;
 }
 

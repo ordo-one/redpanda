@@ -17,7 +17,7 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/fundamental.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -42,8 +42,6 @@ struct fake_serde_only_key
       fake_serde_only_key,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     ss::sstring str;
 
     auto serde_fields() { return std::tie(str); }
@@ -53,8 +51,6 @@ struct fake_serde_only_val
       fake_serde_only_val,
       serde::version<0>,
       serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-
     ss::sstring str;
 
     auto serde_fields() { return std::tie(str); }

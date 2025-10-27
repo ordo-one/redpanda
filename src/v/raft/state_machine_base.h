@@ -24,6 +24,28 @@ using snapshot_at_offset_supported
 class consensus;
 
 /**
+ * Class defining the state machine behavior when it is created for the first
+ * time for a given partition.
+ *
+ * There are two possible policies:
+ *
+ *  - read_everything - when there is no other state the state machine will
+ *                      starts its existence with next offset set to the
+ *                      beginning of the local log. Be careful as read
+ *                      everything may lead to a large amount of data being
+ *                      read on startup.
+ *
+ *   - skip_to_end    - when there is no other state the state machine will
+ *                      start reading from the first confirmed committed offset
+ *                      (see state machine manager implementation for the
+ *                      detailed description).
+ */
+enum class stm_initial_recovery_policy : uint8_t {
+    read_everything = 0,
+    skip_to_end = 1,
+};
+
+/**
  * State machine interface. The class provides an interface that must be
  * implemented to build state machine that can be registered in
  * state_machine_manager.
@@ -67,7 +89,7 @@ public:
      * Returns a snapshot of an STM state with requested last included offset
      */
     virtual ss::future<iobuf>
-    take_snapshot(model::offset last_included_offset) = 0;
+    take_raft_snapshot(model::offset last_included_offset) = 0;
 
     /**
      * Last successfully applied offset
@@ -96,6 +118,11 @@ public:
     virtual snapshot_at_offset_supported supports_snapshot_at_offset() const {
         return snapshot_at_offset_supported::yes;
     }
+
+    /**
+     * Returns state machine configured initial recovery policy.
+     */
+    virtual stm_initial_recovery_policy get_initial_recovery_policy() const = 0;
 
 protected:
     /**
@@ -129,7 +156,7 @@ private:
     mutable offset_monitor<model::offset> _waiters;
     model::offset _next{0};
 };
-
+std::ostream& operator<<(std::ostream&, const stm_initial_recovery_policy&);
 /**
  * This flavor of state machine base allows implementer to opt out from taking
  * snapshot at arbitrary offset. This way a partition that the STM is based on
@@ -141,22 +168,24 @@ class no_at_offset_snapshot_stm_base : public state_machine_base {
     /**
      * Method that will be called whenever a raft snapshot is required
      */
-    virtual ss::future<iobuf> take_snapshot() = 0;
+    virtual ss::future<iobuf> take_raft_snapshot() = 0;
 
     snapshot_at_offset_supported supports_snapshot_at_offset() const final {
         return snapshot_at_offset_supported::no;
     }
 
-    ss::future<iobuf> take_snapshot(model::offset offset) final {
+    ss::future<iobuf> take_raft_snapshot(model::offset offset) final {
         if (offset != last_applied_offset()) {
-            throw std::logic_error(fmt::format(
-              "State machine that do not support taking snapshot at arbitrary "
-              "offset can to take snapshot at requested offset: {}, current "
-              "last applied offset: {}",
-              offset,
-              last_applied_offset()));
+            throw std::logic_error(
+              fmt::format(
+                "State machine that do not support taking snapshot at "
+                "arbitrary "
+                "offset can to take snapshot at requested offset: {}, current "
+                "last applied offset: {}",
+                offset,
+                last_applied_offset()));
         }
-        return take_snapshot();
+        return take_raft_snapshot();
     }
 };
 

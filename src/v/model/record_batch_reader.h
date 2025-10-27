@@ -13,15 +13,17 @@
 
 #include "base/likely.h"
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_circular_buffer.h"
+#include "container/chunked_vector.h"
 #include "model/record.h"
 #include "model/timeout_clock.h"
 
 #include <seastar/core/chunked_fifo.hh>
-#include <seastar/core/circular_buffer.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/coroutine/generator.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/optimized_optional.hh>
 #include <seastar/util/variant_utils.hh>
@@ -46,7 +48,7 @@ concept ReferenceBatchReaderConsumer = requires(
 
 class record_batch_reader final {
 public:
-    using data_t = ss::circular_buffer<model::record_batch>;
+    using data_t = chunked_circular_buffer<model::record_batch>;
     struct foreign_data_t {
         ss::foreign_ptr<std::unique_ptr<data_t>> buffer;
         size_t index{0};
@@ -109,6 +111,55 @@ public:
             return ss::do_with(std::move(c), [this, tm](ReferenceConsumer& c) {
                 return do_peek_each_ref(c, tm);
             });
+        }
+
+        static seastar::coroutine::experimental::generator<model::record_batch>
+        generator(
+          std::unique_ptr<impl> impl, timeout_clock::time_point timeout) {
+            auto gen = slice_generator(std::move(impl), timeout);
+            while (auto slice = co_await gen()) {
+                for (auto& batch : *slice) {
+                    co_yield std::move(batch);
+                }
+            }
+        }
+
+        static seastar::coroutine::experimental::generator<data_t>
+        slice_generator(
+          std::unique_ptr<impl> impl, timeout_clock::time_point timeout) {
+            std::exception_ptr eptr;
+            try {
+                while (!impl->is_end_of_stream()) {
+                    co_yield ss::visit(
+                      co_await impl->do_load_slice(timeout),
+                      [](data_t&& d) { return std::move(d); },
+                      [](foreign_data_t d) {
+                          // Make a copy for the cross-shard case, this is dead
+                          // code anyways now that iobuf uses an atomic
+                          // ref-count and we've removed the foreign data
+                          // readers.
+                          data_t copy;
+                          for (auto& batch : *d.buffer) {
+                              copy.push_back(batch.copy());
+                          }
+                          return copy;
+                      });
+                }
+            } catch (...) {
+                eptr = std::current_exception();
+            }
+            try {
+                co_await impl->finally();
+            } catch (...) {
+                if (eptr) {
+                    throw seastar::nested_exception(
+                      eptr, std::current_exception());
+                }
+                throw;
+            }
+            if (eptr) {
+                std::rethrow_exception(eptr);
+            }
         }
 
     private:
@@ -296,6 +347,38 @@ public:
         return _impl->peek_each_ref(std::move(consumer), timeout);
     }
 
+    /*
+     * Create a coroutine generator from the reader.
+     *
+     *    auto gen = std::move(reader).generator(model::no_timeout);
+     *    while (std::optional<model::record_batch> batch = co_await gen()) {
+     *        ...
+     *    }
+     *
+     * When end of stream is reached std::nullopt will be returned.
+     */
+    seastar::coroutine::experimental::generator<model::record_batch>
+    generator(timeout_clock::time_point timeout) && {
+        return impl::generator(std::move(_impl), timeout);
+    }
+
+    /*
+     * Create a coroutine generator from the reader of chunks of batches.
+     *
+     *    auto gen = std::move(reader).slice_generator(model::no_timeout);
+     *    while (auto batches = co_await gen()) {
+     *        for (const model::record_batch& batch : *batches) {
+     *            ...
+     *        }
+     *    }
+     *
+     * When end of stream is reached std::nullopt will be returned.
+     */
+    seastar::coroutine::experimental::generator<data_t>
+    slice_generator(timeout_clock::time_point timeout) && {
+        return impl::slice_generator(std::move(_impl), timeout);
+    }
+
     std::unique_ptr<impl> release() && { return std::move(_impl); }
 
     // record batch readers may expose these private flags for testing
@@ -338,16 +421,15 @@ record_batch_reader make_record_batch_reader(Args&&... args) {
 record_batch_reader
   make_memory_record_batch_reader(record_batch_reader::storage_t);
 
-record_batch_reader make_fragmented_memory_record_batch_reader(
-  fragmented_vector<model::record_batch>);
+record_batch_reader
+  make_chunked_memory_record_batch_reader(chunked_vector<model::record_batch>);
 
-record_batch_reader make_fragmented_memory_record_batch_reader(
-  chunked_vector<model::record_batch>);
+record_batch_reader
+  make_chunked_memory_record_batch_reader(chunked_vector<model::record_batch>);
 
 inline record_batch_reader
 make_memory_record_batch_reader(model::record_batch b) {
     record_batch_reader::data_t batches;
-    batches.reserve(1);
     batches.push_back(std::move(b));
     return make_memory_record_batch_reader(std::move(batches));
 }
@@ -385,16 +467,16 @@ record_batch_reader make_foreign_memory_record_batch_reader(record_batch);
 record_batch_reader
   make_foreign_memory_record_batch_reader(record_batch_reader::data_t);
 
-record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
-  fragmented_vector<model::record_batch>);
-
-record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
+record_batch_reader make_foreign_chunked_memory_record_batch_reader(
   chunked_vector<model::record_batch>);
 
-record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
+record_batch_reader make_foreign_chunked_memory_record_batch_reader(
+  chunked_vector<model::record_batch>);
+
+record_batch_reader make_chunked_fragmented_memory_record_batch_reader(
   ss::chunked_fifo<model::record_batch>);
 
-record_batch_reader make_fragmented_memory_record_batch_reader(
+record_batch_reader make_chunked_memory_record_batch_reader(
   ss::chunked_fifo<model::record_batch>);
 
 record_batch_reader make_generating_record_batch_reader(
@@ -403,7 +485,7 @@ record_batch_reader make_generating_record_batch_reader(
 ss::future<record_batch_reader::data_t> consume_reader_to_memory(
   record_batch_reader, timeout_clock::time_point timeout);
 
-ss::future<fragmented_vector<model::record_batch>>
+ss::future<chunked_vector<model::record_batch>>
 consume_reader_to_fragmented_memory(
   record_batch_reader, timeout_clock::time_point timeout);
 

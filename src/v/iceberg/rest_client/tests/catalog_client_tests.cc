@@ -9,6 +9,7 @@
  */
 
 #include "bytes/iobuf_parser.h"
+#include "datalake/credential_manager.h"
 #include "iceberg/rest_client/catalog_client.h"
 
 #include <seastar/core/sleep.hh>
@@ -47,6 +48,9 @@ public:
       (override));
     MOCK_METHOD(ss::future<>, shutdown_and_stop, (), (override));
 };
+
+// Global mock credential manager for tests
+datalake::credential_manager mock_credential_manager;
 
 std::unique_ptr<http::abstract_client>
 make_http_client(std::function<void(mock_client& mock)> set_expectations) {
@@ -127,6 +131,7 @@ TEST(client, root_url_computed) {
             .WillRepeatedly(ret);
       }),
       endpoint,
+      mock_credential_manager,
       credentials,
       r::base_path{"api/catalog/"},
       r::warehouse{"x"},
@@ -172,6 +177,7 @@ TEST(token_tests, acquire_token) {
             .WillOnce(validate_token_request);
       }),
       endpoint,
+      mock_credential_manager,
       credentials};
     r::catalog_client_tester t{cc};
     auto token = t.get_current_token().get();
@@ -187,9 +193,10 @@ TEST(token_tests, supplied_token_used) {
           EXPECT_CALL(m, request_and_collect_response(_, _, _)).Times(0);
       }),
       endpoint,
+      mock_credential_manager,
       credentials,
-      std::nullopt,
-      std::nullopt,
+      std::nullopt, // base_path
+      std::nullopt, // warehouse
       r::api_version{"v1"},
       supplied_token};
 
@@ -219,9 +226,10 @@ TEST(token_tests, supplied_token_expired) {
             .WillOnce(validate_token_request);
       }),
       endpoint,
+      mock_credential_manager,
       credentials,
-      std::nullopt,
-      std::nullopt,
+      std::nullopt, // base_path
+      std::nullopt, // warehouse
       r::api_version{"v1"},
       expired_token};
 
@@ -247,11 +255,13 @@ TEST(token_tests, handle_bad_json) {
                   Eq(boost::beast::http::verb::post))),
               _,
               _))
-            .WillOnce(Return(ss::make_ready_future<http::downloaded_response>(
-              http::downloaded_response{
-                .status = bh::status::ok, .body = iobuf::from(R"J({)J")})));
+            .WillOnce(Return(
+              ss::make_ready_future<http::downloaded_response>(
+                http::downloaded_response{
+                  .status = bh::status::ok, .body = iobuf::from(R"J({)J")})));
       }),
       endpoint,
+      mock_credential_manager,
       credentials};
     r::catalog_client_tester t{cc};
     auto token = t.get_current_token().get();
@@ -277,11 +287,13 @@ TEST(token_tests, handle_non_retriable_http_status) {
                   Eq(boost::beast::http::verb::post))),
               _,
               _))
-            .WillOnce(Return(ss::make_ready_future<http::downloaded_response>(
-              http::downloaded_response{
-                .status = bh::status::bad_request, .body = iobuf()})));
+            .WillOnce(Return(
+              ss::make_ready_future<http::downloaded_response>(
+                http::downloaded_response{
+                  .status = bh::status::bad_request, .body = iobuf()})));
       }),
       endpoint,
+      mock_credential_manager,
       credentials};
     r::catalog_client_tester t{cc};
 
@@ -308,17 +320,19 @@ TEST(token_tests, handle_retriable_http_status) {
                   Eq(boost::beast::http::verb::post))),
               _,
               _))
-            .WillOnce(Return(ss::make_ready_future<http::downloaded_response>(
-              http::downloaded_response{
-                .status = bh::status::gateway_timeout, .body = iobuf()})))
-            .WillOnce(Return(ss::make_ready_future<
-                             http::
-                               downloaded_response>(http::downloaded_response{
-              .status = bh::status::ok,
-              .body = iobuf::from(
-                R"J({"access_token": "token","token_type": "bearer", "expires_in": 1})J")})));
+            .WillOnce(Return(
+              ss::make_ready_future<http::downloaded_response>(
+                http::downloaded_response{
+                  .status = bh::status::gateway_timeout, .body = iobuf()})))
+            .WillOnce(Return(
+              ss::make_ready_future<
+                http::downloaded_response>(http::downloaded_response{
+                .status = bh::status::ok,
+                .body = iobuf::from(
+                  R"J({"access_token": "token","token_type": "bearer", "expires_in": 1})J")})));
       }),
       endpoint,
+      mock_credential_manager,
       credentials};
     r::catalog_client_tester t{cc};
 
@@ -353,6 +367,7 @@ TEST(token_tests, handle_retries_exhausted) {
             .WillRepeatedly(ret);
       }),
       endpoint,
+      mock_credential_manager,
       credentials};
     r::catalog_client_tester t{cc};
 

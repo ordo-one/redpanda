@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "base/seastarx.h"
 #include "base/type_traits.h"
 #include "cloud_storage/fwd.h"
@@ -25,6 +26,7 @@
 #include "pandaproxy/rest/fwd.h"
 #include "pandaproxy/schema_registry/fwd.h"
 #include "redpanda/admin/debug_bundle.h"
+#include "redpanda/admin/kafka_connections_service.h"
 #include "resource_mgmt/cpu_profiler.h"
 #include "resource_mgmt/memory_sampling.h"
 #include "rpc/connection_cache.h"
@@ -33,6 +35,7 @@
 #include "security/fwd.h"
 #include "security/request_auth.h"
 #include "security/types.h"
+#include "serde/protobuf/rpc.h"
 #include "storage/node.h"
 #include "transform/fwd.h"
 
@@ -47,8 +50,6 @@
 #include <seastar/json/json_elements.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/log.hh>
-
-#include <absl/container/flat_hash_map.h>
 
 struct admin_server_cfg {
     std::vector<model::broker_endpoint> endpoints;
@@ -68,7 +69,7 @@ struct topic_recovery_service;
 
 extern ss::logger adminlog;
 
-class admin_server {
+class admin_server : public ss::peering_sharded_service<admin_server> {
 public:
     explicit admin_server(
       admin_server_cfg,
@@ -88,14 +89,20 @@ public:
       ss::sharded<cluster::topic_recovery_status_frontend>&,
       ss::sharded<storage::node>&,
       ss::sharded<memory_sampling>&,
-      ss::sharded<cloud_storage::cache>&,
+      ss::sharded<cloud_io::cache>&,
       ss::sharded<resources::cpu_profiler>&,
       ss::sharded<transform::service>*,
       ss::sharded<security::audit::audit_log_manager>&,
       std::unique_ptr<cluster::tx_manager_migrator>&,
       ss::sharded<kafka::server>&,
       ss::sharded<cluster::tx_gateway_frontend>&,
-      ss::sharded<debug_bundle::service>&);
+      ss::sharded<debug_bundle::service>&,
+      ss::sharded<admin::kafka_connections_service>&);
+
+    // Add a ConnectRPC service to the admin server.
+    void add_service(std::unique_ptr<serde::pb::rpc::base_service>);
+    // Handle a ConnectRPC request that has been proxied from another node.
+    ss::future<iobuf> handle_rpc_request(serde::pb::rpc::context, iobuf);
 
     ss::future<> start();
     ss::future<> stop();
@@ -108,10 +115,11 @@ public:
           : default_control_character_thrower()
           , _parameter_name(parameter_name) {}
 
-        [[noreturn]] [[gnu::cold]] void conversion_error() override {
-            throw ss::httpd::bad_request_exception(fmt::format(
-              "Parameter '{}' contained invalid control characters",
-              _parameter_name));
+        [[noreturn]] [[gnu::cold]] void conversion_error() const override {
+            throw ss::httpd::bad_request_exception(
+              fmt::format(
+                "Parameter '{}' contained invalid control characters",
+                _parameter_name));
         }
 
     private:
@@ -217,7 +225,14 @@ private:
 
     static model::ntp parse_ntp_from_request(ss::httpd::parameters& param);
 
+    /// Parses the JSON body of the request. Throws if the body is not valid
+    /// JSON.
     static ss::future<json::Document> parse_json_body(ss::http::request* req);
+
+    /// Returns nullopt if the body is empty. Throws if the body is not empty
+    /// and not valid JSON.
+    static ss::future<std::optional<json::Document>>
+    parse_optional_json_body(ss::http::request* req);
 
     static model::node_id parse_broker_id(const ss::http::request& req);
 
@@ -466,7 +481,7 @@ private:
     ss::future<ss::json::json_return_type>
     oidc_revoke_handler(std::unique_ptr<ss::http::request> req);
     ss::future<ss::json::json_return_type> list_user_roles_handler(
-      std::unique_ptr<ss::http::request>, request_auth_result);
+      std::unique_ptr<ss::http::request>, const request_auth_result&);
 
     ss::future<std::unique_ptr<ss::http::reply>> create_role_handler(
       std::unique_ptr<ss::http::request> req,
@@ -483,6 +498,9 @@ private:
 
     ss::future<ss::json::json_return_type>
     update_role_members_handler(std::unique_ptr<ss::http::request> req);
+
+    ss::future<ss::json::json_return_type>
+    get_security_report(std::unique_ptr<ss::http::request> req);
 
     /// Kafka routes
     ss::future<ss::json::json_return_type>
@@ -551,6 +569,8 @@ private:
       std::unique_ptr<ss::http::request>, bool inject);
     ss::future<ss::json::json_return_type>
       set_partition_replica_core_handler(std::unique_ptr<ss::http::request>);
+    ss::future<ss::json::json_return_type>
+      offset_for_leader_epoch_handler(std::unique_ptr<ss::http::request>);
 
     ss::future<ss::json::json_return_type>
       trigger_on_demand_rebalance_handler(std::unique_ptr<ss::http::request>);
@@ -683,6 +703,10 @@ private:
       execute_migration_action(std::unique_ptr<ss::http::request>);
     ss::future<ss::json::json_return_type>
       delete_migration(std::unique_ptr<ss::http::request>);
+    ss::future<std::unique_ptr<ss::http::reply>> get_migrated_entities_status(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
+    ss::future<std::unique_ptr<ss::http::reply>> set_migrated_entities_status(
+      std::unique_ptr<ss::http::request>, std::unique_ptr<ss::http::reply>);
 
     // Topic routes
     ss::future<std::unique_ptr<ss::http::reply>> list_mountable_topics(
@@ -767,7 +791,7 @@ private:
       _topic_recovery_status_frontend;
     ss::sharded<storage::node>& _storage_node;
     ss::sharded<memory_sampling>& _memory_sampling_service;
-    ss::sharded<cloud_storage::cache>& _cloud_storage_cache;
+    ss::sharded<cloud_io::cache>& _cloud_storage_cache;
     ss::sharded<resources::cpu_profiler>& _cpu_profiler;
     ss::sharded<transform::service>* _transform_service;
     ss::sharded<security::audit::audit_log_manager>& _audit_mgr;
@@ -776,6 +800,10 @@ private:
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
     ss::sharded<debug_bundle::service>& _debug_bundle_service;
     ss::sharded<debug_bundle::file_handler> _debug_bundle_file_handler;
+
+    std::vector<std::unique_ptr<serde::pb::rpc::base_service>> _services;
+
+    ss::sharded<admin::kafka_connections_service>& _kafka_connections_service;
 
     // Value before the temporary override
     std::chrono::milliseconds _default_blocked_reactor_notify;

@@ -9,11 +9,10 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
-#include "container/fragmented_vector.h"
+#include "absl/container/btree_map.h"
+#include "container/chunked_vector.h"
 #include "security/acl.h"
 #include "security/acl_entry_set.h"
-
-#include <absl/container/btree_map.h>
 
 #include <ranges>
 
@@ -58,8 +57,8 @@ public:
 
     // NOTE: the following functions assume that acl_store doesn't change across
     // yield points.
-    ss::future<fragmented_vector<acl_binding>> all_bindings() const;
-    ss::future<> reset_bindings(const fragmented_vector<acl_binding>& bindings);
+    ss::future<chunked_vector<acl_binding>> all_bindings() const;
+    ss::future<> reset_bindings(const chunked_vector<acl_binding>& bindings);
 
 private:
     /*

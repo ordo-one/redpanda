@@ -11,6 +11,7 @@
 
 #include "base/vassert.h"
 #include "base/vlog.h"
+#include "compaction/key_offset_map.h"
 #include "config/configuration.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
@@ -28,9 +29,9 @@
 #include "storage/disk_log_appender.h"
 #include "storage/exceptions.h"
 #include "storage/fwd.h"
-#include "storage/key_offset_map.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
+#include "storage/log_reader.h"
 #include "storage/logger.h"
 #include "storage/offset_assignment.h"
 #include "storage/offset_to_filepos.h"
@@ -49,7 +50,6 @@
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
@@ -60,9 +60,11 @@
 #include <fmt/format.h>
 #include <roaring/roaring.hh>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -114,6 +116,60 @@ bool deletion_exempt(const model::ntp& ntp) {
            || (is_consumer_offsets_ntp && !config::shard_local_cfg().unsafe_enable_consumer_offsets_delete_retention());
 }
 
+// Meant for reading batches from a single `segment`. This does not consider any
+// other `log` state- meaning, the `log` could have been prefix truncated and
+// batches read from the `segment` could be ahead of the new `_start_offset`.
+//
+// This class should only be used when it is necessary to consider the batches
+// still physically stored in a `segment` on disk, e.g for file position
+// calculations. For all other applications, the `log_reader` should be used.
+class single_segment_reader final : public model::record_batch_reader::impl {
+public:
+    using storage_t = model::record_batch_reader::storage_t;
+    single_segment_reader(
+      ss::lw_shared_ptr<segment> seg,
+      ss::rwlock::holder seg_read_lock,
+      local_log_reader_config reader_cfg,
+      probe& pb)
+      : _seg(seg)
+      , _seg_read_lock(std::move(seg_read_lock))
+      , _config(reader_cfg)
+      , _rdr(*_seg, _config, pb) {}
+
+    ~single_segment_reader() final = default;
+
+    bool is_end_of_stream() const final { return _is_end_of_stream; }
+
+    ss::future<storage_t>
+    do_load_slice(model::timeout_clock::time_point timeout) final {
+        auto recs = co_await _rdr.read_some(timeout);
+        if (!recs.has_value() || recs.value().empty()) {
+            _is_end_of_stream = true;
+            co_return storage_t{};
+        }
+
+        auto& batches = recs.value();
+        co_return std::move(batches);
+    }
+
+    ss::future<> finally() noexcept final { return _rdr.close(); }
+
+    void print(std::ostream& os) final {
+        fmt::print(
+          os,
+          "storage::single_segment_reader for {}, config {}",
+          _seg->filename(),
+          _config);
+    }
+
+private:
+    ss::lw_shared_ptr<segment> _seg;
+    ss::rwlock::holder _seg_read_lock;
+    local_log_reader_config _config;
+    log_segment_batch_reader _rdr;
+    bool _is_end_of_stream{false};
+};
+
 disk_log_impl::disk_log_impl(
   ntp_config cfg,
   raft::group_id group,
@@ -139,11 +195,12 @@ disk_log_impl::disk_log_impl(
       resources())
   , _probe(std::make_unique<storage::probe>())
   , _max_segment_size(compute_max_segment_size())
-  , _readers_cache(std::make_unique<readers_cache>(
-      config().ntp(),
-      _manager.config().readers_cache_eviction_timeout,
-      config::shard_local_cfg().readers_cache_target_max_size.bind()))
-  , _compaction_enabled(config().is_compacted()) {
+  , _readers_cache(
+      std::make_unique<readers_cache>(
+        config().ntp(),
+        _manager.config().readers_cache_eviction_timeout,
+        config::shard_local_cfg().readers_cache_target_max_size.bind()))
+  , _compaction_enabled(config().is_locally_compacted()) {
     for (auto& s : _segs) {
         _probe->add_initial_segment(*s);
         if (_compaction_enabled) {
@@ -201,8 +258,8 @@ ss::future<> disk_log_impl::remove() {
       .finally([this] { _probe->clear_metrics(); });
 }
 
-ss::future<>
-disk_log_impl::start(std::optional<truncate_prefix_config> truncate_cfg) {
+ss::future<> disk_log_impl::start(
+  std::optional<truncate_prefix_config> truncate_cfg, ss::abort_source& as) {
     auto is_new = is_new_log();
     co_await offset_translator().start(
       storage::offset_translator::must_reset{is_new});
@@ -212,7 +269,7 @@ disk_log_impl::start(std::optional<truncate_prefix_config> truncate_cfg) {
     // Reset or load the offset translator state, depending on whether this is
     // a brand new log.
     if (!is_new) {
-        co_await offset_translator().sync_with_log(*this, _compaction_as);
+        co_await offset_translator().sync_with_log(*this, as);
     }
 }
 
@@ -341,6 +398,8 @@ disk_log_impl::time_based_gc_max_offset(gc_config cfg) const {
                     : _segs.front()->index().retention_timestamp(retention_cfg),
       retention_cfg);
 
+    auto validated_timestamps = _feature_table.local().is_active(
+      features::feature::validated_batch_timestamps);
     static constexpr auto const_threshold = 1min;
     auto bogus_threshold = model::timestamp(
       model::timestamp::now().value() + const_threshold / 1ms);
@@ -348,23 +407,33 @@ disk_log_impl::time_based_gc_max_offset(gc_config cfg) const {
     auto it = std::find_if(
       std::cbegin(_segs),
       std::cend(_segs),
-      [this, time = cfg.eviction_time, bogus_threshold, retention_cfg](
-        const ss::lw_shared_ptr<segment>& s) {
+      [this,
+       time = cfg.eviction_time,
+       bogus_threshold,
+       retention_cfg,
+       validated_timestamps](const ss::lw_shared_ptr<segment>& s) {
           auto retention_ts = s->index().retention_timestamp(retention_cfg);
 
-          if (retention_ts > bogus_threshold) {
-              // Warn on timestamps more than the "bogus" threshold in future
-              // this should not fire for segments created after v23.3
-              vlog(
-                gclog.warn,
-                "[{}] found segment with bogus retention timestamp: {} (base "
-                "{}, max {}) - {}",
-                config().ntp(),
-                retention_ts,
-                s->index().base_timestamp(),
-                s->index().max_timestamp(),
-                s->index().broker_timestamp(),
-                s);
+          if (!validated_timestamps) {
+              // This legacy behavior of warning on timestamps above
+              // `bogus_threshold` is only needed in older clusters that didn't
+              // validate timestamps.
+              if (retention_ts > bogus_threshold) {
+                  // Warn on timestamps more than the "bogus" threshold in
+                  // future this should not fire for segments created after
+                  // v23.3
+                  vlog(
+                    gclog.warn,
+                    "[{}] found segment with bogus retention timestamp: {} "
+                    "(base "
+                    "{}, max {}) - {}",
+                    config().ntp(),
+                    retention_ts,
+                    s->index().base_timestamp(),
+                    s->index().max_timestamp(),
+                    s->index().broker_timestamp(),
+                    s);
+              }
           }
 
           // first that is not going to be collected
@@ -382,8 +451,9 @@ disk_log_impl::time_based_gc_max_offset(gc_config cfg) const {
 ss::future<model::offset>
 disk_log_impl::monitor_eviction(ss::abort_source& as) {
     if (_eviction_monitor) {
-        throw std::logic_error("Eviction promise already registered. Eviction "
-                               "can not be monitored twice.");
+        throw std::logic_error(
+          "Eviction promise already registered. Eviction "
+          "can not be monitored twice.");
     }
 
     auto opt_sub = as.subscribe([this]() noexcept {
@@ -405,34 +475,59 @@ disk_log_impl::monitor_eviction(ss::abort_source& as) {
 
 model::offset
 disk_log_impl::request_eviction_until_offset(model::offset max_offset) {
-    vlog(
-      gclog.debug,
-      "[{}] requested eviction of segments up to {} offset",
-      config().ntp(),
-      max_offset);
-    // we only notify eviction monitor if there are segments to evict
-    auto have_segments_to_evict
-      = (_segs.size() > 1)
-        && _segs.front()->offsets().get_committed_offset() <= max_offset;
+    const auto min_offset = [this]() -> std::optional<model::offset> {
+        if (_segs.size() > 1) {
+            return _segs.front()->offsets().get_committed_offset();
+        }
+        return std::nullopt;
+    }();
+
+    const auto have_segments_to_evict = min_offset.has_value()
+                                        && min_offset.value() <= max_offset;
 
     if (_eviction_monitor && have_segments_to_evict) {
         _eviction_monitor->promise.set_value(max_offset);
         _eviction_monitor.reset();
 
-        return model::next_offset(max_offset);
-    } else {
         vlog(
           gclog.debug,
-          "[{}] no segments to evict up to {} offset; skipping eviction",
+          "[{}] requested eviction of segments up to {} offset",
           config().ntp(),
           max_offset);
+
+        return model::next_offset(max_offset);
     }
+
+    vlog(
+      gclog.debug,
+      "[{}] skipping eviction: monitor {} min offset {} max offset {}",
+      config().ntp(),
+      _eviction_monitor.has_value(),
+      min_offset,
+      max_offset);
 
     return _start_offset;
 }
 
+ss::future<compaction_result> disk_log_impl::segment_self_compact(
+  compaction::compaction_config cfg,
+  ss::lw_shared_ptr<segment> seg,
+  bool force_compaction) {
+    co_return co_await storage::internal::self_compact_segment(
+      seg,
+      _stm_manager,
+      cfg,
+      *_probe,
+      *_readers_cache,
+      _manager.resources(),
+      _feature_table,
+      force_compaction);
+}
+
 ss::future<> disk_log_impl::adjacent_merge_compact(
-  compaction_config cfg, std::optional<model::offset> new_start_offset) {
+  segment_set segments,
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
     vlog(
       gclog.trace,
       "[{}] applying 'compaction' log cleanup policy with config: {}",
@@ -445,7 +540,7 @@ ss::future<> disk_log_impl::adjacent_merge_compact(
           new_start_offset
           && s.offsets().get_base_offset() < *new_start_offset) {
             vlog(
-              gclog.debug,
+              gclog.trace,
               "[{}] segment {} base offs {}, new start offset {}, "
               "skipping self compaction.",
               config().ntp(),
@@ -455,15 +550,15 @@ ss::future<> disk_log_impl::adjacent_merge_compact(
             return false;
         }
 
-        if (s.has_compactible_offsets(cfg)) {
+        if (s.is_compactible(cfg)) {
             vlog(
-              gclog.debug,
+              gclog.trace,
               "[{}] segment {} stable offs {}, max compactible {}, "
               "compacting.",
               config().ntp(),
               s.reader().filename(),
               s.offsets().get_stable_offset(),
-              cfg.max_collectible_offset);
+              cfg.max_removable_local_log_offset);
             return true;
         } else {
             vlog(
@@ -473,78 +568,49 @@ ss::future<> disk_log_impl::adjacent_merge_compact(
               config().ntp(),
               s.reader().filename(),
               s.offsets().get_stable_offset(),
-              cfg.max_collectible_offset);
+              cfg.max_removable_local_log_offset);
             return false;
         }
     };
 
-    // loop until we compact segment or reached end of segments set
-    while (!_segs.empty()) {
-        const auto end_it = std::prev(_segs.end());
-        auto seg_it = std::find_if(
-          _segs.begin(),
-          end_it,
-          [offsets_compactible](ss::lw_shared_ptr<segment>& s) {
-              return !s->has_appender() && s->is_compacted_segment()
-                     && !s->finished_self_compaction()
-                     && offsets_compactible(*s);
-          });
-        // nothing to compact
-        if (seg_it == end_it) {
-            break;
+    for (auto& seg : segments) {
+        if (cfg.asrc) {
+            cfg.asrc->check();
         }
 
-        auto segment = *seg_it;
-        auto result = co_await storage::internal::self_compact_segment(
-          segment,
-          _stm_manager,
-          cfg,
-          *_probe,
-          *_readers_cache,
-          _manager.resources(),
-          _feature_table);
+        auto is_compactible_segment = !seg->is_closed() && !seg->has_appender()
+                                      && seg->is_compacted_segment()
+                                      && offsets_compactible(*seg);
+        // Skip over segments that that being truncated, or are uncompactible.
+        if (is_compactible_segment) {
+            auto result = co_await segment_self_compact(cfg, seg);
 
-        if (segment->is_closed()) {
-            // We can race here with a truncation operation that removes the
-            // full segment, since we are not under a rewrite lock.
-            continue;
-        }
-
-        vlog(
-          gclog.debug,
-          "[{}] segment {} compaction result: {}",
-          config().ntp(),
-          segment->reader().filename(),
-          result);
-        if (result.did_compact()) {
-            segment->clear_cached_disk_usage();
-            _compaction_ratio.update(result.compaction_ratio());
-            const ssize_t removed_bytes = ssize_t(result.size_before)
-                                          - ssize_t(result.size_after);
-            subtract_segment_bytes(segment, removed_bytes);
-
-            auto config_adjacent_merge_count
-              = config::shard_local_cfg()
-                  .log_compaction_adjacent_merge_self_compaction_count();
-            // >= to ensure proper behavior if the config value were to be
-            // changed to be lower than the active counter.
-            if (
-              config_adjacent_merge_count.has_value()
-              && ++_adjacent_merge_counter
-                   >= config_adjacent_merge_count.value()) {
-                _adjacent_merge_counter = 0;
-                break;
-            } else {
-                co_return;
+            if (seg->is_closed()) {
+                // We can race here with a truncation operation that removes the
+                // full segment, since we are not under a rewrite lock.
+                continue;
+            }
+            vlog(
+              gclog.debug,
+              "[{}] segment {} compaction result: {}",
+              config().ntp(),
+              seg->reader().filename(),
+              result);
+            if (result.did_compact()) {
+                _compaction_ratio.update(result.compaction_ratio());
+                const ssize_t removed_bytes = ssize_t(result.size_before)
+                                              - ssize_t(result.size_after);
+                subtract_segment_bytes(seg, removed_bytes);
             }
         }
     }
 
-    co_await compact_adjacent_segments(cfg);
+    co_await compact_adjacent_segment_ranges(cfg, new_start_offset);
 }
 
 segment_set disk_log_impl::find_sliding_range(
-  const compaction_config& cfg, std::optional<model::offset> new_start_offset) {
+  const compaction::compaction_config& cfg,
+  std::optional<model::offset> new_start_offset) {
     if (
       _last_compaction_window_start_offset.has_value()
       && (_last_compaction_window_start_offset.value()
@@ -565,11 +631,11 @@ segment_set disk_log_impl::find_sliding_range(
         _last_compaction_window_start_offset.reset();
     }
 
-    // Collect all segments that have stable data.
+    // Collect all segments that are compactible.
     segment_set::underlying_t buf;
     for (const auto& seg : _segs) {
-        if (seg->has_appender() || !seg->has_compactible_offsets(cfg)) {
-            // Stop once we get to an unstable segment.
+        if (seg->has_appender() || !seg->is_compactible(cfg)) {
+            // Stop once we get to an uncompactible segment.
             break;
         }
         if (
@@ -596,7 +662,8 @@ segment_set disk_log_impl::find_sliding_range(
 }
 
 ss::future<bool> disk_log_impl::sliding_window_compact(
-  const compaction_config& cfg, std::optional<model::offset> new_start_offset) {
+  const compaction::compaction_config& cfg,
+  std::optional<model::offset> new_start_offset) {
     vlog(gclog.debug, "[{}] running sliding window compaction", config().ntp());
     auto segs = find_sliding_range(cfg, new_start_offset);
     if (segs.empty()) {
@@ -610,14 +677,7 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
             cfg.asrc->check();
         }
 
-        auto result = co_await storage::internal::self_compact_segment(
-          seg,
-          _stm_manager,
-          cfg,
-          *_probe,
-          *_readers_cache,
-          _manager.resources(),
-          _feature_table);
+        auto result = co_await segment_self_compact(cfg, seg);
 
         if (result.did_compact() == false) {
             continue;
@@ -677,7 +737,7 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
         co_return has_self_compacted;
     }
     vlog(
-      gclog.debug,
+      gclog.info,
       "[{}] window compacting {} segments in interval [{}, {}]",
       config().ntp(),
       segs.size(),
@@ -685,21 +745,28 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
       segs.back()->filename());
 
     // TODO: add configuration to use simple_key_offset_map.
-    std::unique_ptr<simple_key_offset_map> simple_map;
+    std::unique_ptr<compaction::simple_key_offset_map> simple_map;
     if (cfg.hash_key_map) {
         co_await cfg.hash_key_map->reset();
     } else {
-        simple_map = std::make_unique<simple_key_offset_map>(
+        simple_map = std::make_unique<compaction::simple_key_offset_map>(
           cfg.key_offset_map_max_keys);
     }
-    key_offset_map& map = cfg.hash_key_map
-                            ? dynamic_cast<key_offset_map&>(*cfg.hash_key_map)
-                            : dynamic_cast<key_offset_map&>(*simple_map);
+    compaction::key_offset_map& map
+      = cfg.hash_key_map
+          ? dynamic_cast<compaction::key_offset_map&>(*cfg.hash_key_map)
+          : dynamic_cast<compaction::key_offset_map&>(*simple_map);
     model::offset idx_start_offset;
     bool needs_chunked_sliding_window_compact = false;
     try {
         idx_start_offset = co_await build_offset_map(
-          cfg, segs, _stm_manager, _manager.resources(), *_probe, map);
+          cfg,
+          segs,
+          _stm_manager,
+          _manager.resources(),
+          *_probe,
+          map,
+          _feature_table);
     } catch (const zero_segments_indexed_exception&) {
         // We failed to index even one segment (the last entry of the segs set).
         // Perform chunked compaction on it.
@@ -723,7 +790,19 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
     }
 
     if (needs_chunked_sliding_window_compact) {
-        co_return co_await chunked_sliding_window_compact(cfg, segs, map);
+        bool did_compact = false;
+        try {
+            did_compact = co_await chunked_sliding_window_compact(
+              cfg, segs, map);
+        } catch (...) {
+            vlog(
+              gclog.debug,
+              "[{}] failed to perform chunked sliding window compaction. "
+              "Stopping compaction: {}",
+              config().ntp(),
+              std::current_exception());
+        }
+        co_return did_compact;
     }
 
     vlog(
@@ -759,11 +838,40 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
             cfg.asrc->check();
         }
 
+        if (seg->is_closed()) {
+            // We may have raced with a prefix truncation while waiting for the
+            // _segment_rewrite_lock, meaning some segments in the window may
+            // have been closed. It is safe to `continue` and rewrite the other,
+            // non-closed segments in the window.
+            continue;
+        }
+
         // A segment is considered "clean" if it has been fully indexed (all
         // keys are de-duplicated)
         const bool is_finished_window_compaction = true;
         const bool is_clean_compacted = seg->offsets().get_base_offset()
                                         >= idx_start_offset;
+
+        const bool segment_needs_rewrite
+          = internal::may_have_removable_tombstones(seg, cfg)
+            || internal::has_removable_transaction_batches(seg, cfg)
+            || co_await segment_needs_rewrite_with_offset_map(cfg, seg, map);
+        if (!segment_needs_rewrite) {
+            vlog(
+              gclog.trace,
+              "[{}] segment does not require rewrite with provided offset map: "
+              "{}",
+              config().ntp(),
+              seg->filename());
+            bool marked_as_cleanly_compacted
+              = co_await internal::mark_segment_as_finished_window_compaction(
+                seg, is_clean_compacted, *_probe);
+            if (marked_as_cleanly_compacted) {
+                subtract_dirty_segment_bytes(seg->size_bytes());
+            }
+
+            continue;
+        }
 
         co_await rewrite_segment_with_offset_map(
           cfg, seg, map, is_finished_window_compaction, is_clean_compacted);
@@ -774,119 +882,209 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
     co_return true;
 }
 
-std::optional<std::pair<segment_set::iterator, segment_set::iterator>>
-disk_log_impl::find_adjacent_compaction_range(const compaction_config& cfg) {
-    /*
-     * adjacent segment compaction.
-     *
-     * the strategy is to choose a pair of adjacent segments and first combine
-     * them into a single segment that replaces the pair, and then perform
-     * self-compaction on the replacement segment.
-     */
+std::optional<
+  chunked_vector<std::pair<segment_set::iterator, segment_set::iterator>>>
+disk_log_impl::find_adjacent_compaction_ranges(
+  const compaction::compaction_config& cfg,
+  std::optional<model::offset> new_start_offset) {
+    {
+        // Early return if cluster configured values effectively disables
+        // adjacent merge compaction.
+        auto max_ranges_size
+          = config::shard_local_cfg().log_compaction_merge_max_ranges();
+        if (max_ranges_size.has_value() && max_ranges_size < 1) {
+            return std::nullopt;
+        }
+
+        auto max_segments_in_range
+          = config::shard_local_cfg()
+              .log_compaction_merge_max_segments_per_range();
+        if (max_segments_in_range.has_value() && max_segments_in_range < 2) {
+            return std::nullopt;
+        }
+    }
+
     if (_segs.size() < 2) {
         return std::nullopt;
     }
 
-    // sliding window over segments. currently restricted to two segments
-    auto range = std::make_pair(_segs.begin(), std::next(_segs.begin(), 2));
-
-    while (true) {
-        // the simple compaction process in use right now builds a concatenation
-        // of segments so we avoid processing a group that is too large.
-        const auto total_size = std::accumulate(
-          range.first,
-          range.second,
-          size_t(0),
-          [](size_t acc, ss::lw_shared_ptr<segment>& seg) {
-              return acc + seg->size_bytes();
-          });
-
-        // batches in a segment have a term that is implicitly defined by the
-        // name of the file they are contained in. since we need to retain the
-        // term information for reach batch we'll avoid combining segments with
-        // different terms. this can be addressed in a later optimization.
-        const auto same_term = std::all_of(
-          range.first,
-          range.second,
-          [term = (*range.first)->offsets().get_term()](
-            ss::lw_shared_ptr<segment>& seg) {
-              return seg->offsets().get_term() == term;
-          });
-
-        // found a good range if all the tests pass
+    // the chosen segments all need to be stable.
+    // Each participating segment should individually pass the
+    // compactible offset check for the compacted segment to be stable.
+    // Additionally each segment should have finished self compaction.
+    // This is needed by transactions because the compaction index of
+    // segments with transactional batches is only populated during self
+    // compaction. Not having this check would result in concatenating
+    // with an empty compaction index and a data loss.
+    auto unstable =
+      [&cfg, new_start_offset](ss::lw_shared_ptr<segment>& seg) -> bool {
+        // Don't bother considering segments below the new start offset for
+        // adjacent compaction.
         if (
-          same_term
-          && total_size < _manager.config().max_compacted_segment_size()) {
-            break;
+          new_start_offset.has_value()
+          && seg->offsets().get_base_offset() < new_start_offset.value()) {
+            return true;
         }
+        return !seg->has_self_compact_timestamp() || seg->has_appender()
+               || !seg->is_compactible(cfg);
+    };
 
-        // no candidate range found, yet. advance the window if we aren't
-        // already at the end of the set. one option would also be to shrink the
-        // range from the lower end if the range is large enough. advanced
-        // scheduling is future work.
-        if (range.second == _segs.end()) {
-            return std::nullopt;
+    // Ensure that the adjacent segments do not span an offset space greater
+    // than the maximum value that can be represented by a uint32_t. This must
+    // be enforced due to use of roaring::bitmap in the compacted_offset_list,
+    // which is used to deduplicate records during self compaction and sliding
+    // window compaction. Overflows in this area could lead to incorrect
+    // compaction.
+    auto valid_offset_range = [](
+                                ss::lw_shared_ptr<segment>& first,
+                                ss::lw_shared_ptr<segment>& last) -> bool {
+        auto base_offset_first_seg = first->offsets().get_base_offset();
+        auto dirty_offset_last_seg = last->offsets().get_dirty_offset();
+        int64_t offset_delta = dirty_offset_last_seg()
+                               - base_offset_first_seg();
+        static constexpr int64_t u32_max = static_cast<int64_t>(
+          std::numeric_limits<uint32_t>::max());
+        return offset_delta <= u32_max;
+    };
+
+    chunked_vector<std::pair<segment_set::iterator, segment_set::iterator>>
+      ranges;
+
+    auto it = _segs.begin();
+    size_t current_size{0};
+    model::term_id current_term{(*it)->offsets().get_term()};
+
+    std::pair<segment_set::iterator, segment_set::iterator> current_range = {
+      it, it};
+    while (it != _segs.end()) {
+        auto& seg = *it;
+        auto seg_size = seg->size_bytes();
+        auto seg_term = seg->offsets().get_term();
+
+        current_size += seg_size;
+
+        auto num_segments_in_range = std::distance(
+          current_range.first, current_range.second);
+
+        bool term_boundary = seg_term != current_term;
+        bool size_boundary = current_size
+                             > _manager.config().max_compacted_segment_size();
+        bool is_unstable = unstable(seg);
+        auto max_segments_in_range
+          = config::shard_local_cfg()
+              .log_compaction_merge_max_segments_per_range();
+        bool reached_max_range_size = max_segments_in_range.has_value()
+                                      && num_segments_in_range
+                                           >= max_segments_in_range.value();
+        bool is_valid_offset_range = valid_offset_range(
+          *current_range.first, seg);
+
+        if (
+          term_boundary || size_boundary || reached_max_range_size
+          || is_unstable || !is_valid_offset_range) {
+            if (num_segments_in_range > 1) {
+                ranges.push_back(current_range);
+                auto max_ranges_size
+                  = config::shard_local_cfg().log_compaction_merge_max_ranges();
+                if (
+                  max_ranges_size.has_value()
+                  && ranges.size() >= max_ranges_size.value()) {
+                    return ranges;
+                }
+            }
+
+            auto next_it = is_unstable ? std::next(it) : it;
+            auto next_size = is_unstable ? 0 : seg_size;
+            auto next_term = next_it != _segs.end()
+                               ? (*next_it)->offsets().get_term()
+                               : model::term_id{};
+            current_range = {next_it, next_it};
+            current_size = next_size;
+            current_term = next_term;
+
+            if (!is_unstable) {
+                ++current_range.second;
+            }
+
+        } else {
+            ++current_range.second;
         }
-        ++range.first;
-        ++range.second;
+        ++it;
     }
 
-    // the chosen segments all need to be stable.
-    // Each participating segment should individually pass the compactible
-    // offset check for the compacted segment to be stable.
-    // Additionally each segment should have finished self compaction. This
-    // is needed by transactions because the compaction index of segments
-    // with transactional batches is only populated during self compaction.
-    // Not having this check would result in concatenating with an empty
-    // compaction index and a data loss.
-    const auto unstable = std::any_of(
-      range.first, range.second, [&cfg](ss::lw_shared_ptr<segment>& seg) {
-          return !seg->finished_self_compaction() || seg->has_appender()
-                 || !seg->has_compactible_offsets(cfg);
-      });
-    if (unstable) {
+    if (std::distance(current_range.first, current_range.second) > 1) {
+        ranges.push_back(current_range);
+    }
+
+    if (ranges.empty()) {
         return std::nullopt;
     }
 
-    return range;
+    return ranges;
 }
 
-ss::future<std::optional<compaction_result>>
-disk_log_impl::compact_adjacent_segments(storage::compaction_config cfg) {
-    std::optional<compaction_result> r;
-    if (auto range = find_adjacent_compaction_range(cfg); range) {
-        r = co_await do_compact_adjacent_segments(std::move(*range), cfg);
-        vlog(
-          gclog.debug,
-          "Adjacent segments of {}, compaction result: {}",
-          config().ntp(),
-          r);
-        if (r->did_compact()) {
-            _compaction_ratio.update(r->compaction_ratio());
+ss::future<std::optional<chunked_vector<compaction_result>>>
+disk_log_impl::compact_adjacent_segment_ranges(
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
+    chunked_vector<compaction_result> rs;
+    if (auto ranges = find_adjacent_compaction_ranges(cfg, new_start_offset);
+        ranges) {
+        // lightweight copy of segments in all of the found ranges. once a
+        // scheduling event occurs in this method we can't rely on the iterators
+        // in the range remaining valid. for example, a concurrent truncate may
+        // erase an element from the range. The act of compacting adjacent
+        // segments will also invalidate iterators pointing to the original
+        // _segs vector.
+        using vec_t = chunked_vector<ss::lw_shared_ptr<segment>>;
+        chunked_vector<vec_t> seg_ranges;
+        seg_ranges.reserve(ranges->size());
+        for (auto& range : *ranges) {
+            seg_ranges.emplace_back(range.first, range.second);
+        }
+        for (auto& range : seg_ranges) {
+            if (cfg.asrc) {
+                cfg.asrc->check();
+            }
+
+            auto r = co_await do_compact_adjacent_segments(range, cfg);
+            vlog(
+              gclog.debug,
+              "Adjacent segments of {}, compaction result: {}",
+              config().ntp(),
+              r);
+            if (r.did_compact()) {
+                _compaction_ratio.update(r.compaction_ratio());
+            }
+            rs.push_back(r);
         }
     } else {
         vlog(
           gclog.debug,
-          "Adjacent segments of {}, no adjacent pair",
+          "Adjacent segments of {}, no adjacent ranges",
           config().ntp());
     }
-    co_return r;
+    co_return rs;
 }
 
 ss::future<compaction_result> disk_log_impl::do_compact_adjacent_segments(
-  std::pair<segment_set::iterator, segment_set::iterator> range,
-  storage::compaction_config cfg) {
-    // lightweight copy of segments in range. once a scheduling event occurs in
-    // this method we can't rely on the iterators in the range remaining valid.
-    // for example, a concurrent truncate may erase an element from the range.
-    auto segments = std::vector<ss::lw_shared_ptr<segment>>(
-      range.first, range.second);
-
-    const bool all_window_compacted = std::ranges::all_of(
-      segments, &segment::finished_windowed_compaction);
+  chunked_vector<ss::lw_shared_ptr<segment>>& segments,
+  compaction::compaction_config cfg) {
+    // This shouldn't be the case for any ranges returned from
+    // find_adjacent_compaction_ranges(), but it is checked regardless.
+    if (segments.size() < 2) {
+        const auto total_size = std::accumulate(
+          segments.begin(),
+          segments.end(),
+          size_t(0),
+          [](size_t acc, ss::lw_shared_ptr<segment>& seg) {
+              return acc + seg->size_bytes();
+          });
+        co_return compaction_result{total_size};
+    }
 
     const bool all_segments_self_compacted = std::ranges::all_of(
-      segments, &segment::finished_self_compaction);
+      segments, &segment::has_self_compact_timestamp);
 
     const bool all_segments_cleanly_compacted = std::ranges::all_of(
       segments, &segment::has_clean_compact_timestamp);
@@ -915,17 +1113,12 @@ ss::future<compaction_result> disk_log_impl::do_compact_adjacent_segments(
         co_return compaction_result{total_size};
     }
 
-    if (gclog.is_enabled(ss::log_level::debug)) {
-        std::stringstream segments_str;
-        for (size_t i = 0; i < segments.size(); i++) {
-            fmt::print(segments_str, "Segment {}: {}, ", i + 1, *segments[i]);
-        }
-        vlog(
-          gclog.debug,
-          "Compacting {} adjacent segments: [{}]",
-          segments.size(),
-          segments_str.str());
-    }
+    vlog(
+      gclog.info,
+      "Compacting {} adjacent segments over range: [{}:{}]",
+      segments.size(),
+      segments.front()->filename(),
+      segments.back()->filename());
 
     // Important that we take this lock _before_ any segment locks.
     auto segment_modify_lock = co_await _segment_rewrite_lock.get_units();
@@ -933,114 +1126,61 @@ ss::future<compaction_result> disk_log_impl::do_compact_adjacent_segments(
     // the segment which will be expanded to replace
     auto target = segments.front();
 
-    target->clear_cached_disk_usage();
-
-    // concatenate segments from the compaction range into replacement segment
-    // backed by a staging file. the process is completed while holding a read
-    // lock on the range, which is then released. the remainder of the
-    // compaction process operates on replacement segment, and any conflicting
-    // log operations are later identified before committing changes.
-    auto staging_path = target->reader().path().to_compaction_staging();
-    auto staging_to_clean = scoped_file_tracker{
-      cfg.files_to_cleanup, {staging_path, staging_path.to_compacted_index()}};
-    auto [replacement, generations]
-      = co_await storage::internal::make_concatenated_segment(
-        staging_path, segments, cfg, _manager.resources(), _feature_table);
-
-    // compact the combined data in the replacement segment. the partition size
-    // tracking needs to be adjusted as compaction routines assume the segment
-    // size is already contained in the partition size probe
-    replacement->mark_as_compacted_segment();
-    if (all_window_compacted) {
-        // replacement's _clean_compact_timestamp will have been set in
-        // make_concatenated_segment if both segments were cleanly compacted
-        // already.
-        replacement->mark_as_finished_windowed_compaction();
-    }
-    _probe->add_initial_segment(*replacement.get());
-    auto ret = co_await storage::internal::self_compact_segment(
-      replacement,
-      _stm_manager,
-      cfg,
-      *_probe,
-      *_readers_cache,
-      _manager.resources(),
-      _feature_table);
-    _probe->delete_segment(*replacement.get());
-    vlog(gclog.debug, "Final compacted segment {}", replacement);
-
-    /*
-     * remove index files. they will be rebuilt by the single segment compaction
-     * operation, and also ensures we examine segments correctly on recovery.
-     */
-    if (co_await ss::file_exists(target->index().path().string())) {
-        co_await ss::remove_file(target->index().path().string());
+    std::optional<compaction_result> opt_ret;
+    try {
+        opt_ret
+          = co_await storage::internal::concatenate_and_rebuild_target_segment(
+            target,
+            segments,
+            _stm_manager,
+            cfg,
+            *_probe,
+            *_readers_cache,
+            _manager.resources(),
+            _feature_table,
+            _segment_rewrite_lock);
+    } catch (const generation_id_mismatch_exception& e) {
+        // Early abort
+        vlog(gclog.info, "{}", e.what());
+        const auto total_size = std::accumulate(
+          segments.begin(),
+          segments.end(),
+          size_t(0),
+          [](size_t acc, ss::lw_shared_ptr<segment>& seg) {
+              return acc + seg->size_bytes();
+          });
+        co_return compaction_result{total_size};
     }
 
-    auto compact_index = target->reader().path().to_compacted_index();
-    if (co_await ss::file_exists(compact_index.string())) {
-        co_await ss::remove_file(compact_index.string());
-    }
-
-    // lock the range. only metadata (e.g. open/rename/delete) i/o occurs with
-    // these locks held so it is a relatively short duration. all of the data
-    // copying and compaction i/o occurred above with no locks held. 5 retries
-    // with a max lock timeout of 1 second. if we don't get the locks there is
-    // probably a reader. compaction will revisit.
-    auto locks = co_await internal::write_lock_segments(segments, 1s, 5);
-
-    // fast check if we should abandon all the expensive i/o work if we happened
-    // to be racing with an operation like truncation or shutdown.
-    vassert(
-      generations.size() == segments.size(),
-      "Each segment must have corresponding generation");
-    auto gen_it = generations.begin();
-    for (const auto& segment : segments) {
-        // check generation id under write lock
-        if (unlikely(segment->get_generation_id() != *gen_it)) {
-            vlog(
-              gclog.info,
-              "Aborting compaction of a segment: {}. Generation id mismatch, "
-              "previous generation: {}",
-              *segment,
-              *gen_it);
-            ret.executed_compaction = false;
-            ret.size_after = ret.size_before;
-            co_return ret;
-        }
-        if (unlikely(segment->is_closed())) {
-            throw segment_closed_exception();
-        }
-        ++gen_it;
-    }
-    // transfer segment state from replacement to target
-    locks = co_await internal::transfer_segment(
-      target, replacement, cfg, *_probe, std::move(locks));
-
-    auto segment_to_remove = segments.back();
-    // We are going to remove one of the segments, but its bytes have not
-    // technically been removed- just moved to the new segment, `target`.
-    // remove_segment_permanently() will remove bytes, so to make sure the
-    // book-keeping stays correct, we must first add them here to ensure a
-    // net zero change post adjacent merge.
-    add_segment_bytes(segment_to_remove, segment_to_remove->size_bytes());
+    // This is guaranteed to have a value.
+    auto ret = *opt_ret;
 
     // remove the now redundant segments, if they haven't already been removed.
     // this could occur if racing with functions like truncate which manipulate
     // the segment set before acquiring segment locks. this also means that the
     // input iterator range may not longer be valid so we must manually search
-    // the segment set.  the current adjacent segment compaction limits
-    // compaction to two segments, and we check that assumption here and use
-    // simplified clean-up routine.
-    locks.clear();
-    staging_to_clean.clear();
-    vassert(segments.size() == 2, "Cannot compact more than two segments");
-    auto it = std::find(_segs.begin(), _segs.end(), segment_to_remove);
-    if (it != _segs.end()) {
-        _segs.erase(it, std::next(it));
-        co_await remove_segment_permanently(
-          segment_to_remove, "compact_adjacent_segments");
+    // the segment set.
+    for (auto seg_it = std::next(segments.begin()); seg_it != segments.end();
+         ++seg_it) {
+        auto segment_to_remove = *seg_it;
+
+        auto it = std::find(_segs.begin(), _segs.end(), segment_to_remove);
+        if (it != _segs.end()) {
+            // We are going to remove one of the segments, but its bytes have
+            // not technically been removed- just moved to the new segment,
+            // `target`. remove_segment_permanently() will remove bytes, so to
+            // make sure the book-keeping stays correct, we must first add them
+            // here to ensure a net zero change post adjacent merge.
+            add_segment_bytes(
+              segment_to_remove, segment_to_remove->size_bytes());
+
+            _segs.erase(it, std::next(it));
+            co_await remove_segment_permanently(
+              segment_to_remove, "compact_adjacent_segments");
+        }
     }
+
+    _probe->add_adjacent_segments_compacted(segments.size() - 1);
 
     add_dirty_segment_bytes(clean_turning_dirty_bytes);
     const ssize_t removed_bytes = ssize_t(ret.size_before)
@@ -1214,10 +1354,10 @@ ss::future<> disk_log_impl::housekeeping(housekeeping_config cfg) {
     auto new_start_offset = co_await do_gc(cfg.gc);
 
     /*
-     * comapction. could factor out into a public interface like gc/retention if
+     * Compaction. Could factor out into a public interface like gc/retention if
      * there is a need to run it separately.
      */
-    if (config().is_compacted() && !_segs.empty()) {
+    if (config().is_locally_compacted() && !_segs.empty()) {
         scoped_file_tracker::set_t leftovers;
         cfg.compact.files_to_cleanup = &leftovers;
         auto fut = co_await ss::coroutine::as_future(
@@ -1249,19 +1389,42 @@ ss::future<> disk_log_impl::housekeeping(housekeeping_config cfg) {
 }
 
 ss::future<> disk_log_impl::do_compact(
-  compaction_config compact_cfg,
+  compaction::compaction_config compact_cfg,
   std::optional<model::offset> new_start_offset) {
-    if (!config::shard_local_cfg().log_compaction_use_sliding_window()) {
-        co_return co_await adjacent_merge_compact(
-          compact_cfg, new_start_offset);
+    compact_cfg.asrc = &_compaction_as;
+
+    auto compact_fut = ss::now();
+
+    auto use_adjacent_merge
+      = !config::shard_local_cfg().log_compaction_use_sliding_window()
+        || config::shard_local_cfg().log_compaction_pause_use_sliding_window()
+        || (compact_cfg.hash_key_map && compact_cfg.hash_key_map->capacity() == 0);
+
+    if (use_adjacent_merge) {
+        // Make a copy of `_segs` to avoid iterator invalidation in
+        // `adjacent_merge_compact`.
+        compact_fut = adjacent_merge_compact(
+          _segs.copy(), compact_cfg, new_start_offset);
+    } else {
+        compact_fut = sliding_window_compact(compact_cfg, new_start_offset)
+                        .then([&](bool compacted) {
+                            vlog(
+                              gclog.info,
+                              "Sliding compaction of {} did {}compact "
+                              "data, proceeding to adjacent "
+                              "segment compaction",
+                              config().ntp(),
+                              compacted ? "" : "not ");
+                            return compact_adjacent_segment_ranges(
+                                     compact_cfg, new_start_offset)
+                              .discard_result();
+                        });
     }
 
-    // TODO: unify error handling.
-    compact_cfg.asrc = &_compaction_as;
-    auto did_compact_fut = co_await ss::coroutine::as_future(
-      sliding_window_compact(compact_cfg, new_start_offset));
-    if (did_compact_fut.failed()) {
-        auto eptr = did_compact_fut.get_exception();
+    auto compact_result = co_await ss::coroutine::as_future(
+      std::move(compact_fut));
+    if (compact_result.failed()) {
+        auto eptr = compact_result.get_exception();
         if (ssx::is_shutdown_exception(eptr)) {
             vlog(
               gclog.debug,
@@ -1271,25 +1434,17 @@ ss::future<> disk_log_impl::do_compact(
         }
         std::rethrow_exception(eptr);
     }
-    bool compacted = did_compact_fut.get();
-    vlog(
-      gclog.debug,
-      "Sliding compaction of {} did {}compact data, proceeding to adjacent "
-      "segment compaction",
-      config().ntp(),
-      compacted ? "" : "not ");
-    co_await compact_adjacent_segments(compact_cfg);
 }
 
 ss::future<bool> disk_log_impl::chunked_sliding_window_compact(
-  const compaction_config& compact_cfg,
+  const compaction::compaction_config& compact_cfg,
   const segment_set& segs,
-  key_offset_map& map) {
+  compaction::key_offset_map& map) {
     // The last segment in the segment set is the first segment we attempted and
     // failed to index (the "unindexed" segment)
     auto seg = segs.back();
     vlog(
-      gclog.debug,
+      gclog.info,
       "Unable to fully index segment with max allowed keys {}. Performing "
       "chunked sliding window compaction for segment {}",
       map.capacity(),
@@ -1303,6 +1458,13 @@ ss::future<bool> disk_log_impl::chunked_sliding_window_compact(
     // release a seg->read_lock(), and rewriting of each segment in the window
     // happens multiple times in the below while() loop
     auto segment_modify_lock = co_await _segment_rewrite_lock.get_units();
+
+    if (seg->is_closed()) {
+        // We may have raced with a prefix truncation while waiting for
+        // the _segment_rewrite_lock. Do not proceed with chunked compaction on
+        // `seg`.
+        co_return false;
+    }
 
     // The key offset map will be repeatedly built from "chunks" of the
     // unindexed segment and used to rewrite the segments in the sliding window
@@ -1322,6 +1484,29 @@ ss::future<bool> disk_log_impl::chunked_sliding_window_compact(
         for (auto& s : segs) {
             if (compact_cfg.asrc) {
                 compact_cfg.asrc->check();
+            }
+
+            if (s->is_closed()) {
+                // We may have raced with a prefix truncation while waiting for
+                // the _segment_rewrite_lock, meaning some segments in the
+                // window may have been closed. It is safe to `continue` and
+                // rewrite the other, non-closed segments in the window.
+                continue;
+            }
+
+            const bool segment_needs_rewrite
+              = internal::may_have_removable_tombstones(s, compact_cfg)
+                || internal::has_removable_transaction_batches(s, compact_cfg)
+                || co_await segment_needs_rewrite_with_offset_map(
+                  compact_cfg, s, map);
+            if (!segment_needs_rewrite) {
+                vlog(
+                  gclog.trace,
+                  "[{}] segment does not require rewrite with provided offset "
+                  "map: {}",
+                  config().ntp(),
+                  seg->filename());
+                continue;
             }
 
             // Neither of these flags are true until chunked compaction is
@@ -1384,9 +1569,9 @@ ss::future<bool> disk_log_impl::chunked_sliding_window_compact(
 }
 
 ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
-  const compaction_config& cfg,
+  const compaction::compaction_config& cfg,
   ss::lw_shared_ptr<segment> seg,
-  key_offset_map& map,
+  compaction::key_offset_map& map,
   bool is_finished_window_compaction,
   bool is_clean_compacted) {
     if (seg->offsets().get_base_offset() > map.max_offset()) {
@@ -1403,7 +1588,7 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
         }
 
         vlog(
-          gclog.debug,
+          gclog.trace,
           "[{}] treating segment as compacted, offsets fall above highest "
           "indexed key {}, likely because they are non-data batches: {}",
           config().ntp(),
@@ -1438,17 +1623,17 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
     auto staging_to_clean = scoped_file_tracker{
       cfg.files_to_cleanup, {tmpname, cmp_idx_tmpname}};
 
+    const auto size_before = seg->size_bytes();
     auto appender = co_await internal::make_segment_appender(
       tmpname,
       segment_appender::write_behind_memory / internal::chunks().chunk_size(),
-      std::nullopt,
-      cfg.iopc,
+      size_before,
       resources(),
       cfg.sanitizer_config);
 
     auto cmp_idx_name = seg->path().to_compacted_index();
     auto compacted_idx_writer = make_file_backed_compacted_index(
-      cmp_idx_tmpname, cfg.iopc, true, resources(), cfg.sanitizer_config);
+      cmp_idx_tmpname, true, resources(), cfg.sanitizer_config);
 
     vlog(
       gclog.debug,
@@ -1470,7 +1655,6 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
           *_probe,
           storage::internal::should_apply_delta_time_offset(_feature_table),
           _feature_table);
-
     } catch (...) {
         eptr = std::current_exception();
     }
@@ -1491,15 +1675,15 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
     auto rdr_holder = co_await _readers_cache->evict_segment_readers(seg);
     auto write_lock = co_await seg->write_lock();
     if (initial_generation_id != seg->get_generation_id()) {
-        throw std::runtime_error(fmt::format(
-          "Aborting compaction of segment: {}, segment was mutated "
-          "while compacting",
-          seg->path()));
+        throw std::runtime_error(
+          fmt::format(
+            "Aborting compaction of segment: {}, segment was mutated "
+            "while compacting",
+            seg->path()));
     }
     if (seg->is_closed()) {
         throw segment_closed_exception();
     }
-    const auto size_before = seg->size_bytes();
     const auto size_after = appender->file_byte_offset();
 
     // Clear our indexes before swapping the data files (note, the new
@@ -1507,12 +1691,13 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
     co_await seg->index().drop_all_data();
 
     // Rename the data file.
-    co_await internal::do_swap_data_file_handles(tmpname, seg, cfg, *_probe);
+    co_await internal::do_swap_data_file_handles(
+      tmpname, seg, cfg, *_probe, compacted_idx_writer->size_bytes());
 
     // Persist the state of our indexes in their new names.
     seg->index().swap_index_state(std::move(new_idx));
     seg->force_set_commit_offset_from_index();
-    seg->release_batch_cache_index();
+    co_await seg->reset_batch_cache_index();
 
     const ssize_t removed_bytes = ssize_t(size_before) - ssize_t(size_after);
 
@@ -1590,7 +1775,7 @@ ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
         co_return request_eviction_until_offset(offset);
     }
 
-    if (!config().is_collectable()) {
+    if (!config().is_locally_collectable()) {
         co_return std::nullopt;
     }
 
@@ -1610,6 +1795,13 @@ ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
 }
 
 ss::future<> disk_log_impl::maybe_adjust_retention_timestamps() {
+    auto validated_timestamps = _feature_table.local().is_active(
+      features::feature::validated_batch_timestamps);
+    if (validated_timestamps) {
+        // Legacy behavior of adjusting retention timestamps is only needed in
+        // older clusters that didn't validate timestamps.
+        co_return;
+    }
     // Correct any timestamps too far in the future, meant to be called before
     // calculating the retention offset for garbage collection.
     // It's expected that this will be used only for segments pre v23.3,
@@ -1625,7 +1817,7 @@ ss::future<> disk_log_impl::maybe_adjust_retention_timestamps() {
     auto retention_cfg = time_based_retention_cfg::make(
       _feature_table.local()); // this will retrieve cluster cfgs
 
-    fragmented_vector<segment_set::type> segs_all_bogus;
+    chunked_vector<segment_set::type> segs_all_bogus;
     for (const auto& s : _segs) {
         auto max_ts = s->index().retention_timestamp(retention_cfg);
 
@@ -1754,17 +1946,13 @@ offset_stats disk_log_impl::offsets() const {
         }
         return ret;
     }
-    // NOTE: we have to do this because ss::circular_buffer<> does not provide
-    // with reverse iterators, so we manually find the iterator
-    segment_set::type end;
-    for (int i = (int)_segs.size() - 1; i >= 0; --i) {
-        auto& seg = _segs[i];
-        if (!seg->empty()) {
-            end = seg;
-            break;
-        }
-    }
-    if (!end) {
+
+    auto it = std::find_if(
+      _segs.rbegin(), _segs.rend(), [](const segment_set::type& s) {
+          return !s->empty();
+      });
+
+    if (it == _segs.rend()) {
         offset_stats ret;
         ret.start_offset = _start_offset;
         if (ret.start_offset > model::offset(0)) {
@@ -1775,7 +1963,7 @@ offset_stats disk_log_impl::offsets() const {
     }
     // we have valid begin and end
     const auto& bof = _segs.front()->offsets();
-    const auto& eof = end->offsets();
+    const auto& eof = (*it)->offsets();
 
     const auto start_offset = _start_offset() >= 0 ? _start_offset
                                                    : bof.get_base_offset();
@@ -1798,8 +1986,8 @@ model::offset disk_log_impl::find_last_term_start_offset() const {
 
     segment_set::type end;
     segment_set::type term_start;
-    for (int i = (int)_segs.size() - 1; i >= 0; --i) {
-        auto& seg = _segs[i];
+    for (auto it = _segs.rbegin(); it != _segs.rend(); ++it) {
+        auto& seg = *it;
         if (!seg->empty()) {
             if (!end) {
                 end = seg;
@@ -1836,8 +2024,7 @@ model::timestamp disk_log_impl::start_timestamp() const {
     return (*seg)->index().base_timestamp();
 }
 
-ss::future<> disk_log_impl::new_segment(
-  model::offset o, model::term_id t, ss::io_priority_class pc) {
+ss::future<> disk_log_impl::new_segment(model::offset o, model::term_id t) {
     vassert(
       o() >= 0 && t() >= 0, "offset:{} and term:{} must be initialized", o, t);
     // Recomputing here means that any roll size checks after this takes into
@@ -1848,7 +2035,6 @@ ss::future<> disk_log_impl::new_segment(
         config(),
         o,
         t,
-        pc,
         config::shard_local_cfg().storage_read_buffer_size(),
         config::shard_local_cfg().storage_read_readahead_count(),
         _max_segment_size)
@@ -1856,7 +2042,7 @@ ss::future<> disk_log_impl::new_segment(
           return remove_empty_segments().then(
             [this, h = std::move(handles)]() mutable {
                 vassert(!_closed, "cannot add log segment to closed log");
-                if (config().is_compacted()) {
+                if (config().is_locally_compacted()) {
                     h->mark_as_compacted_segment();
                 }
                 _segs.add(std::move(h));
@@ -1914,7 +2100,7 @@ size_t disk_log_impl::max_segment_size() const {
         result = *config().get_overrides().segment_size;
     } else {
         // no overrides use defaults
-        result = config().is_compacted()
+        result = config().is_locally_compacted()
                    ? _manager.config().compacted_segment_size()
                    : _manager.config().max_segment_size();
     }
@@ -1939,8 +2125,8 @@ uint64_t disk_log_impl::size_bytes_after_offset(model::offset o) const {
         return 0;
     }
     uint64_t size = 0;
-    for (size_t i = _segs.size(); i-- > 0;) {
-        auto& seg = _segs[i];
+    for (auto it = _segs.rbegin(); it != _segs.rend(); ++it) {
+        auto& seg = *it;
         auto& offsets = seg->offsets();
         if (offsets.get_base_offset() < o) {
             if (offsets.get_dirty_offset() <= o) {
@@ -1986,38 +2172,36 @@ void disk_log_impl::bg_checkpoint_offset_translator() {
     });
 }
 
-ss::future<> disk_log_impl::force_roll(ss::io_priority_class iopc) {
+ss::future<> disk_log_impl::force_roll() {
     auto roll_lock_holder = co_await _segments_rolling_lock.get_units();
     auto t = term();
     auto next_offset = model::next_offset(offsets().dirty_offset);
     if (_segs.empty()) {
-        co_return co_await new_segment(next_offset, t, iopc);
+        co_return co_await new_segment(next_offset, t);
     }
     auto ptr = _segs.back();
     if (!ptr->has_appender()) {
-        co_return co_await new_segment(next_offset, t, iopc);
+        co_return co_await new_segment(next_offset, t);
     }
 
     add_segment_bytes(ptr, ptr->size_bytes());
     co_return co_await ptr->release_appender(_readers_cache.get())
-      .then([this, next_offset, t, iopc] {
-          return new_segment(next_offset, t, iopc);
-      });
+      .then([this, next_offset, t] { return new_segment(next_offset, t); });
 }
 
 ss::future<> disk_log_impl::maybe_roll_unlocked(
-  model::term_id t, model::offset next_offset, ss::io_priority_class iopc) {
+  model::term_id t, model::offset next_offset) {
     vassert(
       !_segments_rolling_lock.ready(),
       "Must have taken _segments_rolling_lock");
 
     vassert(t >= term(), "Term:{} must be greater than base:{}", t, term());
     if (_segs.empty()) {
-        co_return co_await new_segment(next_offset, t, iopc);
+        co_return co_await new_segment(next_offset, t);
     }
     auto ptr = _segs.back();
     if (!ptr->has_appender() || ptr->is_tombstone()) {
-        co_return co_await new_segment(next_offset, t, iopc);
+        co_return co_await new_segment(next_offset, t);
     }
     bool size_should_roll = false;
 
@@ -2027,7 +2211,7 @@ ss::future<> disk_log_impl::maybe_roll_unlocked(
     if (t != term() || size_should_roll) {
         add_segment_bytes(ptr, ptr->size_bytes());
         co_await ptr->release_appender(_readers_cache.get());
-        co_await new_segment(next_offset, t, iopc);
+        co_await new_segment(next_offset, t);
     }
 }
 
@@ -2055,66 +2239,105 @@ ss::future<> disk_log_impl::apply_segment_ms() {
         co_return;
     }
 
+    // Find the max allowable age of a segment. There are two factors:
+    // 1. `segment.ms` configuration.
+    // 2. For a compacted topic, `max.compaction.lag.ms` configuration,
+    //    because this value is the maximum amount of time a segment
+    //    can be ineligible for compaction, and an active segment is
+    //    ineligible.
+    std::optional<std::chrono::milliseconds> max_age;
     auto seg_ms = config().segment_ms();
-    if (!seg_ms.has_value()) {
-        // skip, disabled or no default value
+    auto& local_config = config::shard_local_cfg();
+    static constexpr auto rate_limit = std::chrono::minutes(5);
+    thread_local static ss::logger::rate_limit rate(rate_limit);
+    if (seg_ms.has_value()) {
+        // Clamp user provided value with (hopefully sane) server min and max
+        // values, this should protect against overflow UB.
+        const auto clamped_seg_ms = std::clamp(
+          seg_ms.value(),
+          local_config.log_segment_ms_min(),
+          local_config.log_segment_ms_max());
+
+        if (seg_ms < clamped_seg_ms) {
+            stlog.log(
+              ss::log_level::warn,
+              rate,
+              "Configured segment.ms={} is lower than the configured cluster "
+              "bound {}={}",
+              seg_ms.value(),
+              local_config.log_segment_ms_min.name(),
+              local_config.log_segment_ms_min());
+        }
+
+        if (seg_ms > clamped_seg_ms) {
+            stlog.log(
+              ss::log_level::warn,
+              rate,
+              "Configured segment.ms={} is higher than the configured cluster "
+              "bound {}={}",
+              seg_ms.value(),
+              local_config.log_segment_ms_max.name(),
+              local_config.log_segment_ms_max());
+        }
+
+        max_age = clamped_seg_ms;
+    }
+
+    // Take max compaction lag into account if the topic is compacted.
+    // Skip if the configuration is the default, which is effectively
+    // no max compaction lag.
+    // Technically, we should roll if a message is too old based on
+    // its own timestamp; however, doing this simpler thing matches
+    // what Kafka does exactly.
+    auto max_lag = config().max_compaction_lag_ms();
+    if (
+      config().is_locally_compacted()
+      && max_lag != local_config.max_compaction_lag_ms.default_value()) {
+        // Clamp for the same reasons.
+        const auto clamped_max_lag = std::clamp(
+          seg_ms.value(),
+          local_config.log_segment_ms_min(),
+          local_config.log_segment_ms_max());
+        max_age = max_age.has_value()
+                    ? std::min(max_age.value(), clamped_max_lag)
+                    : clamped_max_lag;
+
+        // If we're applying max_lag to roll segments, that's likely a
+        // misconfiguration, and it's definitely worth noting.
+        if (max_age == max_lag) {
+            stlog.log(
+              ss::log_level::warn,
+              rate,
+              "Segment roll controlled by max.compaction.lag.ms ({}): this is "
+              "likely a configuration problem",
+              max_lag);
+        }
+    }
+
+    if (!max_age.has_value()) {
+        // No time-based rolling.
         co_return;
     }
 
-    auto& local_config = config::shard_local_cfg();
-    // clamp user provided value with (hopefully sane) server min and max
-    // values, this should protect against overflow UB
-    const auto clamped_seg_ms = std::clamp(
-      seg_ms.value(),
-      local_config.log_segment_ms_min(),
-      local_config.log_segment_ms_max());
-
-    static constexpr auto rate_limit = std::chrono::minutes(5);
-    thread_local static ss::logger::rate_limit rate(rate_limit);
-    if (seg_ms < clamped_seg_ms) {
-        stlog.log(
-          ss::log_level::warn,
-          rate,
-          "Configured segment.ms={} is lower than the configured cluster "
-          "bound {}={}",
-          seg_ms.value(),
-          local_config.log_segment_ms_min.name(),
-          local_config.log_segment_ms_min());
-    }
-
-    if (seg_ms > clamped_seg_ms) {
-        stlog.log(
-          ss::log_level::warn,
-          rate,
-          "Configured segment.ms={} is higher than the configured cluster "
-          "bound {}={}",
-          seg_ms.value(),
-          local_config.log_segment_ms_max.name(),
-          local_config.log_segment_ms_max());
-    }
-
-    if (first_write_ts.value() + clamped_seg_ms > ss::lowres_clock::now()) {
+    if (first_write_ts.value() + max_age.value() > ss::lowres_clock::now()) {
         // skip, time hasn't expired
         co_return;
     }
 
-    auto pc = last->appender()
-                .get_priority_class(); // note: has_appender is true, the
-                                       // bouncer condition checked this
     add_segment_bytes(last, last->size_bytes());
     co_await last->release_appender(_readers_cache.get());
     auto offsets = last->offsets();
     auto new_so = model::next_offset(offsets.get_committed_offset());
-    co_await new_segment(new_so, offsets.get_term(), pc);
+    co_await new_segment(new_so, offsets.get_term());
     vlog(
       stlog.trace,
-      "{} segment.ms applied, new segment start offset: {}",
+      "{} segment rolled, new segment start offset: {}",
       config().ntp(),
-      seg_ms.value());
+      new_so);
 }
 
 ss::future<model::record_batch_reader>
-disk_log_impl::make_unchecked_reader(log_reader_config config) {
+disk_log_impl::make_unchecked_reader(local_log_reader_config config) {
     vassert(!_closed, "make_reader on closed log - {}", *this);
     return _lock_mngr.range_lock(config).then(
       [this, cfg = config](std::unique_ptr<lock_manager::lease> lease) {
@@ -2124,7 +2347,7 @@ disk_log_impl::make_unchecked_reader(log_reader_config config) {
 }
 
 ss::future<model::record_batch_reader>
-disk_log_impl::make_cached_reader(log_reader_config config) {
+disk_log_impl::make_cached_reader(local_log_reader_config config) {
     vassert(!_closed, "make_reader on closed log - {}", *this);
 
     auto rdr = _readers_cache->get_reader(config);
@@ -2146,7 +2369,8 @@ namespace details {
 struct batch_size_accumulator {
     ss::future<ss::stop_iteration> operator()(model::record_batch b) {
         vassert(
-          result_size_bytes != nullptr,
+          result_size_bytes != nullptr && base_timestamp != nullptr
+            && max_timestamp != nullptr,
           "batch_size_accumulator is not initialized properly");
         // Target is exclusive:
         // 'target' offset corresponds to the base offset of the
@@ -2162,12 +2386,18 @@ struct batch_size_accumulator {
         //                  target---v
         //     |++++++++++++++[+++++++]X          |
         //
+        *base_timestamp = b.header().first_timestamp;
         if (boundary == boundary_type::inclusive) {
             if (b.last_offset() > target) {
+                *max_timestamp = std::min(
+                  *max_timestamp, b.header().max_timestamp);
                 co_return ss::stop_iteration::yes;
             }
             *result_size_bytes += model::packed_record_batch_header_size
                                   + b.data().size_bytes();
+            if (b.header().last_offset() == target) {
+                *max_timestamp = b.header().max_timestamp;
+            }
             co_return ss::stop_iteration::no;
         } else {
             if (b.base_offset() >= target) {
@@ -2175,6 +2405,7 @@ struct batch_size_accumulator {
             }
             *result_size_bytes += model::packed_record_batch_header_size
                                   + b.data().size_bytes();
+            *max_timestamp = b.header().max_timestamp;
             co_return ss::stop_iteration::no;
         }
     }
@@ -2183,32 +2414,53 @@ struct batch_size_accumulator {
     size_t* result_size_bytes{nullptr};
     model::offset target;
     boundary_type boundary;
+    model::timestamp* base_timestamp{nullptr};
+    model::timestamp* max_timestamp{nullptr};
 };
 } // namespace details
 
-ss::future<size_t> disk_log_impl::get_file_offset(
+auto disk_log_impl::get_file_offset(
   ss::lw_shared_ptr<segment> s,
   std::optional<segment_index::entry> maybe_index_entry,
   model::offset target,
-  boundary_type boundary,
-  ss::io_priority_class priority) {
-    auto index_entry = maybe_index_entry.value_or(segment_index::entry{
-      .offset = s->offsets().get_base_offset(),
-      .filepos = 0,
-    });
+  boundary_type boundary) -> ss::future<file_offset_t> {
+    auto index_entry = maybe_index_entry.value_or(
+      segment_index::entry{
+        .offset = s->offsets().get_base_offset(),
+        .timestamp = s->index().base_timestamp(),
+        .filepos = 0,
+      });
     size_t size_bytes{index_entry.filepos};
+    model::timestamp base_timestamp = index_entry.timestamp;
+    model::timestamp max_timestamp = model::timestamp::max();
     details::batch_size_accumulator acc{
       .result_size_bytes = &size_bytes,
       .target = target,
       .boundary = boundary,
+      .base_timestamp = &base_timestamp,
+      .max_timestamp = &max_timestamp,
     };
 
-    storage::log_reader_config reader_cfg(index_entry.offset, target, priority);
+    auto reader_start_offset = index_entry.offset;
+
+    storage::local_log_reader_config reader_cfg(reader_start_offset, target);
 
     reader_cfg.skip_batch_cache = true;
     reader_cfg.skip_readers_cache = true;
 
-    auto reader = co_await make_reader(reader_cfg);
+    auto lock = s->try_hold_read_lock();
+
+    if (!lock.has_value()) {
+        vlog(
+          stlog.info,
+          "{}: Something prevented access to the segment's read lock. "
+          "aborting...",
+          config().ntp());
+        throw ss::semaphore_timed_out();
+    }
+
+    auto reader = model::make_record_batch_reader<single_segment_reader>(
+      s, std::move(lock).value(), reader_cfg, *_probe);
 
     try {
         co_await std::move(reader).consume(acc, model::no_timeout);
@@ -2219,26 +2471,75 @@ ss::future<size_t> disk_log_impl::get_file_offset(
           std::current_exception());
         throw;
     }
-    co_return size_bytes;
+
+    co_return file_offset_t{
+      .position = size_bytes,
+      .base_timestamp = base_timestamp,
+      .last_timestamp = max_timestamp,
+    };
+}
+
+model::offset disk_log_impl::cleanly_compacted_prefix_offset() const {
+    _cleanly_compacted_offset = std::max(
+      _cleanly_compacted_offset, _start_offset);
+    if (!_segs.empty()) {
+        auto first_seg_to_check_it = _segs.lower_bound(
+          _cleanly_compacted_offset);
+        auto first_non_clean_seg_it = std::find_if(
+          first_seg_to_check_it, _segs.end(), [](const segment_set::type& seg) {
+              return !seg->index().has_clean_compact_timestamp();
+          });
+        if (first_non_clean_seg_it == _segs.end()) [[unlikely]] {
+            // This should not happen, as we never compact the last segment.
+            // If it does for any reason, underreport cleanly compacted offset
+            // by the length of the last segment rather than use its max_offset
+            // which may be uninitialized.
+            --first_non_clean_seg_it;
+        }
+        _cleanly_compacted_offset
+          = (*first_non_clean_seg_it)->index().base_offset();
+    }
+    return _cleanly_compacted_offset;
+}
+
+bool disk_log_impl::log_contains_offset(model::offset o) const noexcept {
+    auto log_offsets = offsets();
+    auto log_interval = model::bounded_offset_interval::optional(
+      log_offsets.start_offset, log_offsets.committed_offset);
+
+    if (!log_interval.has_value()) {
+        // Log is empty
+        return false;
+    }
+
+    return log_interval->contains(o);
+}
+
+bool disk_log_impl::log_contains_offset_range(
+  model::offset first, model::offset last) const noexcept {
+    auto log_offsets = offsets();
+    auto log_interval = model::bounded_offset_interval::optional(
+      log_offsets.start_offset, log_offsets.committed_offset);
+
+    if (!log_interval.has_value()) {
+        // Log is empty
+        return false;
+    }
+
+    return log_interval->contains(first) && log_interval->contains(last);
 }
 
 ss::future<std::optional<log::offset_range_size_result_t>>
 disk_log_impl::offset_range_size(
-  model::offset first, model::offset last, ss::io_priority_class io_priority) {
-    auto log_offsets = offsets();
+  model::offset first, model::offset last, ss::semaphore::time_point timeout) {
     vlog(
       stlog.debug,
       "Offset range size, first: {}, last: {}, lstat: {}",
       first,
       last,
-      log_offsets);
-    auto log_interval = model::bounded_offset_interval::optional(
-      log_offsets.start_offset, log_offsets.committed_offset);
-    if (!log_interval.has_value()) {
-        vlog(stlog.debug, "Log is empty, returning early");
-        co_return std::nullopt;
-    }
-    if (!log_interval->contains(first) || !log_interval->contains(last)) {
+      offsets());
+
+    if (!log_contains_offset_range(first, last)) {
         vlog(stlog.debug, "Log does not include entire range");
         co_return std::nullopt;
     }
@@ -2292,7 +2593,7 @@ disk_log_impl::offset_range_size(
     std::vector<ss::future<ss::rwlock::holder>> f_locks;
     f_locks.reserve(segments.size());
     for (auto& s : segments) {
-        f_locks.emplace_back(s->read_lock());
+        f_locks.emplace_back(s->read_lock(timeout));
     }
 
     auto holders = co_await ss::when_all_succeed(
@@ -2305,46 +2606,63 @@ disk_log_impl::offset_range_size(
         }
     }
 
+    // Recheck log offsets as well, as we could race with a prefix truncation
+    // while waiting for segment locks.
+    if (!log_contains_offset_range(first, last)) {
+        vlog(stlog.debug, "Log does not include entire range");
+        co_return std::nullopt;
+    }
+
     // Left subscan
     auto ix_left = segments.front()->index().find_nearest(first);
     if (ix_left.has_value()) {
         // We have found an index entry.
         vlog(
           stlog.debug,
-          "Scanning (left) log segment {} from the file offset {} (RP offset "
-          "{})",
+          "{}: Scanning (left) log segment {} from the file offset {} (RP "
+          "offset "
+          "{} ; timestamp {})",
+          config().ntp(),
           segments.front()->offsets(),
           ix_left->filepos,
-          ix_left->offset);
+          ix_left->offset,
+          ix_left->timestamp);
     } else {
         // Scan from the beginning of the segment.
         vlog(
           stlog.debug,
-          "Scanning (left) log segment {} from the start",
+          "{}: Scanning (left) log segment {} from the start",
+          config().ntp(),
           segments.front()->offsets());
     }
-    auto left_scan_bytes = co_await get_file_offset(
-      segments.front(), ix_left, first, boundary_type::exclusive, io_priority);
+    auto left_scan_offset = co_await get_file_offset(
+      segments.front(), ix_left, first, boundary_type::exclusive);
+    auto left_scan_bytes = left_scan_offset.position;
 
     // Right subscan
     auto ix_right = segments.back()->index().find_nearest(last);
     if (ix_right.has_value()) {
         vlog(
           stlog.debug,
-          "Scanning (right) log segment {} from the file offset {} (RP offset "
-          "{})",
+          "{}: Scanning (right) log segment {} from the file offset {} (RP "
+          "offset "
+          "{} ; timestamp {})",
+          config().ntp(),
           segments.back()->offsets(),
           ix_right->filepos,
-          ix_right->offset);
+          ix_right->offset,
+          ix_right->timestamp);
     } else {
         // Scan from the beginning of the segment.
         vlog(
           stlog.debug,
-          "Scanning (right) log segment {} from the start",
+          "{}: Scanning (right) log segment {} from the start",
+          config().ntp(),
           segments.back()->offsets());
     }
-    auto right_scan_bytes = co_await get_file_offset(
-      segments.back(), ix_right, last, boundary_type::inclusive, io_priority);
+    auto right_scan_offset = co_await get_file_offset(
+      segments.back(), ix_right, last, boundary_type::inclusive);
+    auto right_scan_bytes = right_scan_offset.position;
 
     // compute size
     size_t total_size = 0;
@@ -2388,29 +2706,23 @@ disk_log_impl::offset_range_size(
     co_return offset_range_size_result_t{
       .on_disk_size = total_size,
       .last_offset = last,
+      .first_timestamp = left_scan_offset.base_timestamp,
+      .last_timestamp = right_scan_offset.last_timestamp,
     };
 }
 
 ss::future<std::optional<log::offset_range_size_result_t>>
 disk_log_impl::offset_range_size(
-  model::offset first,
-  offset_range_size_requirements_t target,
-  ss::io_priority_class io_priority) {
-    auto log_offsets = offsets();
+  model::offset first, offset_range_size_requirements_t target) {
     vlog(
       stlog.debug,
       "Offset range size, first: {}, target size: {}/{}, lstat: {}",
       first,
       target.target_size,
       target.min_size,
-      log_offsets);
-    auto log_interval = model::bounded_offset_interval::optional(
-      log_offsets.start_offset, log_offsets.committed_offset);
-    if (!log_interval.has_value()) {
-        vlog(stlog.debug, "Log is empty, returning early");
-        co_return std::nullopt;
-    }
-    if (!log_interval->contains(first)) {
+      offsets());
+
+    if (!log_contains_offset(first)) {
         vlog(stlog.debug, "Log does not include offset {}", first);
         co_return std::nullopt;
     }
@@ -2441,7 +2753,7 @@ disk_log_impl::offset_range_size(
         }
     }
 
-    size_t first_segment_file_pos = 0;
+    file_offset_t first_segment_file_offsets{};
     auto first_segment = *base_it;
     size_t first_segment_size = first_segment->file_size();
     auto first_segment_offsets = first_segment->offsets();
@@ -2470,10 +2782,18 @@ disk_log_impl::offset_range_size(
     auto holders = co_await ss::when_all_succeed(
       std::begin(f_locks), std::end(f_locks));
 
+    // Check if anything was closed after the scheduling point.
     for (const auto& s : segments) {
         if (s->is_closed()) {
             co_return std::nullopt;
         }
+    }
+
+    // Recheck log offsets as well, as we could race with a prefix truncation
+    // while waiting for segment locks.
+    if (!log_contains_offset(first)) {
+        vlog(stlog.debug, "Log does not include offset {}", first);
+        co_return std::nullopt;
     }
 
     if (
@@ -2487,8 +2807,8 @@ disk_log_impl::offset_range_size(
         // offset.
         auto ix_res = first_segment->index().find_nearest(first);
 
-        first_segment_file_pos = co_await get_file_offset(
-          first_segment, ix_res, first, boundary_type::exclusive, io_priority);
+        first_segment_file_offsets = co_await get_file_offset(
+          first_segment, ix_res, first, boundary_type::exclusive);
     } else {
         // We expect to find first offset inside the first segment.
         // If this is not the case the log was likely truncated concurrently.
@@ -2499,6 +2819,8 @@ disk_log_impl::offset_range_size(
           first);
         co_return std::nullopt;
     }
+
+    size_t first_segment_file_pos = first_segment_file_offsets.position;
 
     // No scheduling points below this point, some invariants has to be
     // validated
@@ -2659,9 +2981,19 @@ disk_log_impl::offset_range_size(
         co_return std::nullopt;
     }
 
+    while (it == _segs.end()
+           || it->get()->offsets().get_base_offset() > last_included_offset) {
+        it = std::prev(it);
+    }
+    auto ix_right = it->get()->index().find_nearest(last_included_offset);
+    auto last_segment_file_offsets = co_await get_file_offset(
+      *it, ix_right, last_included_offset, boundary_type::inclusive);
+
     co_return offset_range_size_result_t{
       .on_disk_size = current_size,
       .last_offset = last_included_offset,
+      .first_timestamp = first_segment_file_offsets.base_timestamp,
+      .last_timestamp = last_segment_file_offsets.last_timestamp,
     };
 }
 
@@ -2679,15 +3011,70 @@ bool disk_log_impl::is_compacted(
     return false;
 }
 
+bool disk_log_impl::eligible_for_compacted_reupload(
+  model::offset first, model::offset last) const {
+    if (auto mco = max_eligible_for_compacted_reupload_offset(first);
+        mco.has_value()) {
+        return last <= mco.value();
+    }
+    return false;
+}
+
+std::optional<model::offset>
+disk_log_impl::max_eligible_for_compacted_reupload_offset(
+  model::offset first) const {
+    auto it = _segs.lower_bound(first);
+    if (it == _segs.end()) {
+        return std::nullopt;
+    }
+    auto compaction_complete = [this](const ss::lw_shared_ptr<segment>& seg) {
+        if (!seg->is_compacted_segment()) {
+            return false;
+        }
+        if (config::shard_local_cfg().log_compaction_use_sliding_window) {
+            // if deletion is enabled, we don't want to wait so long for
+            // perfectly compacted data that truncation leaves us with
+            // uncompacted data in cloud storage. so in this case, a single
+            // round of windowed compaction is 'enough'.
+            if (config().is_locally_collectable()) {
+                return seg->finished_windowed_compaction();
+            }
+
+            // however, if deletion is not enabled, then we may as well wait
+            // for the best possible compacted version of the data.
+            return seg->has_clean_compact_timestamp();
+        }
+        return seg->has_self_compact_timestamp();
+    };
+
+    if (!compaction_complete(*it)) {
+        return std::nullopt;
+    }
+
+    // perform a linear search here because segment_set may not be partitioned
+    // with respect to has_clean_compact_timestamp
+    auto first_uncompacted = std::find_if_not(
+      it, _segs.end(), compaction_complete);
+
+    if (first_uncompacted == _segs.end()) {
+        // in this case everything is compacted enough for reupload
+        return _segs.back()->offsets().get_committed_offset();
+    }
+
+    return model::prev_offset(
+      first_uncompacted->get()->offsets().get_base_offset());
+}
+
 ss::future<model::record_batch_reader>
-disk_log_impl::make_reader(log_reader_config config) {
+disk_log_impl::make_reader(local_log_reader_config config) {
     vassert(!_closed, "make_reader on closed log - {}", *this);
     if (config.start_offset < _start_offset) {
         return ss::make_exception_future<model::record_batch_reader>(
-          std::runtime_error(fmt::format(
-            "Reader cannot read before start of the log {} < {}",
-            config.start_offset,
-            _start_offset)));
+          std::runtime_error(
+            fmt::format(
+              "Reader cannot read before start of the log {} < {}",
+              config.start_offset,
+              _start_offset)));
     }
 
     if (config.start_offset > config.max_offset) {
@@ -2718,14 +3105,16 @@ disk_log_impl::make_reader(timequery_config config) {
               // timestamps on the batches are monotonically increasing.
               if (segment->index().batch_timestamps_are_monotonic()) {
                   index_entry = segment->index().find_nearest(cfg.time);
-                  vlog(
-                    stlog.debug,
-                    "Batch timestamps have monotonically increasing "
-                    "timestamps; used segment index to find first batch before "
-                    "timestamp {}: offset={} with ts={}",
-                    cfg.time,
-                    index_entry->offset,
-                    index_entry->timestamp);
+                  if (index_entry) {
+                      vlog(
+                        stlog.debug,
+                        "Batch timestamps have monotonically increasing "
+                        "timestamps; used segment index to find first batch "
+                        "before timestamp {}: offset={} with ts={}",
+                        cfg.time,
+                        index_entry->offset,
+                        index_entry->timestamp);
+                  }
               }
 
               auto offset_within_segment
@@ -2744,12 +3133,10 @@ disk_log_impl::make_reader(timequery_config config) {
             cfg.time,
             _start_offset);
 
-          log_reader_config config(
+          local_log_reader_config config(
             start_offset,
             cfg.max_offset,
-            0,
             2048, // We just need one record batch
-            cfg.prio,
             cfg.type_filter,
             cfg.time,
             cfg.abort_source);
@@ -2832,23 +3219,20 @@ ss::future<std::optional<timequery_result>>
 disk_log_impl::timequery(timequery_config cfg) {
     vassert(!_closed, "timequery on closed log - {}", *this);
     if (_segs.empty()) {
-        return ss::make_ready_future<std::optional<timequery_result>>();
+        co_return std::nullopt;
     }
-    return make_reader(cfg).then([cfg](model::record_batch_reader reader) {
-        return model::consume_reader_to_memory(
-                 std::move(reader), model::no_timeout)
-          .then([cfg](model::record_batch_reader::storage_t st) {
-              using ret_t = std::optional<timequery_result>;
-              auto& batches = std::get<model::record_batch_reader::data_t>(st);
-              if (
-                !batches.empty()
-                && batches.front().header().max_timestamp >= cfg.time) {
-                  return ret_t(batch_timequery(
-                    batches.front(), cfg.min_offset, cfg.time, cfg.max_offset));
-              }
-              return ret_t();
-          });
-    });
+
+    auto reader = co_await make_reader(cfg);
+    auto batches = co_await model::consume_reader_to_memory(
+      std::move(reader), model::no_timeout);
+
+    if (
+      !batches.empty() && batches.front().header().max_timestamp >= cfg.time) {
+        co_return co_await batch_timequery(
+          std::move(batches.front()), cfg.min_offset, cfg.time, cfg.max_offset);
+    }
+
+    co_return std::nullopt;
 }
 
 ss::future<> disk_log_impl::remove_segment_permanently(
@@ -3139,7 +3523,7 @@ ss::future<> disk_log_impl::do_truncate(
     // starting offset. this is needed because we really do want to read
     // all the data in the segment to find the correct physical offset.
     auto reader = co_await make_unchecked_reader(
-      log_reader_config(start, model::offset::max(), cfg.prio));
+      local_log_reader_config(start, model::offset::max()));
     auto phs = co_await std::move(reader).consume(
       internal::offset_to_filepos_consumer(
         start, cfg.base_offset, initial_size, initial_timestamp),
@@ -3262,7 +3646,7 @@ ss::future<bool> disk_log_impl::update_start_offset(model::offset o) {
 }
 
 bool disk_log_impl::notify_compaction_update() {
-    bool new_compaction_enabled = config().is_compacted();
+    bool new_compaction_enabled = config().is_locally_compacted();
     bool result = (_compaction_enabled != new_compaction_enabled);
     _compaction_enabled = new_compaction_enabled;
 
@@ -3286,143 +3670,37 @@ void disk_log_impl::set_overrides(ntp_config::default_overrides o) {
     mutable_config().set_overrides(o);
 }
 
-/// Calculate the compaction backlog of the segments within a particular term
-///
-/// This is the inner part of compaction_backlog()
-int64_t compaction_backlog_term(
-  std::vector<ss::lw_shared_ptr<segment>> segs, double cf) {
-    int64_t backlog = 0;
-
-    // Only compare each segment to a limited number of other segments, to
-    // avoid the loop below blowing up in runtime when there are many segments
-    // in the same term.
-    static constexpr size_t limit_lookahead = 8;
-
-    auto segment_count = segs.size();
-    if (segment_count <= 1) {
-        return 0;
-    }
-
-    for (size_t n = 1; n <= segment_count; ++n) {
-        auto& s = segs[n - 1];
-        auto sz = s->finished_self_compaction() ? s->size_bytes()
-                                                : s->size_bytes() * cf;
-        for (size_t k = 0; k <= segment_count - n && k < limit_lookahead; ++k) {
-            if (k == segment_count - 1) {
-                continue;
-            }
-            if (k == 0) {
-                backlog += static_cast<int64_t>(sz);
-            } else {
-                backlog += static_cast<int64_t>(std::pow(cf, k) * sz);
-            }
-        }
-    }
-
-    return backlog;
-}
-
 /**
- * We express compaction backlog as the size of a data that have to be read to
+ * We express compaction backlog as the size of data that has to be read to
  * perform full compaction.
- *
- * According to this assumption compaction backlog consist of two components
- *
- * 1) size of not yet self compacted segments
- * 2) size of all possible adjacent segments compactions
- *
- * Component 1. of a compaction backlog is simply a sum of sizes of all not self
- * compacted segments.
- *
- * Calculation of 2nd part of compaction backlog is based on the observation
- * that adjacent segment compactions can be presented as a tree
- * (each leaf represents a log segment)
- *                              ┌────┐
- *                        ┌────►│ s5 │◄┐
- *                        │     └────┘ │
- *                        │            │
- *                        │            │
- *                        │            │
- *                      ┌─┴──┐         │
- *                    ┌►│ s4 │◄┐       │
- *                    │ └────┘ │       │
- *                    │        │       │
- *                    │        │       │
- *                    │        │       │
- *                    │        │       │
- *                  ┌─┴──┐  ┌──┴─┐  ┌──┴─┐
- *                  │ s1 │  │ s2 │  │ s3 │
- *                  └────┘  └────┘  └────┘
- *
- * To create segment from upper tree level two self compacted adjacent segments
- * from level below are concatenated and then resulting segment is self
- * compacted.
- *
- * In presented example size of s4:
- *
- *          sizeof(s4) = sizeof(s1) + sizeof(s2)
- *
- * Estimation of an s4 size after it will be self compacted is based on the
- * average compaction factor - `cf`. After self compaction size of
- * s4 will be estimated as
- *
- *         sizeof(s4) = cf * s4
- *
- * This allows calculating next compaction step which would be:
- *
- *         sizeof(s5) = cf * sizeof(s4) + s3 = cf * (sizeof(s1) + sizeof(s2))
- *
- * In order to calculate the backlog we have to sum both terms.
- *
- * Continuing those operation for upper tree levels we can obtain an equation
- * describing adjacent segments compaction backlog:
- *
- * cnt - segments count
- *
- *  backlog = sum(n=1,cnt) [sum(k=0, cnt - n + 1)][cf^k * sizeof(sn)] -
- *  cf^(cnt-1) * s1
  */
-int64_t disk_log_impl::compaction_backlog() const {
-    if (!config().is_compacted() || _segs.empty()) {
+int64_t disk_log_impl::compaction_backlog() {
+    if (!config().is_locally_compacted() || _segs.empty()) {
         return 0;
     }
 
-    auto current_term = _segs.front()->offsets().get_term();
-    auto cf = _compaction_ratio.get();
-    int64_t backlog = 0;
-    std::vector<ss::lw_shared_ptr<segment>> segments_this_term;
-
-    // Limit how large we will try to allocate the sgements_this_term vector:
-    // this protects us against corner cases where a term has a really large
-    // number of segments.  Typical compaction use cases will have many fewer
-    // segments per term than this (because segments are continuously compacted
-    // away).  Corner cases include non-compactible data in a compacted topic,
-    // or enabling compaction on a previously non-compacted topic.
-    static constexpr size_t limit_segments_this_term = 1024;
-
-    for (auto& s : _segs) {
-        if (!s->finished_self_compaction()) {
-            backlog += static_cast<int64_t>(s->size_bytes());
-        }
-        // if has appender do not include into adjacent segments calculation
-        if (s->has_appender()) {
-            continue;
-        }
-
-        if (current_term != s->offsets().get_term()) {
-            // New term: consume segments from the previous term.
-            backlog += compaction_backlog_term(
-              std::move(segments_this_term), cf);
-            segments_this_term.clear();
-        }
-
-        if (segments_this_term.size() < limit_segments_this_term) {
-            segments_this_term.push_back(s);
-        }
+    if (!needs_compaction()) {
+        return 0;
     }
 
-    // Consume segments from last term in the log after falling out of loop
-    backlog += compaction_backlog_term(std::move(segments_this_term), cf);
+    // Find the last closed yet dirty segment in the log, and sum over all bytes
+    // before it.
+    auto last_dirty_it = std::find_if(
+      _segs.rbegin(), _segs.rend(), [](const segment_set::type& s) {
+          return !s->has_appender() && !s->has_clean_compact_timestamp();
+      });
+
+    if (last_dirty_it == _segs.rend()) {
+        return 0;
+    }
+
+    int64_t backlog = std::accumulate(
+      _segs.begin(),
+      last_dirty_it.base(),
+      int64_t{0},
+      [](int64_t acc, ss::lw_shared_ptr<segment>& seg) {
+          return acc + seg->size_bytes();
+      });
 
     return backlog;
 }
@@ -3483,7 +3761,7 @@ ss::shared_ptr<log> make_disk_backed_log(
 ss::future<std::pair<usage, reclaim_size_limits>>
 disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
     std::optional<model::offset> max_offset;
-    if (config().is_collectable()) {
+    if (config().is_locally_collectable()) {
         auto cfg = apply_overrides(input_cfg);
         max_offset = retention_offset(cfg);
     }
@@ -3514,13 +3792,13 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
      *
      * Because this effort is split between the log, raft, and eviction_stm we
      * end up having to duplicate some of the logic here, such as handling the
-     * max collectible offset from stm. A future refactoring may consider moving
+     * max removable offset from stm. A future refactoring may consider moving
      * more of the retention controls into a higher level location.
      */
-    const auto max_collectible = stm_manager()->max_collectible_offset();
+    const auto max_removable = stm_manager()->max_removable_local_log_offset();
     const auto retention_offset = [&]() -> std::optional<model::offset> {
         if (max_offset.has_value()) {
-            return std::min(max_offset.value(), max_collectible);
+            return std::min(max_offset.value(), max_removable);
         }
         return std::nullopt;
     }();
@@ -3530,10 +3808,10 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
      * retention is not enabled data may be available in cloud storage and
      * still be subject to reclaim in low disk space situations.
      */
-    fragmented_vector<segment_set::type> retention_segments;
-    fragmented_vector<segment_set::type> available_segments;
-    fragmented_vector<segment_set::type> remaining_segments;
-    fragmented_vector<segment_set::type> local_retention_segments;
+    chunked_vector<segment_set::type> retention_segments;
+    chunked_vector<segment_set::type> available_segments;
+    chunked_vector<segment_set::type> remaining_segments;
+    chunked_vector<segment_set::type> local_retention_segments;
     for (auto& seg : _segs) {
         if (
           retention_offset.has_value()
@@ -3541,7 +3819,7 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
             retention_segments.push_back(seg);
         } else if (
           is_cloud_retention_active()
-          && seg->offsets().get_dirty_offset() <= max_collectible) {
+          && seg->offsets().get_dirty_offset() <= max_removable) {
             available_segments.push_back(seg);
         } else {
             remaining_segments.push_back(seg);
@@ -3558,7 +3836,7 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
         if (
           !config().is_read_replica_mode_enabled()
           && is_cloud_retention_active() && seg != _segs.back()
-          && seg->offsets().get_dirty_offset() <= max_collectible
+          && seg->offsets().get_dirty_offset() <= max_removable
           && local_retention_offset.has_value()
           && seg->offsets().get_dirty_offset()
                <= local_retention_offset.value()) {
@@ -3566,8 +3844,10 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
         }
     }
 
-    ss::semaphore limit(std::max<size_t>(
-      1, config::shard_local_cfg().space_management_max_segment_concurrency()));
+    ss::semaphore limit(
+      std::max<size_t>(
+        1,
+        config::shard_local_cfg().space_management_max_segment_concurrency()));
 
     auto [retention, available, remaining, lcl] = co_await ss::when_all_succeed(
       // reduce segment subject to retention policy
@@ -3651,7 +3931,7 @@ disk_log_impl::disk_usage_target(gc_config cfg, usage usage) {
      * compacted topics are always stored whole on local storage such that local
      * retention settings do not come into play.
      */
-    if (config().is_compacted()) {
+    if (config().is_locally_compacted()) {
         /*
          * if there is no delete policy enabled for a compacted topic then its
          * local capacity requirement is limited only by compaction process and
@@ -3659,7 +3939,9 @@ disk_log_impl::disk_usage_target(gc_config cfg, usage usage) {
          * report space wanted as `factor * current capacity` to reflect that we
          * want space for continued growth.
          */
-        if (!config().is_collectable() || deletion_exempt(config().ntp())) {
+        if (
+          !config().is_locally_collectable()
+          || deletion_exempt(config().ntp())) {
             target.min_capacity_wanted = usage.total() * 2;
             co_return target;
         }
@@ -3748,7 +4030,7 @@ disk_log_impl::disk_usage_target_time_retention(gc_config cfg) {
       });
 
     // collect segments for reducing
-    fragmented_vector<segment_set::type> segments;
+    chunked_vector<segment_set::type> segments;
     for (; it != std::cend(_segs); ++it) {
         segments.push_back(*it);
     }
@@ -3790,8 +4072,10 @@ disk_log_impl::disk_usage_target_time_retention(gc_config cfg) {
         co_return std::nullopt;
     }
 
-    ss::semaphore limit(std::max<size_t>(
-      1, config::shard_local_cfg().space_management_max_segment_concurrency()));
+    ss::semaphore limit(
+      std::max<size_t>(
+        1,
+        config::shard_local_cfg().space_management_max_segment_concurrency()));
 
     // roll up the amount of disk space taken by these segments
     auto usage = co_await ss::map_reduce(
@@ -3831,13 +4115,50 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
      * compute the amount of current disk usage as well as the amount available
      * for being reclaimed.
      */
-    auto [usage, reclaim] = co_await disk_usage_and_reclaimable_space(cfg);
+    usage use;
+    reclaim_size_limits reclaim;
+
+    auto usage_and_reclaim_fut = co_await ss::coroutine::as_future(
+      disk_usage_and_reclaimable_space(cfg));
+
+    if (usage_and_reclaim_fut.failed()) {
+        // The disk usage/reclaimable space could not be computed for some
+        // reason. Return the used size, but with 0 bytes indicated as
+        // reclaimable.
+        auto e = usage_and_reclaim_fut.get_exception();
+        ss::semaphore limit(
+          std::max<size_t>(
+            1,
+            config::shard_local_cfg()
+              .space_management_max_segment_concurrency()));
+
+        use = co_await ss::map_reduce(
+          _segs,
+          [&limit](const segment_set::type& seg) {
+              return ss::with_semaphore(
+                limit, 1, [&seg] { return seg->persistent_size(); });
+          },
+          usage{},
+          [](usage acc, usage u) { return acc + u; });
+
+        vlog(
+          gclog.warn,
+          "Unable to collect disk usage for ntp {}: {}, reporting usage of {} "
+          "with no reclaimable bytes",
+          config().ntp(),
+          e,
+          use.total());
+    } else {
+        auto usage_and_reclaim = usage_and_reclaim_fut.get();
+        use = usage_and_reclaim.first;
+        reclaim = usage_and_reclaim.second;
+    }
 
     /*
      * compute target capacities such as minimum required capacity as well as
      * capacities needed to meet goals such as local retention.
      */
-    auto target = co_await disk_usage_target(cfg, usage);
+    auto target = co_await disk_usage_target(cfg, use);
 
     /*
      * the intention here is to establish a needed <= wanted relationship which
@@ -3846,10 +4167,10 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
     target.min_capacity_wanted = std::max(
       target.min_capacity_wanted, target.min_capacity);
 
-    co_return usage_report(usage, reclaim, target);
+    co_return usage_report(use, reclaim, target);
 }
 
-fragmented_vector<ss::lw_shared_ptr<segment>>
+chunked_vector<ss::lw_shared_ptr<segment>>
 disk_log_impl::cloud_gc_eligible_segments() {
     vassert(
       is_cloud_retention_active(),
@@ -3865,16 +4186,16 @@ disk_log_impl::cloud_gc_eligible_segments() {
 
     /*
      * how much are we allowed to collect? sub-systems (e.g. transactions)
-     * may signal restrictions through the max collectible offset. for cloud
-     * topics max collectible will include a reflection of how much data has
+     * may signal restrictions through the max removable offset. for cloud
+     * topics max removable will include a reflection of how much data has
      * been uploaded into the cloud.
      */
-    const auto max_collectible = stm_manager()->max_collectible_offset();
+    const auto max_removable = stm_manager()->max_removable_local_log_offset();
 
     // collect eligible segments
-    fragmented_vector<segment_set::type> segments;
+    chunked_vector<segment_set::type> segments;
     for (auto remaining = _segs.size() - keep_segs; auto& seg : _segs) {
-        if (seg->offsets().get_committed_offset() <= max_collectible) {
+        if (seg->offsets().get_committed_offset() <= max_removable) {
             segments.push_back(seg);
         }
         if (--remaining <= 0) {
@@ -3921,7 +4242,7 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
 
     /*
      * there is currently a bug with read replicas that makes the max
-     * collectible offset unreliable. the read replica topics still have a
+     * removable offset unreliable. the read replica topics still have a
      * retention setting, but we are going to exempt them from forced reclaim
      * until this bug is fixed to avoid any complications.
      *
@@ -3965,12 +4286,12 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
      * for a cloud-backed topic the max collecible offset is the threshold below
      * which data has been uploaded and can safely be removed from local disk.
      */
-    const auto max_collectible = stm_manager()->max_collectible_offset();
+    const auto max_removable = stm_manager()->max_removable_local_log_offset();
 
     /*
      * lightweight segment set copy for safe iteration
      */
-    fragmented_vector<segment_set::type> segments;
+    chunked_vector<segment_set::type> segments;
     for (const auto& seg : _segs) {
         segments.push_back(seg);
     }
@@ -3987,13 +4308,13 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
     vlog(
       stlog.debug,
       "Categorizing {} {} segments for {} with local retention {} low "
-      "space {} max collectible {}",
+      "space {} max removable {}",
       segments.size(),
       (hinted ? "hinted" : "non-hinted"),
       config().ntp(),
       local_retention_offset,
       low_space_offset,
-      max_collectible);
+      max_removable);
 
     /*
      * categorize each segment.
@@ -4014,13 +4335,13 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
              * a potential:
              *
              *   1. rolling the active segment will bound progress towards
-             *   making its current full size reclaimable as max collectible
+             *   making its current full size reclaimable as max removable
              *   increases to cover the entire segment.
              *
-             *   2. finally, we don't report it if max collectible hasn't even
+             *   2. finally, we don't report it if max removable hasn't even
              *   made it to the active segment yet.
              */
-            if (seg->offsets().get_base_offset() <= max_collectible) {
+            if (seg->offsets().get_base_offset() <= max_removable) {
                 res.force_roll = seg_size;
                 vlog(
                   stlog.trace,
@@ -4040,13 +4361,13 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
          * if the current segment is not fully collectible, then subsequent
          * segments will not be either, and don't require consideration.
          */
-        if (point.offset > max_collectible) {
+        if (point.offset > max_removable) {
             vlog(
               stlog.trace,
-              "Stopping collection at offset {}:{} above max collectible {}",
+              "Stopping collection at offset {}:{} above max removable {}",
               point.offset,
               human::bytes(point.size),
-              max_collectible);
+              max_removable);
             break;
         }
 
@@ -4140,7 +4461,7 @@ ss::future<> disk_log_impl::copy_kvstore_state(
     co_await storage.invoke_on(target_shard, [&](storage::api& api) {
         const auto ks = kvstore::key_space::storage;
         std::vector<ss::future<>> write_futures;
-        write_futures.reserve(2);
+        write_futures.reserve(3);
         if (start_offset) {
             write_futures.push_back(api.kvs().put(
               ks, internal::start_offset_key(ntp), start_offset->copy()));
@@ -4162,7 +4483,7 @@ ss::future<> disk_log_impl::remove_kvstore_state(
       .discard_result();
 }
 
-double disk_log_impl::dirty_ratio() {
+double disk_log_impl::dirty_ratio() const {
     // Sanity check/safety hatch against negative values
     if (_dirty_segment_bytes < 0 || _closed_segment_bytes < 0) {
         vlog(
@@ -4225,7 +4546,7 @@ void disk_log_impl::subtract_segment_bytes(
     subtract_closed_segment_bytes(bytes);
 }
 
-void disk_log_impl::reset_dirty_and_closed_bytes() {
+void disk_log_impl::reset_dirty_and_closed_bytes() const {
     ssize_t dirty{0};
     ssize_t closed{0};
     for (const auto& seg : _segs) {
@@ -4238,6 +4559,33 @@ void disk_log_impl::reset_dirty_and_closed_bytes() {
     }
     _dirty_segment_bytes = dirty;
     _closed_segment_bytes = closed;
+}
+
+std::optional<model::timestamp>
+disk_log_impl::earliest_dirty_segment_ts() const {
+    auto dirty_segments_ts = _segs | std::views::filter([](const auto& seg) {
+                                 return !seg->has_appender()
+                                        && !seg->has_clean_compact_timestamp();
+                             })
+                             | std::views::transform([](const auto& seg) {
+                                   return seg->index().base_timestamp();
+                               });
+    if (std::ranges::empty(dirty_segments_ts)) {
+        return std::nullopt;
+    }
+    return *std::ranges::min_element(dirty_segments_ts);
+}
+
+bool disk_log_impl::needs_compaction() const {
+    auto max_lag = config().max_compaction_lag_ms();
+    const auto now = to_time_point(model::timestamp::now());
+    const auto earliest_dirty_ts = earliest_dirty_segment_ts();
+    const auto exceed_compact_lag
+      = earliest_dirty_ts.has_value()
+        && (now - to_time_point(earliest_dirty_ts.value()) > max_lag);
+
+    auto dr = dirty_ratio();
+    return dr >= config().min_cleanable_dirty_ratio() || exceed_compact_lag;
 }
 
 } // namespace storage

@@ -10,23 +10,12 @@
 #include "cluster/errc.h"
 #include "cluster/rm_stm.h"
 #include "cluster/tests/rm_stm_test_fixture.h"
-#include "finjector/hbadger.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/record.h"
 #include "model/tests/random_batch.h"
-#include "model/timestamp.h"
-#include "raft/consensus_utils.h"
-#include "raft/fundamental.h"
-#include "random/generators.h"
-#include "storage/record_batch_builder.h"
-#include "storage/tests/utils/disk_log_builder.h"
-#include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/util/defer.hh>
-
-#include <system_error>
 
 FIXTURE_TEST(
   test_rm_stm_doesnt_interfere_with_out_of_session_messages,
@@ -95,14 +84,15 @@ FIXTURE_TEST(
     wait_for_meta_initialized();
 
     auto count = 5;
-    auto batch1 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(0),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = 0});
+    auto batch1 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(0),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = 0});
 
     auto bid1 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
@@ -116,14 +106,15 @@ FIXTURE_TEST(
                 .get();
     BOOST_REQUIRE((bool)r1);
 
-    auto batch2 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(count),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = count});
+    auto batch2 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(count),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = count});
     auto bid2 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
       .first_seq = count,
@@ -282,14 +273,15 @@ FIXTURE_TEST(test_rm_stm_prevents_gaps, rm_stm_test_fixture) {
     wait_for_meta_initialized();
 
     auto count = 5;
-    auto batch1 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(0),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = 0});
+    auto batch1 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(0),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = 0});
     auto bid1 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
       .first_seq = 0,
@@ -302,14 +294,15 @@ FIXTURE_TEST(test_rm_stm_prevents_gaps, rm_stm_test_fixture) {
                 .get();
     BOOST_REQUIRE((bool)r1);
 
-    auto batch2 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(count),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = count + 1});
+    auto batch2 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(count),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = count + 1});
 
     auto bid2 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
@@ -336,14 +329,15 @@ FIXTURE_TEST(test_rm_stm_passes_immediate_retry, rm_stm_test_fixture) {
     wait_for_meta_initialized();
 
     auto count = 5;
-    auto batch1 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(0),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = 0});
+    auto batch1 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(0),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = 0});
     auto bid1 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
       .first_seq = 0,
@@ -352,14 +346,15 @@ FIXTURE_TEST(test_rm_stm_passes_immediate_retry, rm_stm_test_fixture) {
     // replicate caches only metadata so as long as batch have the same
     // pid and seq numbers the duplicated request should yield the same
     // offsets
-    auto batch2 = model::test::make_random_batch(model::test::record_batch_spec{
-      .offset = model::offset(0),
-      .allow_compression = true,
-      .count = count,
-      .enable_idempotence = true,
-      .producer_id = 1,
-      .producer_epoch = 0,
-      .base_sequence = 0});
+    auto batch2 = model::test::make_random_batch(
+      model::test::record_batch_spec{
+        .offset = model::offset(0),
+        .allow_compression = true,
+        .count = count,
+        .enable_idempotence = true,
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .base_sequence = 0});
     auto bid2 = model::batch_identity{
       .pid = model::producer_identity{1, 0},
       .first_seq = 0,

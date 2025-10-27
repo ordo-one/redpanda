@@ -9,16 +9,15 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "cluster/commands.h"
 #include "cluster/data_migrated_resources.h"
 #include "cluster/data_migration_types.h"
 #include "cluster/topic_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "errc.h"
 #include "utils/named_type.h"
 #include "utils/notification_list.h"
-
-#include <absl/container/node_hash_map.h>
 
 namespace cluster::data_migrations {
 namespace testing_details {
@@ -138,6 +137,9 @@ private:
 
     std::optional<validation_error>
     validate_migrated_resources(const data_migration&) const;
+
+    // Assumes that migration topics have already been validated.
+    void fill_topic_locations(outbound_migration&) const;
 
 private:
     id _next_id{0};

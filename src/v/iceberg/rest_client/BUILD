@@ -7,7 +7,6 @@ redpanda_cc_library(
     hdrs = [
         "catalog_config.h",
     ],
-    include_prefix = "iceberg/rest_client",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -24,7 +23,6 @@ redpanda_cc_library(
     hdrs = [
         "client_probe.h",
     ],
-    include_prefix = "iceberg/rest_client",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/http",
@@ -41,12 +39,11 @@ redpanda_cc_library(
     hdrs = [
         "error.h",
     ],
-    include_prefix = "iceberg/rest_client",
     deps = [
         "//src/v/base",
         "//src/v/http:request_builder",
-        "//src/v/thirdparty/ada",
         "//src/v/utils:named_type",
+        "@ada",
         "@boost//:beast",
         "@seastar",
     ],
@@ -60,7 +57,6 @@ redpanda_cc_library(
     hdrs = [
         "json.h",
     ],
-    include_prefix = "iceberg/rest_client",
     deps = [
         ":catalog_config",
         ":oauth_token",
@@ -79,7 +75,6 @@ redpanda_cc_library(
     hdrs = [
         "retry_policy.h",
     ],
-    include_prefix = "iceberg/rest_client",
     deps = [
         ":error",
         "//src/v/bytes:streambuf",
@@ -93,7 +88,6 @@ redpanda_cc_library(
     hdrs = [
         "credentials.h",
     ],
-    include_prefix = "iceberg/rest_client",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -106,7 +100,6 @@ redpanda_cc_library(
     hdrs = [
         "oauth_token.h",
     ],
-    include_prefix = "iceberg/rest_client",
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
@@ -122,9 +115,8 @@ redpanda_cc_library(
     hdrs = [
         "entities.h",
     ],
-    include_prefix = "iceberg/rest_client",
     deps = [
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/http:rest_entity",
         "//src/v/ssx:sformat",
     ],
@@ -138,7 +130,9 @@ redpanda_cc_library(
     hdrs = [
         "catalog_client.h",
     ],
-    include_prefix = "iceberg/rest_client",
+    implementation_deps = [
+        "//src/v/bytes:iobuf_parser",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":client_probe",
@@ -150,7 +144,10 @@ redpanda_cc_library(
         ":retry_policy",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:streambuf",
+        "//src/v/cloud_roles",
         "//src/v/config",
+        "//src/v/datalake:credential_manager",
+        "//src/v/hashing:secure",
         "//src/v/http",
         "//src/v/http:request_builder",
         "//src/v/http:rest_entity",
@@ -166,6 +163,7 @@ redpanda_cc_library(
         "//src/v/ssx:future_util",
         "//src/v/utils:named_type",
         "//src/v/utils:retry_chain_node",
+        "//src/v/utils:to_string",
         "@abseil-cpp//absl/strings",
         "@rapidjson",
         "@seastar",

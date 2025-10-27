@@ -9,7 +9,7 @@
 
 #include "storage/mvlog/versioned_log.h"
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/offset_interval.h"
 #include "storage/mvlog/file.h"
 #include "storage/mvlog/logger.h"
@@ -17,7 +17,6 @@
 #include "storage/mvlog/segment_appender.h"
 
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
 
 #include <chrono>
@@ -44,8 +43,10 @@ readonly_segment::readonly_segment(std::unique_ptr<active_segment> active_seg)
   : segment_file(std::move(active_seg->segment_file))
   , readable_seg(std::move(active_seg->readable_seg))
   , id(active_seg->id)
-  , offsets(model::bounded_offset_interval::checked(
-      active_seg->base_offset, model::prev_offset(active_seg->next_offset))) {}
+  , offsets(
+      model::bounded_offset_interval::checked(
+        active_seg->base_offset, model::prev_offset(active_seg->next_offset))) {
+}
 
 versioned_log::versioned_log(storage::ntp_config cfg)
   : ntp_cfg_(std::move(cfg)) {}
@@ -161,7 +162,7 @@ size_t versioned_log::compute_max_segment_size() const {
     }
     // TODO(awong): get defaults from log_manager
     // TODO(awong): clamp by min/max configs
-    vassert(false, "Not implemented");
+    vunreachable("Not implemented");
 }
 
 std::optional<ss::lowres_clock::time_point>

@@ -11,14 +11,14 @@
 
 #pragma once
 
+#include "absl/container/btree_set.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/state_machine_registry.h"
 #include "cluster/tm_stm_types.h"
 #include "cluster/tx_hash_ranges.h"
 #include "container/chunked_hash_map.h"
-#include "container/fragmented_vector.h"
-#include "features/feature_table.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/timestamp.h"
@@ -28,9 +28,6 @@
 #include "utils/mutex.h"
 
 #include <seastar/core/sharded.hh>
-
-#include <absl/container/btree_set.h>
-#include <absl/container/flat_hash_map.h>
 
 #include <cstdint>
 #include <string_view>
@@ -217,21 +214,20 @@ public:
         static constexpr uint8_t version = 0;
 
         model::offset offset;
-        fragmented_vector<tx_metadata> transactions;
+        chunked_vector<tx_metadata> transactions;
     };
 
     struct tm_snapshot {
         static constexpr uint8_t version = 1;
 
         model::offset offset;
-        fragmented_vector<tx_metadata> transactions;
+        chunked_vector<tx_metadata> transactions;
         // hash_ranges is unused and the relevant code can be
         // removed at some point.
         locally_hosted_txs hash_ranges;
     };
 
-    explicit tm_stm(
-      ss::logger&, raft::consensus*, ss::sharded<features::feature_table>&);
+    explicit tm_stm(ss::logger&, raft::consensus*);
 
     void try_rm_lock(const kafka::transactional_id& tid) {
         auto it = _transactions.find(tid);
@@ -297,17 +293,12 @@ public:
       update_transaction_status(
         model::term_id, kafka::transactional_id, tx_status);
 
-    // todo: cleanup last_pid and rolled_pid. It seems like they are doing
-    // the same thing but in practice they are not. last_pid is not updated
-    // in all cases whereas rolled_pid is need to cleanup all the state
-    // from previous epochs.
     ss::future<tm_stm::op_status> update_tx_producer(
       model::term_id,
       kafka::transactional_id,
       std::chrono::milliseconds,
       model::producer_identity pid_to_register,
-      model::producer_identity last_pid,
-      model::producer_identity rolled_pid);
+      model::producer_identity last_pid);
     ss::future<tm_stm::op_status> register_new_producer(
       model::term_id,
       kafka::transactional_id,
@@ -326,7 +317,7 @@ public:
     absl::btree_set<kafka::transactional_id> get_expired_txs();
 
     using get_txs_result
-      = checked<fragmented_vector<tx_metadata>, tm_stm::op_status>;
+      = checked<chunked_vector<tx_metadata>, tm_stm::op_status>;
     ss::future<get_txs_result> get_all_transactions();
 
     ss::future<checked<tx_metadata, tm_stm::op_status>>
@@ -347,7 +338,9 @@ public:
     size_t tx_cache_size() const;
 
     std::optional<tx_metadata> oldest_tx() const;
-    ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
+    ss::future<iobuf> take_raft_snapshot(model::offset) final {
+        co_return iobuf{};
+    }
 
     /**
      * Resets state of finished transaction. This operation is done in memory.
@@ -355,6 +348,11 @@ public:
      */
     checked<tx_metadata, tm_stm::op_status>
     reset_transaction_state(tx_metadata& tx);
+
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
 
 protected:
     ss::future<> apply_raft_snapshot(const iobuf&) final;
@@ -394,7 +392,7 @@ private:
 
     void upsert_transaction(tx_metadata);
 
-    fragmented_vector<tx_metadata> get_transactions_list() const;
+    chunked_vector<tx_metadata> get_transactions_list() const;
 
 private:
     std::chrono::milliseconds _sync_timeout;
@@ -403,7 +401,6 @@ private:
       _pid_tx_id;
     chunked_hash_map<kafka::transactional_id, ss::lw_shared_ptr<mutex>>
       _tx_locks;
-    ss::sharded<features::feature_table>& _feature_table;
 
     struct tx_wrapper {
         tx_wrapper() = default;
@@ -457,15 +454,15 @@ inline txlock_unit::~txlock_unit() noexcept {
 
 class tm_stm_factory : public state_machine_factory {
 public:
-    explicit tm_stm_factory(ss::sharded<features::feature_table>&);
+    tm_stm_factory() = default;
     bool is_applicable_for(const storage::ntp_config& raft) const final;
 
     void create(
       raft::state_machine_manager_builder& builder,
-      raft::consensus* raft) final;
+      raft::consensus* raft,
+      const cluster::stm_instance_config& cfg) final;
 
 private:
-    ss::sharded<features::feature_table>& _feature_table;
 };
 
 } // namespace cluster

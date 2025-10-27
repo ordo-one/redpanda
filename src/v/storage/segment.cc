@@ -11,8 +11,9 @@
 
 #include "base/vassert.h"
 #include "base/vlog.h"
-#include "compression/compression.h"
+#include "compaction/utils.h"
 #include "config/configuration.h"
+#include "model/batch_compression.h"
 #include "ssx/future-util.h"
 #include "storage/batch_cache.h"
 #include "storage/compacted_index_writer.h"
@@ -20,7 +21,6 @@
 #include "storage/fs_utils.h"
 #include "storage/fwd.h"
 #include "storage/logger.h"
-#include "storage/parser_utils.h"
 #include "storage/readers_cache.h"
 #include "storage/record_batch_utils.h"
 #include "storage/segment_set.h"
@@ -71,10 +71,11 @@ segment::segment(
 
 void segment::check_segment_not_closed(const char* msg) {
     if (unlikely(is_closed())) {
-        throw std::runtime_error(fmt::format(
-          "Attempted to perform operation: '{}' on a closed segment: {}",
-          msg,
-          *this));
+        throw std::runtime_error(
+          fmt::format(
+            "Attempted to perform operation: '{}' on a closed segment: {}",
+            msg,
+            *this));
     }
 }
 
@@ -120,7 +121,9 @@ ss::future<usage> segment::persistent_size() {
      * segment appender will transparently extend the size of the segment file
      * using fallocate, always stat the on disk size for the head partition.
      */
-    if (!_appender && _data_disk_usage_size.has_value()) {
+    if (_appender) {
+        u.data = _appender->size_bytes();
+    } else if (_data_disk_usage_size.has_value()) {
         u.data = _data_disk_usage_size.value();
     } else {
         try {
@@ -139,7 +142,9 @@ ss::future<usage> segment::persistent_size() {
      * however, we pay for that stat() with no guarantee that the information
      * will be used.
      */
-    if (_compaction_index_size.has_value()) {
+    if (_compaction_index) {
+        u.compaction = _compaction_index.value()->size_bytes();
+    } else if (_compaction_index_size.has_value()) {
         u.compaction = _compaction_index_size.value();
     } else {
         auto path = reader().path().to_compacted_index();
@@ -187,6 +192,14 @@ void segment::clear_cached_disk_usage() {
     _idx.clear_cached_disk_usage();
     _data_disk_usage_size.reset();
     _compaction_index_size.reset();
+}
+
+void segment::set_cached_disk_usage(
+  size_t new_seg_size, std::optional<size_t> new_compacted_index_size) {
+    _data_disk_usage_size = new_seg_size;
+    if (new_compacted_index_size.has_value()) {
+        _compaction_index_size = new_compacted_index_size.value();
+    }
 }
 
 ss::future<size_t> segment::remove_persistent_state() {
@@ -243,13 +256,22 @@ ss::future<> segment::do_release_appender(
         std::optional<std::unique_ptr<compacted_index_writer>>&
           compacted_index) {
           return appender->close()
-            .then([this] { return _idx.flush(); })
-            .then([this, &compacted_index] {
+            .then([this] {
+                clear_cached_disk_usage();
+                return _idx.flush();
+            })
+            .then([&compacted_index] {
                 if (compacted_index) {
                     return compacted_index.value()->close();
                 }
-                clear_cached_disk_usage();
                 return ss::now();
+            })
+            .then([this, &compacted_index, &appender] {
+                std::optional<size_t> cmp_idx_size{std::nullopt};
+                if (compacted_index) {
+                    cmp_idx_size = compacted_index.value()->size_bytes();
+                }
+                set_cached_disk_usage(appender->size_bytes(), cmp_idx_size);
             });
       });
 }
@@ -340,7 +362,7 @@ ss::future<> segment::flush() {
     });
 }
 ss::future<> segment::do_flush() {
-    _generation_id++;
+    advance_generation();
     if (!_appender) {
         return ss::make_ready_future<>();
     }
@@ -403,7 +425,7 @@ ss::future<> segment::do_truncate(
       "truncating segment {} at {}",
       _reader->filename(),
       new_max_offset);
-    _generation_id++;
+    advance_generation();
     cache_truncate(new_max_offset + model::offset(1));
     auto f = ss::now();
     if (is_compacted_segment()) {
@@ -484,7 +506,7 @@ ss::future<> segment::compaction_index_batch(const model::record_batch& b) {
         co_return;
     }
     // do not index not compactible batches
-    if (!internal::is_compactible(b)) {
+    if (!compaction::is_compactible(b.header())) {
         co_return;
     }
 
@@ -503,7 +525,7 @@ ss::future<> segment::compaction_index_batch(const model::record_batch& b) {
     // compacted topics, and/or avoiding huge batches on compacted topics.
     auto units = co_await _resources.get_compaction_compression_units();
 
-    auto decompressed = co_await internal::decompress_batch(b);
+    auto decompressed = co_await model::decompress_batch(b);
 
     co_return co_await do_compaction_index_batch(decompressed);
 }
@@ -516,34 +538,35 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
       *this,
       b.header());
     if (unlikely(b.base_offset() > b.last_offset())) {
-        return ss::make_exception_future<append_result>(
-          std::runtime_error(fmt::format(
+        return ss::make_exception_future<append_result>(std::runtime_error(
+          fmt::format(
             "Empty batch written to {}. Batch header: {}",
             path(),
             b.header())));
     }
     if (unlikely(b.base_offset() < _tracker.get_base_offset())) {
-        return ss::make_exception_future<
-          append_result>(std::runtime_error(fmt::format(
-          "Invalid state. Attempted to append a batch with base_offset:{}, but "
-          "would invalidate our initial state base offset of:{}. Actual batch "
-          "header:{}, self:{}",
-          b.base_offset(),
-          _tracker.get_base_offset(),
-          b.header(),
-          *this)));
+        return ss::make_exception_future<append_result>(std::runtime_error(
+          fmt::format(
+            "Invalid state. Attempted to append a batch with base_offset:{}, "
+            "but would invalidate our initial state base offset of:{}. Actual "
+            "batch header:{}, self:{}",
+            b.base_offset(),
+            _tracker.get_base_offset(),
+            b.header(),
+            *this)));
     }
     if (unlikely(b.compressed() && !b.header().attrs.is_valid_compression())) {
-        return ss::make_exception_future<
-          append_result>(std::runtime_error(fmt::format(
-          "record batch marked as compressed, but has no valid compression:{}",
-          b.header())));
+        return ss::make_exception_future<append_result>(std::runtime_error(
+          fmt::format(
+            "record batch marked as compressed, but has no valid "
+            "compression:{}",
+            b.header())));
     }
     const auto start_physical_offset = _appender->file_byte_offset();
     const auto expected_end_physical = start_physical_offset
                                        + b.header().size_bytes;
 
-    _generation_id++;
+    advance_generation();
 
     // inflight index. trimmed on every dma_write in appender
     _inflight.emplace(expected_end_physical, b.last_offset());
@@ -623,22 +646,26 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
 }
 
 ss::future<append_result> segment::append(const model::record_batch& b) {
-    if (has_compaction_index() && b.contains_transactional_data()) {
-        // With transactional batches, we do not know ahead of time whether the
-        // batch will be committed or aborted. We may not have this information
-        // during the lifetime of this segment as the batch may be aborted in
-        // the next segment. We mark this index as `incomplete` and rebuild it
-        // later from scratch during compaction.
-        try {
-            auto index = std::exchange(_compaction_index, std::nullopt).value();
-            index->set_flag(compacted_index::footer_flags::incomplete);
-            vlog(
-              gclog.info,
-              "Marking compaction index {} as incomplete",
-              index->filename());
-            co_await index->close();
-        } catch (...) {
-            co_return ss::coroutine::exception(std::current_exception());
+    if (b.contains_transactional_data()) {
+        if (has_compaction_index()) {
+            // With transactional batches, we do not know ahead of time whether
+            // the batch will be committed or aborted. We may not have this
+            // information during the lifetime of this segment as the batch may
+            // be aborted in the next segment. We mark this index as
+            // `incomplete` and rebuild it later from scratch during compaction.
+            try {
+                auto compacted_index
+                  = std::exchange(_compaction_index, std::nullopt).value();
+                compacted_index->set_flag(
+                  compacted_index::footer_flags::incomplete);
+                vlog(
+                  gclog.info,
+                  "Marking compaction index {} as incomplete",
+                  compacted_index->filename());
+                co_await compacted_index->close();
+            } catch (...) {
+                co_return ss::coroutine::exception(std::current_exception());
+            }
         }
     }
     co_return co_await do_append(b);
@@ -650,8 +677,7 @@ ss::future<append_result> segment::append(model::record_batch&& b) {
     });
 }
 
-ss::future<segment_reader_handle>
-segment::offset_data_stream(model::offset o, ss::io_priority_class iopc) {
+ss::future<segment_reader_handle> segment::offset_data_stream(model::offset o) {
     check_segment_not_closed("offset_data_stream()");
     auto nearest = _idx.find_nearest(o);
     size_t position = 0;
@@ -663,7 +689,7 @@ segment::offset_data_stream(model::offset o, ss::io_priority_class iopc) {
     // size) (https://github.com/redpanda-data/redpanda/issues/2101)
     vassert(position < size_bytes(), "Index points beyond file size");
 
-    return _reader->data_stream(position, iopc);
+    return _reader->data_stream(position);
 }
 
 void segment::advance_stable_offset(size_t filepos) {
@@ -703,10 +729,12 @@ void segment::advance_stable_offset(size_t filepos) {
 std::ostream& operator<<(std::ostream& o, const segment::offset_tracker& t) {
     fmt::print(
       o,
-      "{{term:{}, base_offset:{}, committed_offset:{}, dirty_offset:{}}}",
+      "{{term:{}, base_offset:{}, committed_offset:{}, stable_offset:{}, "
+      "dirty_offset:{}}}",
       t.get_term(),
       t.get_base_offset(),
       t.get_committed_offset(),
+      t.get_stable_offset(),
       t.get_dirty_offset());
     return o;
 }
@@ -714,7 +742,7 @@ std::ostream& operator<<(std::ostream& o, const segment::offset_tracker& t) {
 std::ostream& operator<<(std::ostream& o, const segment& h) {
     o << "{offset_tracker:" << h._tracker
       << ", compacted_segment=" << h.is_compacted_segment()
-      << ", finished_self_compaction=" << h.finished_self_compaction()
+      << ", finished_self_compaction=" << h.has_self_compact_timestamp()
       << ", finished_windowed_compaction=" << h.finished_windowed_compaction()
       << ", generation=" << h.get_generation_id() << ", reader=";
     if (h._reader) {
@@ -773,11 +801,12 @@ ss::future<ss::lw_shared_ptr<segment>> open_segment(
   ss::sharded<features::feature_table>& feature_table,
   std::optional<ntp_sanitizer_config> ntp_sanitizer_config) {
     if (path.get_version() != record_version_type::v1) {
-        throw std::runtime_error(fmt::format(
-          "Segment has invalid version {} != {} path {}",
-          path.get_version(),
-          record_version_type::v1,
-          path));
+        throw std::runtime_error(
+          fmt::format(
+            "Segment has invalid version {} != {} path {}",
+            path.get_version(),
+            record_version_type::v1,
+            path));
     }
 
     auto rdr = std::make_unique<segment_reader>(
@@ -805,7 +834,6 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
   const ntp_config& ntpc,
   model::offset base_offset,
   model::term_id term,
-  ss::io_priority_class pc,
   record_version_type version,
   size_t buf_size,
   unsigned read_ahead,
@@ -824,26 +852,16 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
              resources,
              feature_table,
              ntp_sanitizer_config)
-      .then([path,
-             &ntpc,
-             pc,
-             segment_size_hint,
-             &resources,
-             ntp_sanitizer_config](ss::lw_shared_ptr<segment> seg) mutable {
+      .then([path, &ntpc, segment_size_hint, &resources, ntp_sanitizer_config](
+              ss::lw_shared_ptr<segment> seg) mutable {
           return with_segment(
             std::move(seg),
-            [path,
-             &ntpc,
-             pc,
-             segment_size_hint,
-             &resources,
-             ntp_sanitizer_config](
+            [path, &ntpc, segment_size_hint, &resources, ntp_sanitizer_config](
               const ss::lw_shared_ptr<segment>& seg) mutable {
                 return internal::make_segment_appender(
                          path,
                          internal::number_of_chunks_from_config(ntpc),
                          segment_size_hint,
-                         pc,
                          resources,
                          std::move(ntp_sanitizer_config))
                   .then([seg, &resources](segment_appender_ptr a) {
@@ -861,19 +879,18 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
                   });
             });
       })
-      .then([path, &ntpc, pc, &resources, ntp_sanitizer_config](
+      .then([path, &ntpc, &resources, ntp_sanitizer_config](
               ss::lw_shared_ptr<segment> seg) mutable {
-          if (!ntpc.is_compacted()) {
+          if (!ntpc.is_locally_compacted()) {
               return ss::make_ready_future<ss::lw_shared_ptr<segment>>(seg);
           }
           return with_segment(
             seg,
-            [path, pc, &resources, ntp_sanitizer_config](
+            [path, &resources, ntp_sanitizer_config](
               const ss::lw_shared_ptr<segment>& seg) mutable {
                 auto compacted_path = path.to_compacted_index();
                 auto compact = make_file_backed_compacted_index(
                   compacted_path,
-                  pc,
                   false,
                   resources,
                   std::move(ntp_sanitizer_config));

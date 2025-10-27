@@ -41,9 +41,10 @@ enum class audit_resource_type : int8_t {
 
 template<typename Clock>
 timestamp_t create_timestamp_t(std::chrono::time_point<Clock> time_point) {
-    return timestamp_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-                         time_point.time_since_epoch())
-                         .count());
+    return timestamp_t(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        time_point.time_since_epoch())
+        .count());
 }
 
 template<typename Clock = ss::lowres_system_clock>
@@ -156,8 +157,7 @@ template<typename Func>
 concept returns_auditable_resource_vector = requires(Func func) {
     {
         func()
-    }
-    -> std::same_as<
+    } -> std::same_as<
       std::vector<typename std::remove_cvref_t<decltype(func())>::value_type>>;
 
     requires AuditableResource<

@@ -25,19 +25,26 @@
 #include "cluster/topic_updates_dispatcher.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "config/node_config.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "random/generators.h"
-#include "test_utils/fixture.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/smp.hh>
+
+#include <boost/test/unit_test.hpp>
 
 #include <chrono>
 #include <optional>
+
+#if defined(IS_GTEST)
+#error "this fixture is not gtest compatible because it uses boost assertions"
+#endif
 
 constexpr uint64_t node_size = 200_MiB;
 constexpr uint64_t full_node_free_size = 5_MiB;
@@ -63,11 +70,15 @@ create_allocation_node(model::node_id nid, uint32_t cores) {
 struct controller_workers {
 public:
     controller_workers()
-      : dispatcher(allocator, table, leaders, state) {
+      : dispatcher(allocator, table, state) {
+        ss::smp::invoke_on_all([] {
+            config::node().node_id.set_value(model::node_id{1});
+        }).get();
         migrated_resources.start().get();
         table
-          .start(ss::sharded_parameter(
-            [this] { return std::ref(migrated_resources.local()); }))
+          .start(ss::sharded_parameter([this] {
+              return std::ref(migrated_resources.local());
+          }))
           .get();
         members.start_single().get();
         features.start().get();
@@ -180,12 +191,12 @@ struct partition_balancer_planner_fixture {
       model::partition_autobalancing_mode mode
       = model::partition_autobalancing_mode::continuous,
       size_t max_concurrent_actions = 2,
-      bool request_ondemand_rebalance = false) {
+      bool request_ondemand_rebalance = false,
+      double max_disk_usage_ratio = 0.8) {
         return cluster::partition_balancer_planner(
           cluster::planner_config{
             .mode = mode,
-            .soft_max_disk_usage_ratio = 0.8,
-            .hard_max_disk_usage_ratio = 0.95,
+            .max_disk_usage_ratio = max_disk_usage_ratio,
             .max_concurrent_actions = max_concurrent_actions,
             .node_availability_timeout_sec = std::chrono::minutes(1),
             .ondemand_rebalance_requested = request_ondemand_rebalance,
@@ -228,11 +239,13 @@ struct partition_balancer_planner_fixture {
             BOOST_REQUIRE_EQUAL(nodes.size(), replication_factor);
             std::vector<model::broker_shard> replicas;
             for (model::node_id n : nodes) {
-                replicas.push_back(model::broker_shard{
-                  n, random_generators::get_int<uint32_t>(0, 3)});
+                replicas.push_back(
+                  model::broker_shard{
+                    n, random_generators::get_int<uint32_t>(0, 3)});
             }
-            assignments.push_back(cluster::partition_assignment{
-              raft::group_id{1}, model::partition_id{i}, replicas});
+            assignments.push_back(
+              cluster::partition_assignment{
+                raft::group_id{1}, model::partition_id{i}, replicas});
         }
         cluster::create_topic_cmd cmd{
           make_tp_ns(name),
@@ -297,8 +310,9 @@ struct partition_balancer_planner_fixture {
       model::ntp ntp, const std::vector<model::node_id>& new_nodes) {
         std::vector<model::broker_shard> new_replicas;
         for (auto n : new_nodes) {
-            new_replicas.push_back(model::broker_shard{
-              n, random_generators::get_int<uint32_t>(0, 3)});
+            new_replicas.push_back(
+              model::broker_shard{
+                n, random_generators::get_int<uint32_t>(0, 3)});
         }
         move_partition_replicas(std::move(ntp), std::move(new_replicas));
     }
@@ -341,10 +355,11 @@ struct partition_balancer_planner_fixture {
             if (unavailable_nodes.contains(i)) {
                 last_seen = last_seen - node_unavailable_timeout;
             }
-            status_updates.push_back(cluster::node_status{
-              .node_id = model::node_id(i),
-              .last_seen = last_seen,
-            });
+            status_updates.push_back(
+              cluster::node_status{
+                .node_id = model::node_id(i),
+                .last_seen = last_seen,
+              });
         }
 
         co_await workers.node_status_table.invoke_on_all(

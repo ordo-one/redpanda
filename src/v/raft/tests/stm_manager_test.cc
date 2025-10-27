@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "container/chunked_circular_buffer.h"
 #include "raft/tests/raft_fixture_retry_policy.h"
 #include "raft/tests/stm_test_fixture.h"
 
@@ -306,16 +307,17 @@ TEST_F_CORO(state_machine_fixture, test_recovery_from_snapshot) {
       10s, [](raft_node_instance& node) {
           auto committed = node.raft()->committed_offset();
           return node.raft()
-            ->make_reader(storage::log_reader_config(
-              node.raft()->start_offset(),
-              model::offset(random_generators::get_int(
-                node.raft()->start_offset()(), committed())),
-              ss::default_priority_class()))
+            ->make_reader(
+              storage::local_log_reader_config(
+                node.raft()->start_offset(),
+                model::offset(
+                  random_generators::get_int(
+                    node.raft()->start_offset()(), committed()))))
             .then([](auto rdr) {
                 return model::consume_reader_to_memory(
                   std::move(rdr), model::no_timeout);
             })
-            .then([](ss::circular_buffer<model::record_batch> batches) {
+            .then([](chunked_circular_buffer<model::record_batch> batches) {
                 return batches.back().last_offset();
             });
       });
@@ -326,8 +328,9 @@ TEST_F_CORO(state_machine_fixture, test_recovery_from_snapshot) {
           ->take_snapshot(snapshot_offset)
           .then([raft = n.raft(), snapshot_offset](
                   state_machine_manager::snapshot_result snapshot_result) {
-              return raft->write_snapshot(raft::write_snapshot_cfg(
-                snapshot_offset, std::move(snapshot_result.data)));
+              return raft->write_snapshot(
+                raft::write_snapshot_cfg(
+                  snapshot_offset, std::move(snapshot_result.data)));
           });
     });
 
@@ -380,16 +383,17 @@ TEST_F_CORO(
       10s, [](raft_node_instance& node) {
           auto committed = node.raft()->committed_offset();
           return node.raft()
-            ->make_reader(storage::log_reader_config(
-              node.raft()->start_offset(),
-              model::offset(random_generators::get_int(
-                node.raft()->start_offset()(), committed())),
-              ss::default_priority_class()))
+            ->make_reader(
+              storage::local_log_reader_config(
+                node.raft()->start_offset(),
+                model::offset(
+                  random_generators::get_int(
+                    node.raft()->start_offset()(), committed()))))
             .then([](auto rdr) {
                 return model::consume_reader_to_memory(
                   std::move(rdr), model::no_timeout);
             })
-            .then([](ss::circular_buffer<model::record_batch> batches) {
+            .then([](chunked_circular_buffer<model::record_batch> batches) {
                 return batches.back().last_offset();
             });
       });
@@ -422,10 +426,9 @@ TEST_F_CORO(
 
     simple_kv::state_t partial_expected_state;
 
-    auto rdr = co_await new_node.raft()->make_reader(storage::log_reader_config(
-      model::next_offset(snapshot_offset),
-      committed_offset,
-      ss::default_priority_class()));
+    auto rdr = co_await new_node.raft()->make_reader(
+      storage::local_log_reader_config(
+        model::next_offset(snapshot_offset), committed_offset));
 
     auto batches = co_await model::consume_reader_to_memory(
       std::move(rdr), model::no_timeout);
@@ -446,11 +449,12 @@ struct controllable_throwing_kv : public simple_kv {
       const model::record_batch& batch,
       const ssx::semaphore_units& apply_units) override {
         if (batch.last_offset() > _allow_apply) {
-            throw std::runtime_error(fmt::format(
-              "not allowed to apply batches with last offset greater than {}. "
-              "Current batch last offset: {}",
-              _allow_apply,
-              batch.last_offset()));
+            throw std::runtime_error(
+              fmt::format(
+                "not allowed to apply batches with last offset greater than "
+                "{}. Current batch last offset: {}",
+                _allow_apply,
+                batch.last_offset()));
         }
         vassert(
           batch.base_offset() == next(),
@@ -575,8 +579,12 @@ public:
     explicit non_fast_movable_kv(raft_node_instance& rn)
       : simple_kv_base<no_at_offset_snapshot_stm_base>(rn) {}
 
-    ss::future<iobuf> take_snapshot() final {
+    ss::future<iobuf> take_raft_snapshot() final {
         co_return serde::to_iobuf(state);
+    }
+
+    stm_initial_recovery_policy get_initial_recovery_policy() const override {
+        return stm_initial_recovery_policy::read_everything;
     }
 };
 
@@ -605,9 +613,10 @@ TEST_F_CORO(state_machine_fixture, test_opt_out_from_snapshot_at_offset) {
           [raft = node->raft()](
             state_machine_manager::snapshot_result snapshot_data) {
               return raft
-                ->write_snapshot(raft::write_snapshot_cfg(
-                  snapshot_data.last_included_offset,
-                  std::move(snapshot_data.data)))
+                ->write_snapshot(
+                  raft::write_snapshot_cfg(
+                    snapshot_data.last_included_offset,
+                    std::move(snapshot_data.data)))
                 .then([o = snapshot_data.last_included_offset] { return o; });
           });
         offsets[id] = o;

@@ -52,6 +52,8 @@ public:
     }
     kafka_produce_transport& producer() { return _producer; }
 
+    ss::future<> stop() { co_await _producer.stop(); }
+
     // Produces records, flushing and rolling the local log, and uploading
     // according to the given parameters. Once the given segments are produced,
     // the partition manifest is uploaded.
@@ -82,7 +84,7 @@ public:
                 }
             }
             co_await log->flush();
-            co_await log->force_roll(ss::default_priority_class());
+            co_await log->force_roll();
             if (
               config::shard_local_cfg()
                 .cloud_storage_disable_upload_loop_for_tests.value()
@@ -125,7 +127,7 @@ public:
                 }
             }
             co_await log->flush();
-            co_await log->force_roll(ss::default_priority_class());
+            co_await log->force_roll();
         }
         co_return total_records;
     }

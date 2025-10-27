@@ -102,6 +102,8 @@ void client_probe::register_utilization(unsigned clients_in_use) {
     _pool_utilization = clients_in_use;
 }
 
+void client_probe::register_timeout() { _total_timeouts += 1; }
+
 void client_probe::setup_internal_metrics(
   net::metrics_disabled disable, std::span<raw_label> raw_labels) {
     namespace sm = ss::metrics;
@@ -149,8 +151,9 @@ void client_probe::setup_internal_metrics(
         sm::make_gauge(
           "active_requests",
           [this] { return get_active_requests(); },
-          sm::description("Number of active HTTP requests at the moment "
-                          "(includes PUT and GET)"),
+          sm::description(
+            "Number of active HTTP requests at the moment "
+            "(includes PUT and GET)"),
           labels),
         sm::make_counter(
           "total_inbound_bytes",
@@ -165,8 +168,9 @@ void client_probe::setup_internal_metrics(
         sm::make_counter(
           "num_rpc_errors",
           [this] { return _total_rpc_errors; },
-          sm::description("Total number of REST API errors received from "
-                          "cloud storage provider"),
+          sm::description(
+            "Total number of REST API errors received from "
+            "cloud storage provider"),
           labels),
         sm::make_counter(
           "num_transport_errors",
@@ -176,8 +180,9 @@ void client_probe::setup_internal_metrics(
         sm::make_counter(
           "num_slowdowns",
           [this] { return _total_slowdowns; },
-          sm::description("Total number of SlowDown errors received from cloud "
-                          "storage provider"),
+          sm::description(
+            "Total number of SlowDown errors received from cloud "
+            "storage provider"),
           labels),
         sm::make_counter(
           "num_nosuchkey",
@@ -189,8 +194,9 @@ void client_probe::setup_internal_metrics(
         sm::make_counter(
           "num_borrows",
           [this] { return _total_borrows; },
-          sm::description("Number of time current shard had to borrow a cloud "
-                          "storage client from another shard"),
+          sm::description(
+            "Number of time current shard had to borrow a cloud "
+            "storage client from another shard"),
           labels),
         sm::make_histogram(
           "lease_duration",
@@ -200,8 +206,16 @@ void client_probe::setup_internal_metrics(
         sm::make_gauge(
           "client_pool_utilization",
           [this] { return _pool_utilization; },
-          sm::description("Utilization of the cloud storage pool(0 - unused, "
-                          "100 - fully utilized)"),
+          sm::description(
+            "Utilization of the cloud storage pool(0 - unused, "
+            "100 - fully utilized)"),
+          labels),
+        sm::make_counter(
+          "lease_timeouts_total",
+          [this] { return _total_timeouts; },
+          sm::description(
+            "Number of cloud storage client lease timeouts, usually indicating "
+            "something stuck in the transport layer."),
           labels),
       });
 }
@@ -254,22 +268,25 @@ void client_probe::setup_public_metrics(
         sm::make_counter(
           "uploads",
           [this] { return get_total_put_requests(); },
-          sm::description("Total number of requests that uploaded an object to "
-                          "cloud storage"),
+          sm::description(
+            "Total number of requests that uploaded an object to "
+            "cloud storage"),
           labels)
           .aggregate({sm::shard_label}),
         sm::make_counter(
           "downloads",
           [this] { return get_total_get_requests(); },
-          sm::description("Total number of requests that downloaded an object "
-                          "from cloud storage"),
+          sm::description(
+            "Total number of requests that downloaded an object "
+            "from cloud storage"),
           labels)
           .aggregate({sm::shard_label}),
         sm::make_counter(
           "num_borrows",
           [this] { return _total_borrows; },
-          sm::description("Number of time current shard had to borrow a cloud "
-                          "storage client from another shard"),
+          sm::description(
+            "Number of time current shard had to borrow a cloud "
+            "storage client from another shard"),
           labels),
         sm::make_histogram(
           "lease_duration",
@@ -279,8 +296,16 @@ void client_probe::setup_public_metrics(
         sm::make_gauge(
           "client_pool_utilization",
           [this] { return _pool_utilization; },
-          sm::description("Utilization of the cloud storage pool(0 - unused, "
-                          "100 - fully utilized)"),
+          sm::description(
+            "Utilization of the cloud storage pool(0 - unused, "
+            "100 - fully utilized)"),
+          labels),
+        sm::make_counter(
+          "lease_timeouts_total",
+          [this] { return _total_timeouts; },
+          sm::description(
+            "Number of cloud storage client lease timeouts, usually indicating "
+            "something stuck in the netransport layer."),
           labels),
       });
 }

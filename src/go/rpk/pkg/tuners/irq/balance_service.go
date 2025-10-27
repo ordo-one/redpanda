@@ -182,7 +182,7 @@ func (balanceService *balanceService) GetBannedIRQs() ([]int, error) {
 	if len(bannedIRQsMatches) > 0 {
 		for _, groupMatch := range bannedIRQsMatches {
 			if len(groupMatch) != 2 {
-				return nil, fmt.Errorf("Malformed option --banirq option")
+				return nil, fmt.Errorf("malformed option --banirq option")
 			}
 			IRQ, err := strconv.Atoi(groupMatch[1])
 			if err != nil {
@@ -202,6 +202,14 @@ func (balanceService *balanceService) getBalanceServiceInfo() (
 	optionsKey := "OPTIONS"
 	configFile := "/etc/default/irqbalance"
 	systemd := false
+
+	libSystemdServiceExists, _ := afero.Exists(fs, "/lib/systemd/system/irqbalance.service")
+	usrLibSystemdServiceExists, _ := afero.Exists(fs, "/usr/lib/systemd/system/irqbalance.service")
+	if libSystemdServiceExists || usrLibSystemdServiceExists {
+		optionsKey = "IRQBALANCE_ARGS"
+		systemd = true
+	}
+
 	if exists, _ := afero.Exists(fs, configFile); !exists {
 		zap.L().Sugar().Debugf("File '%s' does not exist", configFile)
 		if exists, _ := afero.Exists(fs, "/etc/sysconfig/irqbalance"); exists {
@@ -210,7 +218,7 @@ func (balanceService *balanceService) getBalanceServiceInfo() (
 			systemd = true
 		} else if exists, _ := afero.Exists(fs, "/etc/conf.d/irqbalance"); !exists {
 			zap.L().Sugar().Error("Unknown system configuration - not restarting irqbalance!")
-			return nil, errors.New("Unsupported irqbalance service configuration")
+			return nil, errors.New("unsupported irqbalance service configuration")
 		} else {
 			configFile = "/etc/conf.d/irqbalance"
 			optionsKey = "IRQBALANCE_OPTS"

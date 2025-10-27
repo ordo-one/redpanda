@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "absl/container/btree_map.h"
 #include "base/seastarx.h"
 #include "base/vassert.h"
 #include "model/fundamental.h"
@@ -20,8 +21,6 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/timer.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace raft {
 
@@ -43,6 +42,7 @@ public:
             waiter.second->done.set_exception(ss::abort_requested_exception());
         }
         _waiters.clear();
+        stopped = true;
     }
 
     /**
@@ -56,6 +56,9 @@ public:
         // the offset has already been applied
         if (offset <= _last_applied) {
             return ss::now();
+        }
+        if (unlikely(stopped)) {
+            return ss::make_exception_future<>(ss::abort_requested_exception());
         }
         auto w = std::make_unique<waiter>(this, deadline, as);
         auto f = w->done.get_future();
@@ -148,6 +151,7 @@ private:
 
     waiters_type _waiters;
     Offset _last_applied;
+    bool stopped{false};
 };
 
 } // namespace raft

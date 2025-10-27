@@ -11,8 +11,8 @@
 
 #include "cloud_storage/fwd.h"
 #include "cluster/cloud_metadata/offsets_recovery_rpc_types.h"
-#include "cluster/cloud_metadata/offsets_snapshot.h"
 #include "cluster/fwd.h"
+#include "cluster/offsets_snapshot.h"
 #include "model/metadata.h"
 
 #include <seastar/core/future.hh>
@@ -36,7 +36,7 @@ public:
     offsets_recoverer(
       model::node_id node_id,
       ss::sharded<cloud_storage::remote>& remote,
-      ss::sharded<cloud_storage::cache>& cache,
+      ss::sharded<cloud_io::cache>& cache,
       ss::sharded<offsets_lookup>& local_lookup,
       ss::sharded<cluster::partition_leaders_table>& leaders_table,
       ss::sharded<rpc::connection_cache>& connection_cache,
@@ -70,7 +70,7 @@ private:
 
     model::node_id _node_id;
     ss::sharded<cloud_storage::remote>& _remote;
-    ss::sharded<cloud_storage::cache>& _cache;
+    ss::sharded<cloud_io::cache>& _cache;
     ss::sharded<offsets_lookup>& _offsets_lookup;
     ss::sharded<cluster::partition_leaders_table>& _leaders_table;
     ss::sharded<rpc::connection_cache>& _connection_cache;

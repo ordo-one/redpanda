@@ -39,9 +39,10 @@ ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
     // hold invariant of having an always valid dispatch gate
     // and make sure we don't have a live connection already
     if (is_valid() || _dispatch_gate.is_closed()) {
-        throw std::runtime_error(fmt::format(
-          "cannot do_connect with a valid connection. remote:{}",
-          server_address()));
+        throw std::runtime_error(
+          fmt::format(
+            "cannot do_connect with a valid connection. remote:{}",
+            server_address()));
     }
     try {
         base_transport::reset_state();
@@ -78,6 +79,19 @@ ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
     }
 
     co_return;
+}
+
+void base_transport::set_keepalive_parameters(
+  const ss::net::keepalive_params& params) {
+    if (_fd) {
+        _fd->set_keepalive_parameters(params);
+    }
+}
+
+void base_transport::set_keepalive(bool keepalive) {
+    if (_fd) {
+        _fd->set_keepalive(keepalive);
+    }
 }
 
 ss::future<>

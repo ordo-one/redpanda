@@ -55,7 +55,7 @@ class consensus;
  */
 class state_machine {
 public:
-    state_machine(consensus*, ss::logger& log, ss::io_priority_class io_prio);
+    state_machine(consensus*, ss::logger& log);
     state_machine(state_machine&&) = delete;
     state_machine(const state_machine&) = delete;
     state_machine& operator=(state_machine&&) = delete;
@@ -86,7 +86,9 @@ public:
      */
     model::offset bootstrap_last_applied() const;
     /**
-     * Return when the committed offset has been established when STM starts.
+     * Return the current committed offset if the STM is already bootstrapped.
+     * Otherwise, wait until the STM has been started and bootstrapped, then
+     * return the committed offset.
      */
     ss::future<model::offset> bootstrap_committed_offset();
     /**
@@ -105,8 +107,10 @@ public:
      * to returned offsets are linearizable. (i.e. majority of followers have
      * updated their commit indices to at least reaturned offset). For more
      * details see paragraph 6.4 of Raft protocol dissertation.
+     *
+     * Returns the barrier offset and its term if successful.
      */
-    ss::future<result<model::offset>>
+    ss::future<result<std::pair<model::offset, model::term_id>>>
       insert_linearizable_barrier(model::timeout_clock::time_point);
 
 protected:
@@ -138,7 +142,6 @@ private:
     ss::future<> maybe_apply_raft_snapshot();
     bool stop_batch_applicator();
 
-    ss::io_priority_class _io_prio;
     ss::logger& _log;
     offset_monitor<model::offset> _waiters;
     model::offset _next;

@@ -10,9 +10,10 @@
  */
 #pragma once
 #include "cluster/rm_stm.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "container/intrusive_list_helpers.h"
 #include "kafka/protocol/fetch.h"
+#include "kafka/server/fetch_memory_units.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler.h"
 #include "model/fundamental.h"
@@ -33,7 +34,7 @@ fetch_scheduling_group_provider(const connection_context&);
 using fetch_handler = single_stage_handler<
   fetch_api,
   4,
-  11,
+  13,
   default_estimate_adaptor,
   fetch_scheduling_group_provider>;
 
@@ -48,12 +49,16 @@ struct op_context {
     public:
         response_placeholder(fetch_response::iterator, op_context* ctx);
 
-        void set(fetch_response::partition_response&&);
+        void set(
+          fetch_response::partition_response&&,
+          std::optional<fetch_memory_units>&&);
 
-        const model::topic& topic() { return _it->partition->name; }
+        const model::topic& topic() { return _it->partition->topic; }
         model::partition_id partition_id() {
             return _it->partition_response->partition_index;
         }
+
+        const model::ktp_with_hash& ktp() { return _ktp; }
 
         bool empty() { return _it->partition_response->records->empty(); }
         bool has_error() {
@@ -66,9 +71,40 @@ struct op_context {
         }
         intrusive_list_hook _hook;
 
+        // Returns the number of bytes currently written to the ntp response
+        // this placeholder corresponds to.
+        size_t response_size() const {
+            return _it->partition_response->records
+              .transform(&kafka::batch_reader::size_bytes)
+              .value_or(0);
+        }
+
+        // Returns whether there are memory units held for this ntp.
+        bool has_memory_units() const { return num_memory_units() > 0; }
+
+        // Returns the number of memory units held for this ntp.
+        size_t num_memory_units() const {
+            return _response_memory_units ? _response_memory_units->num_units()
+                                          : 0;
+        }
+
+        // Adds/replaces the memory units that are held for this ntp.
+        void
+        replace_or_add_memory_units(std::optional<fetch_memory_units>&& units) {
+            _response_memory_units = std::move(units);
+        }
+
+        // Releases/returns the memory units that are held for this ntp.
+        std::optional<fetch_memory_units> release_memory_units() {
+            return std::move(_response_memory_units);
+        }
+
     private:
         fetch_response::iterator _it;
         op_context* _ctx;
+        const model::ktp_with_hash _ktp;
+        // Tracks memory used by response data in `_it`.
+        std::optional<fetch_memory_units> _response_memory_units;
     };
 
     using iteration_order_t
@@ -142,8 +178,15 @@ struct op_context {
      */
     size_t fetch_partition_count() const;
 
-    template<typename Func>
-    void for_each_fetch_partition(Func&& f) const;
+    /**
+     * @brief Moves all memory units for response data into a `ss::deleter`.
+     */
+    ss::deleter response_memory_units_deleter();
+
+    /**
+     * @brief Returns the total number of units held by the response.
+     */
+    size_t total_response_memory_units() const;
 
     request_context rctx;
     ss::smp_service_group ssg;
@@ -171,6 +214,7 @@ struct fetch_config {
     model::offset start_offset;
     model::offset max_offset;
     size_t max_bytes;
+    size_t max_batch_size;
     model::timeout_clock::time_point timeout;
     kafka::leader_epoch current_leader_epoch;
     model::isolation_level isolation_level;
@@ -180,16 +224,17 @@ struct fetch_config {
     std::optional<model::rack_id> consumer_rack_id;
     std::optional<std::reference_wrapper<ssx::sharded_abort_source>>
       abort_source;
-    std::optional<model::client_address_t> client_address;
+    model::opt_client_address_t client_address;
 
     friend std::ostream& operator<<(std::ostream& o, const fetch_config& cfg) {
         fmt::print(
           o,
-          R"({{"start_offset": {}, "max_offset": {}, "isolation_lvl": {}, "max_bytes": {}, "strict_max_bytes": {}, "skip_read": {}, "current_leader_epoch:" {}, "follower_read:" {}, "consumer_rack_id": {}, "abortable": {}, "aborted": {}, "client_address": {}}})",
+          R"({{"start_offset": {}, "max_offset": {}, "isolation_lvl": {}, "max_bytes": {}, "max_batch_size": {}, "strict_max_bytes": {}, "skip_read": {}, "current_leader_epoch:" {}, "follower_read:" {}, "consumer_rack_id": {}, "abortable": {}, "aborted": {}, "client_address": {}}})",
           cfg.start_offset,
           cfg.max_offset,
           cfg.isolation_level,
           cfg.max_bytes,
+          cfg.max_batch_size,
           cfg.strict_max_bytes,
           cfg.skip_read,
           cfg.current_leader_epoch,
@@ -205,10 +250,10 @@ struct fetch_config {
 };
 
 struct ntp_fetch_config {
-    ntp_fetch_config(model::ktp ktp, fetch_config cfg)
+    ntp_fetch_config(model::ktp_with_hash&& ktp, fetch_config&& cfg)
       : _ktp(std::move(ktp))
-      , cfg(cfg) {}
-    model::ktp _ktp;
+      , cfg(std::move(cfg)) {}
+    model::ktp_with_hash _ktp;
     fetch_config cfg;
 
     const model::ktp& ktp() const { return _ktp; }
@@ -224,43 +269,19 @@ struct ntp_fetch_config {
  * Simple type aggregating either data or an error
  */
 struct read_result {
-    using foreign_data_t = ss::foreign_ptr<std::unique_ptr<iobuf>>;
     using data_t = std::unique_ptr<iobuf>;
-    using variant_t = std::variant<data_t, foreign_data_t>;
-
-    /// Holds semaphore units from memory semaphores. Can be passed across
-    /// shards, semaphore units will be released in the shard where the instance
-    /// of this class has been created.
-    struct memory_units_t {
-        ssx::semaphore_units kafka;
-        ssx::semaphore_units fetch;
-        ss::shard_id shard = ss::this_shard_id();
-
-        ~memory_units_t() noexcept;
-        memory_units_t() noexcept = default;
-        memory_units_t(memory_units_t&&) noexcept = default;
-        memory_units_t& operator=(memory_units_t&&) noexcept = default;
-        memory_units_t(const memory_units_t&) = delete;
-        memory_units_t& operator=(const memory_units_t&) = delete;
-        memory_units_t(
-          ssx::semaphore& memory_sem,
-          ssx::semaphore& memory_fetch_sem) noexcept;
-
-        /*
-         * Adopts another memory_units_t. This requires that both
-         * memory_units_t are from the same shard.
-         */
-        void adopt(memory_units_t&& o);
-
-        bool has_units() const {
-            return fetch.count() > 0 || kafka.count() > 0;
-        }
-    };
 
     explicit read_result(error_code e)
       : start_offset(-1)
       , high_watermark(-1)
       , last_stable_offset(-1)
+      , error(e) {}
+
+    read_result(error_code e, leader_id_and_epoch leader)
+      : start_offset(-1)
+      , high_watermark(-1)
+      , last_stable_offset(-1)
+      , current_leader(std::move(leader))
       , error(e) {}
 
     // special case for offset_out_of_range_error
@@ -275,14 +296,18 @@ struct read_result {
       , error(e) {}
 
     read_result(
-      variant_t data,
+      data_t data,
       model::offset start_offset,
+      model::offset data_base_offset,
+      model::offset data_last_offset,
       model::offset hw,
       model::offset lso,
       std::optional<std::chrono::milliseconds> delta,
       std::vector<cluster::tx::tx_range> aborted_transactions)
       : data(std::move(data))
       , start_offset(start_offset)
+      , data_base_offset(data_base_offset)
+      , data_last_offset(data_last_offset)
       , high_watermark(hw)
       , last_stable_offset(lso)
       , delta_from_tip_ms(delta)
@@ -300,47 +325,36 @@ struct read_result {
       , preferred_replica(preferred_replica)
       , error(error_code::none) {}
 
-    bool has_data() const {
-        return ss::visit(
-          data,
-          [](const data_t& d) { return d != nullptr; },
-          [](const foreign_data_t& d) { return !d->empty(); });
-    }
+    bool has_data() const { return data != nullptr; }
 
-    const iobuf& get_data() const {
-        if (std::holds_alternative<data_t>(data)) {
-            return *std::get<data_t>(data);
-        } else {
-            return *std::get<foreign_data_t>(data);
-        }
-    }
+    const iobuf& get_data() const { return *data; }
 
     size_t data_size_bytes() const {
-        return ss::visit(
-          data,
-          [](const data_t& d) { return d == nullptr ? 0 : d->size_bytes(); },
-          [](const foreign_data_t& d) {
-              return d->empty() ? 0 : d->size_bytes();
-          });
+        return data == nullptr ? 0 : data->size_bytes();
     }
 
-    iobuf release_data() && {
-        return ss::visit(
-          data,
-          [](data_t& d) { return std::move(*d); },
-          [](foreign_data_t& d) { return std::move(*d); });
+    iobuf release_data() && { return std::move(*data); }
+
+    // Returns the number of kafka offsets the result spans.
+    size_t offset_count() const {
+        return data_size_bytes() > 0
+                 ? (data_last_offset - data_base_offset)() + 1
+                 : 0;
     }
 
-    variant_t data;
+    data_t data;
     model::offset start_offset;
+    model::offset data_base_offset;
+    model::offset data_last_offset;
     model::offset high_watermark;
     model::offset last_stable_offset;
     std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     std::optional<model::node_id> preferred_replica;
+    std::optional<leader_id_and_epoch> current_leader;
     error_code error;
     model::partition_id partition;
     std::vector<cluster::tx::tx_range> aborted_transactions;
-    memory_units_t memory_units;
+    std::optional<fetch_memory_units> memory_units;
 };
 // struct aggregating fetch requests and corresponding response iterators for
 // the same shard
@@ -351,10 +365,13 @@ struct shard_fetch {
       , start_time{start_time} {}
 
     void push_back(
-      ntp_fetch_config config, op_context::response_placeholder_ptr r_ph) {
-        requests.push_back(std::move(config));
+      model::ktp_with_hash ktp,
+      kafka::fetch_config&& config,
+      op_context::response_placeholder_ptr r_ph) {
+        requests.emplace_back(std::move(ktp), std::move(config));
         responses.push_back(r_ph);
     }
+
     bool empty() const;
 
     void reserve(size_t n) {
@@ -420,14 +437,13 @@ namespace testing {
 
 ss::future<read_result> read_from_ntp(
   cluster::partition_manager&,
+  const cluster::metadata_cache&,
   const replica_selector&,
   const model::ktp&,
   fetch_config,
-  bool,
   std::optional<model::timeout_clock::time_point>,
   bool obligatory_batch_read,
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem);
+  fetch_memory_units_manager& units_mgr);
 
 /**
  * Create a fetch plan with the simple fetch planner.
@@ -435,12 +451,6 @@ ss::future<read_result> read_from_ntp(
  * Exposed for testing/benchmarking only.
  */
 kafka::fetch_plan make_simple_fetch_plan(op_context& octx);
-
-read_result::memory_units_t reserve_memory_units(
-  ssx::semaphore& memory_sem,
-  ssx::semaphore& memory_fetch_sem,
-  const size_t max_bytes,
-  const bool obligatory_batch_read);
 
 ss::future<> do_fetch(op_context& octx);
 

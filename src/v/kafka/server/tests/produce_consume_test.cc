@@ -7,10 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
+#include "kafka/protocol/offset_for_leader_epoch.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/server/handlers/produce.h"
 #include "kafka/server/snc_quota_manager.h"
@@ -18,12 +19,15 @@
 #include "kafka/server/tests/produce_consume_utils.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/timeout_clock.h"
+#include "model/timestamp.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
 #include "storage/record_batch_builder.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
+#include "test_utils/scoped_config.h"
 
 #include <seastar/core/metrics_types.hh>
 #include <seastar/core/sleep.hh>
@@ -107,7 +111,7 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
         req.data.timeout_ms = std::chrono::seconds(2);
         req.has_idempotent = false;
         req.has_transactional = false;
-        return producer.dispatch(std::move(req));
+        return producer.dispatch(std::move(req), kafka::api_version(7));
     }
 
     ss::future<kafka::produce_response> produce_raw(
@@ -129,12 +133,12 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
     fetch_next(kafka::client::transport& consumer, model::partition_id p_id) {
         kafka::fetch_request::partition partition;
         partition.fetch_offset = fetch_offsets[p_id()];
-        partition.partition_index = p_id;
+        partition.partition = p_id;
         partition.log_start_offset = model::offset(0);
-        partition.max_bytes = 1_MiB;
+        partition.partition_max_bytes = 1_MiB;
         kafka::fetch_request::topic topic;
-        topic.name = test_topic;
-        topic.fetch_partitions.push_back(partition);
+        topic.topic = test_topic;
+        topic.partitions.push_back(partition);
 
         kafka::fetch_request req;
         req.data.min_bytes = 1;
@@ -144,10 +148,10 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
 
         return consumer.dispatch(std::move(req), kafka::api_version(4))
           .then([this, p_id](kafka::fetch_response resp) {
-              if (resp.data.topics.empty()) {
+              if (resp.data.responses.empty()) {
                   return resp;
               }
-              auto& part = *resp.data.topics.begin();
+              auto& part = *resp.data.responses.begin();
 
               for ([[maybe_unused]] auto& r : part.partitions) {
                   const auto& data = part.partitions.begin()->records;
@@ -176,6 +180,15 @@ struct prod_consume_fixture : public redpanda_thread_fixture {
         return kafka_probe()._bytes_by_compression.at((size_t)compression_type);
     }
 
+    ~prod_consume_fixture() {
+        ss::parallel_for_each(consumers, [](kafka::client::transport& t) {
+            return t.stop();
+        }).get();
+        ss::parallel_for_each(producers, [](kafka::client::transport& t) {
+            return t.stop();
+        }).get();
+    }
+
     std::vector<model::offset> fetch_offsets;
     std::vector<kafka::client::transport> consumers;
     std::vector<kafka::client::transport> producers;
@@ -202,21 +215,23 @@ FIXTURE_TEST(test_produce_consume_small_batches, prod_consume_fixture) {
                     }).get();
     auto resp_2 = fetch_next().get();
 
-    BOOST_REQUIRE_EQUAL(resp_1.data.topics.empty(), false);
-    BOOST_REQUIRE_EQUAL(resp_2.data.topics.empty(), false);
-    BOOST_REQUIRE_EQUAL(resp_1.data.topics.begin()->partitions.empty(), false);
+    BOOST_REQUIRE_EQUAL(resp_1.data.responses.empty(), false);
+    BOOST_REQUIRE_EQUAL(resp_2.data.responses.empty(), false);
     BOOST_REQUIRE_EQUAL(
-      resp_1.data.topics.begin()->partitions.begin()->error_code,
+      resp_1.data.responses.begin()->partitions.empty(), false);
+    BOOST_REQUIRE_EQUAL(
+      resp_1.data.responses.begin()->partitions.begin()->error_code,
       kafka::error_code::none);
     BOOST_REQUIRE_EQUAL(
-      resp_1.data.topics.begin()->partitions.begin()->records->last_offset(),
+      resp_1.data.responses.begin()->partitions.begin()->records->last_offset(),
       offset_1);
-    BOOST_REQUIRE_EQUAL(resp_2.data.topics.begin()->partitions.empty(), false);
     BOOST_REQUIRE_EQUAL(
-      resp_2.data.topics.begin()->partitions.begin()->error_code,
+      resp_2.data.responses.begin()->partitions.empty(), false);
+    BOOST_REQUIRE_EQUAL(
+      resp_2.data.responses.begin()->partitions.begin()->error_code,
       kafka::error_code::none);
     BOOST_REQUIRE_EQUAL(
-      resp_2.data.topics.begin()->partitions.begin()->records->last_offset(),
+      resp_2.data.responses.begin()->partitions.begin()->records->last_offset(),
       offset_2);
 };
 
@@ -224,8 +239,9 @@ FIXTURE_TEST(test_version_handler, prod_consume_fixture) {
     wait_for_controller_leadership().get();
     start();
     chunked_vector<kafka::produce_request::topic> topics;
-    topics.push_back(kafka::produce_request::topic{
-      .name = model::topic{"abc123"}, .partitions = small_batches(10)});
+    topics.push_back(
+      kafka::produce_request::topic{
+        .name = model::topic{"abc123"}, .partitions = small_batches(10)});
 
     const auto unsupported_version = kafka::api_version(
       kafka::produce_handler::max_supported() + 1);
@@ -342,9 +358,10 @@ struct tuple_binary_op {
           [&](auto&&... args1) {
               return std::apply(
                 [&](auto&&... args2) {
-                    return std::make_tuple(BinaryOp{}(
-                      std::forward<decltype(args1)>(args1),
-                      std::forward<decltype(args2)>(args2))...);
+                    return std::make_tuple(
+                      BinaryOp{}(
+                        std::forward<decltype(args1)>(args1),
+                        std::forward<decltype(args2)>(args2))...);
                 },
                 std::forward<decltype(t2)>(t2));
           },
@@ -401,11 +418,12 @@ struct throughput_limits_fixure : prod_consume_fixture {
                 ss::sleep(throttle_time).get();
             }
             const auto fetch_resp = fetch_next(consumers[i], p_id).get();
-            BOOST_REQUIRE_EQUAL(fetch_resp.data.topics.size(), 1);
-            BOOST_REQUIRE_EQUAL(fetch_resp.data.topics[0].partitions.size(), 1);
+            BOOST_REQUIRE_EQUAL(fetch_resp.data.responses.size(), 1);
+            BOOST_REQUIRE_EQUAL(
+              fetch_resp.data.responses[0].partitions.size(), 1);
             BOOST_TEST_REQUIRE(
-              fetch_resp.data.topics[0].partitions[0].records.has_value());
-            const auto kafka_data_len = fetch_resp.data.topics[0]
+              fetch_resp.data.responses[0].partitions[0].records.has_value());
+            const auto kafka_data_len = fetch_resp.data.responses[0]
                                           .partitions[0]
                                           .records.value()
                                           .size_bytes();
@@ -684,7 +702,6 @@ FIXTURE_TEST(test_offset_for_leader_epoch, prod_consume_fixture) {
     };
     req.data.topics.emplace_back(std::move(t));
     auto resp = client.dispatch(std::move(req), kafka::api_version(2)).get();
-    client.stop().then([&client] { client.shutdown(); }).get();
     BOOST_REQUIRE_EQUAL(1, resp.data.topics.size());
     const auto& topic_resp = resp.data.topics[0];
     BOOST_REQUIRE_EQUAL(1, topic_resp.partitions.size());
@@ -716,6 +733,7 @@ FIXTURE_TEST(test_basic_delete_around_batch, prod_consume_fixture) {
     auto log = partition->log();
 
     tests::kafka_produce_transport producer(make_kafka_client().get());
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
     producer.start().get();
     producer
       .produce_to_partition(
@@ -746,12 +764,14 @@ FIXTURE_TEST(test_basic_delete_around_batch, prod_consume_fixture) {
         })
       .get();
     log->flush().get();
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     BOOST_REQUIRE_EQUAL(2, log->segments().size());
 
     tests::kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
     tests::kafka_delete_records_transport deleter(make_kafka_client().get());
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     deleter.start().get();
 
     // At this point, we have three batches:
@@ -850,22 +870,27 @@ FIXTURE_TEST(test_produce_bad_timestamps, prod_consume_fixture) {
 
     auto producer = tests::kafka_produce_transport(make_kafka_client().get());
     producer.start().get();
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
 
     // helper to produce a bunch of messages with some drift applied to the
     // timestamps. the drift is the same for all the messages, but a more
     // advaced test would be to have a range of drifts from start to finish
     auto produce_messages = [&](std::chrono::system_clock::duration drift) {
-        producer
-          .produce_to_partition(
-            ntp.tp.topic,
-            ntp.tp.partition,
-            {
-              {"key0", "val0"},
-              {"key1", "val1"},
-              {"key2", "val2"},
-            },
-            model::to_timestamp(std::chrono::system_clock::now() + drift))
-          .get();
+        try {
+            producer
+              .produce_to_partition(
+                ntp.tp.topic,
+                ntp.tp.partition,
+                {
+                  {"key0", "val0"},
+                  {"key1", "val1"},
+                  {"key2", "val2"},
+                },
+                model::to_timestamp(std::chrono::system_clock::now() + drift))
+              .get();
+        } catch (...) {
+            // Fall through
+        }
     };
 
     BOOST_TEST_INFO("expect produce_bad_create_time to be 0");
@@ -878,7 +903,7 @@ FIXTURE_TEST(test_produce_bad_timestamps, prod_consume_fixture) {
 
     BOOST_TEST_INFO(
       "messages with a skew towards the future trigger the probe");
-    config::shard_local_cfg().log_message_timestamp_alert_after_ms.set_value(
+    config::shard_local_cfg().log_message_timestamp_after_max_ms.set_value(
       std::chrono::duration_cast<std::chrono::milliseconds>(1h));
     produce_messages(2h);
     BOOST_CHECK_LT(bad_timestamps_metric, produce_bad_ts_count());
@@ -886,8 +911,8 @@ FIXTURE_TEST(test_produce_bad_timestamps, prod_consume_fixture) {
     bad_timestamps_metric = produce_bad_ts_count();
 
     BOOST_TEST_INFO("messages with a skew towards the past trigger the probe");
-    config::shard_local_cfg().log_message_timestamp_alert_before_ms.set_value(
-      std::optional{std::chrono::duration_cast<std::chrono::milliseconds>(1h)});
+    config::shard_local_cfg().log_message_timestamp_before_max_ms.set_value(
+      std::chrono::duration_cast<std::chrono::milliseconds>(1h));
     produce_messages(-2h);
     BOOST_CHECK_LT(bad_timestamps_metric, produce_bad_ts_count());
 
@@ -898,10 +923,11 @@ FIXTURE_TEST(test_produce_bad_timestamps, prod_consume_fixture) {
     produce_messages(30min);
     BOOST_CHECK_EQUAL(bad_timestamps_metric, produce_bad_ts_count());
 
-    BOOST_TEST_INFO("disabling the alert for the past allows messages in the "
-                    "past without triggering the probe");
-    config::shard_local_cfg().log_message_timestamp_alert_before_ms.set_value(
-      std::optional<std::chrono::milliseconds>{});
+    BOOST_TEST_INFO(
+      "disabling the alert for the past allows messages in the "
+      "past without triggering the probe");
+    config::shard_local_cfg().log_message_timestamp_before_max_ms.set_value(
+      std::chrono::milliseconds::max());
     produce_messages(-365 * 24h);
     BOOST_CHECK_EQUAL(bad_timestamps_metric, produce_bad_ts_count());
 }
@@ -915,6 +941,7 @@ FIXTURE_TEST(test_compression_metrics, prod_consume_fixture) {
 
     auto producer = tests::kafka_produce_transport(make_kafka_client().get());
     producer.start().get();
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
 
     auto produce_messages = [&](ctype compression) {
         producer
@@ -922,7 +949,7 @@ FIXTURE_TEST(test_compression_metrics, prod_consume_fixture) {
             ntp.tp.topic,
             ntp.tp.partition,
             {{"key0", "val0"}},
-            std::nullopt,
+            model::timestamp::now(),
             compression)
           .get();
     };
@@ -946,5 +973,313 @@ FIXTURE_TEST(test_compression_metrics, prod_consume_fixture) {
                 BOOST_CHECK_EQUAL(0, bytes_by_compression(ctype));
             }
         }
+    }
+}
+
+FIXTURE_TEST(test_produce_unset_max_timestamp_legacy, prod_consume_fixture) {
+    scoped_config cfg;
+    cfg.get("kafka_produce_batch_validation")
+      .set_value(model::kafka_batch_validation_mode::legacy);
+    wait_for_controller_leadership().get();
+    start();
+    auto ntp = model::ntp(test_tp_ns.ns, test_tp_ns.tp, model::partition_id(0));
+
+    auto producer = tests::kafka_produce_transport(make_kafka_client().get());
+    producer.start().get();
+    auto deferred_p_close = ss::defer([&producer] { producer.stop().get(); });
+
+    // Produce a batch per compression type with 3 records and `max_timestamp`
+    // left unset.
+    auto produce_messages = [&](model::compression ctype) {
+        static std::vector<kv_t> records = {
+          {"key0", "val0"},
+          {"key1", "val1"},
+          {"key2", "val2"},
+        };
+        storage::record_batch_builder builder(
+          model::record_batch_type::raft_data, model::offset(0));
+        builder.set_compression(ctype);
+        for (auto& kv : records) {
+            const auto& k = kv.key;
+            const auto& v_opt = kv.val;
+            iobuf key_buf;
+            key_buf.append(k.data(), k.size());
+            std::optional<iobuf> val_buf;
+            if (v_opt.has_value()) {
+                const auto& v = v_opt.value();
+                val_buf = iobuf::from({v.data(), v.size()});
+            }
+            builder.add_raw_kv(std::move(key_buf), std::move(val_buf));
+        }
+        builder.set_timestamp(model::timestamp::now());
+        auto batch = std::move(builder).build();
+
+        // Override max timestamp with `missing`
+        batch.set_max_timestamp(
+          model::timestamp_type::create_time, model::timestamp::missing());
+        producer
+          .produce_to_partition(
+            ntp.tp.topic, ntp.tp.partition, std::move(batch))
+          .get();
+    };
+
+    for (auto c : model::all_batch_compression_types) {
+        produce_messages(c);
+    }
+
+    auto transport = make_kafka_client().get();
+    transport.connect().get();
+    auto deferred_t_close = ss::defer([&transport] { transport.stop().get(); });
+
+    // Perform a manual fetch in order to consume the produced batch, not
+    // individual records.
+    std::vector<model::record_batch> batches;
+    {
+        kafka::fetch_request::topic topic;
+        topic.topic = ntp.tp.topic;
+        kafka::fetch_request::partition partition{
+          .partition = ntp.tp.partition,
+          .fetch_offset = model::offset{0},
+          .log_start_offset = model::offset{0},
+          .partition_max_bytes = 100_MiB};
+        topic.partitions.emplace_back(std::move(partition));
+        kafka::fetch_request req;
+        req.data.min_bytes = 1;
+        req.data.max_bytes = 100_MiB;
+        req.data.max_wait_ms = 1000ms;
+        req.data.topics.push_back(std::move(topic));
+        auto fetch_resp
+          = transport.dispatch(std::move(req), kafka::api_version(4)).get();
+        BOOST_REQUIRE_EQUAL(
+          fetch_resp.data.error_code, kafka::error_code::none);
+        auto& data = fetch_resp.data;
+        for (auto& topic : data.responses) {
+            for (auto& partition : topic.partitions) {
+                BOOST_REQUIRE_EQUAL(
+                  partition.error_code, kafka::error_code::none);
+                BOOST_REQUIRE(partition.records.has_value());
+                while (!partition.records->is_end_of_stream()) {
+                    auto batch_adapter
+                      = partition.records.value().consume_batch();
+                    BOOST_REQUIRE(batch_adapter.batch.has_value());
+                    batches.push_back(std::move(batch_adapter.batch).value());
+                }
+            }
+        }
+    }
+
+    // Check that the `max_timestamp` was left as missing (== {-1}) for batches
+    // with compression in the produce path, and set (!= {-1}) for batches
+    // without compression when left unset by client in `legacy` validation
+    // mode.
+    for (const auto& batch : batches) {
+        if (batch.compressed()) {
+            BOOST_REQUIRE_EQUAL(
+              batch.header().max_timestamp, model::timestamp::missing());
+        } else {
+            BOOST_REQUIRE_NE(
+              batch.header().max_timestamp, model::timestamp::missing());
+        }
+    }
+}
+
+FIXTURE_TEST(test_produce_unset_max_timestamp_relaxed, prod_consume_fixture) {
+    scoped_config cfg;
+    cfg.get("kafka_produce_batch_validation")
+      .set_value(model::kafka_batch_validation_mode::relaxed);
+    wait_for_controller_leadership().get();
+    start();
+    auto ntp = model::ntp(test_tp_ns.ns, test_tp_ns.tp, model::partition_id(0));
+
+    auto producer = tests::kafka_produce_transport(make_kafka_client().get());
+    producer.start().get();
+    auto deferred_p_close = ss::defer([&producer] { producer.stop().get(); });
+
+    // Produce a batch per compression type with 3 records and `max_timestamp`
+    // left unset.
+    auto produce_messages = [&](model::compression ctype) {
+        static std::vector<kv_t> records = {
+          {"key0", "val0"},
+          {"key1", "val1"},
+          {"key2", "val2"},
+        };
+        storage::record_batch_builder builder(
+          model::record_batch_type::raft_data, model::offset(0));
+        builder.set_compression(ctype);
+        for (auto& kv : records) {
+            const auto& k = kv.key;
+            const auto& v_opt = kv.val;
+            iobuf key_buf;
+            key_buf.append(k.data(), k.size());
+            std::optional<iobuf> val_buf;
+            if (v_opt.has_value()) {
+                const auto& v = v_opt.value();
+                val_buf = iobuf::from({v.data(), v.size()});
+            }
+            builder.add_raw_kv(std::move(key_buf), std::move(val_buf));
+        }
+        builder.set_timestamp(model::timestamp::now());
+        auto batch = std::move(builder).build();
+
+        // Override max timestamp with `missing`
+        batch.set_max_timestamp(
+          model::timestamp_type::create_time, model::timestamp::missing());
+        producer
+          .produce_to_partition(
+            ntp.tp.topic, ntp.tp.partition, std::move(batch))
+          .get();
+    };
+
+    for (auto c : model::all_batch_compression_types) {
+        produce_messages(c);
+    }
+
+    auto transport = make_kafka_client().get();
+    transport.connect().get();
+    auto deferred_t_close = ss::defer([&transport] { transport.stop().get(); });
+
+    // Perform a manual fetch in order to consume the produced batch, not
+    // individual records.
+    std::vector<model::record_batch> batches;
+    {
+        kafka::fetch_request::topic topic;
+        topic.topic = ntp.tp.topic;
+        kafka::fetch_request::partition partition{
+          .partition = ntp.tp.partition,
+          .fetch_offset = model::offset{0},
+          .log_start_offset = model::offset{0},
+          .partition_max_bytes = 100_MiB};
+        topic.partitions.emplace_back(std::move(partition));
+        kafka::fetch_request req;
+        req.data.min_bytes = 1;
+        req.data.max_bytes = 100_MiB;
+        req.data.max_wait_ms = 1000ms;
+        req.data.topics.push_back(std::move(topic));
+        auto fetch_resp
+          = transport.dispatch(std::move(req), kafka::api_version(4)).get();
+        BOOST_REQUIRE_EQUAL(
+          fetch_resp.data.error_code, kafka::error_code::none);
+        auto& data = fetch_resp.data;
+        for (auto& topic : data.responses) {
+            for (auto& partition : topic.partitions) {
+                BOOST_REQUIRE_EQUAL(
+                  partition.error_code, kafka::error_code::none);
+                BOOST_REQUIRE(partition.records.has_value());
+                while (!partition.records->is_end_of_stream()) {
+                    auto batch_adapter
+                      = partition.records.value().consume_batch();
+                    BOOST_REQUIRE(batch_adapter.batch.has_value());
+                    batches.push_back(std::move(batch_adapter.batch).value());
+                }
+            }
+        }
+    }
+
+    // Check that the `max_timestamp` was indeed set (!= {-1}) in the produce
+    // path when left unset by client in `relaxed` validation mode.
+    for (const auto& batch : batches) {
+        BOOST_REQUIRE_NE(
+          batch.header().max_timestamp, model::timestamp::missing());
+    }
+}
+
+FIXTURE_TEST(test_produce_unset_timestamps_relaxed, prod_consume_fixture) {
+    scoped_config cfg;
+    cfg.get("kafka_produce_batch_validation")
+      .set_value(model::kafka_batch_validation_mode::relaxed);
+    wait_for_controller_leadership().get();
+    start();
+    auto ntp = model::ntp(test_tp_ns.ns, test_tp_ns.tp, model::partition_id(0));
+
+    auto producer = tests::kafka_produce_transport(make_kafka_client().get());
+    producer.start().get();
+    auto deferred_p_close = ss::defer([&producer] { producer.stop().get(); });
+
+    // Produce a batch per compression type with 3 records and `max_timestamp`
+    // left unset.
+    auto produce_messages = [&](model::compression ctype) {
+        static std::vector<kv_t> records = {
+          {"key0", "val0"},
+          {"key1", "val1"},
+          {"key2", "val2"},
+        };
+        storage::record_batch_builder builder(
+          model::record_batch_type::raft_data, model::offset(0));
+        builder.set_compression(ctype);
+        for (auto& kv : records) {
+            const auto& k = kv.key;
+            const auto& v_opt = kv.val;
+            iobuf key_buf;
+            key_buf.append(k.data(), k.size());
+            std::optional<iobuf> val_buf;
+            if (v_opt.has_value()) {
+                const auto& v = v_opt.value();
+                val_buf = iobuf::from({v.data(), v.size()});
+            }
+            builder.add_raw_kv(std::move(key_buf), std::move(val_buf));
+        }
+        builder.set_timestamp(model::timestamp::missing());
+        auto batch = std::move(builder).build();
+
+        // Override max timestamp with `missing`
+        batch.set_max_timestamp(
+          model::timestamp_type::create_time, model::timestamp::missing());
+        producer
+          .produce_to_partition(
+            ntp.tp.topic, ntp.tp.partition, std::move(batch))
+          .get();
+    };
+
+    for (auto c : model::all_batch_compression_types) {
+        produce_messages(c);
+    }
+
+    auto transport = make_kafka_client().get();
+    transport.connect().get();
+    auto deferred_t_close = ss::defer([&transport] { transport.stop().get(); });
+
+    // Perform a manual fetch in order to consume the produced batch, not
+    // individual records.
+    std::vector<model::record_batch> batches;
+    {
+        kafka::fetch_request::topic topic;
+        topic.topic = ntp.tp.topic;
+        kafka::fetch_request::partition partition{
+          .partition = ntp.tp.partition,
+          .fetch_offset = model::offset{0},
+          .log_start_offset = model::offset{0},
+          .partition_max_bytes = 100_MiB};
+        topic.partitions.emplace_back(std::move(partition));
+        kafka::fetch_request req;
+        req.data.min_bytes = 1;
+        req.data.max_bytes = 100_MiB;
+        req.data.max_wait_ms = 1000ms;
+        req.data.topics.push_back(std::move(topic));
+        auto fetch_resp
+          = transport.dispatch(std::move(req), kafka::api_version(4)).get();
+        BOOST_REQUIRE_EQUAL(
+          fetch_resp.data.error_code, kafka::error_code::none);
+        auto& data = fetch_resp.data;
+        for (auto& topic : data.responses) {
+            for (auto& partition : topic.partitions) {
+                BOOST_REQUIRE_EQUAL(
+                  partition.error_code, kafka::error_code::none);
+                BOOST_REQUIRE(partition.records.has_value());
+                while (!partition.records->is_end_of_stream()) {
+                    auto batch_adapter
+                      = partition.records.value().consume_batch();
+                    BOOST_REQUIRE(batch_adapter.batch.has_value());
+                    batches.push_back(std::move(batch_adapter.batch).value());
+                }
+            }
+        }
+    }
+
+    // Check that the `max_timestamp` was left (== {-1}) in the produce
+    // path when left unset by client in `relaxed` validation mode, since all
+    // records also had {-1} as their timestamp.
+    for (const auto& batch : batches) {
+        BOOST_REQUIRE_EQUAL(
+          batch.header().max_timestamp, model::timestamp::missing());
     }
 }

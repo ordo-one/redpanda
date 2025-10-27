@@ -33,15 +33,16 @@
 #   should strongly consider leveraging the C++ type system to generate code
 #   that forces users to explicitly "unwrap" sensitive fields before use, to
 #   make it easier to audit where sensitive information is used.
+import enum
 import io
 import json
 import pathlib
 import re
 import sys
 import textwrap
-import jsonschema
+
 import jinja2
-import enum
+import jsonschema
 
 # Type overrides
 # ==============
@@ -62,7 +63,12 @@ path_type_map = {
     "OffsetFetchRequestData": {
         "Topics": {
             "PartitionIndexes": ("model::partition_id", "int32"),
-        }
+        },
+        "Groups": {
+            "Topics": {
+                "PartitionIndexes": ("model::partition_id", "int32"),
+            }
+        },
     },
     "OffsetFetchResponseData": {
         "Topics": {
@@ -70,8 +76,17 @@ path_type_map = {
                 "PartitionIndex": ("model::partition_id", "int32"),
                 "CommittedOffset": ("model::offset", "int64"),
                 "CommittedLeaderEpoch": ("kafka::leader_epoch", "int32"),
-            },
-        }
+            }
+        },
+        "Groups": {
+            "Topics": {
+                "Partitions": {
+                    "PartitionIndex": ("model::partition_id", "int32"),
+                    "CommittedOffset": ("model::offset", "int64"),
+                    "CommittedLeaderEpoch": ("kafka::leader_epoch", "int32"),
+                }
+            }
+        },
     },
     "OffsetCommitRequestData": {
         "Topics": {
@@ -85,24 +100,14 @@ path_type_map = {
         "GroupInstanceId": ("kafka::group_instance_id", "string"),
     },
     "AddPartitionsToTxnRequestData": {
-        "Topics": {
-            "Partitions": ("model::partition_id", "int32")
-        }
+        "Topics": {"Partitions": ("model::partition_id", "int32")}
     },
     "AddPartitionsToTxnResponseData": {
-        "Results": {
-            "Results": {
-                "PartitionIndex": ("model::partition_id", "int32")
-            }
-        }
+        "Results": {"Results": {"PartitionIndex": ("model::partition_id", "int32")}}
     },
     "OffsetDeleteRequestData": {
         "GroupId": ("kafka::group_id", "string"),
-        "Topics": {
-            "Partitions": {
-                "PartitionIndex": ("model::partition_id", "int32")
-            }
-        }
+        "Topics": {"Partitions": {"PartitionIndex": ("model::partition_id", "int32")}},
     },
     "OffsetDeleteResponseData": {
         "ErrorCode": ("kafka::error_code", "int16"),
@@ -111,7 +116,7 @@ path_type_map = {
                 "PartitionIndex": ("model::partition_id", "int32"),
                 "ErrorCode": ("kafka::error_code", "int16"),
             }
-        }
+        },
     },
     "TxnOffsetCommitRequestData": {
         "MemberId": ("kafka::member_id", "string"),
@@ -122,7 +127,7 @@ path_type_map = {
                 "CommittedOffset": ("model::offset", "int64"),
                 "CommittedLeaderEpoch": ("kafka::leader_epoch", "int32"),
             },
-        }
+        },
     },
     "JoinGroupRequestData": {
         "MemberId": ("kafka::member_id", "string"),
@@ -170,6 +175,14 @@ path_type_map = {
     },
     "DeleteTopicsRequestData": {
         "TimeoutMs": ("std::chrono::milliseconds", "int32"),
+        "Topics": {
+            "TopicId": ("model::topic_id", "uuid"),
+        },
+    },
+    "DeleteTopicsResponseData": {
+        "Responses": {
+            "TopicId": ("model::topic_id", "uuid"),
+        },
     },
     "CreateTopicsRequestData": {
         "timeoutMs": ("std::chrono::milliseconds", "int32"),
@@ -181,6 +194,7 @@ path_type_map = {
     },
     "CreateTopicsResponseData": {
         "Topics": {
+            "TopicId": ("model::topic_id", "uuid"),
             "Configs": {
                 "ConfigSource": ("kafka::describe_configs_source", "int8"),
             },
@@ -251,14 +265,34 @@ path_type_map = {
             },
         },
     },
+    "MetadataRequestData": {
+        "Topics": {
+            "TopicId": ("model::topic_id", "uuid"),
+        }
+    },
     "MetadataResponseData": {
         "Topics": {
+            "TopicId": ("model::topic_id", "uuid"),
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
                 "IsrNodes": ("model::node_id", "int32"),
                 "LeaderEpoch": ("kafka::leader_epoch", "int32"),
             },
+            "TopicAuthorizedOperations": (
+                "kafka::topic_authorized_operations",
+                "int32",
+            ),
         },
+        "ClusterAuthorizedOperations": (
+            "kafka::cluster_authorized_operations",
+            "int32",
+        ),
+    },
+    "DescribeClusterResponseData": {
+        "ClusterAuthorizedOperations": (
+            "kafka::cluster_authorized_operations",
+            "int32",
+        ),
     },
     "FetchRequestData": {
         "MaxWaitMs": ("std::chrono::milliseconds", "int32"),
@@ -266,21 +300,36 @@ path_type_map = {
         "ReplicaId": ("model::node_id", "int32"),
         "RackId": ("model::rack_id", "string"),
         "Topics": {
-            "FetchPartitions": {
-                "PartitionIndex": ("model::partition_id", "int32"),
+            "TopicId": ("model::topic_id", "uuid"),
+            "Partitions": {
+                "Partition": ("model::partition_id", "int32"),
                 "FetchOffset": ("model::offset", "int64"),
                 "CurrentLeaderEpoch": ("kafka::leader_epoch", "int32"),
             },
         },
+        "ForgottenTopicsData": {
+            "TopicId": ("model::topic_id", "uuid"),
+        },
     },
     "FetchResponseData": {
-        "Topics": {
+        "Responses": {
+            "TopicId": ("model::topic_id", "uuid"),
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
                 "HighWatermark": ("model::offset", "int64"),
                 "LastStableOffset": ("model::offset", "int64"),
                 "LogStartOffset": ("model::offset", "int64"),
-                "Records": ("kafka::batch_reader", "fetch_record_set"),
+                "DivergingEpoch": {
+                    "Epoch": ("kafka::leader_epoch", "int32"),
+                    "EndOffset": ("model::offset", "int64"),
+                },
+                "CurrentLeader": {
+                    "LeaderEpoch": ("kafka::leader_epoch", "int32"),
+                },
+                "SnapshotId": {
+                    "EndOffset": ("model::offset", "int64"),
+                    "Epoch": ("kafka::leader_epoch", "int32"),
+                },
                 "PreferredReadReplica": ("model::node_id", "int32"),
             },
         },
@@ -316,7 +365,7 @@ path_type_map = {
                 "Offset": ("model::offset", "int64"),
             }
         },
-        "TimeoutMs": ("std::chrono::milliseconds", "int32")
+        "TimeoutMs": ("std::chrono::milliseconds", "int32"),
     },
     "DeleteRecordsResponseData": {
         "ThrottleTimeMs": ("std::chrono::milliseconds", "int32"),
@@ -324,9 +373,9 @@ path_type_map = {
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
                 "LowWatermark": ("model::offset", "int64"),
-                "ErrorCode": ("kafka::error_code", "int16")
+                "ErrorCode": ("kafka::error_code", "int16"),
             }
-        }
+        },
     },
     "AlterPartitionReassignmentsRequestData": {
         "TimeoutMs": ("std::chrono::milliseconds", "int32"),
@@ -334,7 +383,7 @@ path_type_map = {
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
             },
-        }
+        },
     },
     "AlterPartitionReassignmentsResponseData": {
         "ThrottleTimeMs": ("std::chrono::milliseconds", "int32"),
@@ -342,13 +391,13 @@ path_type_map = {
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
             },
-        }
+        },
     },
     "ListPartitionReassignmentsRequestData": {
         "TimeoutMs": ("std::chrono::milliseconds", "int32"),
         "Topics": {
             "PartitionIndexes": ("model::partition_id", "int32"),
-        }
+        },
     },
     "ListPartitionReassignmentsResponseData": {
         "ThrottleTimeMs": ("std::chrono::milliseconds", "int32"),
@@ -356,7 +405,7 @@ path_type_map = {
             "Partitions": {
                 "PartitionIndex": ("model::partition_id", "int32"),
             },
-        }
+        },
     },
     "DescribeProducersRequestData": {
         "Topics": {
@@ -372,6 +421,32 @@ path_type_map = {
         "Components": {
             "MatchType": ("kafka::describe_client_quotas_match_type", "int8"),
         },
+    },
+    "DescribeUserScramCredentialsRequestData": {
+        "Users": {
+            "Name": ("kafka::scram_user_name", "string"),
+        },
+    },
+    "DescribeUserScramCredentialsResponseData": {
+        "Results": {
+            "User": ("kafka::scram_user_name", "string"),
+            "CredentialInfos": {
+                "Mechanism": ("kafka::scram_mechanism", "int8"),
+            },
+        },
+    },
+    "AlterUserScramCredentialsRequestData": {
+        "Deletions": {
+            "Name": ("kafka::scram_user_name", "string"),
+            "Mechanism": ("kafka::scram_mechanism", "int8"),
+        },
+        "Upsertions": {
+            "Name": ("kafka::scram_user_name", "string"),
+            "Mechanism": ("kafka::scram_mechanism", "int8"),
+        },
+    },
+    "AlterUserScramCredentialsResponseData": {
+        "Results": {"User": ("kafka::scram_user_name", "string")},
     },
 }
 
@@ -395,10 +470,13 @@ field_name_type_map = {
 
 # primitive types
 basic_type_map = dict(
-    string=("ss::sstring", "read_string_with_control_check()",
-            "read_nullable_string_with_control_check()",
-            "read_flex_string_with_control_check()",
-            "read_nullable_flex_string_with_control_check()"),
+    string=(
+        "ss::sstring",
+        "read_string_with_control_check()",
+        "read_nullable_string_with_control_check()",
+        "read_flex_string_with_control_check()",
+        "read_nullable_flex_string_with_control_check()",
+    ),
     bytes=("bytes", "read_bytes()", None, "read_flex_bytes()", None),
     bool=("bool", "read_bool()"),
     int8=("int8_t", "read_int8()"),
@@ -407,10 +485,20 @@ basic_type_map = dict(
     int64=("int64_t", "read_int64()"),
     float64=("float64_t", "read_float64()"),
     uuid=("uuid", "read_uuid()"),
-    iobuf=("iobuf", None, "read_fragmented_nullable_bytes()", None,
-           "read_fragmented_nullable_flex_bytes()"),
-    fetch_record_set=("batch_reader", None, "read_nullable_batch_reader()",
-                      None, "read_nullable_flex_batch_reader()"),
+    iobuf=(
+        "iobuf",
+        None,
+        "read_fragmented_nullable_bytes()",
+        None,
+        "read_fragmented_nullable_flex_bytes()",
+    ),
+    records=(
+        "kafka::batch_reader",
+        None,
+        "read_nullable_batch_reader()",
+        None,
+        "read_nullable_flex_batch_reader()",
+    ),
 )
 
 # Declare some fields as sensitive. Utmost care should be taken to ensure the
@@ -433,6 +521,9 @@ sensitive_map = {
 # mapping to the new type name.
 # yapf: disable
 struct_renames = {
+    ("ApiVersionsResponseData", "ApiKeys"):
+        ("ApiVersion", "ApiVersionsResponseKey"),
+
     ("IncrementalAlterConfigsRequestData", "Resources"):
         ("AlterConfigsResource", "IncrementalAlterConfigsResource"),
 
@@ -455,6 +546,9 @@ struct_renames = {
         ("EntityData", "AlterClientQuotasResponseEntityData"),
     ("DescribeClientQuotasResponseData", "Entries", "Entity"):
         ("EntityData", "DescribeClientQuotasResponseEntityData"),
+
+    ("FetchResponseData", "Responses", "Partitions", "DivergingEpoch"):
+        ("EpochEndOffset", "DivergingEpochEndOffset"),
 }
 
 # extra header per type name
@@ -484,31 +578,23 @@ extra_headers = {
 # These types, when they appear as the member type of an array, will override
 # the container type from std::vector
 override_member_container = {
-    'metadata_response_partition': 'large_fragment_vector',
-    'metadata_response_topic': 'small_fragment_vector',
-    'fetchable_partition_response': 'small_fragment_vector',
-    'offset_fetch_response_partition': 'small_fragment_vector',
-    'int32_t': 'std::vector',
-    'model::node_id': 'std::vector',
-    'model::partition_id': 'std::vector',
-    'reassignable_partition_response': 'std::vector',
-    'reassignable_partition': 'std::vector',
-    'describe_configs_synonym': 'std::vector',
-    'createable_topic_config': 'std::vector',
-    'creatable_topic_configs': 'std::vector',
-    'creatable_replica_assignment': 'std::vector',
-    'offset_commit_request_partition': 'std::vector',
-    'offset_commit_response_partition': 'std::vector',
-    'offset_commit_request_topic': 'std::vector',
-    'offset_fetch_request_topic': 'std::vector',
-    'partition_produce_response': 'std::vector',
-    'creatable_acl_result': 'std::vector',
-    'offset_delete_request_partition': 'std::vector',
-    'deletable_group_result': 'std::vector',
-    'delete_acls_matching_acl': 'std::vector',
-    'txn_offset_commit_request_partition': 'std::vector',
-    'txn_offset_commit_request_topic': 'std::vector',
-    'txn_offset_commit_response_partition': 'std::vector',
+    "metadata_response_partition": "chunked_vector",
+    "metadata_response_topic": "chunked_vector",
+    "partition_data": "chunked_vector",
+    "int32_t": "std::vector",
+    "model::node_id": "std::vector",
+    "model::partition_id": "std::vector",
+    "reassignable_partition_response": "std::vector",
+    "reassignable_partition": "std::vector",
+    "describe_configs_synonym": "std::vector",
+    "createable_topic_config": "std::vector",
+    "creatable_topic_configs": "std::vector",
+    "creatable_replica_assignment": "std::vector",
+    "partition_produce_response": "std::vector",
+    "creatable_acl_result": "std::vector",
+    "offset_delete_request_partition": "std::vector",
+    "deletable_group_result": "std::vector",
+    "delete_acls_matching_acl": "std::vector",
 }
 
 
@@ -518,17 +604,21 @@ def make_context_field(path):
     structure. This structure will not be encoded/decoded on the wire and is
     used to add some extra context.
     """
-    if path == ("FetchResponseData", "Topics", "Partitions"):
+    if path == ("FetchResponseData", "Responses", "Partitions"):
         return ("bool", "has_to_be_included{true}")
 
 
 # a listing of expected struct types
 STRUCT_TYPES = [
-    "ApiVersionsRequestKey",
-    "ApiVersionsResponseKey",
+    "ApiVersion",
+    "OffsetFetchRequestGroup",
     "OffsetFetchRequestTopic",
+    "OffsetFetchRequestTopics",
+    "OffsetFetchResponseGroup",
     "OffsetFetchResponseTopic",
+    "OffsetFetchResponseTopics",
     "OffsetFetchResponsePartition",
+    "OffsetFetchResponsePartitions",
     "OffsetCommitRequestTopic",
     "OffsetCommitRequestPartition",
     "OffsetCommitResponseTopic",
@@ -539,6 +629,7 @@ STRUCT_TYPES = [
     "MemberIdentity",
     "MemberResponse",
     "DeletableTopicResult",
+    "DescribeClusterBroker",
     "DescribeConfigsResult",
     "DescribeConfigsResource",
     "DescribeConfigsResourceResult",
@@ -590,7 +681,7 @@ STRUCT_TYPES = [
     "ForgottenTopic",
     "FetchPartition",
     "FetchableTopicResponse",
-    "FetchablePartitionResponse",
+    "PartitionData",
     "AbortedTransaction",
     "CreatePartitionsTopic",
     "CreatePartitionsTopicResult",
@@ -629,7 +720,17 @@ STRUCT_TYPES = [
     "OpData",
     "ComponentData",
     "ValueData",
+    "UserName",
+    "DescribeUserScramCredentialsResult",
+    "CredentialInfo",
+    "ScramCredentialDeletion",
+    "ScramCredentialUpsertion",
+    "AlterUserScramCredentialsResult",
+    "Coordinator",
 ]
+
+# A list of StructTypes that are allowed to be not arrays in the schema.
+ALLOWED_SINGULAR_STRUCT_TYPES = ["EpochEndOffset"]
 
 DROP_STREAM_OPERATOR = [
     "metadata_response_data",
@@ -642,13 +743,21 @@ DROP_STREAM_OPERATOR = [
 # `operator==()`, because one or more of its member variables are not
 # comparable
 WITHOUT_DEFAULT_EQUALITY_OPERATOR = {
-    'kafka::batch_reader', 'kafka::produce_request_record_data'
+    "kafka::batch_reader",
+    "kafka::produce_request_record_data",
+    "kafka::fetchable_topic_response",
 }
 
 # The following is a list of tag types which contain fields where their
 # respective types are not prefixed with []. The generator special cases these
 # as ArrayTypes
 TAGGED_WITH_FIELDS = []
+
+# The following is a list of tag types which contain fields where their
+# respective types are correctly not prefixed with [].
+# They must not be treated as ArrayTypes
+# This list is the names after struct_renames have been applied.
+SINGULAR_STRUCT_TYPES = ["DivergingEpochEndOffset", "LeaderIdAndEpoch", "SnapshotId"]
 
 SCALAR_TYPES = list(basic_type_map.keys())
 ENTITY_TYPES = list(entity_type_map.keys())
@@ -667,6 +776,7 @@ class VersionRange:
     A version range is fundamentally a range [min, max] but there are several
     different ways in the kafka schema format to specify the bounds.
     """
+
     def __init__(self, spec):
         self.min, self.max = self._parse(spec)
 
@@ -687,7 +797,7 @@ class VersionRange:
             max = int(match.group("max"))
             return min, max
 
-    guard_modes = enum.Enum('guard_modes', 'GUARD, NO_GUARD, NO_SOURCE')
+    guard_modes = enum.Enum("guard_modes", "GUARD, NO_GUARD, NO_SOURCE")
 
     @property
     def guard_enum(self):
@@ -707,8 +817,11 @@ class VersionRange:
                 cond.append(f"version <= api_version({self.max})")
             cond = " && ".join(cond)
 
-        return (self.guard_enum.NO_GUARD,
-                None) if cond == "" else (self.guard_enum.GUARD, cond)
+        return (
+            (self.guard_enum.NO_GUARD, None)
+            if cond == ""
+            else (self.guard_enum.GUARD, cond)
+        )
 
     def guard(self, flex, first_flex):
         """
@@ -725,8 +838,6 @@ class VersionRange:
                     return self.guard_enum.NO_GUARD, None
             elif self.max < first_flex:
                 return self.guard_enum.NO_SOURCE, None
-            elif self.max == first_flex:
-                return self.guard_enum.NO_GUARD, None
 
         return self._guard()
 
@@ -738,7 +849,8 @@ class VersionRange:
 def snake_case(name):
     """Convert camel to snake case"""
     return name[0].lower() + "".join(
-        [f"_{c.lower()}" if c.isupper() else c for c in name[1:]])
+        [f"_{c.lower()}" if c.isupper() else c for c in name[1:]]
+    )
 
 
 class FieldType:
@@ -772,11 +884,13 @@ class FieldType:
             t = ScalarType(type_name)
         else:
             # Its possible for tagged types to contain fields where the type is not
-            # prefixed with [], these types are listed in the TAGGED_WITH_FIELDS map
+            # prefixed with [].
+            # Types in TAGGED_WITH_FIELDS map are treated as ArrayTypes
+            # Types in SINGULAR_STRUCT_TYPES map are not treated as ArrayTypes
             is_array = is_array or (type_name in TAGGED_WITH_FIELDS)
-            assert is_array
-            path = path + (field["name"], )
+            path = path + (field["name"],)
             type_name = apply_struct_renames(path, type_name)
+            assert is_array or (type_name in SINGULAR_STRUCT_TYPES)
             t = StructType(type_name, field["fields"], path)
 
         if is_array:
@@ -801,7 +915,12 @@ class ScalarType(FieldType):
     def potentially_flexible_type(self):
         """Evaluates to true if the scalar type would be parsed as flex
         if the version is high enough"""
-        return self.name == "string" or self.name == "bytes" or self.name == "iobuf"
+        return (
+            self.name == "string"
+            or self.name == "bytes"
+            or self.name == "records"
+            or self.name == "iobuf"
+        )
 
 
 class StructType(FieldType):
@@ -885,7 +1004,8 @@ class StructType(FieldType):
     @property
     def is_streamable(self):
         return self._name not in DROP_STREAM_OPERATOR and all(
-            field.is_streamable for field in self.fields)
+            field.is_streamable for field in self.fields
+        )
 
 
 class ArrayType(FieldType):
@@ -907,7 +1027,7 @@ class Field:
     def __init__(self, field, field_type, path):
         self._field = field
         self._type = field_type
-        self._path = path + (self._field["name"], )
+        self._path = path + (self._field["name"],)
         self._versions = VersionRange(self._field["versions"])
         self._nullable_versions = self._field.get("nullableVersions", None)
         if self._nullable_versions is not None:
@@ -1068,9 +1188,11 @@ class Field:
             # sensitive decendents defined. This field is an ancestor of a
             # sensitive field, but it itself isn't sensitive.
             return False
-        assert d is None or d is True, \
-            "expected field '{}' to be missing or True; field path: {}, remaining path: {}" \
-            .format(self._field["name"], self._path, d)
+        assert d is None or d is True, (
+            "expected field '{}' to be missing or True; field path: {}, remaining path: {}".format(
+                self._field["name"], self._path, d
+            )
+        )
         return d
 
     @property
@@ -1090,9 +1212,9 @@ class Field:
         gen = self.type_name_parts()
         name = next(gen)
         if isinstance(self._type, ArrayType):
-            name = f'{next(gen)}<{name}>'
+            name = f"{next(gen)}<{name}>"
         if self.nullable():
-            return f'{next(gen)}<{name}>', None
+            return f"{next(gen)}<{name}>", None
         return name, next(gen)
 
     def type_name_parts(self):
@@ -1144,7 +1266,7 @@ HEADER_TEMPLATE = """
 #include "model/metadata.h"
 #include "kafka/protocol/errors.h"
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 {%- if not struct.is_streamable %}
 #include <fmt/format.h>
 {%- endif %}
@@ -1382,7 +1504,7 @@ if ({{ cond }}) {
 {%- endif %}
 {%- endmacro %}
 
-{% macro field_decoder(field, methods, obj) %}
+{% macro field_decoder(field, methods, obj, unused = "") %}
 {%- set flex = methods|length > 1 %}
 {%- if obj %}
 {%- set fname = obj + "." + field.name %}
@@ -1409,6 +1531,9 @@ if ({{ cond }}) {
 {%- endif %}
 });
 {%- else %}
+{%- if field.type().is_struct -%}
+{{- struct_serde(field.type(), methods, "v." ~ field.name) -}}
+{%- else -%}
 {%- set decoder, named_type = field.decoder(flex) %}
 {%- if named_type == None %}
 {{ fname }} = reader.{{ decoder }};
@@ -1425,6 +1550,7 @@ if ({{ cond }}) {
 }
 {%- else %}
 {{ fname }} = {{ named_type }}(reader.{{ decoder }});
+{%- endif %}
 {%- endif %}
 {%- endif %}
 {%- endmacro %}
@@ -1451,7 +1577,7 @@ while(num_tags-- > 0) {
 }
 {%- endmacro %}
 
-{% macro tag_decoder(tag_definitions, obj = "") %}
+{% macro tag_decoder(tag_definitions, obj = "", unused = "") %}
 {%- if tag_definitions|length == 0 %}
 {%- set tf = "unknown_tags" %}
 {%- if obj != "" %}
@@ -1477,6 +1603,10 @@ if ({{ fname }}) {
 }
 {%- elif tdef.is_array %}
 if (!{{ fname }}.empty()) {
+    {{ vec }}.push_back({{ tdef.tag() }});
+}
+{%- elif tdef.type().is_struct  %}
+if ({{ fname }} != {{ tdef.type().name }}{}) {
     {{ vec }}.push_back({{ tdef.tag() }});
 }
 {%- elif tdef.default_value() != "" %}
@@ -1509,7 +1639,11 @@ for(uint32_t tag : to_encode) {
     switch(tag){
 {%- for tdef in tag_definitions %}
     case {{ tdef.tag() }}:
+{%- if tdef.type().is_struct -%}
+{{- struct_serde(tdef.type(), (field_encoder, tag_encoder), obj ~ "." ~ tdef.name, "rw") | indent | indent }}
+{%- else %}
 {{- field_encoder(tdef, (field_encoder, tag_encoder), obj, "rw") | indent | indent }}
+{%- endif %}
         break;
 {%- endfor %}
     default:
@@ -1520,13 +1654,13 @@ for(uint32_t tag : to_encode) {
 writer.write_tags(tagged_fields(std::move(tags_to_encode)));
 {%- endmacro %}
 
-{% macro tag_encoder(tag_definitions, obj = "") %}
+{% macro tag_encoder(tag_definitions, obj = "", writer = "writer") %}
 {%- if tag_definitions|length == 0 %}
 {%- set tf = "unknown_tags" %}
 {%- if obj != "" %}
 {%- set tf = obj + '.unknown_tags' %}
 {%- endif %}
-writer.write_tags(std::move({{ tf }}));
+{{ writer }}.write_tags(std::move({{ tf }}));
 {%- else %}
 {
 {{- tag_encoder_impl(tag_definitions, obj) | indent }}
@@ -1539,15 +1673,15 @@ writer.write_tags(std::move({{ tf }}));
 {% set flex_encoder = (field_encoder, tag_encoder) %}
 {% set flex_decoder = (field_decoder, tag_decoder) %}
 
-{% macro struct_serde(struct, serde_methods, obj = "") %}
+{% macro struct_serde(struct, serde_methods, obj = "", writer = "writer") %}
 {%- set flex = serde_methods|length > 1 %}
 {%- for field in struct.fields %}
 {%- call version_guard(field, flex) %}
-{{- serde_methods[0](field, serde_methods, obj) }}
+{{- serde_methods[0](field, serde_methods, obj, writer) }}
 {%- endcall %}
 {%- endfor %}
 {%- if flex %}
-{{- serde_methods[1](struct.tags, obj) }}
+{{- serde_methods[1](struct.tags, obj, writer) }}
 {%- endif %}
 {%- endmacro %}
 
@@ -1799,10 +1933,13 @@ std::ostream& operator<<(std::ostream& o, const {{ struct.name }}&) {
 # type is not a native kafka type, but is still represented in the code
 # generator for some scenarios involving overloads / customizing output.
 ALLOWED_SCALAR_TYPES = list(set(SCALAR_TYPES) - set(["iobuf"]))
-ALLOWED_TYPES = \
-    ALLOWED_SCALAR_TYPES + \
-    [f"[]{t}" for t in ALLOWED_SCALAR_TYPES +
-        STRUCT_TYPES] + TAGGED_WITH_FIELDS
+ALLOWED_TYPES = (
+    SINGULAR_STRUCT_TYPES
+    + ALLOWED_SINGULAR_STRUCT_TYPES
+    + ALLOWED_SCALAR_TYPES
+    + TAGGED_WITH_FIELDS
+    + [f"[]{t}" for t in ALLOWED_SCALAR_TYPES + STRUCT_TYPES]
+)
 
 # yapf: disable
 SCHEMA = {
@@ -1902,9 +2039,9 @@ SCHEMA = {
 # helper called from template to render a nice struct comment
 def render_struct_comment(struct):
     indent = " * "
-    wrapper = textwrap.TextWrapper(initial_indent=indent,
-                                   subsequent_indent=indent,
-                                   width=80)
+    wrapper = textwrap.TextWrapper(
+        initial_indent=indent, subsequent_indent=indent, width=80
+    )
     comment = wrapper.fill(f"The {struct.name} message.") + "\n"
     comment += indent + "\n"
 
@@ -1914,10 +2051,11 @@ def render_struct_comment(struct):
 
     for field in struct.fields:
         field_indent = indent + f"{field.name:>{max_width}}: "
-        wrapper = textwrap.TextWrapper(initial_indent=field_indent,
-                                       subsequent_indent=indent + " " *
-                                       (2 + max_width),
-                                       width=80)
+        wrapper = textwrap.TextWrapper(
+            initial_indent=field_indent,
+            subsequent_indent=indent + " " * (2 + max_width),
+            width=80,
+        )
         about = field.about() + f" Supported versions: {field.versions()}"
         comment += wrapper.fill(about) + "\n"
 
@@ -1960,7 +2098,7 @@ def codegen(schema_path):
     # but its naming in snake case will conflict with our high level request and
     # response types so arrange for a "_data" suffix to be generated.
     type_name = f"{msg['name']}Data"
-    struct = StructType(type_name, msg["fields"], (type_name, ))
+    struct = StructType(type_name, msg["fields"], (type_name,))
 
     # request or response
     op_type = msg["type"]
@@ -1994,12 +2132,12 @@ def codegen(schema_path):
         api_key=api_key,
         request_name=request_name,
         first_flex=first_flex,
-        valid_range=valid_range)
+        valid_range=valid_range,
+    )
 
-    src = jinja2.Template(SOURCE_TEMPLATE).render(struct=struct,
-                                                  op_type=op_type,
-                                                  fail=fail,
-                                                  first_flex=first_flex)
+    src = jinja2.Template(SOURCE_TEMPLATE).render(
+        struct=struct, op_type=op_type, fail=fail, first_flex=first_flex
+    )
 
     return hdr, src, struct.headers("source")
 
@@ -2030,13 +2168,14 @@ if __name__ == "__main__":
         hdr, src, extra = codegen(schema)
         sources.append((schema.name, src))
         extra_schema_headers.update(extra)
-        with open(hdr_path, 'w') as f:
+        with open(hdr_path, "w") as f:
             f.write(hdr)
 
     src = jinja2.Template(COMBINED_SOURCE_TEMPLATE).render(
         schema_headers=map(lambda p: p.name, headers),
         extra_headers=extra_schema_headers,
-        sources=sources)
+        sources=sources,
+    )
 
-    with open(source, 'w') as f:
+    with open(source, "w") as f:
         f.write(src)

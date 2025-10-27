@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/outcome.h"
+#include "raft/follower_stats.h"
 #include "raft/fwd.h"
 #include "raft/recovery_memory_quota.h"
 #include "raft/types.h"
@@ -57,10 +58,10 @@ private:
     using snapshot_reader_t
       = std::variant<storage::snapshot_reader, on_demand_snapshot_reader>;
     ss::future<> recover();
-    ss::future<> do_recover(ss::io_priority_class);
+    ss::future<> do_recover();
     ss::future<
       std::optional<std::tuple<chunked_vector<model::record_batch>, size_t>>>
-    read_range_for_recovery(model::offset, ss::io_priority_class, bool, size_t);
+    read_range_for_recovery(model::offset, bool, size_t);
 
     ss::future<> replicate(
       chunked_vector<model::record_batch> batches,

@@ -10,12 +10,11 @@
  */
 #include "cluster/data_migrated_resources.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "container/chunked_hash_map.h"
 #include "data_migration_types.h"
 
 #include <seastar/util/variant_utils.hh>
-
-#include <absl/container/flat_hash_set.h>
 
 #include <utility>
 
@@ -51,18 +50,18 @@ migrated_resource_state get_resource_state<inbound_migration>(state state) {
     case state::planned:
         return migrated_resource_state::metadata_locked;
     case state::preparing:
-        return migrated_resource_state::create_only;
     case state::prepared:
     case state::canceling:
     case state::executing:
     case state::executed:
-    case state::cut_over:
         return migrated_resource_state::fully_blocked;
+    case state::cut_over:
+        return migrated_resource_state::create_only;
     case state::finished:
     case state::cancelled:
         return migrated_resource_state::non_restricted;
     case state::deleted:
-        vassert(false, "a migration cannot be in deleted state");
+        vunreachable("a migration cannot be in deleted state");
     }
 }
 
@@ -83,7 +82,7 @@ migrated_resource_state get_resource_state<outbound_migration>(state state) {
     case state::cancelled:
         return migrated_resource_state::non_restricted;
     case state::deleted:
-        vassert(false, "a migration cannot be in deleted state");
+        vunreachable("a migration cannot be in deleted state");
     }
 }
 

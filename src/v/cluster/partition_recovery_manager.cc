@@ -10,6 +10,7 @@
 
 #include "cluster/partition_recovery_manager.h"
 
+#include "absl/container/btree_map.h"
 #include "bytes/streambuf.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/partition_manifest_downloader.h"
@@ -40,7 +41,6 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/log.hh>
 
-#include <absl/container/btree_map.h>
 #include <boost/algorithm/string/detail/sequence.hpp>
 
 #include <chrono>
@@ -57,8 +57,9 @@ static constexpr ss::lowres_clock::duration initial_backoff = 200ms;
 class missing_partition_exception final : public std::exception {
 public:
     explicit missing_partition_exception(const storage::ntp_config& ntpc)
-      : _msg(ssx::sformat(
-          "missing partition {}, rev {}", ntpc.ntp(), ntpc.get_revision())) {}
+      : _msg(
+          ssx::sformat(
+            "missing partition {}, rev {}", ntpc.ntp(), ntpc.get_revision())) {}
 
     explicit missing_partition_exception(const remote_manifest_path& path)
       : _msg(ssx::sformat("missing partition s3://{}", path)) {}
@@ -90,12 +91,7 @@ ss::future<log_recovery_result> partition_recovery_manager::download_log(
   model::initial_revision_id remote_revision,
   int32_t remote_partition_count,
   cloud_storage::remote_path_provider& path_provider) {
-    if (!ntp_cfg.has_overrides()) {
-        vlog(
-          cst_log.debug, "No overrides for {} found, skipping", ntp_cfg.ntp());
-        co_return log_recovery_result{};
-    }
-    auto enabled = ntp_cfg.get_overrides().recovery_enabled;
+    auto enabled = ntp_cfg.recovery_enabled();
     if (!enabled) {
         vlog(
           cst_log.debug,
@@ -161,7 +157,7 @@ partition_downloader::partition_downloader(
   cloud_storage_clients::bucket_name bucket,
   ss::gate& gate_root,
   retry_chain_node& parent,
-  storage::opt_abort_source_t as)
+  model::opt_abort_source_t as)
   : _ntpc(ntpc)
   , _remote_path_provider(path_provider)
   , _bucket(std::move(bucket))
@@ -259,7 +255,7 @@ std::ostream& operator<<(std::ostream& o, const retention& r) {
 }
 
 static retention get_retention_policy(const storage::ntp_config& prop) {
-    if (prop.is_collectable()) {
+    if (prop.is_remotely_collectable()) {
         // If a space constraint is set on the topic, use that: otherwise
         // use time based constraint if present.  If total retention setting
         // is less than local retention setting, take the smallest.
@@ -269,7 +265,7 @@ static retention get_retention_policy(const storage::ntp_config& prop) {
         //
         // This will also drop the compact settings and replace it with
         // delete.
-        auto overrides = prop.get_overrides();
+        const auto& overrides = prop.get_overrides();
         if (overrides.retention_local_target_bytes.has_optional_value()) {
             auto v = overrides.retention_local_target_bytes.value();
 
@@ -490,10 +486,11 @@ partition_downloader::download_log_with_capped_size(
           dlpart.dest_prefix);
         auto offsets = co_await download_segment_file(s, dlpart);
         if (offsets.has_value()) {
-            dloffsets.push_back(offset_range{
-              .min_offset = offsets->min_offset,
-              .max_offset = offsets->max_offset,
-            });
+            dloffsets.push_back(
+              offset_range{
+                .min_offset = offsets->min_offset,
+                .max_offset = offsets->max_offset,
+              });
         }
     }
 

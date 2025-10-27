@@ -27,18 +27,38 @@
 namespace iceberg {
 
 namespace {
+
+// Derive the metadata location from table properties.
+// Some catalogs require respecting the property `write.metadata.path`,
+// but the default location is <table location>/metadata.
+uri get_metadata_location(const table_metadata& table) {
+    static constexpr std::string_view write_metadata_path_prop
+      = "write.metadata.path";
+
+    if (table.properties.has_value()) {
+        auto it = table.properties->find(write_metadata_path_prop);
+        if (it != table.properties->end()) {
+            return uri(it->second);
+        }
+    }
+
+    return uri(fmt::format("{}/metadata", table.location));
+}
+
 uri get_manifest_path(
-  const uri& location, const uuid_t& commit_uuid, size_t num) {
+  const table_metadata& table, const uuid_t& commit_uuid, size_t num) {
+    auto metadata_location = get_metadata_location(table);
     return uri(
-      fmt::format("{}/metadata/{}-m{}.avro", location, commit_uuid, num));
+      fmt::format("{}/{}-m{}.avro", metadata_location, commit_uuid, num));
 }
 uri get_manifest_list_path(
-  const uri& location,
+  const table_metadata& table,
   snapshot_id snap_id,
   const uuid_t& commit_uuid,
   size_t num) {
+    auto metadata_location = get_metadata_location(table);
     return uri{fmt::format(
-      "{}/metadata/snap-{}-{}-{}.avro", location, snap_id(), commit_uuid, num)};
+      "{}/snap-{}-{}-{}.avro", metadata_location, snap_id(), commit_uuid, num)};
 }
 
 action::errc to_action_errc(metadata_io::errc e) {
@@ -153,6 +173,8 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
       new_data_files_.size());
 
     // Validate our input files that their partition keys look sane.
+    size_t added_records{0};
+    size_t added_files_size{0};
     for (const auto& f : new_data_files_) {
         if (f.file.partition.val == nullptr) {
             vlog(
@@ -180,11 +202,15 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
               pspec->fields.size());
             co_return action::errc::unexpected_state;
         }
+        added_records += f.file.record_count;
+        added_files_size += f.file.file_size_bytes;
     }
+    auto added_data_files = new_data_files_.size();
 
     // Get the manifest list for the current snapshot, if any.
     manifest_list mlist;
     std::optional<snapshot_id> old_snap_id;
+    std::optional<snapshot_summary> old_summary;
     if (table_.snapshots.has_value() && !table_.snapshots->empty()) {
         if (!table_.current_snapshot_id.has_value()) {
             // We have snapshots, but it's unclear which one to base our update
@@ -217,6 +243,7 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
         }
         mlist = std::move(mlist_res).value();
         old_snap_id = table_cur_snap_id;
+        old_summary = snap_it->summary;
     } else if (
       table_.current_snapshot_id.has_value()
       && table_.current_snapshot_id.value() != invalid_snapshot_id) {
@@ -248,7 +275,7 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
     // naming uniqueness. Retries for us are expected to take the form of an
     // entirely new transaction.
     const auto new_mlist_path = get_manifest_list_path(
-      table_.location, new_snap_id, commit_uuid_, 0);
+      table_, new_snap_id, commit_uuid_, 0);
 
     vlog(
       log.info,
@@ -261,16 +288,44 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
         co_return to_action_errc(mlist_up_res.error());
     }
 
+    snapshot_summary new_summary = {
+      .operation = snapshot_operation::append,
+      .added_data_files = added_data_files,
+      .added_records = added_records,
+      .added_files_size = added_files_size,
+      // TODO: serialize other fields.
+      .other = {},
+    };
+    if (old_summary) {
+        // Only update existing total metrics; otherwise we wouldn't have an
+        // accurate starting point.
+        if (old_summary->total_data_files.has_value()) {
+            new_summary.total_data_files = added_data_files
+                                           + *old_summary->total_data_files;
+        }
+        if (old_summary->total_records.has_value()) {
+            new_summary.total_records = added_records
+                                        + *old_summary->total_records;
+        }
+        if (old_summary->total_files_size.has_value()) {
+            new_summary.total_files_size = added_files_size
+                                           + *old_summary->total_files_size;
+        }
+    } else {
+        // This is the first summary. The totals are just what we're adding in
+        // (presumably) this first snapshot.
+        new_summary.total_data_files = added_data_files;
+        new_summary.total_records = added_records;
+        new_summary.total_files_size = added_files_size;
+    }
+
     // Return the snapshot metadata.
     snapshot s{
       .id = new_snap_id,
       .parent_snapshot_id = old_snap_id,
       .sequence_number = new_seq_num,
       .timestamp_ms = model::timestamp::now(),
-      .summary = {
-          .operation = snapshot_operation::append,
-          .other = {},
-      },
+      .summary = std::move(new_summary),
       .manifest_list_path = new_mlist_path,
       .schema_id = table_.current_schema_id,
     };
@@ -296,10 +351,11 @@ ss::future<action::action_outcome> merge_append_action::build_updates() && {
           },
         });
     }
-    ret.requirements.emplace_back(table_requirement::assert_ref_snapshot_id{
-      .ref = "main",
-      .snapshot_id = old_snap_id,
-    });
+    ret.requirements.emplace_back(
+      table_requirement::assert_ref_snapshot_id{
+        .ref = "main",
+        .snapshot_id = old_snap_id,
+      });
     co_return ret;
 }
 
@@ -516,7 +572,7 @@ merge_append_action::merge_mfiles(
     }
 
     const auto merged_manifest_path = get_manifest_path(
-      table_.location, ctx.commit_uuid, generate_manifest_num());
+      table_, ctx.commit_uuid, generate_manifest_num());
     const auto mfile_up_res = co_await upload_as_manifest(
       merged_manifest_path, *schema, pspec, std::move(merged_entries));
     if (mfile_up_res.has_error()) {

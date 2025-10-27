@@ -15,6 +15,8 @@
 #include "cloud_storage/topic_mount_handler.h"
 #include "cluster/partition_leaders_table.h"
 #include "config/node_config.h"
+#include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "data_migration_frontend.h"
 #include "data_migration_types.h"
 #include "data_migration_worker.h"
@@ -24,6 +26,7 @@
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "ssx/async_algorithm.h"
@@ -81,11 +84,13 @@ ss::future<errc> retry_loop(retry_chain_node& rcn, TryFunc try_func) {
 backend::backend(
   migrations_table& table,
   frontend& frontend,
+  router& router,
   ss::sharded<worker>& worker,
   partition_leaders_table& leaders_table,
   topics_frontend& topics_frontend,
   topic_table& topic_table,
   shard_table& shard_table,
+  group_proxy& group_proxy,
   std::optional<std::reference_wrapper<cloud_storage::remote>>
     cloud_storage_api,
   std::optional<std::reference_wrapper<cloud_storage::topic_mount_handler>>
@@ -95,10 +100,12 @@ backend::backend(
   , _table(table)
   , _frontend(frontend)
   , _worker(worker)
+  , _router(router)
   , _leaders_table(leaders_table)
   , _topics_frontend(topics_frontend)
   , _topic_table(topic_table)
   , _shard_table(shard_table)
+  , _group_proxy(group_proxy)
   , _cloud_storage_api(cloud_storage_api)
   , _topic_mount_handler(topic_mount_handler)
   , _as(as) {}
@@ -108,17 +115,41 @@ ss::future<> backend::start() {
     vassert(
       ss::this_shard_id() == data_migrations_shard, "Called on wrong shard");
 
-    _is_raft0_leader = _is_coordinator
-      = _self == _leaders_table.get_leader(model::controller_ntp);
+    auto leader_term = _leaders_table.get_leader_term(model::controller_ntp);
+    if (leader_term && leader_term->leader == _self) {
+        _raft0_leader_term = _coordinator_term = leader_term->term;
+    }
+
     _plt_raft0_leadership_notification_id
       = _leaders_table.register_leadership_change_notification(
         model::controller_ntp,
-        [this](model::ntp, model::term_id, model::node_id leader_node_id) {
-            _is_raft0_leader = leader_node_id == _self;
-            if (_is_raft0_leader != _is_coordinator) {
-                ssx::spawn_with_gate(
-                  _gate, [this]() { return handle_raft0_leadership_update(); });
+        [this](
+          const model::ntp&,
+          model::term_id term,
+          model::node_id leader_node_id) {
+            std::optional<model::term_id> new_term_if_leader
+              = (leader_node_id == _self) ? std::make_optional(term)
+                                          : std::nullopt;
+            vlog(
+              dm_log.trace,
+              "_raft0_leader_term={}, new_term_if_leader={}",
+              _raft0_leader_term,
+              new_term_if_leader);
+
+            if (!new_term_if_leader && !_raft0_leader_term) {
+                // remaining a non-leader
+                return;
             }
+            if (
+              new_term_if_leader && _raft0_leader_term
+              && ((*new_term_if_leader)() - (*_raft0_leader_term)() == 1)) {
+                // remaining a leader, no other leaders between our terms
+                _raft0_leader_term = _coordinator_term = new_term_if_leader;
+                return;
+            }
+            _raft0_leader_term = new_term_if_leader;
+            ssx::spawn_with_gate(
+              _gate, [this]() { return handle_raft0_leadership_update(); });
         });
 
     _topic_table_notification_id = _topic_table.register_ntp_delta_notification(
@@ -180,6 +211,236 @@ ss::future<> backend::stop() {
     vlog(dm_log.info, "backend stopped");
 }
 
+ss::future<result<entities_status, errc>>
+backend::get_entities_status(id migration_id) {
+    // for safe async iteration
+    auto units = co_await _mutex.get_units(_as);
+    if (!_coordinator_term) {
+        vlog(dm_log.warn, "called on non-coordinator node {}", _self);
+        co_return errc::not_leader_controller;
+    }
+
+    const auto& maybe_meta = _table.get_migration(migration_id);
+    if (!maybe_meta) {
+        vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& meta = maybe_meta->get();
+
+    if (!std::holds_alternative<outbound_migration>(meta.migration)) {
+        vlog(dm_log.warn, "migration {} is not outbound", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+
+    if (meta.state != state::executed) {
+        vlog(
+          dm_log.warn,
+          "get_entities_status: migration {} is not in executed "
+          "state, current state: {}",
+          migration_id,
+          meta.state);
+        co_return errc::invalid_data_migration_state;
+    }
+
+    result<entities_status, errc> ret{entities_status{}};
+
+    auto holder = _gate.hold();
+
+    chunked_vector<partition_consumer_group_map_t::value_type>
+      groups_by_partition(
+        std::from_range,
+        build_migration_group_map(meta) | std::views::as_rvalue);
+    vlog(
+      dm_log.debug,
+      "get_entities_status: migration {}, groups by partition: {}",
+      migration_id,
+      groups_by_partition.size());
+    errc last_errc = errc::success;
+    co_await ss::parallel_for_each(
+      std::move(groups_by_partition), [this, &ret, &last_errc](auto&& pair) {
+          // TODO: retry per-partition
+          auto&& [pid, groups] = pair;
+          return _router
+            .get_group_offsets(
+              get_group_offsets_request(pid, std::move(groups)))
+            .then([&ret, pid, &last_errc](get_group_offsets_reply&& reply) {
+                if (!ret.has_value()) {
+                    // broken by one of the previous results
+                    return;
+                }
+                if (reply.ec != errc::success) {
+                    vlog(
+                      dm_log.warn,
+                      "get_group_offsets for partition {} failed: {}",
+                      pid,
+                      reply.ec);
+                    last_errc = reply.ec;
+                } else {
+                    std::ranges::move(
+                      std::move(reply.group_offsets),
+                      std::back_inserter(ret.assume_value().groups));
+                }
+            });
+      });
+    if (last_errc != errc::success) {
+        co_return last_errc;
+    }
+
+    co_return ret;
+}
+
+ss::future<errc>
+backend::set_entities_status(id migration_id, entities_status status) {
+    // for safe async iteration
+    auto units = co_await _mutex.get_units(_as);
+    vlog(
+      dm_log.trace,
+      "set_entities_status for {} with: {}",
+      migration_id,
+      status);
+    if (!_coordinator_term) {
+        vlog(dm_log.warn, "called on non-coordinator node {}", _self);
+        co_return errc::not_leader_controller;
+    }
+
+    const auto& maybe_meta = _table.get_migration(migration_id);
+    if (!maybe_meta) {
+        vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& meta = maybe_meta->get();
+
+    if (!std::holds_alternative<inbound_migration>(meta.migration)) {
+        vlog(dm_log.warn, "migration {} is not inbound", migration_id);
+        co_return errc::data_migration_not_exists;
+    }
+    const auto& migration = std::get<inbound_migration>(meta.migration);
+
+    switch (meta.state) {
+    case state::executing: {
+        auto migration_it = _migration_states.find(migration_id);
+        if (migration_it == _migration_states.end()) {
+            vlog(
+              dm_log.warn,
+              "reconciliation state for migration {} not found",
+              migration_id);
+            // assume we did not start to reconcile yet
+            co_return errc::invalid_data_migration_state;
+        }
+        auto& mrstate = migration_it->second;
+        if (mrstate.scope.sought_state != state::executed) {
+            // reconciliation is ahead
+            co_return errc::success;
+        }
+
+        vassert(
+          mrstate.partition_group_map, "partition group map must be filled");
+
+        // valid, as guarded by mutex
+        auto groups_topic_rstate_it = mrstate.outstanding_topics.find(
+          model::kafka_consumer_offsets_nt);
+        bool group_topic_outstanding = groups_topic_rstate_it
+                                       != mrstate.outstanding_topics.end();
+        if (!group_topic_outstanding) {
+            vlog(
+              dm_log.debug,
+              "kafka consumer offsets topic does not require approval"
+              "in migration {}, probably already done",
+              migration_id);
+        } else {
+            // reverse map is more to make sure we have data for exactly
+            // required groups rather than for lookup
+            chunked_hash_map<kafka::group_id, model::partition_id> rev_map;
+            rev_map.reserve(migration.groups.size());
+            for (const auto& [pid, groups] : *mrstate.partition_group_map) {
+                co_await ssx::async_for_each(
+                  groups, [&rev_map, pid](const kafka::group_id& group) {
+                      rev_map[group] = pid;
+                  });
+            }
+
+            chunked_hash_map<model::partition_id, group_offsets_snapshot>
+              requests;
+            requests.reserve(mrstate.partition_group_map->size());
+            for (auto p : *mrstate.partition_group_map | std::views::keys) {
+                requests[p].offsets_topic_pid = p;
+            };
+            co_await ssx::async_for_each(
+              std::move(status.groups),
+              [&rev_map, &requests, migration_id](group_offsets& group) {
+                  kafka::group_id gid{group.group_id};
+                  if (auto it = rev_map.find(gid);
+                      likely(it != rev_map.end())) {
+                      auto pid = it->second;
+                      requests[pid].groups.push_back(std::move(group));
+                  } else {
+                      vlog(
+                        dm_log.warn,
+                        "set_entities_status: group {} is not part of "
+                        "migration {}",
+                        group.group_id,
+                        migration_id);
+                  }
+              });
+
+            errc last_error = errc::success;
+            co_await ss::parallel_for_each(
+              *mrstate.partition_group_map,
+              [&requests, this, &last_error](const auto& pair) {
+                  auto& [pid, groups] = pair;
+                  auto& request = requests.at(pid);
+                  if (request.groups.empty()) {
+                      vlog(
+                        dm_log.debug,
+                        "set_entities_status: no groups for partition "
+                        "{}",
+                        pid);
+                      return ss::now();
+                  }
+                  return _router
+                    .set_group_offsets(
+                      set_group_offsets_request{std::move(request)})
+                    .then([&last_error](set_group_offsets_reply&& reply) {
+                        if (reply.ec != cluster::errc::success) {
+                            vlog(
+                              dm_log.warn,
+                              "set_group_offsets failed: {}",
+                              reply.ec);
+                            last_error = reply.ec;
+                        }
+                    });
+              });
+            if (last_error != errc::success) {
+                co_return last_error;
+            }
+
+            // old iterator may be invalidated
+            auto groups_topic_rstate_it = mrstate.outstanding_topics.find(
+              model::kafka_consumer_offsets_nt);
+            mrstate.entities_ready = true;
+            schedule_topic_work(groups_topic_rstate_it->first);
+        }
+
+        // 3) persist all-approved state
+        units.return_all();
+        wakeup();
+        vlog(dm_log.debug, "set_entities_status: migration={}", migration_id);
+        co_return errc::success;
+    }
+    case state::executed:
+        // already ahead
+        co_return errc::success;
+    default:
+        vlog(
+          dm_log.warn,
+          "get_entities_status: migration {} is not in executing or "
+          "executed state, current state: {}",
+          migration_id,
+          meta.state);
+        co_return errc::invalid_data_migration_state;
+    }
+}
+
 ss::future<> backend::loop_once() {
     try {
         co_await _sem.wait(_as);
@@ -199,6 +460,20 @@ ss::future<> backend::loop_once() {
     }
 }
 
+void backend::schedule_topic_work_if_partitions_ready(
+  const model::topic_namespace& tp_ns,
+  const backend::migration_reconciliation_state& mrstate) {
+    auto it = mrstate.outstanding_topics.find(tp_ns);
+    if (it == mrstate.outstanding_topics.end()) {
+        // topic already gone, it didn't need to wait for partition work
+        return;
+    }
+
+    if (it->second.all_partitions_ready()) {
+        schedule_topic_work(tp_ns);
+    }
+}
+
 ss::future<> backend::work_once() {
     vlog(dm_log.info, "begin backend work cycle");
     // process pending deltas
@@ -213,8 +488,14 @@ ss::future<> backend::work_once() {
         co_await ssx::async_for_each(
           response.actual_states, [this](const auto& ntp_resp) {
               if (auto rs_it = get_rstate(ntp_resp.migration, ntp_resp.state)) {
-                  mark_migration_step_done_for_ntp(
-                    (*rs_it)->second, ntp_resp.ntp);
+                  auto& mr_state = (*rs_it)->second;
+                  mark_migration_step_done_for_ntp(mr_state, ntp_resp.ntp);
+                  schedule_topic_work_if_partitions_ready(
+                    model::topic_namespace(
+                      ntp_resp.ntp.ns, ntp_resp.ntp.tp.topic),
+                    mr_state);
+                  // advance if done as a last step as it may invalidate the
+                  // reconciliation state iterator.
                   to_advance_if_done(*rs_it);
               }
           });
@@ -271,10 +552,11 @@ ss::future<> backend::work_once() {
               next_tick = std::min(deadline, next_tick);
           }
       });
+    _topic_work_to_retry.clear();
 
     // defer RPC retries and topic work
     // todo: configure timeout
-    auto new_deadline = now + 2s;
+    auto new_deadline = now + 500ms;
     for (const auto& node_id : rpc_responses | std::views::keys) {
         if (_node_states.contains(node_id)) {
             _nodes_to_retry.try_emplace(node_id, new_deadline);
@@ -303,10 +585,11 @@ ss::future<> backend::work_once() {
         _nodes_to_retry.erase(node_id);
         co_await send_rpc(node_id);
     }
-    for (const auto& nt : to_schedule_topic_work) {
-        _topic_work_to_retry.erase(nt);
-        co_await schedule_topic_work(nt);
-    }
+    co_await ssx::async_for_each(
+      to_schedule_topic_work, [this](const model::topic_namespace& nt) {
+          vlog(dm_log.debug, "rescheduling topic {} work", nt);
+          return schedule_topic_work(nt);
+      });
     spawn_advances();
     if (next_tick == model::timeout_clock::time_point::max()) {
         _timer.cancel();
@@ -406,22 +689,44 @@ ss::future<> backend::send_rpc(model::node_id node_id) {
       });
 }
 
-ss::future<> backend::schedule_topic_work(model::topic_namespace nt) {
+void backend::schedule_topic_work(model::topic_namespace nt) {
     auto it = _topic_migration_map.find(nt);
     if (it == _topic_migration_map.end()) {
-        co_return;
+        return;
     }
     auto migration_id = it->second;
 
     auto& mrstate = _migration_states.find(migration_id)->second;
-    auto& tstate = mrstate.outstanding_topics[nt];
+    auto& tstate = mrstate.outstanding_topics.at(nt);
+    vlog(
+      dm_log.trace,
+      "maybe scheduling topic work migration_id={} nt={}, "
+      "tstate.topic_work_needed={}, tstate.topic_scoped_work_done={}, "
+      "entities_ready={}",
+      migration_id,
+      nt,
+      tstate.topic_scoped_work_needed,
+      tstate.topic_scoped_work_done,
+      mrstate.entities_ready);
     if (!tstate.topic_scoped_work_needed || tstate.topic_scoped_work_done) {
-        co_return;
+        return;
+    }
+
+    if (nt == model::kafka_consumer_offsets_nt && !mrstate.entities_ready) {
+        // groups topic work must be scheduled only after entities are ready
+        return;
+    }
+    if (
+      mrstate.scope.wait_for_partition_work_to_finish
+      && !tstate.all_partitions_ready()) {
+        // waiting for partitions to finish first
+        vlog(dm_log.trace, "waiting for partitions to finish for nt={}", nt);
+        return;
     }
     const auto maybe_migration = _table.get_migration(migration_id);
     if (!maybe_migration) {
         vlog(dm_log.trace, "migration {} gone, ignoring", migration_id);
-        co_return;
+        return;
     }
     topic_work tw{
       .migration_id = migration_id,
@@ -429,11 +734,12 @@ ss::future<> backend::schedule_topic_work(model::topic_namespace nt) {
       .info = get_topic_work_info(nt, maybe_migration->get())};
 
     ssx::spawn_with_gate(
-      _gate, [this, nt = std::move(nt), tw = std::move(tw)]() {
-          return do_topic_work(nt, tw).then([this](topic_work_result&& twr) {
-              _topic_work_results.push_back(std::move(twr));
-              return wakeup();
-          });
+      _gate, [this, nt = std::move(nt), tw = std::move(tw)]() mutable {
+          return do_topic_work(std::move(nt), std::move(tw))
+            .then([this](topic_work_result&& twr) {
+                _topic_work_results.push_back(std::move(twr));
+                return wakeup();
+            });
       });
 }
 
@@ -442,31 +748,34 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     auto tsws = ss::make_lw_shared<topic_scoped_work_state>();
     while (true) {
         auto [it, ins] = _active_topic_work_states.try_emplace(nt);
-        it->second = tsws;
         if (ins) {
+            it->second = tsws;
             break;
         }
-        tsws->rcn().request_abort();
-        // waiting for existing work to complete and delete its entry
+        // delete existing work's entry
+        auto [_, old_tsws] = _active_topic_work_states.extract(it);
+        old_tsws->rcn().request_abort();
+        // wait for existing work to complete
+        vlog(
+          dm_log.info, "waiting for older topic work on nt={} to complete", nt);
+        auto old_ec = co_await old_tsws->future();
         vlog(
           dm_log.info,
-          "waiting for older topic work {} on nt={} to complete",
-          tw,
-          nt);
-        auto old_ec = co_await tsws->future();
-        vlog(
-          dm_log.info,
-          "older topic work {} on nt {} completed with {}",
-          tw,
+          "older topic work on nt={} completed with errc={}",
           nt,
           old_ec);
+        // carry over cached manifest, if any
+        if (old_tsws->cached_topic_manifest().has_value()) {
+            it->second->cache_topic_manifest(
+              std::move(*old_tsws).release_cached_topic_manifest().value());
+        }
     }
 
     errc ec;
     try {
         vlog(dm_log.debug, "doing topic work {} on nt={}", tw, nt);
         ec = co_await std::visit(
-          [this, &nt, &tw, tsws = std::move(tsws)](const auto& info) mutable {
+          [this, &nt, &tw, tsws](auto& info) mutable {
               return do_topic_work(nt, tw.sought_state, info, std::move(tsws));
           },
           tw.info);
@@ -487,9 +796,19 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     }
 
     auto it = _active_topic_work_states.find(nt);
-    vassert(it != _active_topic_work_states.end(), "tsws {} disappeared", nt);
-    it->second->set_value(ec);
-    _active_topic_work_states.erase(it);
+    if (it == _active_topic_work_states.end()) {
+        vlog(dm_log.info, "topic work state for nt {} disappeared", nt);
+    } else if (it->second != tsws) {
+        vlog(
+          dm_log.info,
+          "topic work state for nt {} was superseded by another task",
+          nt);
+    } else {
+        // only remove relevant entry
+        _active_topic_work_states.erase(it);
+    }
+    // but we have a handle to the state in any case
+    tsws->set_value(ec);
 
     co_return topic_work_result{
       .nt = std::move(nt),
@@ -506,22 +825,71 @@ ss::future<errc> backend::do_topic_work(
   tsws_lwptr_t tsws) {
     auto& rcn = tsws->rcn();
     // this switch should be in accordance to the logic in get_work_scope
+    if (nt == model::kafka_consumer_offsets_nt) {
+        co_return errc::success;
+    }
     switch (sought_state) {
-    case state::prepared:
-        co_return co_await retry_loop(rcn, [this, &nt, &itwi, &rcn] {
-            return create_topic(
-              nt, itwi.source, itwi.cloud_storage_location, rcn);
+    case state::prepared: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &rcn, &result] {
+            return prepare_mount_topic(nt, result.value(), rcn);
         });
-    case state::executed:
-        co_return co_await retry_loop(
-          rcn, [this, &nt, &rcn] { return prepare_mount_topic(nt, rcn); });
+    }
+    case state::executed: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &rcn, &result] {
+            return confirm_mount_topic(nt, result.value(), rcn);
+        });
+    }
     case state::finished: {
-        co_return co_await retry_loop(
-          rcn, [this, &nt, &rcn] { return confirm_mount_topic(nt, rcn); });
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            co_return result.error();
+        }
+
+        co_return co_await retry_loop(rcn, [this, &nt, &itwi, &rcn, &result] {
+            return create_topic(nt, itwi.source, result.value(), rcn);
+        });
     }
     case state::cancelled: {
+        auto result = co_await maybe_download_topic_manifest(
+          nt, itwi.source, itwi.cloud_storage_location, tsws);
+        if (result.has_error()) {
+            if (result.error() == errc::topic_not_exists) {
+                // topic manifest missing, nothing to unmount
+                vlog(
+                  dm_log.info,
+                  "topic {} manifest missing, nothing to unmount",
+                  nt);
+                co_return errc::success;
+            }
+
+            vlog(dm_log.warn, "topic {} manifest download failed", nt);
+            co_return errc::topic_operation_error;
+        }
+        auto& manifest = result.value().get();
+        auto& cfg = manifest.get_topic_config();
+        if (!cfg) {
+            vlog(
+              dm_log.warn,
+              "topic {} configuration missing in manifest, cannot unmount",
+              nt);
+            co_return errc::topic_operation_error;
+        }
         // attempt to unmount first
-        auto unmount_res = co_await unmount_topic(nt, rcn);
+        auto unmount_res = co_await unmount_not_existing_topic(
+          nt, manifest, rcn);
         if (unmount_res != errc::success) {
             vlog(
               dm_log.warn, "failed to unmount topic {}: {}", nt, unmount_res);
@@ -551,24 +919,18 @@ ss::future<errc> backend::do_topic_work(
     auto& rcn = tsws->rcn();
     // this switch should be in accordance to the logic in get_work_scope
     switch (sought_state) {
+    case state::executed: {
+        if (nt == model::kafka_consumer_offsets_nt) {
+            co_return errc::success;
+        }
+        co_return co_await unmount_topic(nt, rcn);
+    }
     case state::finished: {
-        // unmount first
-        auto unmount_res = co_await unmount_topic(nt, rcn);
-        if (unmount_res != errc::success) {
-            vlog(
-              dm_log.warn, "failed to unmount topic {}: {}", nt, unmount_res);
-            co_return unmount_res;
+        if (nt == model::kafka_consumer_offsets_nt) {
+            co_return errc::success;
         }
         // delete
         co_return co_await delete_topic(nt, rcn);
-    }
-    case state::cancelled: {
-        // Noop, we have it here only because reconciliation logic requires
-        // either topic or partition work. The topic is unmounted and deleted in
-        // cut_over state, which cannot be cancelled. So if we are here we only
-        // need to lift topic restrictions, which is performed by
-        // migrated_resources.
-        co_return errc::success;
     }
     default:
         vassert(
@@ -584,15 +946,36 @@ ss::future<> backend::abort_all_topic_work() {
         tsws->rcn().request_abort();
     }
     while (!_active_topic_work_states.empty()) {
+        vlog(
+          dm_log.info,
+          "waiting for {} topic work states to complete",
+          _active_topic_work_states.size());
+
         co_await _active_topic_work_states.begin()->second->future();
+
+        vlog(dm_log.info, "one topic work state completed");
     }
 }
-
-ss::future<errc> backend::create_topic(
-  const model::topic_namespace& local_nt,
+ss::future<
+  result<std::reference_wrapper<const cloud_storage::topic_manifest>, errc>>
+backend::maybe_download_topic_manifest(
+  const model::topic_namespace& nt,
   const std::optional<model::topic_namespace>& original_nt,
   const std::optional<cloud_storage_location>& storage_location,
-  retry_chain_node& rcn) {
+  tsws_lwptr_t tsws) {
+    if (tsws->cached_topic_manifest()) {
+        vlog(
+          dm_log.trace,
+          "using cached topic manifest for topic {} (location {})",
+          original_nt.value_or(nt),
+          storage_location);
+        co_return *tsws->cached_topic_manifest();
+    }
+    vlog(
+      dm_log.debug,
+      "downloading topic manifest for inbound migration topic {} (location {})",
+      original_nt.value_or(nt),
+      storage_location);
     // download manifest
     const auto& bucket_prop = cloud_storage::configuration::get_bucket_config();
     auto maybe_bucket = bucket_prop.value();
@@ -603,28 +986,54 @@ ss::future<errc> backend::create_topic(
       cloud_storage_clients::bucket_name{*maybe_bucket},
       storage_location ? std::make_optional(storage_location->hint)
                        : std::nullopt,
-      original_nt.value_or(local_nt),
+      original_nt.value_or(nt),
       _cloud_storage_api->get()); // checked in frontend::data_migrations_active
-    // todo: is it correct to rely on it checked in frontend?
-    // todo: configure timeout and backoff
+
     auto backoff = std::chrono::duration_cast<model::timestamp_clock::duration>(
-      rcn.get_backoff());
+      tsws->rcn().get_backoff());
     cloud_storage::topic_manifest tm;
     auto download_res = co_await tmd.download_manifest(
-      rcn, rcn.get_deadline(), backoff, &tm);
-    if (
-      !download_res.has_value()
-      || download_res.assume_value()
-           != cloud_storage::find_topic_manifest_outcome::success) {
+      tsws->rcn(), tsws->rcn().get_deadline(), backoff, &tm);
+    if (!download_res.has_value()) {
         vlog(
           dm_log.warn,
           "failed to download manifest for topic {} (storage_location {}): {}",
-          original_nt.value_or(local_nt),
+          original_nt.value_or(nt),
           storage_location,
           download_res);
         co_return errc::topic_operation_error;
     }
-    auto maybe_cfg = tm.get_topic_config();
+    auto download_result = download_res.value();
+    switch (download_result) {
+    case cloud_storage::find_topic_manifest_outcome::success:
+        tsws->cache_topic_manifest(std::move(tm));
+        co_return tsws->cached_topic_manifest().value();
+    case cloud_storage::find_topic_manifest_outcome::no_matching_manifest:
+        vlog(
+          dm_log.warn,
+          "no matching manifest found for topic {} (storage_location {})",
+          original_nt.value_or(nt),
+          storage_location);
+        // map not matching
+        co_return errc::topic_not_exists;
+    case cloud_storage::find_topic_manifest_outcome::
+      multiple_matching_manifests:
+        vlog(
+          dm_log.warn,
+          "multiple matching manifests found for topic {} (storage_location "
+          "{})",
+          original_nt.value_or(nt),
+          storage_location);
+        co_return errc::topic_operation_error;
+    }
+}
+
+ss::future<errc> backend::create_topic(
+  const model::topic_namespace& local_nt,
+  const std::optional<model::topic_namespace>& original_nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto maybe_cfg = manifest.get_topic_config();
     if (!maybe_cfg) {
         co_return errc::topic_invalid_config;
     }
@@ -633,7 +1042,8 @@ ss::future<errc> backend::create_topic(
       local_nt.ns,
       local_nt.tp,
       maybe_cfg->partition_count,
-      maybe_cfg->replication_factor);
+      maybe_cfg->replication_factor,
+      maybe_cfg->tp_id);
     auto& topic_properties = topic_to_create_cfg.properties;
 
     // copy all properties
@@ -645,7 +1055,7 @@ ss::future<errc> backend::create_topic(
         topic_properties.remote_topic_namespace_override = original_nt;
     }
     topic_properties.remote_topic_properties.emplace(
-      tm.get_revision(), maybe_cfg->partition_count);
+      manifest.get_revision(), maybe_cfg->partition_count);
     topic_properties.shadow_indexing = model::shadow_indexing_mode::full;
     topic_properties.recovery = true;
     topic_properties.read_replica = {};
@@ -669,24 +1079,24 @@ ss::future<errc> backend::create_topic(
 }
 
 ss::future<errc> backend::prepare_mount_topic(
-  const model::topic_namespace& nt, retry_chain_node& rcn) {
-    auto cfg = _topic_table.get_topic_cfg(nt);
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
     if (!cfg) {
-        co_return errc::topic_not_exists;
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot prepare mount",
+          nt);
+        co_return errc::topic_operation_error;
     }
-
-    auto rev_id = _topic_table.get_initial_revision(nt);
-    if (!rev_id) {
-        co_return errc::topic_not_exists;
-    }
-
     vlog(
       dm_log.info,
       "trying to prepare mount topic, cfg={}, rev_id={}",
-      *cfg,
-      *rev_id);
+      manifest.get_topic_config(),
+      manifest.get_revision());
     auto mnt_res = co_await _topic_mount_handler->get().prepare_mount_topic(
-      *cfg, *rev_id, rcn);
+      cfg.value(), manifest.get_revision(), rcn);
     if (mnt_res == cloud_storage::topic_mount_result::mount_manifest_exists) {
         co_return errc::success;
     }
@@ -695,24 +1105,30 @@ ss::future<errc> backend::prepare_mount_topic(
 }
 
 ss::future<errc> backend::confirm_mount_topic(
-  const model::topic_namespace& nt, retry_chain_node& rcn) {
-    auto cfg = _topic_table.get_topic_cfg(nt);
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
     if (!cfg) {
-        co_return errc::topic_not_exists;
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot prepare mount",
+          nt);
+        co_return errc::topic_operation_error;
     }
-
-    auto rev_id = _topic_table.get_initial_revision(nt);
-    if (!rev_id) {
-        co_return errc::topic_not_exists;
-    }
+    vlog(
+      dm_log.info,
+      "trying to commit mount topic, cfg={}, rev_id={}",
+      manifest.get_topic_config(),
+      manifest.get_revision());
 
     vlog(
       dm_log.info,
       "trying to confirm mount topic, cfg={}, rev_id={}",
-      *cfg,
-      *rev_id);
+      manifest.get_topic_config(),
+      manifest.get_revision());
     auto mnt_res = co_await _topic_mount_handler->get().confirm_mount_topic(
-      *cfg, *rev_id, rcn);
+      *cfg, manifest.get_revision(), rcn);
     if (
       mnt_res
       != cloud_storage::topic_mount_result::mount_manifest_not_deleted) {
@@ -737,6 +1153,39 @@ backend::delete_topic(const model::topic_namespace& nt, retry_chain_node& rcn) {
     });
 }
 
+ss::future<errc> backend::unmount_not_existing_topic(
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    return retry_loop(rcn, [this, &nt, &manifest, &rcn] {
+        return do_unmount_not_existing_topic(nt, manifest, rcn);
+    });
+}
+
+ss::future<errc> backend::do_unmount_not_existing_topic(
+  const model::topic_namespace& nt,
+  const cloud_storage::topic_manifest& manifest,
+  retry_chain_node& rcn) {
+    auto& cfg = manifest.get_topic_config();
+    if (!cfg) {
+        vlog(
+          dm_log.warn,
+          "topic {} configuration missing in manifest, cannot unmount",
+          nt);
+        co_return errc::topic_operation_error;
+    }
+
+    auto rev_id = manifest.get_revision();
+
+    auto umnt_res = co_await _topic_mount_handler->get().unmount_topic(
+      *cfg, rev_id, rcn);
+    if (umnt_res == cloud_storage::topic_unmount_result::success) {
+        co_return errc::success;
+    }
+    vlog(dm_log.warn, "failed to unmount topic {}: {}", nt, umnt_res);
+    co_return errc::topic_operation_error;
+}
+
 ss::future<errc> backend::unmount_topic(
   const model::topic_namespace& nt, retry_chain_node& rcn) {
     return retry_loop(
@@ -745,6 +1194,7 @@ ss::future<errc> backend::unmount_topic(
 
 ss::future<errc> backend::do_unmount_topic(
   const model::topic_namespace& nt, retry_chain_node& rcn) {
+    vlog(dm_log.trace, "trying to unmount {} topic", nt);
     auto cfg = _topic_table.get_topic_cfg(nt);
     if (!cfg) {
         vlog(dm_log.warn, "topic {} missing, ignoring", nt);
@@ -832,24 +1282,25 @@ ss::future<> backend::handle_raft0_leadership_update() {
     auto units = co_await _mutex.get_units(_as);
     vlog(
       dm_log.trace,
-      "_is_raft0_leader={}, _is_coordinator={}",
-      _is_raft0_leader,
-      _is_coordinator);
-    if (_is_raft0_leader == _is_coordinator) {
+      "_raft0_leader_term={}, _coordinator_term={}",
+      _raft0_leader_term,
+      _coordinator_term);
+    if (_raft0_leader_term == _coordinator_term) {
+        // multiple leadership updates have been handled in an earlier call
         co_return;
     }
-    _is_coordinator = _is_raft0_leader;
-    if (_is_coordinator) {
-        vlog(dm_log.debug, "stepping up as a coordinator");
-        // start coordinating
-        for (auto& [id, mrstate] : _migration_states) {
-            for (auto& [nt, tstate] : mrstate.outstanding_topics) {
-                co_await reconcile_existing_topic(
-                  nt, tstate, id, mrstate.scope, false);
-            }
-        }
-        wakeup();
-    } else {
+
+    auto old_coordinator_term = _coordinator_term;
+    _coordinator_term = _raft0_leader_term;
+
+    // We need to restart coordinating if another node have been a leader and
+    // potentially a coordinator between our coordinatorship terms.
+    // This is to recollect metadata of affected topics. While
+    // data_migrated_resources guards from topic metadata changes in presence of
+    // an active migration, another coordinator may have start or complete
+    // migrations between our terms.
+
+    if (old_coordinator_term) {
         vlog(dm_log.debug, "stepping down as a coordinator");
         // stop topic-scoped work
         co_await abort_all_topic_work();
@@ -863,6 +1314,18 @@ ss::future<> backend::handle_raft0_leadership_update() {
         _node_states.clear();
         _topic_work_to_retry.clear();
     }
+
+    if (_coordinator_term) {
+        vlog(dm_log.debug, "stepping up as a coordinator");
+        // start coordinating
+        for (auto& [id, mrstate] : _migration_states) {
+            for (auto& [nt, tstate] : mrstate.outstanding_topics) {
+                co_await reconcile_existing_topic(
+                  nt, tstate, id, mrstate.scope, false);
+            }
+        }
+        wakeup();
+    }
 }
 
 ss::future<> backend::handle_migration_update(id id) {
@@ -872,12 +1335,10 @@ ss::future<> backend::handle_migration_update(id id) {
 
     auto new_ref = _table.get_migration(id);
     // copying as it may go from the table on scheduling points
-    auto new_metadata = new_ref ? std::make_optional<migration_metadata>(
-                                    new_ref->get().copy())
-                                : std::nullopt;
-    auto new_state = new_metadata
-                       ? std::make_optional<state>(new_metadata->state)
-                       : std::nullopt;
+    auto new_metadata = new_ref.transform(
+      [](const auto& new_ref) { return new_ref.get().copy(); });
+    auto new_state = new_metadata.transform(
+      [](const auto& md) { return md.state; });
     vlog(dm_log.debug, "migration {} new state is {}", id, new_state);
 
     work_scope new_scope;
@@ -885,8 +1346,10 @@ ss::future<> backend::handle_migration_update(id id) {
         new_scope = get_work_scope(*new_metadata);
     }
 
+    std::optional<partition_consumer_group_map_t> group_map;
+
     // forget about the migration if it went forward or is gone
-    auto old_it = std::as_const(_migration_states).find(id);
+    auto old_it = _migration_states.find(id);
     if (old_it != _migration_states.cend()) {
         const migration_reconciliation_state& old_mrstate = old_it->second;
         vlog(
@@ -901,6 +1364,7 @@ ss::future<> backend::handle_migration_update(id id) {
           old_mrstate.scope.sought_state,
           new_state);
         vlog(dm_log.debug, "dropping migration {} reconciliation state", id);
+        group_map.emplace(std::move(*old_it->second.partition_group_map));
         co_await drop_migration_reconciliation_rstate(old_it);
     }
     // delete old advance requests
@@ -913,7 +1377,12 @@ ss::future<> backend::handle_migration_update(id id) {
     if (new_scope.sought_state) {
         vlog(dm_log.debug, "creating migration {} reconciliation state", id);
         auto new_it = _migration_states.emplace_hint(old_it, id, new_scope);
-        if (new_scope.topic_work_needed || new_scope.partition_work_needed) {
+        if (
+          new_scope.topic_work_needed
+          || new_scope.any_partition_work_needed()) {
+            if (group_map) {
+                new_it->second.partition_group_map = std::move(*group_map);
+            }
             co_await reconcile_migration(new_it->second, *new_metadata);
         } else {
             // yes it is done as there is nothing to do
@@ -921,7 +1390,7 @@ ss::future<> backend::handle_migration_update(id id) {
         }
     }
 
-    if (new_scope.sought_state && _is_coordinator) {
+    if (new_scope.sought_state && _coordinator_term) {
         wakeup();
     }
 }
@@ -954,11 +1423,11 @@ ss::future<> backend::process_delta(cluster::topic_table_ntp_delta&& delta) {
       migration_id);
     auto& mrstate = _migration_states.find(migration_id)->second;
     if (
-      !mrstate.scope.partition_work_needed
+      !mrstate.scope.partition_work_needed(nt)
       && !mrstate.scope.topic_work_needed) {
         co_return;
     }
-    auto& tstate = mrstate.outstanding_topics[nt];
+    auto& tstate = mrstate.outstanding_topics.at(nt);
     clear_tstate_belongings(nt, tstate);
     tstate.clear();
     // We potentially re-enqueue an already coordinated partition here.
@@ -971,7 +1440,8 @@ ss::future<> backend::process_delta(cluster::topic_table_ntp_delta&& delta) {
         _local_work_states[nt].try_emplace(
           delta.ntp.tp.partition,
           migration_id,
-          *_migration_states.find(migration_id)->second.scope.sought_state);
+          *_migration_states.find(migration_id)->second.scope.sought_state,
+          migrated_replica_status::waiting_for_rpc);
     } else {
         auto topic_work_it = _local_work_states.find(nt);
         if (topic_work_it != _local_work_states.end()) {
@@ -980,10 +1450,7 @@ ss::future<> backend::process_delta(cluster::topic_table_ntp_delta&& delta) {
             if (rwstate_it != topic_work_state.end()) {
                 auto& rwstate = rwstate_it->second;
                 if (rwstate.shard) {
-                    stop_partition_work(
-                      model::topic_namespace_view{delta.ntp},
-                      delta.ntp.tp.partition,
-                      rwstate);
+                    stop_partition_work(delta.ntp, rwstate);
                 }
                 topic_work_state.erase(rwstate_it);
                 if (topic_work_state.empty()) {
@@ -1043,47 +1510,64 @@ backend::check_ntp_states_locally(check_ntp_states_request&& req) {
             continue;
         }
 
-        auto maybe_rwstate = get_replica_work_state(ntp_req.ntp);
-        if (!maybe_rwstate) {
-            vlog(
-              dm_log.debug,
-              "migration_id={} got RPC to move ntp {} to state {}, but "
-              "missing partition state for it",
-              ntp_req.migration,
-              ntp_req.ntp,
-              ntp_req.state);
-            continue;
-        }
-        auto& rwstate = maybe_rwstate->get();
-        if (ntp_req.state != rwstate.sought_state) {
+        auto& topic_work_state
+          = _local_work_states[model::topic_namespace_view{ntp_req.ntp}];
+        auto& rwstate
+          = topic_work_state
+              .try_emplace(
+                ntp_req.ntp.tp.partition,
+                ntp_req.migration,
+                ntp_req.state,
+                migrated_replica_status::waiting_for_controller_update)
+              .first->second;
+
+        if (ntp_req.migration != rwstate.migration_id) {
             vlog(
               dm_log.warn,
-              "migration_id={} got RPC to move ntp {} to state {}, but in "
-              "raft0 its desired state is {}, ignoring",
+              "migration_id={} got RPC to move ntp {} to state {}, but current "
+              "migration id is {}, ignoring",
               ntp_req.migration,
               ntp_req.ntp,
               ntp_req.state,
-              metadata.state);
+              rwstate.migration_id);
             continue;
         }
-        vlog(
-          dm_log.trace,
-          "migration_id={} got both RPC and raft0 message to move ntp {} "
-          "to "
-          "state {}, replica state is {}",
-          ntp_req.migration,
-          ntp_req.ntp,
-          ntp_req.state,
-          rwstate.status);
-        // raft0 and RPC agree => time to do it!
+
+        if (ntp_req.state > rwstate.sought_state) {
+            // RPC request indicates that partition work has already progressed
+            // to a later state. Stop current work and wait for the controller
+            // update.
+            if (rwstate.shard) {
+                stop_partition_work(ntp_req.ntp, rwstate);
+            }
+            rwstate = replica_work_state(
+              ntp_req.migration,
+              ntp_req.state,
+              migrated_replica_status::waiting_for_controller_update);
+        } else if (ntp_req.state < rwstate.sought_state) {
+            vlog(
+              dm_log.warn,
+              "migration_id={} got RPC to move ntp {} to state {}, but current "
+              "replica work state is {}, ignoring",
+              ntp_req.migration,
+              ntp_req.ntp,
+              ntp_req.state,
+              rwstate);
+            continue;
+        }
+
         switch (rwstate.status) {
+        case migrated_replica_status::waiting_for_controller_update:
+            break;
         case migrated_replica_status::waiting_for_rpc:
+            // raft0 and RPC agree => time to do it!
             rwstate.status = migrated_replica_status::can_run;
             [[fallthrough]];
         case migrated_replica_status::can_run: {
             auto new_shard = _shard_table.shard_for(ntp_req.ntp);
             update_partition_shard(ntp_req.ntp, rwstate, new_shard);
-        } break;
+            break;
+        }
         case migrated_replica_status::done:
             reply.actual_states.push_back(
               {.ntp = ntp_req.ntp,
@@ -1111,8 +1595,7 @@ void backend::update_partition_shard(
       new_shard);
     if (new_shard != rwstate.shard) {
         if (rwstate.shard) {
-            stop_partition_work(
-              model::topic_namespace_view{ntp}, ntp.tp.partition, rwstate);
+            stop_partition_work(ntp, rwstate);
         }
         rwstate.shard = new_shard;
         if (new_shard) {
@@ -1159,7 +1642,8 @@ backend::clear_tstate(const topic_map_t::value_type& topic_map_entry) {
           topic_work_state, [this, &nt](auto& partition_local_work_entry) {
               auto& [partition_id, rwstate] = partition_local_work_entry;
               if (rwstate.shard) {
-                  stop_partition_work(nt, partition_id, rwstate);
+                  stop_partition_work(
+                    model::ntp(nt.ns, nt.tp, partition_id), rwstate);
               }
           });
     }
@@ -1178,7 +1662,7 @@ ss::future<> backend::reconcile_existing_topic(
   id migration,
   work_scope scope,
   bool schedule_local_partition_work) {
-    if (!schedule_local_partition_work && !_is_coordinator) {
+    if (!schedule_local_partition_work && !_coordinator_term) {
         vlog(
           dm_log.debug,
           "not tracking topic {} transition towards state {} as part of "
@@ -1191,85 +1675,122 @@ ss::future<> backend::reconcile_existing_topic(
     vlog(
       dm_log.debug,
       "tracking topic {} transition towards state {} as part of "
-      "migration {}, schedule_local_work={}, _is_coordinator={}",
+      "migration {}, schedule_local_work={}, _coordinator_term={}",
       nt,
       scope.sought_state,
       migration,
       schedule_local_partition_work,
-      _is_coordinator);
+      _coordinator_term);
     auto now = model::timeout_clock::now();
-    if (scope.partition_work_needed) {
-        if (auto maybe_assignments = _topic_table.get_topic_assignments(nt)) {
-            co_await ssx::async_for_each(
-              *maybe_assignments | std::views::values,
-              [this,
-               nt,
-               &tstate,
-               scope,
-               migration,
-               now,
-               schedule_local_partition_work](const auto& assignment) {
-                  model::ntp ntp{nt.ns, nt.tp, assignment.id};
-                  auto nodes = assignment.replicas
-                               | std::views::transform(
-                                 &model::broker_shard::node_id);
-                  if (_is_coordinator) {
-                      auto [it, ins] = tstate.outstanding_partitions.emplace(
-                        std::piecewise_construct,
-                        std::tuple{assignment.id},
-                        std::tuple{nodes.begin(), nodes.end()});
+    if (scope.partition_work_needed(nt)) {
+        co_await ssx::async_for_each(
+          get_topic_assignments(nt, migration),
+          [this,
+           nt,
+           &tstate,
+           scope,
+           migration,
+           now,
+           schedule_local_partition_work](const auto& assignment) {
+              model::ntp ntp{nt.ns, nt.tp, assignment.id};
+              auto nodes = assignment.replicas
+                           | std::views::transform(
+                             &model::broker_shard::node_id);
+              if (_coordinator_term) {
+                  auto [it, ins] = tstate.outstanding_partitions.emplace(
+                    std::piecewise_construct,
+                    std::tuple{assignment.id},
+                    std::tuple{nodes.begin(), nodes.end()});
+                  vassert(
+                    ins,
+                    "tried to repeatedly track partition {} "
+                    "as part of migration {}",
+                    ntp,
+                    migration);
+              }
+              for (const auto& node_id : nodes) {
+                  if (_coordinator_term) {
+                      auto [it, ins] = _node_states[node_id].emplace(
+                        ntp, migration);
                       vassert(
                         ins,
-                        "tried to repeatedly track partition {} "
-                        "as part of migration {}",
+                        "tried to track partition {} on node {} as part of "
+                        "migration {}, while it is already tracked as part "
+                        "of migration {}",
                         ntp,
-                        migration);
+                        node_id,
+                        migration,
+                        it->second);
+                      _nodes_to_retry.insert_or_assign(node_id, now);
                   }
-                  for (const auto& node_id : nodes) {
-                      if (_is_coordinator) {
-                          auto [it, ins] = _node_states[node_id].emplace(
-                            ntp, migration);
-                          vassert(
-                            ins,
-                            "tried to track partition {} on node {} as part of "
-                            "migration {}, while it is already tracked as part "
-                            "of migration {}",
-                            ntp,
-                            node_id,
+                  if (schedule_local_partition_work && _self == node_id) {
+                      vlog(
+                        dm_log.debug,
+                        "tracking ntp {} transition towards state {} as "
+                        "part of migration {}",
+                        ntp,
+                        scope.sought_state,
+                        migration);
+                      auto& topic_work_state = _local_work_states[nt];
+                      auto [it, _] = topic_work_state.try_emplace(
+                        assignment.id,
+                        migration,
+                        *scope.sought_state,
+                        migrated_replica_status::waiting_for_rpc);
+                      auto& rwstate = it->second;
+                      if (
+                        rwstate.migration_id != migration
+                        || rwstate.sought_state < *scope.sought_state) {
+                          if (it->second.shard) {
+                              stop_partition_work(ntp, rwstate);
+                          }
+                          rwstate = replica_work_state{
                             migration,
-                            it->second);
-                          _nodes_to_retry.insert_or_assign(node_id, now);
+                            *scope.sought_state,
+                            migrated_replica_status::waiting_for_rpc};
                       }
-                      if (schedule_local_partition_work && _self == node_id) {
-                          vlog(
-                            dm_log.debug,
-                            "tracking ntp {} transition towards state {} as "
-                            "part of migration {}",
-                            ntp,
-                            scope.sought_state,
-                            migration);
-                          auto& topic_work_state = _local_work_states[nt];
-                          auto [it, _] = topic_work_state.try_emplace(
-                            assignment.id, migration, *scope.sought_state);
-                          auto& rwstate = it->second;
-                          if (
-                            rwstate.sought_state != scope.sought_state
-                            || rwstate.migration_id != migration) {
-                              if (it->second.shard) {
-                                  stop_partition_work(
-                                    nt, assignment.id, rwstate);
-                              }
-                              rwstate = {migration, *scope.sought_state};
+                      if (rwstate.sought_state == *scope.sought_state) {
+                          switch (rwstate.status) {
+                          case migrated_replica_status::
+                            waiting_for_controller_update:
+                              rwstate.status = migrated_replica_status::can_run;
+                              [[fallthrough]];
+                          case migrated_replica_status::can_run: {
+                              auto new_shard = _shard_table.shard_for(ntp);
+                              update_partition_shard(ntp, rwstate, new_shard);
+                              break;
+                          }
+                          case migrated_replica_status::waiting_for_rpc:
+                          case migrated_replica_status::done:
+                              break;
                           }
                       }
                   }
-              });
-        }
+              }
+          });
     }
-    if (_is_coordinator && scope.topic_work_needed) {
+    if (_coordinator_term && scope.topic_work_needed) {
         tstate.topic_scoped_work_needed = true;
         _topic_work_to_retry.insert_or_assign(nt, now);
     }
+}
+
+backend::partition_consumer_group_map_t
+backend::build_migration_group_map(const migration_metadata& metadata) const {
+    partition_consumer_group_map_t ret;
+    const auto& groups = std::visit(
+      [](const auto& migration) -> const chunked_vector<consumer_group>& {
+          return migration.groups;
+      },
+      metadata.migration);
+
+    for (const auto& group : groups) {
+        auto partition = _group_proxy.partition_for(group);
+        vassert(partition, "cannot get ntp for group {}", group);
+        auto [it, ins] = ret.try_emplace(*partition);
+        it->second.push_back(group);
+    }
+    return ret;
 }
 
 ss::future<> backend::reconcile_migration(
@@ -1279,6 +1800,12 @@ ss::future<> backend::reconcile_migration(
       "tracking migration {} transition towards state {}",
       metadata.id,
       mrstate.scope.sought_state);
+
+    if (!mrstate.partition_group_map) {
+        mrstate.partition_group_map.emplace(
+          build_migration_group_map(metadata));
+    }
+
     co_await std::visit(
       [this, migration_id = metadata.id, &mrstate](
         const auto& migration) mutable {
@@ -1306,6 +1833,11 @@ ss::future<> backend::reconcile_topic(
   size_t idx_in_migration,
   const model::topic_namespace& nt,
   migration_reconciliation_state& mrstate) {
+    if (
+      !mrstate.scope.topic_work_needed
+      && !mrstate.scope.partition_work_needed(nt)) {
+        co_return;
+    }
     auto& tstate = mrstate.outstanding_topics[nt];
     tstate.idx_in_migration = idx_in_migration;
     _topic_migration_map.emplace(nt, migration_id);
@@ -1326,24 +1858,54 @@ backend::get_replica_work_state(const model::ntp& ntp) {
     return std::nullopt;
 }
 
+const inbound_topic& backend::get_inbound_topic(
+  const model::topic_namespace_view& nt,
+  const inbound_migration& im,
+  id migration_id) const {
+    auto it = _migration_states.find(migration_id);
+    vassert(
+      it != _migration_states.end(),
+      "migration {} not found in migration states",
+      migration_id);
+    auto idx = it->second.outstanding_topics.at(nt).idx_in_migration;
+    vlog(
+      dm_log.trace,
+      "get_inbound_topic: migration {}, topic {}, idx {}, topics: {}",
+      migration_id,
+      nt,
+      idx,
+      im.topics);
+    return im.topics[idx];
+}
+
 inbound_partition_work_info backend::get_partition_work_info(
-  const model::ntp& ntp, const inbound_migration& im, id migration_id) {
-    auto idx = _migration_states.find(migration_id)
-                 ->second.outstanding_topics[{ntp.ns, ntp.tp.topic}]
-                 .idx_in_migration;
-    auto& inbound_topic = im.topics[idx];
+  const model::ntp& ntp, const inbound_migration& im, id migration_id) const {
+    if (model::topic_namespace_view{ntp} == model::kafka_consumer_offsets_nt) {
+        const auto& mrstate = _migration_states.find(migration_id)->second;
+        return {
+          .groups = mrstate.partition_group_map->at(ntp.tp.partition).copy()};
+    }
+    const auto& inbound_topic = get_inbound_topic(
+      {ntp.ns, ntp.tp.topic}, im, migration_id);
     return {
       .source = inbound_topic.source_topic_name,
       .cloud_storage_location = inbound_topic.cloud_storage_location};
 }
 
 outbound_partition_work_info backend::get_partition_work_info(
-  const model::ntp&, const outbound_migration& om, id) {
-    return {om.copy_to};
+  const model::ntp& ntp, const outbound_migration& om, id migration_id) const {
+    outbound_partition_work_info ret = {.copy_to = om.copy_to};
+
+    if (model::topic_namespace_view{ntp} == model::kafka_consumer_offsets_nt) {
+        const auto& mrstate = _migration_states.find(migration_id)->second;
+        ret.groups = mrstate.partition_group_map->at(ntp.tp.partition).copy();
+    }
+
+    return ret;
 }
 
 partition_work_info backend::get_partition_work_info(
-  const model::ntp& ntp, const migration_metadata& metadata) {
+  const model::ntp& ntp, const migration_metadata& metadata) const {
     return std::visit(
       [this, &ntp, &metadata](auto& migration) -> partition_work_info {
           return get_partition_work_info(ntp, migration, metadata.id);
@@ -1354,11 +1916,12 @@ partition_work_info backend::get_partition_work_info(
 inbound_topic_work_info backend::get_topic_work_info(
   const model::topic_namespace& nt,
   const inbound_migration& im,
-  id migration_id) {
-    auto idx = _migration_states.find(migration_id)
-                 ->second.outstanding_topics[nt]
-                 .idx_in_migration;
-    auto& inbound_topic = im.topics[idx];
+  id migration_id) const {
+    if (nt == model::kafka_consumer_offsets_nt) {
+        return {};
+    }
+    const auto& inbound_topic = get_inbound_topic(nt, im, migration_id);
+
     return {
       .source = inbound_topic.alias
                   ? std::make_optional(inbound_topic.source_topic_name)
@@ -1367,12 +1930,12 @@ inbound_topic_work_info backend::get_topic_work_info(
 }
 
 outbound_topic_work_info backend::get_topic_work_info(
-  const model::topic_namespace&, const outbound_migration& om, id) {
+  const model::topic_namespace&, const outbound_migration& om, id) const {
     return {om.copy_to};
 }
 
 topic_work_info backend::get_topic_work_info(
-  const model::topic_namespace& nt, const migration_metadata& metadata) {
+  const model::topic_namespace& nt, const migration_metadata& metadata) const {
     return std::visit(
       [this, &nt, &metadata](auto& migration) -> topic_work_info {
           return get_topic_work_info(nt, migration, metadata.id);
@@ -1440,26 +2003,25 @@ void backend::start_partition_work(
 }
 
 void backend::stop_partition_work(
-  model::topic_namespace_view nt,
-  model::partition_id partition_id,
-  const backend::replica_work_state& rwstate) {
+  model::ntp ntp, const backend::replica_work_state& rwstate) {
     vlog(
       dm_log.info,
       "while working on migration {}, asking worker on shard "
-      "{} to stop trying to advance ntp {}/{} to state {}",
+      "{} to stop trying to advance ntp {} to state {}",
       rwstate.migration_id,
       rwstate.shard,
-      nt,
-      partition_id,
+      ntp,
       rwstate.sought_state);
-    ssx::spawn_with_gate(_gate, [this, &rwstate, &nt, &partition_id]() {
-        return _worker.invoke_on(
-          *rwstate.shard,
-          &worker::abort_partition_work,
-          model::ntp{nt.ns, nt.tp, partition_id},
-          rwstate.migration_id,
-          rwstate.sought_state);
-    });
+    ssx::spawn_with_gate(
+      _gate,
+      [this,
+       &ntp,
+       id = rwstate.migration_id,
+       shard = rwstate.shard.value(),
+       state = rwstate.sought_state] {
+          return _worker.invoke_on(
+            shard, &worker::abort_partition_work, std::move(ntp), id, state);
+      });
 }
 
 void backend::on_partition_work_completed(
@@ -1514,7 +2076,7 @@ backend::get_work_scope(const migration_metadata& metadata) {
                   // we'd like to investigate how it happened.
                   break;
               case state::deleted:
-                  vassert(false, "A migration cannot be in a deleted state");
+                  vunreachable("A migration cannot be in a deleted state");
               case state::preparing:
               case state::executing:
               case state::cut_over:
@@ -1536,15 +2098,50 @@ backend::work_scope backend::get_work_scope(
   const migration_metadata& metadata) {
     switch (metadata.state) {
     case state::preparing:
-        return {state::prepared, false, true};
+        return {
+          .sought_state = state::prepared,
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::executing:
-        return {state::executed, false, true};
+        return {
+          .sought_state = state::executed,
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = true,
+          .needs_entity_state_update = true,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::cut_over:
-        return {state::finished, false, true};
+        return {
+          .sought_state = state::finished,
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::canceling:
-        return {state::cancelled, false, true};
+        return {
+          .sought_state = state::cancelled,
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     default:
-        return {{}, false, false};
+        return {
+          .sought_state = {},
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = false,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     };
 }
 
@@ -1553,15 +2150,49 @@ backend::work_scope backend::get_work_scope(
   const migration_metadata& metadata) {
     switch (metadata.state) {
     case state::preparing:
-        return {state::prepared, true, false};
+        return {
+          .sought_state = state::prepared,
+          .data_partition_work_needed = true,
+          .co_partition_work_needed = false,
+          .topic_work_needed = false,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     case state::executing:
-        return {state::executed, true, false};
+        return {
+          .sought_state = state::executed,
+          .data_partition_work_needed = true,
+          .co_partition_work_needed = true,
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false};
     case state::cut_over:
-        return {state::finished, false, true};
+        return {
+          .sought_state = state::finished,
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = true,
+          .topic_work_needed = true,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = true,
+        };
     case state::canceling:
-        return {state::cancelled, true, true};
+        return {
+          .sought_state = state::cancelled,
+          .data_partition_work_needed = true,
+          .co_partition_work_needed = true,
+          .topic_work_needed = false,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     default:
-        return {{}, false, false};
+        return {
+          .sought_state = {},
+          .data_partition_work_needed = false,
+          .co_partition_work_needed = false,
+          .topic_work_needed = false,
+          .needs_entity_state_update = false,
+          .wait_for_partition_work_to_finish = false,
+        };
     };
 }
 
@@ -1590,6 +2221,61 @@ void backend::topic_scoped_work_state::set_value(errc ec) {
 
 ss::future<errc> backend::topic_scoped_work_state::future() {
     return _promise.get_shared_future();
+}
+
+std::ostream&
+operator<<(std::ostream& os, const backend::replica_work_state& rws) {
+    fmt::print(
+      os,
+      "{{migration {}, sought_state: {}, shard: {}, status: {}}}",
+      rws.migration_id,
+      rws.sought_state,
+      rws.shard,
+      rws.status);
+    return os;
+}
+
+chunked_vector<partition_assignment>
+backend::get_topic_assignments(const model::topic_namespace& nt, const id id) {
+    auto maybe_assignments = _topic_table.get_topic_assignments(nt);
+    if (!maybe_assignments) {
+        // A lagging non-leader may encounter a outbound migration that
+        // has already been completed in the cluster, and its topics are gone.
+        // If it is a controller or even a leader it will step down soon, so we
+        // are not worried we have no data.
+        // TODO: In theory, there is a race condition possible here if a new
+        // topic with the same name was created shortly after the original one
+        // was migrated away. We probably should remember topic initial
+        // revisions when creating a migration.
+        vlogl(
+          dm_log,
+          _raft0_leader_term ? ss::log_level::error : ss::log_level::warn,
+          "topic {} not found in topic table for migration {}",
+          nt,
+          id);
+        return {};
+    }
+    auto assignments = std::views::values(std::move(*maybe_assignments));
+
+    if (nt == model::kafka_consumer_offsets_nt) {
+        const auto& mrstate = _migration_states.find(id)->second;
+        vassert(
+          mrstate.partition_group_map,
+          "group map not found for migration {}",
+          id);
+
+        auto filtered = std::move(assignments)
+                        | std::views::filter(
+                          [&group_map = *mrstate.partition_group_map](
+                            const auto& assignment) {
+                              return group_map.contains(assignment.id);
+                          });
+        return std::move(filtered) | std::views::as_rvalue
+               | std::ranges::to<chunked_vector<partition_assignment>>();
+    } else {
+        return std::move(assignments) | std::views::as_rvalue
+               | std::ranges::to<chunked_vector<partition_assignment>>();
+    }
 }
 
 } // namespace cluster::data_migrations

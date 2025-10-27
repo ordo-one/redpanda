@@ -1,4 +1,5 @@
 
+#include "absl/container/node_hash_map.h"
 #include "cluster/controller_api.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/tests/rebalancing_tests_fixture.h"
@@ -6,8 +7,8 @@
 #include "model/namespace.h"
 #include "ssx/future-util.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 
-#include <absl/container/node_hash_map.h>
 #include <boost/test/tools/old/interface.hpp>
 
 #include <algorithm>
@@ -30,8 +31,8 @@ calculate_replicas_per_node(const cluster::metadata_cache& cache) {
 }
 
 void wait_for_even_replicas_distribution(
-  int min_expected,
-  int max_expected,
+  size_t min_expected,
+  size_t max_expected,
   model::node_id added_node,
   const cluster::metadata_cache& cache) {
     static ss::logger logger("test-log");
@@ -76,8 +77,9 @@ void wait_for_all_partition_moves_to_finish(
                                  return std::all_of(
                                    states.begin(),
                                    states.end(),
-                                   [](const cluster::ntp_reconciliation_state&
-                                        st) {
+                                   [](
+                                     const cluster::ntp_reconciliation_state&
+                                       st) {
                                        return st.status()
                                               == cluster::
                                                 reconciliation_status::done;

@@ -16,6 +16,8 @@
 #include "storage/record_batch_builder.h"
 #include "utils/waiter_queue.h"
 
+#include <seastar/core/gate.hh>
+
 #include <array>
 #include <memory>
 #include <string_view>
@@ -38,6 +40,15 @@ struct feature_table_snapshot;
 /// only used at runtime.  Therefore it is safe to re-use an integer that
 /// has been made available by another feature being retired.
 enum class feature : std::uint64_t {
+    iceberg_schema_merging = 1ULL << 0U,
+    validated_batch_timestamps = 1ULL << 1U,
+    topic_locations_in_outbound_migrations = 1ULL << 2U,
+    schema_registry_authz = 1ULL << 3U,
+    topic_ids_api = 1ULL << 4U,
+    controller_forced_reconfiguration = 1ULL << 5U,
+    consumer_groups_migrations = 1ULL << 7U,
+    shadow_linking = 1ULL << 8U,
+    coordinated_compaction = 1ULL << 10U,
     cloud_retention = 1ULL << 11U,
     node_isolation = 1ULL << 19U,
     group_offset_retention = 1ULL << 20U,
@@ -72,6 +83,8 @@ enum class feature : std::uint64_t {
     datalake_iceberg_ga = 1ULL << 56U,
     cloud_storage_metadata_rw_fence = 1ULL << 57U,
     node_restart_risk_assessment = 1ULL << 58U,
+    topic_ids = 1ULL << 59U,
+    kafka_data_rpc = 1ULL << 60U,
     // Dummy features for testing only
     test_alpha = 1ULL << 61U,
     test_bravo = 1ULL << 62U,
@@ -143,7 +156,9 @@ enum class release_version : int64_t {
     v24_2_1 = 13,
     v24_3_1 = 14,
     v25_1_1 = 15,
-    MAX = v25_1_1, // affects the latest_version
+    v25_2_1 = 16,
+    v25_3_1 = 17,
+    MAX = v25_3_1, // affects the latest_version
 };
 
 constexpr cluster::cluster_version to_cluster_version(release_version rv) {
@@ -161,9 +176,11 @@ constexpr cluster::cluster_version to_cluster_version(release_version rv) {
     case release_version::v24_2_1:
     case release_version::v24_3_1:
     case release_version::v25_1_1:
+    case release_version::v25_2_1:
+    case release_version::v25_3_1:
         return cluster::cluster_version{static_cast<int64_t>(rv)};
     }
-    vassert(false, "Invalid release_version");
+    vunreachable("Invalid release_version");
 }
 
 constexpr cluster::cluster_version TEST_VERSION{2001};
@@ -433,6 +450,72 @@ inline constexpr std::array feature_schema{
     release_version::v25_1_1,
     "node_restart_risk_assessment",
     feature::node_restart_risk_assessment,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_2_1,
+    "topic_ids",
+    feature::topic_ids,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::requires_migration},
+  feature_spec{
+    release_version::v25_2_1,
+    "kafka_data_rpc",
+    feature::kafka_data_rpc,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_2_1,
+    "topic_locations_in_outbound_migrations",
+    feature::topic_locations_in_outbound_migrations,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_2_1,
+    "schema_registry_authz",
+    feature::schema_registry_authz,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_2_1,
+    "consumer_groups_migrations",
+    feature::consumer_groups_migrations,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "iceberg_schema_merging",
+    feature::iceberg_schema_merging,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "topic_ids_api",
+    feature::topic_ids_api,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "controller_forced_reconfiguration",
+    feature::controller_forced_reconfiguration,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "shadow_linking",
+    feature::shadow_linking,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "validated_batch_timestamps",
+    feature::validated_batch_timestamps,
+    feature_spec::available_policy::new_clusters_only,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v25_3_1,
+    "coordinated_compaction",
+    feature::coordinated_compaction,
     feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
 };

@@ -82,9 +82,12 @@ ss::future<checked<std::nullopt_t, coordinator_stm::errc>>
 coordinator_stm::replicate_and_wait(
   model::term_id term, model::record_batch batch, ss::abort_source& as) {
     auto opts = raft::replicate_options(
-      raft::consistency_level::quorum_ack, std::ref(as));
+      raft::consistency_level::quorum_ack,
+      /*expected_term=*/term,
+      /*timeout=*/std::nullopt,
+      std::ref(as));
     opts.set_force_flush();
-    auto res = co_await _raft->replicate(term, std::move(batch), opts);
+    auto res = co_await _raft->replicate(std::move(batch), opts);
     if (res.has_error()) {
         co_return errc::raft_error;
     }
@@ -140,7 +143,7 @@ ss::future<> coordinator_stm::do_apply(const model::record_batch& b) {
     rearm_snapshot_timer();
 }
 
-model::offset coordinator_stm::max_collectible_offset() { return {}; }
+model::offset coordinator_stm::max_removable_local_log_offset() { return {}; }
 
 ss::future<raft::local_snapshot_applied> coordinator_stm::apply_local_snapshot(
   raft::stm_snapshot_header, iobuf&& snapshot_buf) {
@@ -167,7 +170,7 @@ ss::future<> coordinator_stm::apply_raft_snapshot(const iobuf& snapshot_buf) {
     state_ = std::move(snapshot.topics);
 }
 
-ss::future<iobuf> coordinator_stm::take_snapshot() {
+ss::future<iobuf> coordinator_stm::take_raft_snapshot() {
     iobuf snapshot_buf;
     co_await serde::write_async(snapshot_buf, make_snapshot());
     co_return std::move(snapshot_buf);
@@ -191,8 +194,9 @@ ss::future<> coordinator_stm::maybe_write_snapshot() {
       _log.debug,
       "creating snapshot at offset: {}",
       snapshot.last_included_offset);
-    co_await _raft->write_snapshot(raft::write_snapshot_cfg(
-      snapshot.last_included_offset, std::move(snapshot.data)));
+    co_await _raft->write_snapshot(
+      raft::write_snapshot_cfg(
+        snapshot.last_included_offset, std::move(snapshot.data)));
 }
 
 void coordinator_stm::write_snapshot_async() {
@@ -218,7 +222,9 @@ bool stm_factory::is_applicable_for(const storage::ntp_config& config) const {
 }
 
 void stm_factory::create(
-  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
+  raft::state_machine_manager_builder& builder,
+  raft::consensus* raft,
+  const cluster::stm_instance_config&) {
     auto stm = builder.create_stm<coordinator_stm>(
       datalake_log,
       raft,

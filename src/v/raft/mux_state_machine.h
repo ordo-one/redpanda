@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_map.h"
 #include "base/outcome.h"
 #include "base/vassert.h"
 #include "model/fundamental.h"
@@ -30,9 +32,6 @@
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/log.hh>
-
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/node_hash_map.h>
 
 #include <optional>
 #include <system_error>
@@ -239,7 +238,7 @@ mux_state_machine<T...>::mux_state_machine(
   persistent_last_applied persist,
   absl::flat_hash_set<model::record_batch_type> not_handled_batch_types,
   T&... state)
-  : raft::state_machine(c, logger, ss::default_priority_class())
+  : raft::state_machine(c, logger)
   , _c(c)
   , _persist_last_applied(persist)
   , _not_handled_batch_types(std::move(not_handled_batch_types))
@@ -253,9 +252,9 @@ ss::future<result<raft::replicate_result>> mux_state_machine<T...>::replicate(
       _gate, [this, batch = std::move(batch), term]() mutable {
           if (term) {
               return _c->replicate(
-                term.value(),
                 std::move(batch),
-                raft::replicate_options{raft::consistency_level::quorum_ack});
+                raft::replicate_options{
+                  raft::consistency_level::quorum_ack, term.value()});
           }
 
           return _c->replicate(

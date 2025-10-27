@@ -10,6 +10,7 @@
  */
 #include "cluster/data_migration_types.h"
 
+#include "model/namespace.h"
 #include "ssx/sformat.h"
 #include "utils/to_string.h"
 
@@ -30,11 +31,15 @@ ss::sstring print_migration(const data_migration& dm) {
       });
 }
 } // namespace
+
 data_migration copy_migration(const data_migration& migration) {
     return std::visit(
       [](const auto& migration) { return data_migration{migration.copy()}; },
       migration);
 }
+
+const chunked_vector<inbound_topic> inbound_migration::consumer_offsets_topic{
+  {.source_topic_name = model::kafka_consumer_offsets_nt}};
 
 inbound_migration inbound_migration::copy() const {
     return inbound_migration{
@@ -43,12 +48,17 @@ inbound_migration inbound_migration::copy() const {
       .auto_advance = auto_advance};
 }
 
+const chunked_vector<model::topic_namespace>
+  outbound_migration::consumer_offsets_topic{model::kafka_consumer_offsets_nt};
+
 outbound_migration outbound_migration::copy() const {
     return outbound_migration{
       .topics = topics.copy(),
       .groups = groups.copy(),
       .copy_to = copy_to,
-      .auto_advance = auto_advance};
+      .auto_advance = auto_advance,
+      .topic_locations = topic_locations.copy(),
+    };
 }
 
 std::ostream& operator<<(std::ostream& o, state state) {
@@ -80,6 +90,8 @@ std::ostream& operator<<(std::ostream& o, migrated_replica_status status) {
     switch (status) {
     case migrated_replica_status::waiting_for_rpc:
         return o << "waiting_for_rpc";
+    case migrated_replica_status::waiting_for_controller_update:
+        return o << "waiting_for_controller_update";
     case migrated_replica_status::can_run:
         return o << "can_run";
     case migrated_replica_status::done:
@@ -116,8 +128,15 @@ std::ostream& operator<<(std::ostream& o, const cloud_storage_location& l) {
     fmt::print(o, "{{hint: {}}}", l.hint);
     return o;
 }
+
 std::ostream& operator<<(std::ostream& o, const copy_target& t) {
     fmt::print(o, "{{bucket: {}}}", t.bucket);
+    return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const topic_location& tl) {
+    fmt::print(
+      o, "{{remote_topic: {}, location: {}}}", tl.remote_topic, tl.location);
     return o;
 }
 
@@ -134,11 +153,13 @@ std::ostream& operator<<(std::ostream& o, const inbound_migration& dm) {
 std::ostream& operator<<(std::ostream& o, const outbound_migration& dm) {
     fmt::print(
       o,
-      "{{topics: {}, consumer_groups: {}, copy_to: {}, auto_advance: {}}}",
+      "{{topics: {}, consumer_groups: {}, copy_to: {}, auto_advance: {}, "
+      "topic_locations: {}}}",
       fmt::join(dm.topics, ", "),
       fmt::join(dm.groups, ", "),
       dm.copy_to,
-      dm.auto_advance);
+      dm.auto_advance,
+      fmt::join(dm.topic_locations, ", "));
     return o;
 }
 
@@ -188,10 +209,12 @@ std::ostream& operator<<(std::ostream& o, const data_migration_ntp_state& r) {
 std::ostream& operator<<(std::ostream& o, const create_migration_cmd_data& d) {
     fmt::print(
       o,
-      "{{id: {}, migration: {}, op_timestamp: {}}}",
+      "{{id: {}, migration: {}, op_timestamp: {}, "
+      "fill_outbound_topic_locations: {}}}",
       d.id,
       print_migration(d.migration),
-      d.op_timestamp);
+      d.op_timestamp,
+      d.fill_outbound_topic_locations);
     return o;
 }
 
@@ -250,6 +273,17 @@ std::ostream& operator<<(std::ostream& o, const check_ntp_states_request& r) {
 
 std::ostream& operator<<(std::ostream& o, const check_ntp_states_reply& r) {
     fmt::print(o, "{{actual_states: {}}}", r.actual_states);
+    return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const entities_status& es) {
+    fmt::print(
+      o,
+      "{{groups: {}}}",
+      fmt::join(
+        std::views::transform(
+          es.groups, [](const group_offsets& g) { return g.group_id; }),
+        ", "));
     return o;
 }
 

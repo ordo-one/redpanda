@@ -9,10 +9,9 @@
 
 import json
 
-from rptest.services.cluster import cluster
-
-from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk import RpkTool
+from rptest.services.cluster import cluster
+from rptest.tests.redpanda_test import RedpandaTest
 
 
 class RpkGenerateTest(RedpandaTest):
@@ -30,8 +29,11 @@ class RpkGenerateTest(RedpandaTest):
 
         # dashboard is the dictionary of the current dashboards and their title.
         dashboards = [
-            "operations", "consumer-metrics", "consumer-offsets",
-            "topic-metrics", "legacy"
+            "operations",
+            "consumer-metrics",
+            "consumer-offsets",
+            "topic-metrics",
+            "legacy",
         ]
         for name in dashboards:
             datasource = ""
@@ -39,14 +41,14 @@ class RpkGenerateTest(RedpandaTest):
             if name == "legacy":
                 datasource = "redpanda"
                 n = self.redpanda.get_node(1)
-                metrics_endpoint = self.redpanda.admin_endpoint(
-                    n) + "/public_metrics"
-            out = self._rpk.generate_grafana(name,
-                                             datasource=datasource,
-                                             metrics_endpoint=metrics_endpoint)
+                metrics_endpoint = self.redpanda.admin_endpoint(n) + "/public_metrics"
+            out = self._rpk.generate_grafana(
+                name, datasource=datasource, metrics_endpoint=metrics_endpoint
+            )
             try:
                 # We just need to assert that it was able to retrieve and parse the dashboard as valid json
                 json.loads(out)
             except json.JSONDecodeError as err:
                 self.logger.error(
-                    f"unable to parse generated' {name}' dashboard : {err}")
+                    f"unable to parse generated' {name}' dashboard : {err}"
+                )

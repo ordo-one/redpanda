@@ -10,7 +10,12 @@
  */
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "absl/container/btree_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
+#include "absl/container/node_hash_set.h"
+#include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "random/generators.h"
 #include "utils/tristate.h"
 
@@ -18,10 +23,6 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
 
-#include <absl/container/btree_set.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-#include <absl/container/node_hash_set.h>
 #include <bits/stdint-uintn.h>
 
 #include <iterator>
@@ -84,8 +85,8 @@ template<
   typename... Args,
   typename T = std::invoke_result_t<Fn, Args...>>
 inline auto random_frag_vector(Fn&& gen, size_t size = 20, Args&&... args)
-  -> fragmented_vector<T> {
-    fragmented_vector<T> v;
+  -> chunked_vector<T> {
+    chunked_vector<T> v;
     while (size-- > 0) {
         v.push_back(gen(std::forward<Args>(args)...));
     }
@@ -106,8 +107,8 @@ inline auto random_chunked_vector(Fn&& gen, size_t size = 20, Args&&... args)
 }
 
 template<typename Fn, typename T = std::invoke_result_t<Fn>>
-inline auto
-random_circular_buffer(Fn&& gen, size_t size = 5) -> ss::circular_buffer<T> {
+inline auto random_circular_buffer(Fn&& gen, size_t size = 5)
+  -> ss::circular_buffer<T> {
     ss::circular_buffer<T> v;
     v.reserve(size);
     std::generate_n(v.begin(), size, gen);
@@ -115,8 +116,8 @@ random_circular_buffer(Fn&& gen, size_t size = 5) -> ss::circular_buffer<T> {
 }
 
 template<typename Fn, typename T = std::invoke_result_t<Fn>>
-inline auto
-random_chunked_fifo(Fn&& gen, size_t size = 20) -> ss::chunked_fifo<T> {
+inline auto random_chunked_fifo(Fn&& gen, size_t size = 20)
+  -> ss::chunked_fifo<T> {
     ss::chunked_fifo<T> v;
     v.reserve(size);
     std::generate_n(std::back_inserter(v), size, gen);
@@ -141,8 +142,7 @@ inline std::chrono::milliseconds random_duration_ms() {
 }
 
 template<
-  template<typename...>
-  typename MapType,
+  template<typename...> typename MapType,
   typename Key,
   typename Value,
   typename Fn>
@@ -153,6 +153,13 @@ inline MapType<Key, Value> random_map(Fn&& gen, size_t size = 20) {
         hm[k] = v;
     }
     return hm;
+}
+
+template<typename Key, typename Value, typename Fn>
+inline chunked_hash_map<Key, Value>
+random_chunked_hash_map(Fn&& gen, size_t size = 20) {
+    return random_map<chunked_hash_map, Key, Value, Fn>(
+      std::forward<Fn>(gen), size);
 }
 
 template<typename Key, typename Value, typename Fn>

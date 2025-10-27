@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "raft/state_machine_base.h"
@@ -21,6 +21,8 @@
 #include "utils/mutex.h"
 #include "utils/prefix_logger.h"
 
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 
 namespace raft {
@@ -208,8 +210,11 @@ public:
       std::optional<std::reference_wrapper<ss::abort_source>>
       = std::nullopt) const noexcept;
 
-    model::offset max_collectible_offset() override;
-    ss::future<fragmented_vector<model::tx_range>>
+    model::offset max_removable_local_log_offset() override;
+    std::optional<kafka::offset> lowest_pinned_data_offset() const override {
+        return std::nullopt;
+    }
+    ss::future<chunked_vector<model::tx_range>>
       aborted_tx_ranges(model::offset, model::offset) override;
 
     ss::future<> apply(
@@ -243,7 +248,10 @@ protected:
      * called within its term it waits until the state machine is caught
      * up with all the events written by the previous leaders
      */
-    ss::future<bool> sync(model::timeout_clock::duration);
+    ss::future<bool> sync(
+      model::timeout_clock::duration,
+      std::optional<std::reference_wrapper<ss::abort_source>> as
+      = std::nullopt);
 
     bool _is_catching_up{false};
     model::term_id _insync_term;
@@ -253,9 +261,15 @@ protected:
 
 private:
     ss::future<> wait_offset_committed(
-      model::timeout_clock::duration, model::offset, model::term_id);
-    ss::future<bool>
-      do_sync(model::timeout_clock::duration, model::offset, model::term_id);
+      model::timeout_clock::duration,
+      model::offset,
+      model::term_id,
+      std::optional<std::reference_wrapper<ss::abort_source>> as);
+    ss::future<bool> do_sync(
+      model::timeout_clock::duration,
+      model::offset,
+      model::term_id,
+      std::optional<std::reference_wrapper<ss::abort_source>> as);
     ss::future<std::optional<stm_snapshot>> load_local_snapshot();
     ss::future<> wait_for_snapshot_hydrated();
 

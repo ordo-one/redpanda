@@ -1,18 +1,19 @@
-from rptest.tests.redpanda_test import RedpandaTest
+from ducktape.tests.test import TestContext
+from rptest.services.cluster import cluster
 from rptest.services.openmessaging_benchmark import OpenMessagingBenchmark
 from rptest.services.openmessaging_benchmark_configs import OMBSampleConfigurations
-from rptest.services.cluster import cluster
+from rptest.tests.redpanda_test import RedpandaTest
 
 
 class SmallBatchesTest(RedpandaTest):
     """
     A many clients and partitions test where producers send small batches to Redpanda.
     """
-    def __init__(self, ctx):
-        self._ctx = ctx
-        super(SmallBatchesTest,
-              self).__init__(test_context=ctx,
-                             extra_rp_conf={"aggregate_metrics": True})
+
+    def __init__(self, ctx: TestContext):
+        super(SmallBatchesTest, self).__init__(
+            test_context=ctx, extra_rp_conf={"aggregate_metrics": True}
+        )
 
     @cluster(num_nodes=6)
     def omb_test(self):
@@ -44,19 +45,22 @@ class SmallBatchesTest(RedpandaTest):
             "consumer_config": {
                 "auto.offset.reset": "earliest",
                 "enable.auto.commit": "false",
-                "max.partition.fetch.bytes": 131072
+                "max.partition.fetch.bytes": 131072,
             },
         }
         validator = {
-            OMBSampleConfigurations.AVG_THROUGHPUT_MBPS:
-            [OMBSampleConfigurations.gte(2)],
+            OMBSampleConfigurations.AVG_THROUGHPUT_MBPS: [
+                OMBSampleConfigurations.gte(2)
+            ],
         }
 
-        benchmark = OpenMessagingBenchmark(ctx=self._ctx,
-                                           redpanda=self.redpanda,
-                                           driver=driver,
-                                           workload=(workload, validator),
-                                           topology="ensemble")
+        benchmark = OpenMessagingBenchmark(
+            ctx=self.test_context,
+            redpanda=self.redpanda,
+            driver=driver,
+            workload=(workload, validator),
+            topology="ensemble",
+        )
 
         benchmark.start()
         benchmark_time_min = benchmark.benchmark_time_mins() + 5

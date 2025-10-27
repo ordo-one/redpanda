@@ -69,7 +69,6 @@ redpanda_test_cc_library(
     hdrs = [
         "test_fixture.h",
     ],
-    include_prefix = "transform/tests",
     deps = [
         "//src/v/base",
         "//src/v/model",
@@ -100,6 +99,7 @@ redpanda_cc_gtest(
         "//src/v/test_utils:gtest",
         "//src/v/transform:impl",
         "//src/v/transform:logger",
+        "//src/v/utils:backoff_policy",
         "//src/v/utils:human",
         "//src/v/utils:uuid",
         "@abseil-cpp//absl/container:btree",
@@ -128,6 +128,7 @@ redpanda_cc_gtest(
         "//src/v/test_utils:random_bytes",
         "//src/v/transform:impl",
         "//src/v/transform:logger",
+        "//src/v/utils:backoff_policy",
         "//src/v/utils:human",
         "@googletest//:gtest",
         "@seastar",

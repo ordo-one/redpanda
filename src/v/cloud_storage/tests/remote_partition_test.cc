@@ -39,11 +39,10 @@
 #include "storage/segment.h"
 #include "storage/types.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/future.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
@@ -142,8 +141,8 @@ static model::record_batch_header read_single_batch_from_remote_partition(
   model::offset target,
   bool expect_exists = true) {
     auto conf = fixture.get_configuration();
-    storage::log_reader_config reader_config(
-      target, target, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      model::offset_cast(target), model::offset_cast(target));
 
     auto manifest = hydrate_manifest(fixture.api.local(), fixture.bucket_name);
     partition_probe probe(manifest.get_ntp());
@@ -263,7 +262,7 @@ static void
 test_remote_partition_cache_size_estimate_materialized_segments_args(
   cloud_storage_fixture& context,
   ss::sharded<remote>& api,
-  ss::sharded<cloud_storage::cache>& cache,
+  ss::sharded<cloud_io::cache>& cache,
   cloud_storage::segment_name_format sname_format) {
     auto segments = setup_s3_imposter(
       context, 3, 10, manifest_inconsistency::none, sname_format);
@@ -317,8 +316,8 @@ test_remote_partition_cache_size_estimate_materialized_segments_args(
     partition->start().get();
     auto base = segments[0].base_offset;
     auto max = segments[2].max_offset;
-    storage::log_reader_config reader_config(
-      base, max, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), model::offset_cast(max));
     auto reader = partition->make_reader(reader_config).get().reader;
     reader.consume(test_consumer(), model::no_timeout).get();
     std::move(reader).release();
@@ -1043,10 +1042,10 @@ FIXTURE_TEST(test_remote_partition_read_cached_index, cloud_storage_fixture) {
           [&partition] { partition->stop().get(); });
         partition->start().get();
 
-        storage::log_reader_config reader_config(
-          base, max, ss::default_priority_class());
-
-        reader_config.start_offset = segments.front().base_offset;
+        cloud_log_reader_config reader_config(
+          model::offset_cast(base), model::offset_cast(max));
+        reader_config.start_offset = model::offset_cast(
+          segments.front().base_offset);
         reader_config.max_bytes = max_bytes_limit;
         vlog(test_log.info, "read first segment {}", reader_config);
         auto reader = partition->make_reader(reader_config).get().reader;
@@ -1067,10 +1066,10 @@ FIXTURE_TEST(test_remote_partition_read_cached_index, cloud_storage_fixture) {
           [&partition] { partition->stop().get(); });
         partition->start().get();
 
-        storage::log_reader_config reader_config(
-          base, max, ss::default_priority_class());
-
-        reader_config.start_offset = segments.front().base_offset;
+        cloud_log_reader_config reader_config(
+          model::offset_cast(base), model::offset_cast(max));
+        reader_config.start_offset = model::offset_cast(
+          segments.front().base_offset);
         reader_config.max_bytes = max_bytes_limit;
         vlog(test_log.info, "read last segment: {}", reader_config);
         auto reader = partition->make_reader(reader_config).get().reader;
@@ -1137,12 +1136,11 @@ FIXTURE_TEST(test_remote_partition_concurrent_truncate, cloud_storage_fixture) {
 
     {
         ss::abort_source as;
-        storage::log_reader_config reader_config(
-          base,
-          max,
+        cloud_log_reader_config reader_config(
+          model::offset_cast(base),
+          model::offset_cast(max),
           0,
           std::numeric_limits<size_t>::max(),
-          ss::default_priority_class(),
           std::nullopt,
           std::nullopt,
           as);
@@ -1177,12 +1175,11 @@ FIXTURE_TEST(test_remote_partition_concurrent_truncate, cloud_storage_fixture) {
 
     {
         ss::abort_source as;
-        storage::log_reader_config reader_config(
-          model::offset(400),
-          max,
+        cloud_log_reader_config reader_config(
+          kafka::offset(400),
+          model::offset_cast(max),
           0,
           std::numeric_limits<size_t>::max(),
-          ss::default_priority_class(),
           std::nullopt,
           std::nullopt,
           as);
@@ -1252,12 +1249,11 @@ FIXTURE_TEST(
 
     {
         ss::abort_source as;
-        storage::log_reader_config reader_config(
-          model::offset(200),
-          model::offset(299),
+        cloud_log_reader_config reader_config(
+          kafka::offset(200),
+          kafka::offset(299),
           0,
           std::numeric_limits<size_t>::max(),
-          ss::default_priority_class(),
           std::nullopt,
           std::nullopt,
           as);
@@ -1331,12 +1327,11 @@ FIXTURE_TEST(
 
     {
         ss::abort_source as;
-        storage::log_reader_config reader_config(
-          base,
-          max,
+        cloud_log_reader_config reader_config(
+          model::offset_cast(base),
+          model::offset_cast(max),
           0,
           std::numeric_limits<size_t>::max(),
-          ss::default_priority_class(),
           std::nullopt,
           std::nullopt,
           as);
@@ -1355,12 +1350,11 @@ FIXTURE_TEST(
 
     {
         ss::abort_source as;
-        storage::log_reader_config reader_config(
-          base,
-          max,
+        cloud_log_reader_config reader_config(
+          model::offset_cast(base),
+          model::offset_cast(max),
           0,
           std::numeric_limits<size_t>::max(),
-          ss::default_priority_class(),
           std::nullopt,
           std::nullopt,
           as);
@@ -1482,7 +1476,7 @@ ss::future<> sleep_and_abort(ss::abort_source* as, ss::gate* gate) {
       std::system_error(std::make_error_code(std::errc::connection_aborted)));
 }
 ss::future<>
-read(storage::log_reader_config reader_config, remote_partition* partition) {
+read(cloud_log_reader_config reader_config, remote_partition* partition) {
     auto next = reader_config.start_offset;
     while (true) {
         reader_config.start_offset = next;
@@ -1494,7 +1488,8 @@ read(storage::log_reader_config reader_config, remote_partition* partition) {
         if (headers_read.empty()) {
             break;
         }
-        next = headers_read.back().last_offset() + model::offset(1);
+        next = model::offset_cast(
+          headers_read.back().last_offset() + model::offset(1));
     }
 }
 } // anonymous namespace
@@ -1536,8 +1531,8 @@ FIXTURE_TEST(test_remote_partition_abort_eos_race, cloud_storage_fixture) {
     // Intentionally use max - 1 so the reader stops early and is forced to
     // handle it as an EOS.
     ss::abort_source as;
-    storage::log_reader_config reader_config(
-      base, model::offset{max() - 1}, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), kafka::offset{max() - 1});
     reader_config.abort_source = as;
 
     std::vector<ss::future<>> futs;
@@ -2002,10 +1997,10 @@ std::vector<model::record_batch_header> scan_remote_partition_with_replacements(
           .cloud_storage_max_segment_readers_per_shard.set_value(
             maybe_max_readers);
     }
-    storage::log_reader_config read_one(
-      base, model::next_offset(base), ss::default_priority_class());
-    storage::log_reader_config read_all(
-      base, max, ss::default_priority_class());
+    cloud_log_reader_config read_one(
+      model::offset_cast(base), model::offset_cast(model::next_offset(base)));
+    cloud_log_reader_config read_all(
+      model::offset_cast(base), model::offset_cast(max));
 
     // 1. Hydrate the manifest and create the remote partition.
     // 2. Make a reader.

@@ -14,7 +14,7 @@
 #include "cluster/feature_manager.h"
 #include "cluster/members_table.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 
 #include <seastar/core/manual_clock.hh>
 #include <seastar/core/sleep.hh>
@@ -52,12 +52,13 @@ struct barrier_fixture {
     void create_brokers(int n) {
         std::vector<model::broker> brokers;
         for (int i = 0; i < n; ++i) {
-            brokers.push_back(model::broker(
-              model::node_id{i},
-              net::unresolved_address{},
-              net::unresolved_address{},
-              std::nullopt,
-              model::broker_properties{}));
+            brokers.push_back(
+              model::broker(
+                model::node_id{i},
+                net::unresolved_address{},
+                net::unresolved_address{},
+                std::nullopt,
+                model::broker_properties{}));
         }
         for (auto& br : brokers) {
             BOOST_REQUIRE(!members.apply(

@@ -171,6 +171,47 @@
             "name": "alter_client_quotas",
             "input_type": "client_quota::alter_quotas_request",
             "output_type": "client_quota::alter_quotas_response"
+        },
+        {
+            "name": "upsert_cluster_link",
+            "input_type": "upsert_cluster_link_request",
+            "output_type": "upsert_cluster_link_response"
+        },
+        {
+            "name": "remove_cluster_link",
+            "input_type": "remove_cluster_link_request",
+            "output_type": "remove_cluster_link_response"
+        },
+        {
+            "name": "add_mirror_topic",
+            "input_type": "add_mirror_topic_request",
+            "output_type": "add_mirror_topic_response"
+        },
+        {
+            "name": "update_mirror_topic_status",
+            "input_type": "update_mirror_topic_status_request",
+            "output_type": "update_mirror_topic_status_response"
+        },
+        {
+            "name": "update_mirror_topic_properties",
+            "input_type": "update_mirror_topic_properties_request",
+            "output_type": "update_mirror_topic_properties_response"
+        },
+        {
+            "name": "delete_mirror_topic",
+            "input_type": "delete_mirror_topic_request",
+            "output_type": "delete_mirror_topic_response"
+        },
+
+        {
+            "name": "get_current_cluster_epoch",
+            "input_type": "get_current_cluster_epoch_request",
+            "output_type": "get_current_cluster_epoch_response"
+        },
+        {
+            "name": "update_cluster_link_configuration",
+            "input_type": "update_cluster_link_configuration_request",
+            "output_type": "update_cluster_link_configuration_response"
         }
     ]
 }

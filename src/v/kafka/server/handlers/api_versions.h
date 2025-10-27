@@ -9,14 +9,14 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/api_versions.h"
 #include "kafka/server/handlers/handler.h"
 
 namespace kafka {
 
 struct api_versions_handler
-  : public single_stage_handler<api_versions_api, 0, 3> {
+  : public single_stage_handler<api_versions_api, 0, 4> {
     static constexpr api_version min_flexible = api_version(3);
 
     static ss::future<response_ptr>

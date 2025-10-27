@@ -4,7 +4,6 @@ load("//src/v/rpc:compiler.bzl", "redpanda_cc_rpc_library")
 redpanda_cc_rpc_library(
     name = "transform_rpc",
     src = "rpc.json",
-    include_prefix = "transform/rpc",
 )
 
 redpanda_cc_library(
@@ -23,23 +22,25 @@ redpanda_cc_library(
         "serde.h",
         "service.h",
     ],
-    include_prefix = "transform/rpc",
     visibility = ["//visibility:public"],
     deps = [
         ":transform_rpc",
         "//src/v/base",
         "//src/v/cluster",
         "//src/v/config",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
+        "//src/v/features",
+        "//src/v/kafka/data:log_reader_config",
         "//src/v/kafka/data:partition_proxy",
+        "//src/v/kafka/data/rpc",
         "//src/v/model",
         "//src/v/raft",
-        "//src/v/resource_mgmt:io_priority",
         "//src/v/rpc",
         "//src/v/serde",
         "//src/v/storage",
         "//src/v/storage:record_batch_builder",
         "//src/v/transform/stm",
+        "//src/v/utils:backoff_policy",
         "//src/v/utils:to_string",
         "//src/v/utils:uuid",
         "@abseil-cpp//absl/container:btree",

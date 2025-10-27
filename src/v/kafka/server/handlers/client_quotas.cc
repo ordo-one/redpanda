@@ -25,7 +25,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/algorithm/container.h>
 #include <boost/outcome/success_failure.hpp>
 #include <boost/range/combine.hpp>
 
@@ -294,7 +293,6 @@ bool valid_key_combination(const entity_key&, entity_value_diff::key) {
     // For now, all combinations we can parse are valid
     return true;
 }
-
 } // namespace
 
 template<>
@@ -329,6 +327,16 @@ ss::future<response_ptr> describe_client_quotas_handler::handle(
     // std::optional<key_part_predicate> ip_predicate;
 
     for (const auto& component : request.data.components) {
+        // This is a work around for the fact that we don't support user based
+        // quotas yet.  The `kafka-configs` tool will error out when attempting
+        // to describe a principal when this returns unsupported_version.  This
+        // is a problem with implementing support for KIP-554, as
+        // `kafka-configs` is a common kafka tool used to manage users.
+        // TODO: Fully implement quotas
+        if (component.entity_type == "user") {
+            continue;
+        }
+
         auto filter_or_err = make_filter(component);
 
         if (filter_or_err.has_error()) {
@@ -370,10 +378,12 @@ ss::future<response_ptr> describe_client_quotas_handler::handle(
           // that matches it (regardless of strict mode)
           const auto& key = kv.first;
           auto each_predicate_has_a_match = !client_predicate
-                                            || absl::c_any_of(
+                                            || std::ranges::any_of(
                                               key.parts, *client_predicate);
-          // && (!user_predicate || absl::c_any_of(key.parts, *user_predicate))
-          // && (!ip_predicate || absl::c_any_of(key.parts, *ip_predicate));
+          // && (!user_predicate || std::ranges::any_of(key.parts,
+          // *user_predicate))
+          // && (!ip_predicate || std::ranges::any_of(key.parts,
+          // *ip_predicate));
 
           if (!each_predicate_has_a_match) {
               return false;
@@ -387,7 +397,7 @@ ss::future<response_ptr> describe_client_quotas_handler::handle(
                 //  || (user_predicate && (*user_predicate)(part))
                 //  || (ip_predicate && (*ip_predicate)(part));
             };
-          return !strict || absl::c_all_of(key.parts, reverse_predicate);
+          return !strict || std::ranges::all_of(key.parts, reverse_predicate);
       });
 
     res.data.entries->reserve(quotas.size());

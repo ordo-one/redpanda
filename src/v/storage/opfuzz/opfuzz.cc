@@ -12,6 +12,7 @@
 #include "base/units.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/record.h"
 #include "model/tests/random_batch.h"
 #include "model/timestamp.h"
@@ -33,7 +34,7 @@ namespace storage {
 ss::logger fuzzlogger("opfuzz");
 
 static size_t
-record_count(const ss::circular_buffer<model::record_batch>& batches) {
+record_count(const chunked_circular_buffer<model::record_batch>& batches) {
     return std::accumulate(
       batches.begin(),
       batches.end(),
@@ -111,9 +112,7 @@ struct append_op final : opfuzz::op {
     const char* name() const final { return "append"; }
     ss::future<> invoke(opfuzz::op_context ctx) final {
         storage::log_append_config append_cfg{
-          storage::log_append_config::fsync::no,
-          ss::default_priority_class(),
-          model::no_timeout};
+          storage::log_append_config::fsync::no, model::no_timeout};
         auto batches = co_await model::test::make_random_batches(
           model::offset(0), 10);
         vlog(
@@ -168,9 +167,7 @@ struct append_op_foreign final : opfuzz::op {
               return ss::smp::submit_to(
                 0, [rdr = std::move(p.first), cnt = p.second, ctx]() mutable {
                     storage::log_append_config append_cfg{
-                      storage::log_append_config::fsync::no,
-                      ss::default_priority_class(),
-                      model::no_timeout};
+                      storage::log_append_config::fsync::no, model::no_timeout};
                     auto validator = append_offsets_validator(
                       ctx.log, cnt, false);
                     return std::move(rdr)
@@ -187,9 +184,7 @@ struct append_multi_term_op final : opfuzz::op {
     const char* name() const final { return "append_with_multiple_terms"; }
     ss::future<> invoke(opfuzz::op_context ctx) final {
         storage::log_append_config append_cfg{
-          storage::log_append_config::fsync::no,
-          ss::default_priority_class(),
-          model::no_timeout};
+          storage::log_append_config::fsync::no, model::no_timeout};
         auto batches = co_await model::test::make_random_batches(
           model::offset(0), 10);
         const size_t mid = batches.size() / 2;
@@ -235,10 +230,8 @@ struct truncate_op final : opfuzz::op {
     const char* name() const final { return "truncate"; }
     ss::future<> invoke(opfuzz::op_context ctx) final {
         auto lstats = ctx.log->offsets();
-        storage::log_reader_config cfg(
-          lstats.start_offset,
-          lstats.dirty_offset,
-          ss::default_priority_class());
+        storage::local_log_reader_config cfg(
+          lstats.start_offset, lstats.dirty_offset);
         vlog(
           fuzzlogger.info,
           "[{}] - collect base offsets {} - {}",
@@ -266,10 +259,9 @@ struct truncate_op final : opfuzz::op {
                 "[{}] - Truncating log at suffix offset: {}",
                 ctx.log->config().ntp(),
                 to);
-              return ctx.log
-                ->truncate(
-                  storage::truncate_config(to, ss::default_priority_class()))
-                .then([to] { return to; });
+              return ctx.log->truncate(storage::truncate_config(to)).then([to] {
+                  return to;
+              });
           })
           .then([ctx](model::offset to) {
               auto loffsets = ctx.log->offsets();
@@ -314,10 +306,8 @@ struct truncate_prefix_op final : opfuzz::op {
     const char* name() const final { return "truncate_prefix"; }
     ss::future<> invoke(opfuzz::op_context ctx) final {
         auto lstats = ctx.log->offsets();
-        storage::log_reader_config cfg(
-          lstats.start_offset,
-          lstats.dirty_offset,
-          ss::default_priority_class());
+        storage::local_log_reader_config cfg(
+          lstats.start_offset, lstats.dirty_offset);
         vlog(
           fuzzlogger.info,
           "[{}] - collect header::max_offsets {} - {}",
@@ -346,8 +336,8 @@ struct truncate_prefix_op final : opfuzz::op {
                 "[{}] - Truncating log at prefix offset: {}",
                 ctx.log->config().ntp(),
                 to);
-              return ctx.log->truncate_prefix(storage::truncate_prefix_config(
-                to, ss::default_priority_class()));
+              return ctx.log->truncate_prefix(
+                storage::truncate_prefix_config(to));
           });
     }
 };
@@ -439,15 +429,15 @@ struct read_op final : opfuzz::op {
               random_generators::get_int<model::offset::type>(
                 start(), lstats.dirty_offset()));
             // random end point
-            end = model::offset(random_generators::get_int<model::offset::type>(
-              start(), lstats.dirty_offset));
+            end = model::offset(
+              random_generators::get_int<model::offset::type>(
+                start(), lstats.dirty_offset));
         } else {
             start = lstats.start_offset;
             end = lstats.start_offset;
         }
 
-        storage::log_reader_config cfg(
-          start, end, ss::default_priority_class());
+        storage::local_log_reader_config cfg(start, end);
         vlog(
           fuzzlogger.info,
           "[{}] - Read [{},{}] - {}",
@@ -511,8 +501,10 @@ struct compact_op final : opfuzz::op {
           model::timestamp::max(),
           std::nullopt,
           model::offset::max(),
+          model::offset::max(),
           std::nullopt,
-          ss::default_priority_class(),
+          std::nullopt,
+          std::chrono::milliseconds{0},
           *(ctx._as),
           storage::ntp_sanitizer_config{.sanitize_only = true});
         if (random_generators::get_int(0, 100) > 70) {
@@ -594,7 +586,7 @@ std::unique_ptr<opfuzz::op> opfuzz::random_operation() {
     case op_name::term_roll:
         return std::make_unique<term_roll_op>();
     }
-    vassert(false, "could not generate random operation for log");
+    vunreachable("could not generate random operation for log");
 }
 
 void opfuzz::generate_workload(size_t count) {

@@ -8,6 +8,7 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 #include "cloud_io/provider.h"
+#include "container/chunked_circular_buffer.h"
 #include "datalake/base_types.h"
 #include "datalake/catalog_schema_manager.h"
 #include "datalake/local_parquet_file_writer.h"
@@ -20,6 +21,7 @@
 #include "datalake/tests/test_data_writer.h"
 #include "datalake/tests/test_utils.h"
 #include "datalake/translation/translation_probe.h"
+#include "features/feature_table.h"
 #include "iceberg/filesystem_catalog.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -51,6 +53,8 @@ TEST(DatalakeMultiplexerTest, TestMultiplexer) {
     auto writer_factory = std::make_unique<datalake::test_data_writer_factory>(
       false);
     translation_probe probe(ntp);
+    features::feature_table features;
+    features.testing_activate_all();
     datalake::record_multiplexer multiplexer(
       ntp,
       rev,
@@ -63,14 +67,20 @@ TEST(DatalakeMultiplexerTest, TestMultiplexer) {
       location_provider(
         cloud_io::s3_compat_provider{"s3"},
         cloud_storage_clients::bucket_name{"bucket"}),
-      probe);
+      probe,
+      &features);
 
     model::test::record_batch_spec batch_spec;
     batch_spec.records = record_count;
     batch_spec.count = batch_count;
     batch_spec.offset = model::offset{start_offset};
-    ss::circular_buffer<model::record_batch> batches
+    chunked_circular_buffer<model::record_batch> batches
       = model::test::make_random_batches(batch_spec).get();
+
+    uint64_t total_bytes = 0;
+    for (const auto& batch : batches) {
+        total_bytes += batch.size_bytes();
+    }
 
     auto reader = model::make_generating_record_batch_reader(
       [batches = std::move(batches)]() mutable {
@@ -82,25 +92,29 @@ TEST(DatalakeMultiplexerTest, TestMultiplexer) {
       .multiplex(
         std::move(reader), kafka::offset{start_offset}, model::no_timeout, as)
       .get();
-    auto result = std::move(multiplexer).finish().get();
+    record_multiplexer::finished_files files;
+    auto result = std::move(multiplexer).finish(files).get();
 
     ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(result.value().data_files.size(), 1);
+    ASSERT_EQ(files.data_files.size(), 1);
     EXPECT_EQ(
-      result.value().data_files[0].local_file.row_count,
-      record_count * batch_count);
+      files.data_files[0].local_file.row_count, record_count * batch_count);
     EXPECT_EQ(result.value().start_offset(), start_offset);
     // Subtract one since offsets end at 0, and this is an inclusive range.
     EXPECT_EQ(
       result.value().last_offset(),
       start_offset + record_count * batch_count - 1);
+    EXPECT_EQ(result.value().kafka_bytes_processed, total_bytes);
 }
+
 TEST(DatalakeMultiplexerTest, TestMultiplexerWriteError) {
     int record_count = 10;
     int batch_count = 10;
     auto writer_factory = std::make_unique<datalake::test_data_writer_factory>(
       true);
     translation_probe probe(ntp);
+    features::feature_table features;
+    features.testing_activate_all();
     datalake::record_multiplexer multiplexer(
       ntp,
       rev,
@@ -113,12 +127,13 @@ TEST(DatalakeMultiplexerTest, TestMultiplexerWriteError) {
       location_provider(
         cloud_io::s3_compat_provider{"s3"},
         cloud_storage_clients::bucket_name{"bucket"}),
-      probe);
+      probe,
+      &features);
 
     model::test::record_batch_spec batch_spec;
     batch_spec.records = record_count;
     batch_spec.count = batch_count;
-    ss::circular_buffer<model::record_batch> batches
+    chunked_circular_buffer<model::record_batch> batches
       = model::test::make_random_batches(batch_spec).get();
 
     auto reader = model::make_generating_record_batch_reader(
@@ -129,7 +144,8 @@ TEST(DatalakeMultiplexerTest, TestMultiplexerWriteError) {
     multiplexer
       .multiplex(std::move(reader), kafka::offset{0}, model::no_timeout, as)
       .get();
-    auto res = std::move(multiplexer).finish().get();
+    record_multiplexer::finished_files files;
+    auto res = std::move(multiplexer).finish(files).get();
     ASSERT_TRUE(res.has_error());
     EXPECT_EQ(res.error(), datalake::writer_error::parquet_conversion_error);
 }
@@ -152,6 +168,8 @@ TEST(DatalakeMultiplexerTest, WritesDataFiles) {
       tracker);
 
     translation_probe probe(ntp);
+    features::feature_table features;
+    features.testing_activate_all();
     datalake::record_multiplexer multiplexer(
       ntp,
       rev,
@@ -164,13 +182,14 @@ TEST(DatalakeMultiplexerTest, WritesDataFiles) {
       location_provider(
         cloud_io::s3_compat_provider{"s3"},
         cloud_storage_clients::bucket_name{"bucket"}),
-      probe);
+      probe,
+      &features);
 
     model::test::record_batch_spec batch_spec;
     batch_spec.records = record_count;
     batch_spec.count = batch_count;
     batch_spec.offset = model::offset{start_offset};
-    ss::circular_buffer<model::record_batch> batches
+    chunked_circular_buffer<model::record_batch> batches
       = model::test::make_random_batches(batch_spec).get();
 
     auto reader = model::make_generating_record_batch_reader(
@@ -183,13 +202,13 @@ TEST(DatalakeMultiplexerTest, WritesDataFiles) {
       .multiplex(
         std::move(reader), kafka::offset{start_offset}, model::no_timeout, as)
       .get();
-    auto result = std::move(multiplexer).finish().get();
+    record_multiplexer::finished_files files;
+    auto result = std::move(multiplexer).finish(files).get();
 
     ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(result.value().data_files.size(), 1);
+    ASSERT_EQ(files.data_files.size(), 1);
     EXPECT_EQ(
-      result.value().data_files[0].local_file.row_count,
-      record_count * batch_count);
+      files.data_files[0].local_file.row_count, record_count * batch_count);
     EXPECT_EQ(result.value().start_offset(), start_offset);
     // Subtract one since offsets end at 0, and this is an inclusive range.
     EXPECT_EQ(
@@ -229,9 +248,13 @@ class RecordMultiplexerParquetTest
   , public ::testing::Test {
 public:
     RecordMultiplexerParquetTest()
-      : schema_mgr(catalog)
+      : schema_mgr(catalog, &features)
       , type_resolver(registry)
-      , t_creator(type_resolver, schema_mgr) {}
+      , t_creator(type_resolver, schema_mgr) {
+        features.testing_activate_all();
+    }
+
+    features::feature_table features;
     catalog_schema_manager schema_mgr;
     record_schema_resolver type_resolver;
     direct_table_creator t_creator;
@@ -241,7 +264,7 @@ TEST_F(RecordMultiplexerParquetTest, TestSimple) {
     tests::record_generator gen(&registry);
     auto reg_res = gen.register_avro_schema("schema", avro_schema).get();
     EXPECT_FALSE(reg_res.has_error()) << reg_res.error();
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     model::offset o{0};
     const auto start_offset = o;
     const size_t num_hrs = 3;
@@ -249,6 +272,7 @@ TEST_F(RecordMultiplexerParquetTest, TestSimple) {
     const size_t records_per_batch = 4;
     auto start_ts = model::timestamp::now();
     constexpr auto ms_per_hr = 1000 * 3600;
+    uint64_t total_bytes = 0;
     for (size_t h = 0; h < num_hrs; ++h) {
         // Split batches across the hours.
         auto h_ts = model::timestamp{
@@ -267,7 +291,9 @@ TEST_F(RecordMultiplexerParquetTest, TestSimple) {
                 ASSERT_FALSE(add_res.has_error());
                 ++o;
             }
-            batches.emplace_back(std::move(batch_builder).build());
+            auto batch = std::move(batch_builder).build();
+            total_bytes += batch.size_bytes();
+            batches.emplace_back(std::move(batch));
         }
     }
     auto reader = model::make_memory_record_batch_reader(std::move(batches));
@@ -290,15 +316,18 @@ TEST_F(RecordMultiplexerParquetTest, TestSimple) {
       t_creator,
       model::iceberg_invalid_record_action::dlq_table,
       location_provider(scoped_remote->remote.local().provider(), bucket_name),
-      probe);
+      probe,
+      &features);
     mux
       .multiplex(
         std::move(reader), kafka::offset{start_offset}, model::no_timeout, as)
       .get();
-    auto res = std::move(mux).finish().get();
+    record_multiplexer::finished_files files;
+    auto res = std::move(mux).finish(files).get();
     ASSERT_FALSE(res.has_error()) << res.error();
     EXPECT_EQ(res.value().start_offset(), start_offset());
 
     const auto num_records = num_hrs * batches_per_hr * records_per_batch;
     EXPECT_EQ(res.value().last_offset(), start_offset() + num_records - 1);
+    EXPECT_EQ(res.value().kafka_bytes_processed, total_bytes);
 }

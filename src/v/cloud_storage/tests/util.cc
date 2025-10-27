@@ -11,8 +11,10 @@
 #include "cloud_storage/tests/util.h"
 
 #include "cloud_storage/partition_manifest_downloader.h"
+#include "cloud_storage/types.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
+#include "test_utils/test_macros.h"
 #include "utils/stream_provider.h"
 
 #include <seastar/core/lowres_clock.hh>
@@ -321,17 +323,19 @@ make_segments(const partition_manifest& manifest) {
         std::vector<batch_t> all_batches;
         for (long i = 0; i < num_records; i++) {
             if (i < num_config_records) {
-                all_batches.push_back(batch_t{
-                  .num_records = 1,
-                  .type = model::record_batch_type::archival_metadata,
-                  .record_sizes = {random_generators::get_int(10UL, 200UL)},
-                });
+                all_batches.push_back(
+                  batch_t{
+                    .num_records = 1,
+                    .type = model::record_batch_type::archival_metadata,
+                    .record_sizes = {random_generators::get_int(10UL, 200UL)},
+                  });
             } else {
-                all_batches.push_back(batch_t{
-                  .num_records = 1,
-                  .type = model::record_batch_type::raft_data,
-                  .record_sizes = {random_generators::get_int(10UL, 200UL)},
-                });
+                all_batches.push_back(
+                  batch_t{
+                    .num_records = 1,
+                    .type = model::record_batch_type::raft_data,
+                    .record_sizes = {random_generators::get_int(10UL, 200UL)},
+                  });
             }
         }
         std::random_device dev;
@@ -376,7 +380,7 @@ std::vector<in_memory_segment> make_segments(
                       : 0;
                 s.push_back(std::move(truncated));
             } else {
-                BOOST_REQUIRE(body.delta_offset_overlap == 0);
+                RPTEST_REQUIRE(body.delta_offset_overlap == 0);
                 prev = copy_in_memory_segment(body);
                 s.push_back(std::move(body));
             }
@@ -432,17 +436,19 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
     for (const auto& s : segments) {
         auto url = m.generate_segment_path(
           *m.get(s.base_offset), path_provider);
-        results.push_back(cloud_storage_fixture::expectation{
-          .url = url().string(), .body = s.bytes});
+        results.push_back(
+          cloud_storage_fixture::expectation{
+            .url = url().string(), .body = s.bytes});
     }
     auto serialized = [&] {
         auto s_data = m.serialize().get();
         auto buf = s_data.stream.read_exactly(s_data.size_bytes).get();
         return ss::sstring(buf.begin(), buf.end());
     };
-    results.push_back(cloud_storage_fixture::expectation{
-      .url = m.get_manifest_path(path_provider)().string(),
-      .body = serialized()});
+    results.push_back(
+      cloud_storage_fixture::expectation{
+        .url = m.get_manifest_path(path_provider)().string(),
+        .body = serialized()});
     std::stringstream ostr;
     m.serialize_json(ostr);
     vlog(
@@ -475,7 +481,7 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
           "computed segment delta {}, segment {}",
           segment_delta,
           s);
-        BOOST_REQUIRE(model::offset_cast(segment_delta) <= s.base_offset());
+        RPTEST_REQUIRE(model::offset_cast(segment_delta) <= s.base_offset());
         cloud_storage::partition_manifest::segment_meta meta{
           .is_compacted = false,
           .size_bytes = s.bytes.size(),
@@ -494,8 +500,9 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
                 + model::offset(s.num_config_records - s.delta_offset_overlap);
         auto url = m.generate_segment_path(
           *m.get(meta.base_offset), path_provider);
-        results.push_back(cloud_storage_fixture::expectation{
-          .url = url().string(), .body = body});
+        results.push_back(
+          cloud_storage_fixture::expectation{
+            .url = url().string(), .body = body});
     }
     m.advance_insync_offset(m.get_last_offset());
     auto serialized = [&] {
@@ -503,9 +510,10 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
         auto buf = s_data.stream.read_exactly(s_data.size_bytes).get();
         return ss::sstring(buf.begin(), buf.end());
     };
-    results.push_back(cloud_storage_fixture::expectation{
-      .url = m.get_manifest_path(path_provider)().string(),
-      .body = serialized()});
+    results.push_back(
+      cloud_storage_fixture::expectation{
+        .url = m.get_manifest_path(path_provider)().string(),
+        .body = serialized()});
     std::ostringstream ostr;
     m.serialize_json(ostr);
 
@@ -570,7 +578,7 @@ std::vector<in_memory_segment> replace_segments(
     for (const auto& s : segments) {
         auto bo = s.base_offset;
         auto it = manifest.find(bo);
-        BOOST_REQUIRE(it != manifest.end());
+        RPTEST_REQUIRE(it != manifest.end());
         auto path = manifest.generate_segment_path(*it, path_provider);
         segments_to_remove.push_back(path().native());
     }
@@ -632,8 +640,8 @@ partition_manifest hydrate_manifest(
     retry_chain_node rtc(never_abort, 300s, 200ms);
     ss::lowres_clock::update();
     auto res = dl.download_manifest(rtc, &m).get();
-    BOOST_REQUIRE(res.has_value());
-    BOOST_REQUIRE(res.value() == find_partition_manifest_outcome::success);
+    RPTEST_REQUIRE(res.has_value());
+    RPTEST_REQUIRE(res.value() == find_partition_manifest_outcome::success);
     return m;
 }
 
@@ -684,9 +692,8 @@ std::vector<model::record_batch_header> scan_remote_partition_incrementally(
 
     std::vector<model::record_batch_header> headers;
 
-    storage::log_reader_config reader_config(
-      base, max, ss::default_priority_class());
-
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), model::offset_cast(max));
     // starting max_bytes
     constexpr size_t max_bytes_limit = 4_KiB;
     reader_config.max_bytes = maybe_max_bytes != 0 ? maybe_max_bytes
@@ -696,7 +703,7 @@ std::vector<model::record_batch_header> scan_remote_partition_incrementally(
 
     int num_fetches = 0;
     while (next < max) {
-        reader_config.start_offset = next;
+        reader_config.start_offset = model::offset_cast(next);
         if (maybe_max_bytes == 0) {
             reader_config.max_bytes = random_generators::get_int(
               max_bytes_limit - 1);
@@ -718,7 +725,7 @@ std::vector<model::record_batch_header> scan_remote_partition_incrementally(
           std::back_inserter(headers));
         num_fetches++;
     }
-    BOOST_REQUIRE(num_fetches > 0);
+    RPTEST_REQUIRE(num_fetches > 0);
     vlog(test_util_log.info, "{} fetch operations performed", num_fetches);
     return headers;
 }
@@ -748,8 +755,8 @@ std::vector<model::record_batch_header> scan_remote_partition(
           .cloud_storage_max_segment_readers_per_shard.set_value(
             maybe_max_readers);
     }
-    storage::log_reader_config reader_config(
-      base, max, ss::default_priority_class());
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), model::offset_cast(max));
 
     auto manifest = hydrate_manifest(
       imposter.api.local(), imposter.bucket_name);
@@ -810,8 +817,9 @@ scan_result scan_remote_partition(
     }
     auto manifest = hydrate_manifest(
       imposter.api.local(), imposter.bucket_name);
-    storage::log_reader_config reader_config(
-      min, max, ss::default_priority_class());
+
+    cloud_log_reader_config reader_config(
+      model::offset_cast(min), model::offset_cast(max));
     reader_config.first_timestamp = timestamp;
 
     partition_probe probe(manifest.get_ntp());
@@ -898,9 +906,8 @@ scan_remote_partition_incrementally_with_closest_lso(
 
     std::vector<model::record_batch_header> headers;
 
-    storage::log_reader_config reader_config(
-      base, model::next_offset(base), ss::default_priority_class());
-
+    cloud_log_reader_config reader_config(
+      model::offset_cast(base), model::offset_cast(model::next_offset(base)));
     // starting max_bytes
     reader_config.max_bytes = 1;
 
@@ -908,8 +915,8 @@ scan_remote_partition_incrementally_with_closest_lso(
 
     int num_fetches = 0;
     while (next < max) {
-        reader_config.start_offset = next;
-        reader_config.max_offset = model::next_offset(next);
+        reader_config.start_offset = model::offset_cast(next);
+        reader_config.max_offset = model::offset_cast(model::next_offset(next));
         vlog(test_util_log.info, "reader_config {}", reader_config);
         auto reader = partition->make_reader(reader_config).get().reader;
         auto headers_read
@@ -928,7 +935,7 @@ scan_remote_partition_incrementally_with_closest_lso(
             // test is prepared to see the gaps in place of tx-fence batches
             continue;
         }
-        BOOST_REQUIRE(headers_read.size() == 1);
+        RPTEST_REQUIRE(headers_read.size() == 1);
         vlog(test_util_log.info, "header {}", headers_read.front());
         next = headers_read.back().last_offset() + model::offset(1);
         std::copy(
@@ -937,7 +944,7 @@ scan_remote_partition_incrementally_with_closest_lso(
           std::back_inserter(headers));
         num_fetches++;
     }
-    BOOST_REQUIRE(num_fetches > 0);
+    RPTEST_REQUIRE(num_fetches > 0);
     vlog(test_util_log.info, "{} fetch operations performed", num_fetches);
     return headers;
 }
@@ -999,10 +1006,109 @@ void reupload_compacted_segments(
                               rtc,
                               always_continue)
                             .get();
-            BOOST_REQUIRE_EQUAL(result, cloud_storage::upload_result::success);
+            RPTEST_REQUIRE_EQ(result, cloud_storage::upload_result::success);
         }
     }
     m.advance_insync_offset(m.get_last_offset());
 }
+
+namespace testing {
+
+void topic_manifest_serialize_v1_json(
+  std::ostream& out, const topic_manifest& m) {
+    json::OStreamWrapper wrapper(out);
+    json::Writer<json::OStreamWrapper> w(wrapper);
+    w.StartObject();
+    w.Key("version");
+    w.Int(static_cast<int>(topic_manifest::first_version()));
+    w.Key("namespace");
+    w.String(m._topic_config->tp_ns.ns());
+    w.Key("topic");
+    w.String(m._topic_config->tp_ns.tp());
+    w.Key("partition_count");
+    w.Int(m._topic_config->partition_count);
+    w.Key("replication_factor");
+    w.Int(m._topic_config->replication_factor);
+    w.Key("revision_id");
+    w.Int(m._rev());
+
+    // optional values are encoded in the following manner:
+    // - key set to null - optional is nullopt
+    // - key is not null - optional has value
+    w.Key("compression");
+    if (m._topic_config->properties.compression.has_value()) {
+        w.String(
+          boost::lexical_cast<std::string>(
+            *m._topic_config->properties.compression));
+    } else {
+        w.Null();
+    }
+    w.Key("cleanup_policy_bitflags");
+    if (m._topic_config->properties.cleanup_policy_bitflags.has_value()) {
+        w.String(
+          boost::lexical_cast<std::string>(
+            *m._topic_config->properties.cleanup_policy_bitflags));
+    } else {
+        w.Null();
+    }
+    w.Key("compaction_strategy");
+    if (m._topic_config->properties.compaction_strategy.has_value()) {
+        w.String(
+          boost::lexical_cast<std::string>(
+            *m._topic_config->properties.compaction_strategy));
+    } else {
+        w.Null();
+    }
+    w.Key("timestamp_type");
+    if (m._topic_config->properties.timestamp_type.has_value()) {
+        w.String(
+          boost::lexical_cast<std::string>(
+            *m._topic_config->properties.timestamp_type));
+    } else {
+        w.Null();
+    }
+    w.Key("segment_size");
+    if (m._topic_config->properties.segment_size.has_value()) {
+        w.Uint64(*m._topic_config->properties.segment_size);
+    } else {
+        w.Null();
+    }
+    // NOTE: manifest_object_name is intentionaly ommitted
+
+    // tristate values are encoded in the following manner:
+    // - key not present - tristate is disabled
+    // - key set to null - tristate is enabled but not set
+    // - key is not null - tristate is enabled and set
+    if (!m._topic_config->properties.retention_bytes.is_disabled()) {
+        w.Key("retention_bytes");
+        if (m._topic_config->properties.retention_bytes.has_optional_value()) {
+            w.Uint64(m._topic_config->properties.retention_bytes.value());
+        } else {
+            w.Null();
+        }
+    }
+    if (!m._topic_config->properties.retention_duration.is_disabled()) {
+        w.Key("retention_duration");
+        if (m._topic_config->properties.retention_duration
+              .has_optional_value()) {
+            w.Int64(
+              m._topic_config->properties.retention_duration.value().count());
+        } else {
+            w.Null();
+        }
+    }
+
+    // do not serialize fields that are not deserializable by previous versions
+    // of redpanda
+    if (m._topic_config->properties.mpx_virtual_cluster_id) {
+        w.Key("virtual_cluster_id");
+        w.String(
+          fmt::format(
+            "{}", m._topic_config->properties.mpx_virtual_cluster_id.value()));
+    }
+    w.EndObject();
+}
+
+} // namespace testing
 
 } // namespace cloud_storage

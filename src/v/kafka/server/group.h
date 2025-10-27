@@ -10,6 +10,8 @@
  */
 
 #pragma once
+#include "absl/container/node_hash_map.h"
+#include "absl/container/node_hash_set.h"
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/simple_batch_builder.h"
@@ -19,10 +21,11 @@
 #include "config/property.h"
 #include "config/types.h"
 #include "container/chunked_hash_map.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/protocol/offset_commit.h"
+#include "kafka/protocol/offset_fetch.h"
 #include "kafka/server/group_metadata.h"
 #include "kafka/server/group_probe.h"
 #include "kafka/server/member.h"
@@ -31,16 +34,13 @@
 #include "model/timestamp.h"
 #include "raft/replicate.h"
 #include "utils/mutex.h"
-#include "utils/rwlock.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/log.hh>
-
-#include <absl/container/node_hash_map.h>
-#include <absl/container/node_hash_set.h>
 
 #include <iosfwd>
 #include <optional>
@@ -263,24 +263,22 @@ public:
       kafka::group_id id,
       group_state s,
       config::configuration& conf,
-      ss::lw_shared_ptr<ssx::rwlock> catchup_lock,
+      ss::lw_shared_ptr<ss::rwlock> catchup_lock,
       ss::lw_shared_ptr<cluster::partition> partition,
       model::term_id,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
-      ss::sharded<features::feature_table>&,
-      group_metadata_serializer);
+      ss::sharded<features::feature_table>&);
 
     // constructor used when loading state from log
     group(
       kafka::group_id id,
       group_metadata_value& md,
       config::configuration& conf,
-      ss::lw_shared_ptr<ssx::rwlock> catchup_lock,
+      ss::lw_shared_ptr<ss::rwlock> catchup_lock,
       ss::lw_shared_ptr<cluster::partition> partition,
       model::term_id,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
-      ss::sharded<features::feature_table>&,
-      group_metadata_serializer);
+      ss::sharded<features::feature_table>&);
 
     ~group() noexcept;
 
@@ -564,6 +562,9 @@ public:
     /// Removes a full member and may rebalance.
     void remove_member(member_ptr member);
 
+    /// Remove all full members so that group can be deleted.
+    void remove_full_members();
+
     /// Handle a group sync request.
     sync_group_stages handle_sync_group(sync_group_request&& r);
 
@@ -632,8 +633,8 @@ public:
     ss::future<cluster::commit_group_tx_reply>
     handle_commit_tx(cluster::commit_group_tx_request r);
 
-    ss::future<offset_fetch_response>
-    handle_offset_fetch(offset_fetch_request&& r);
+    ss::future<offset_fetch_response_group>
+    handle_offset_fetch(offset_fetch_request_group r, bool require_stable);
 
     void insert_offset(const model::topic_partition& tp, offset_metadata md) {
         if (auto o_it = _offsets.find(tp); o_it != _offsets.end()) {
@@ -709,7 +710,7 @@ public:
      *
      * The set of expired offsets that have been removed is returned.
      */
-    std::vector<model::topic_partition>
+    chunked_vector<model::topic_partition>
     delete_expired_offsets(std::chrono::seconds retention_period);
 
     /*
@@ -717,10 +718,16 @@ public:
      *
      *  Returns the set of offsets that were deleted.
      */
-    std::vector<model::topic_partition>
-    delete_offsets(std::vector<model::topic_partition> offsets);
+    chunked_vector<model::topic_partition>
+    delete_offsets(const chunked_vector<model::topic_partition>& offsets);
 
     void set_lag_metrics(consumer_lag_metrics lag_metrics);
+
+    /*
+     *  If expired_only is false aborts all TXes.
+     *  If expired_only is true aborts only expired TXes.
+     */
+    ss::future<cluster::tx::errc> abort_txes(bool expired_only);
 
 private:
     using member_map = absl::node_hash_map<kafka::member_id, member_ptr>;
@@ -837,8 +844,9 @@ private:
         cluster::simple_batch_builder builder(
           model::record_batch_type::raft_data, model::offset(0));
 
-        auto kv = _md_serializer.to_kv(group_metadata_kv{
-          .key = std::move(key), .value = std::move(metadata)});
+        auto kv = group_metadata_serializer::to_kv(
+          group_metadata_kv{
+            .key = std::move(key), .value = std::move(metadata)});
         builder.add_raw_kv(std::move(kv.key), std::move(kv.value));
 
         return std::move(builder).build();
@@ -905,12 +913,12 @@ private:
     void update_subscriptions();
     std::optional<absl::node_hash_set<model::topic>> _subscriptions;
 
-    std::vector<model::topic_partition> filter_expired_offsets(
+    chunked_vector<model::topic_partition> filter_expired_offsets(
       std::chrono::seconds retention_period,
       const std::function<bool(const model::topic&)>&,
       const std::function<model::timestamp(const offset_metadata&)>&);
 
-    std::vector<model::topic_partition>
+    chunked_vector<model::topic_partition>
     get_expired_offsets(std::chrono::seconds retention_period);
 
     bool use_dedicated_batch_type_for_fence() const {
@@ -944,7 +952,7 @@ private:
     ss::timer<clock_type> _join_timer;
     bool _new_member_added;
     config::configuration& _conf;
-    ss::lw_shared_ptr<ssx::rwlock> _catchup_lock;
+    ss::lw_shared_ptr<ss::rwlock> _catchup_lock;
     ss::lw_shared_ptr<cluster::partition> _partition;
     chunked_hash_map<
       model::topic_partition,
@@ -957,7 +965,6 @@ private:
       _probe;
     ctx_log _ctxlog;
     ctx_log _ctx_txlog;
-    group_metadata_serializer _md_serializer;
     /**
      * flag indicating that the group rebalance is a result of initial join i.e.
      * the group was in Empty state before it went into PreparingRebalance

@@ -151,7 +151,7 @@ inline std::istream& operator>>(std::istream& is, datalake_catalog_type& ct) {
     return is;
 }
 
-enum class datalake_catalog_auth_mode { none, bearer, oauth2 };
+enum class datalake_catalog_auth_mode { none, bearer, oauth2, aws_sigv4, gcp };
 
 constexpr std::string_view to_string_view(datalake_catalog_auth_mode cam) {
     switch (cam) {
@@ -161,14 +161,11 @@ constexpr std::string_view to_string_view(datalake_catalog_auth_mode cam) {
         return "bearer";
     case datalake_catalog_auth_mode::oauth2:
         return "oauth2";
+    case datalake_catalog_auth_mode::aws_sigv4:
+        return "aws_sigv4";
+    case datalake_catalog_auth_mode::gcp:
+        return "gcp";
     }
-}
-
-static constexpr auto acceptable_datalake_catalog_auth_modes() {
-    return std::to_array(
-      {to_string_view(datalake_catalog_auth_mode::none),
-       to_string_view(datalake_catalog_auth_mode::bearer),
-       to_string_view(datalake_catalog_auth_mode::oauth2)});
 }
 
 inline std::ostream&
@@ -188,8 +185,14 @@ operator>>(std::istream& is, datalake_catalog_auth_mode& cam) {
               to_string_view(datalake_catalog_auth_mode::bearer),
               datalake_catalog_auth_mode::bearer)
             .match(
-              to_string_view(datalake_catalog_auth_mode::bearer),
-              datalake_catalog_auth_mode::bearer);
+              to_string_view(datalake_catalog_auth_mode::oauth2),
+              datalake_catalog_auth_mode::oauth2)
+            .match(
+              to_string_view(datalake_catalog_auth_mode::aws_sigv4),
+              datalake_catalog_auth_mode::aws_sigv4)
+            .match(
+              to_string_view(datalake_catalog_auth_mode::gcp),
+              datalake_catalog_auth_mode::gcp);
     return is;
 }
 
@@ -226,5 +229,32 @@ inline std::istream& operator>>(std::istream& is, tls_name_format& format) {
                  tls_name_format::rfc2253);
     return is;
 }
+
+enum class audit_failure_policy : uint8_t {
+    // If the audit log is full or misconfigured, reject any request that cannot
+    // be audited
+    reject,
+    // If the audit log is full or misconfigured, permit requests that cannot be
+    // audited to proceed, but log a warning that the audit message was dropped
+    permit,
+};
+
+constexpr std::string_view to_string_view(audit_failure_policy policy) {
+    switch (policy) {
+    case audit_failure_policy::reject:
+        return "reject";
+    case audit_failure_policy::permit:
+        return "permit";
+    }
+}
+
+static constexpr auto acceptable_audit_log_failure_policy_values() {
+    return std::to_array(
+      {to_string_view(audit_failure_policy::reject),
+       to_string_view(audit_failure_policy::permit)});
+}
+
+std::ostream& operator<<(std::ostream&, audit_failure_policy);
+std::istream& operator>>(std::istream&, audit_failure_policy&);
 
 } // namespace config

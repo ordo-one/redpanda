@@ -17,10 +17,10 @@
 #include "pandaproxy/schema_registry/types.h"
 #include "pandaproxy/test/utils.h"
 
-#include <absl/algorithm/container.h>
 #include <boost/beast/http/status.hpp>
 #include <boost/beast/http/verb.hpp>
 
+#include <algorithm>
 #include <iterator>
 
 namespace pp = pandaproxy;
@@ -41,6 +41,17 @@ inline auto put_config(
       make_body(
         fmt::format(R"({{"compatibility": "{}"}})", to_string_view(lvl))),
       boost::beast::http::verb::put,
+      ppj::serialization_format::schema_registry_v1_json,
+      ppj::serialization_format::schema_registry_v1_json);
+}
+
+inline auto lookup_schema(
+  http::client& client, const pps::subject& sub, const ss::sstring& payload) {
+    return http_request(
+      client,
+      fmt::format("/subjects/{}", sub()),
+      make_body(payload),
+      boost::beast::http::verb::post,
       ppj::serialization_format::schema_registry_v1_json,
       ppj::serialization_format::schema_registry_v1_json);
 }
@@ -106,7 +117,7 @@ get_body_versions(const ss::sstring& body) {
     const auto& arr = doc.GetArray();
     std::vector<pps::schema_version> found_versions;
     found_versions.reserve(arr.Size());
-    absl::c_transform(
+    std::ranges::transform(
       arr, std::back_inserter(found_versions), [](const auto& v) {
           return pps::schema_version{v.template Get<int>()};
       });

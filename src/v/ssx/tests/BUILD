@@ -25,7 +25,6 @@ redpanda_cc_btest(
         "//src/v/base",
         "//src/v/ssx:thread_worker",
         "//src/v/test_utils:seastar_boost",
-        "@abseil-cpp//absl/algorithm:container",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -105,7 +104,6 @@ redpanda_cc_btest(
         "//src/v/base",
         "//src/v/ssx:task_local",
         "//src/v/test_utils:seastar_boost",
-        "@abseil-cpp//absl/algorithm:container",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
@@ -147,6 +145,41 @@ redpanda_cc_btest(
     ],
 )
 
+redpanda_cc_btest(
+    name = "async_transforms",
+    timeout = "short",
+    srcs = [
+        "async_transforms.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/base",
+        "//src/v/container:chunked_vector",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "async_merge_top_k",
+    timeout = "short",
+    srcs = [
+        "async_merge_top_k_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/base",
+        "//src/v/container:chunked_vector",
+        "//src/v/ssx:async_merge_top_k",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
 redpanda_cc_gtest(
     name = "when_all_test",
     timeout = "short",
@@ -155,7 +188,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/base",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/ssx:when_all",
         "//src/v/test_utils:gtest",
         "@boost//:container",
@@ -226,5 +259,77 @@ redpanda_cc_bench(
         "@boost//:uuid",
         "@seastar",
         "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "async_algorithm_rpbench",
+    srcs = [
+        "async_algorithm_bench.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/ssx:async_algorithm",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "rate_limited_function_test",
+    timeout = "short",
+    srcs = [
+        "rate_limited_function_test.cc",
+    ],
+    deps = [
+        "//src/v/ssx:rate_limited_function",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "checkpoint_mutex_test",
+    timeout = "short",
+    srcs = [
+        "checkpoint_mutex_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/ssx:checkpoint_mutex",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "condition_variable_test",
+    timeout = "short",
+    srcs = [
+        "condition_variable_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/ssx:condition_variable",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "single_fiber_executor_test",
+    timeout = "short",
+    srcs = [
+        "single_fiber_executor_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/ssx:single_fiber_executor",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
     ],
 )

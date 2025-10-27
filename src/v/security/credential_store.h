@@ -9,13 +9,13 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/node_hash_map.h"
 #include "bytes/bytes.h"
 #include "security/scram_credential.h"
 #include "security/types.h"
 
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/node_hash_map.h>
 #include <boost/range/adaptor/filtered.hpp>
 
 namespace security {
@@ -53,7 +53,10 @@ public:
     template<typename T>
     auto get(const credential_user& name) const -> const std::optional<T> {
         if (auto it = _credentials.find(name); it != _credentials.end()) {
-            return std::get<T>(it->second);
+            return ss::visit(
+              it->second,
+              [](const T& cred) { return cred; },
+              [](const auto&) { return std::nullopt; });
         }
         return std::nullopt;
     }

@@ -1,13 +1,12 @@
-load("//bazel:test.bzl", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
     name = "avro_payloads",
     hdrs = [
         "avro_payloads.h",
     ],
-    include_prefix = "pandaproxy/schema_registry/test",
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
     ],
 )
 
@@ -16,13 +15,11 @@ redpanda_test_cc_library(
     hdrs = [
         "client_utils.h",
     ],
-    include_prefix = "pandaproxy/schema_registry/test",
     deps = [
         "//src/v/http",
         "//src/v/json",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/test:utils",
-        "@abseil-cpp//absl/algorithm:container",
         "@boost//:beast",
     ],
 )
@@ -32,9 +29,8 @@ redpanda_test_cc_library(
     hdrs = [
         "compatibility_avro.h",
     ],
-    include_prefix = "pandaproxy/schema_registry/test",
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
     ],
 )
 
@@ -43,9 +39,8 @@ redpanda_test_cc_library(
     hdrs = [
         "compatibility_protobuf.h",
     ],
-    include_prefix = "pandaproxy/schema_registry/test",
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
     ],
 )
 
@@ -54,9 +49,21 @@ redpanda_test_cc_library(
     hdrs = [
         "compatibility_common.h",
     ],
-    include_prefix = "pandaproxy/schema_registry/test",
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "protobuf_utils",
+    srcs = [
+        "protobuf_utils.cc",
+    ],
+    hdrs = [
+        "protobuf_utils.h",
+    ],
+    deps = [
+        "//src/v/pandaproxy/schema_registry:core",
     ],
 )
 
@@ -67,7 +74,8 @@ redpanda_cc_btest(
         "sanitize_avro.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:json",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_avro",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -82,7 +90,7 @@ redpanda_cc_btest(
         "util.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar//:testing",
@@ -96,7 +104,8 @@ redpanda_cc_btest(
         "storage.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:json",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@fmt",
@@ -111,10 +120,9 @@ redpanda_cc_btest(
         "store.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_avro",
         "//src/v/test_utils:seastar_boost",
-        "@abseil-cpp//absl/algorithm:container",
         "@boost//:test",
         "@seastar//:testing",
     ],
@@ -128,7 +136,7 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/config",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -143,7 +151,7 @@ redpanda_cc_btest(
         "mt_sharded_store.cc",
     ],
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_protobuf",
         "//src/v/test_utils:seastar_boost",
         "@boost//:range",
@@ -161,12 +169,23 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_protobuf",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
         "@seastar//:testing",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "utils",
+    hdrs = [
+        "utils.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/pandaproxy/schema_registry:core",
     ],
 )
 
@@ -178,8 +197,9 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
+        ":utils",
         "//src/v/model",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -195,7 +215,7 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_avro",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -212,8 +232,9 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
+        ":utils",
         "//src/v/model",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -232,9 +253,10 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/bytes:iobuf_parser",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_common",
         "//src/v/pandaproxy/schema_registry/test:compatibility_protobuf",
+        "//src/v/pandaproxy/schema_registry/test:protobuf_utils",
         "//src/v/test_utils:seastar_boost",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@boost//:test",
@@ -252,7 +274,7 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_avro",
         "//src/v/pandaproxy/schema_registry/test:compatibility_common",
         "//src/v/test_utils:seastar_boost",
@@ -272,7 +294,7 @@ redpanda_cc_btest(
     ],
     cpu = 1,
     deps = [
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_common",
         "//src/v/test_utils:seastar_boost",
         "@abseil-cpp//absl/container:flat_hash_set",
@@ -290,7 +312,6 @@ redpanda_cc_btest(
     srcs = [
         "get_schema_types.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         "//src/v/http",
         "//src/v/pandaproxy/test:fixture",
@@ -309,11 +330,13 @@ redpanda_cc_btest(
     srcs = [
         "post_subjects_subject_version.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":avro_payloads",
         ":client_utils",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy:core",
+        "//src/v/pandaproxy:error",
+        "//src/v/pandaproxy:json",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/test:fixture",
         "//src/v/pandaproxy/test:utils",
         "//src/v/test_utils:seastar_boost",
@@ -328,11 +351,10 @@ redpanda_cc_btest(
     srcs = [
         "delete_subject_endpoints.cc",
     ],
-    tags = ["exclusive"],
     deps = [
         ":avro_payloads",
         ":client_utils",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/test:fixture",
         "//src/v/pandaproxy/test:utils",
         "//src/v/test_utils:seastar_boost",
@@ -362,9 +384,10 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/bytes:iobuf_parser",
-        "//src/v/pandaproxy",
+        "//src/v/pandaproxy/schema_registry:core",
         "//src/v/pandaproxy/schema_registry/test:compatibility_common",
         "//src/v/pandaproxy/schema_registry/test:compatibility_protobuf",
+        "//src/v/pandaproxy/schema_registry/test:protobuf_utils",
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:runfiles",
         "//src/v/utils:file_io",
@@ -372,5 +395,58 @@ redpanda_cc_gtest(
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "protobuf_large_alloc_test",
+    timeout = "short",
+    srcs = [
+        "protobuf_large_alloc.cc",
+    ],
+    cpu = 1,
+    data = [
+        ":test_protos",
+    ],
+    memory = "256MiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/pandaproxy/schema_registry:core",
+        "//src/v/pandaproxy/schema_registry/test:protobuf_utils",
+        "//src/v/test_utils:gtest",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "api_rpbench",
+    timeout = "moderate",
+    srcs = [
+        "api_bench.cc",
+    ],
+    deps = [
+        ":client_utils",
+        "//src/v/base",
+        "//src/v/http",
+        "//src/v/json",
+        "//src/v/pandaproxy/schema_registry:core",
+        "//src/v/pandaproxy/schema_registry/test:protobuf_utils",
+        "//src/v/pandaproxy/test:fixture",
+        "@abseil-cpp//absl/strings",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "random",
+    hdrs = [
+        "random.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/pandaproxy/schema_registry:subject_name_strategy",
+        "//src/v/random:generators",
     ],
 )

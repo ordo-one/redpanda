@@ -9,13 +9,12 @@
  */
 #include "iceberg/snapshot_json.h"
 
+#include "absl/container/btree_map.h"
 #include "iceberg/json_utils.h"
 #include "iceberg/snapshot.h"
 #include "json/document.h"
 #include "model/timestamp.h"
 #include "strings/string_switch.h"
-
-#include <absl/container/btree_map.h>
 
 namespace iceberg {
 
@@ -80,18 +79,20 @@ snapshot parse_snapshot(const json::Value& v) {
     }
     const auto& summary_json = parse_required(v, "summary");
     if (!summary_json.IsObject()) {
-        throw std::invalid_argument(fmt::format(
-          "Expected JSON object to parse field 'summary', found: {}",
-          summary_json.GetType()));
+        throw std::invalid_argument(
+          fmt::format(
+            "Expected JSON object to parse field 'summary', found: {}",
+            summary_json.GetType()));
     }
     std::optional<snapshot_operation> operation;
     absl::btree_map<ss::sstring, ss::sstring> other_map;
     for (const auto& m : summary_json.GetObject()) {
         if (!m.name.IsString() || !m.value.IsString()) {
-            throw std::invalid_argument(fmt::format(
-              "Expected 'summary' field to be a string map, found: {} => {}",
-              m.name.GetType(),
-              m.value.GetType()));
+            throw std::invalid_argument(
+              fmt::format(
+                "Expected 'summary' field to be a string map, found: {} => {}",
+                m.name.GetType(),
+                m.value.GetType()));
         }
         const auto& val_str = m.value.GetString();
         // Pull out the 'operation' field specifically, as it's a required
@@ -107,18 +108,41 @@ snapshot parse_snapshot(const json::Value& v) {
         throw std::invalid_argument(
           "Expected 'summary' field to have 'operation' member");
     }
+    snapshot_summary summary{
+      .operation = operation.value(),
+      .other = std::move(other_map),
+    };
+    const auto maybe_parse_metric =
+      [&summary](std::string_view metric_name, std::optional<int64_t>* out) {
+          // Look for the given metric in the map and assign `out` if it
+          // exists. If so, the metric is removed from the map.
+          auto it = summary.other.find(ss::sstring(metric_name));
+          if (it == summary.other.end()) {
+              return;
+          }
+          try {
+              auto m = std::stol(it->second);
+              summary.other.erase(it);
+              *out = m;
+          } catch (...) {
+              // Ignore surprising values.
+          }
+      };
+    maybe_parse_metric("added-data-files", &summary.added_data_files);
+    maybe_parse_metric("total-data-files", &summary.total_data_files);
+    maybe_parse_metric("added-records", &summary.added_records);
+    maybe_parse_metric("total-records", &summary.total_records);
+    maybe_parse_metric("added-files-size", &summary.added_files_size);
+    maybe_parse_metric("total-files-size", &summary.total_files_size);
     auto operation_str = parse_required_str(summary_json, "operation");
     return snapshot{
-          .id = snapshot_id{id},
-          .parent_snapshot_id = parent_id,
-          .sequence_number = sequence_number{seq_num},
-          .timestamp_ms = model::timestamp{timestamp_ms},
-          .summary = snapshot_summary{
-              .operation = operation.value(),
-              .other = std::move(other_map),
-          },
-          .manifest_list_path = uri(manifest_list_path),
-          .schema_id = schema_id,
+      .id = snapshot_id{id},
+      .parent_snapshot_id = parent_id,
+      .sequence_number = sequence_number{seq_num},
+      .timestamp_ms = model::timestamp{timestamp_ms},
+      .summary = std::move(summary),
+      .manifest_list_path = uri(manifest_list_path),
+      .schema_id = schema_id,
     };
 }
 
@@ -168,6 +192,23 @@ void rjson_serialize(iceberg::json_writer& w, const iceberg::snapshot& s) {
         w.Key(k);
         w.String(v);
     }
+    const auto maybe_serialize_metric =
+      [&w](std::string_view metric_name, const std::optional<int64_t>& metric) {
+          if (!metric.has_value()) {
+              return;
+          }
+          w.Key(ss::sstring(metric_name));
+          w.String(fmt::to_string(*metric));
+
+          // TODO: is it important to make sure we don't double-serialize if
+          // it's in `other`?
+      };
+    maybe_serialize_metric("added-data-files", s.summary.added_data_files);
+    maybe_serialize_metric("total-data-files", s.summary.total_data_files);
+    maybe_serialize_metric("added-records", s.summary.added_records);
+    maybe_serialize_metric("total-records", s.summary.total_records);
+    maybe_serialize_metric("added-files-size", s.summary.added_files_size);
+    maybe_serialize_metric("total-files-size", s.summary.total_files_size);
     w.EndObject();
 
     w.EndObject();

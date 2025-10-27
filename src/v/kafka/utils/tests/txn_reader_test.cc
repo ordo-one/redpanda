@@ -9,7 +9,10 @@
  * by the Apache License, Version 2.0
  */
 
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
 #include "bytes/iobuf.h"
+#include "container/chunked_circular_buffer.h"
 #include "gmock/gmock.h"
 #include "kafka/utils/txn_reader.h"
 #include "model/fundamental.h"
@@ -23,16 +26,14 @@
 #include "test_utils/test.h"
 
 #include <seastar/core/chunked_fifo.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/algorithm/container.h>
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_map.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <algorithm>
 
 namespace kafka {
 namespace {
@@ -99,10 +100,10 @@ make_aborted_txns(const std::vector<aborted_txn_range>& aborts) {
     return std::make_unique<predetermined_aborted_transaction_tracker>(tracked);
 }
 
-model::record_batch_reader
-make_reader(const std::initializer_list<
-            std::reference_wrapper<const model::record_batch>>& batches) {
-    ss::circular_buffer<model::record_batch> buffer;
+model::record_batch_reader make_reader(
+  const std::initializer_list<
+    std::reference_wrapper<const model::record_batch>>& batches) {
+    chunked_circular_buffer<model::record_batch> buffer;
     for (const auto& b : batches) {
         buffer.push_back(b.get().copy());
     }
@@ -166,7 +167,7 @@ public:
             constexpr static int max_batches = 10;
             auto batch_size = random_generators::get_int<size_t>(
               1, max_batches);
-            ss::circular_buffer<model::record_batch> batches;
+            chunked_circular_buffer<model::record_batch> batches;
             while (batches.size() < batch_size && !producers.empty()) {
                 auto& selected = random_generators::random_choice(producers);
                 auto batch = make_batch(selected.pid, selected.data.back());
@@ -265,8 +266,7 @@ private:
         std::erase_if(
           _committed_log,
           [&aborted_batches](const model::record_batch& committed) {
-              return absl::c_find(aborted_batches, committed)
-                     != aborted_batches.end();
+              return std::ranges::contains(aborted_batches, committed);
           });
         _aborted.emplace_back(
           model::producer_identity(p.id, p.epoch),

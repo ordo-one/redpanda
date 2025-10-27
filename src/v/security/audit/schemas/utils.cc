@@ -10,11 +10,16 @@
 
 #include "security/audit/schemas/utils.h"
 
+#include "kafka/protocol/api_versions.h"
+#include "kafka/protocol/describe_cluster.h"
+#include "kafka/protocol/sasl_authenticate.h"
+#include "kafka/protocol/sasl_handshake.h"
 #include "kafka/protocol/schemata/add_offsets_to_txn_request.h"
 #include "kafka/protocol/schemata/add_partitions_to_txn_request.h"
 #include "kafka/protocol/schemata/alter_client_quotas_request.h"
 #include "kafka/protocol/schemata/alter_configs_request.h"
 #include "kafka/protocol/schemata/alter_partition_reassignments_request.h"
+#include "kafka/protocol/schemata/alter_user_scram_credentials_request.h"
 #include "kafka/protocol/schemata/create_acls_request.h"
 #include "kafka/protocol/schemata/create_partitions_request.h"
 #include "kafka/protocol/schemata/create_topics_request.h"
@@ -29,6 +34,7 @@
 #include "kafka/protocol/schemata/describe_log_dirs_request.h"
 #include "kafka/protocol/schemata/describe_producers_request.h"
 #include "kafka/protocol/schemata/describe_transactions_request.h"
+#include "kafka/protocol/schemata/describe_user_scram_credentials_request.h"
 #include "kafka/protocol/schemata/end_txn_request.h"
 #include "kafka/protocol/schemata/fetch_request.h"
 #include "kafka/protocol/schemata/find_coordinator_request.h"
@@ -61,6 +67,7 @@
 #include "security/gssapi_authenticator.h"
 #include "security/mtls.h"
 #include "security/oidc_authenticator.h"
+#include "security/plain_authenticator.h"
 #include "security/request_auth.h"
 #include "security/scram_authenticator.h"
 #include "utils/unresolved_address.h"
@@ -193,7 +200,7 @@ actor actor_from_request_auth_result(
 }
 
 actor actor_from_user_string(
-  const ss::sstring& user, const ss::sstring& svc_name) {
+  const ss::sstring& user, std::string_view svc_name) {
     struct user u = {
       .name = user.empty() ? "{{anonymous}}" : user,
       .type_id = user.empty() ? user::type::unknown : user::type::user,
@@ -201,7 +208,8 @@ actor actor_from_user_string(
     std::vector<authorization_result> auths{
       {.decision = "authorized",
        .policy = policy{
-         .desc = user.empty() ? "Auth Disabled" : "", .name = svc_name}}};
+         .desc = user.empty() ? "Auth Disabled" : "",
+         .name = ss::sstring{svc_name}}}};
 
     return {.authorizations = std::move(auths), .user = std::move(u)};
 }
@@ -212,18 +220,15 @@ mechanism_string_to_auth_protocol(std::string_view mech) {
         return authentication::auth_protocol_id::unknown;
     }
     return string_switch<authentication::auth_protocol_variant>(mech)
-      .match(
-        security::scram_sha256_authenticator::name,
-        security::scram_sha256_authenticator::name)
-      .match(
-        security::scram_sha512_authenticator::name,
-        security::scram_sha512_authenticator::name)
+      .match(security::scram_sha256_authenticator::name, "SASL-SCRAM")
+      .match(security::scram_sha512_authenticator::name, "SASL-SCRAM")
       .match(
         security::gssapi_authenticator::name,
         authentication::auth_protocol_id::kerberos)
       .match(
         security::oidc::sasl_authenticator::name,
         authentication::auth_protocol_id::oauth_2_0)
+      .match(security::plain_authenticator::name, "SASL-PLAIN")
       .default_match(ss::sstring{mech});
 }
 
@@ -252,7 +257,7 @@ actor result_to_actor(const security::auth_result& result) {
 
     if (result.authorization_disabled) {
         policy.desc = "authorization disabled";
-    } else if (result.is_superuser) {
+    } else if (result.is_superuser || result.required_superuser) {
         policy.desc = "superuser";
     } else if (result.empty_matches) {
         policy.desc = "no matches";
@@ -478,12 +483,25 @@ event_type kafka_api_to_event_type(kafka::api_key key) {
         return event_type::describe;
     case kafka::heartbeat_api::key:
         return event_type::heartbeat;
+    case kafka::describe_user_scram_credentials_api::key:
+        return event_type::describe;
+    case kafka::alter_user_scram_credentials_api::key:
+        return event_type::management;
+    case kafka::describe_cluster_api::key:
+        return event_type::describe;
+    // The following Kafka APIs should not generate an audit event as either
+    // they are not an action taken by an authenticated user (such as an API
+    // request) or are covered by other auditing events, for example
+    // authentication
+    case kafka::api_versions_api::key:
+        return event_type::describe;
+    case kafka::sasl_authenticate_api::key:
+        return event_type::authenticate;
+    case kafka::sasl_handshake_api::key:
+        return event_type::authenticate;
     }
 
-    // this method should only be used by handlers or the audit system while an
-    // event is being handled meaning if we have reached this spot, there is a
-    // bug
-    vassert(false, "Unhandled Kafka API in kafka_api_to_event_type: {}", key);
+    return event_type::unknown;
 }
 
 api_activity api_activity::construct(
@@ -507,6 +525,59 @@ api_activity api_activity::construct(
                  : api_activity::status_id::failure,
       create_timestamp_t(),
       unmapped_data()};
+}
+
+api_activity api_activity::construct(
+  std::string_view svc_name,
+  ss::httpd::const_req req,
+  std::string_view operation_name,
+  const auth_result& auth_result) {
+    return {
+      op_to_crud(auth_result.operation),
+      result_to_actor(auth_result),
+      api{
+        .operation = ss::sstring{operation_name},
+        .service = {.name = ss::sstring{svc_name}}},
+      from_ss_endpoint(req.get_server_address(), svc_name),
+      from_ss_http_request(req),
+      {resource_detail{
+        .name = auth_result.resource_name,
+        .type = fmt::format("{}", auth_result.resource_type)}},
+      severity_id::informational,
+      from_ss_endpoint(req.get_client_address()),
+      auth_result.is_authorized() ? api_activity::status_id::success
+                                  : api_activity::status_id::failure,
+      create_timestamp_t(),
+      unmapped_data(auth_result)};
+}
+
+api_activity api_activity::construct(
+  std::string_view svc_name,
+  ss::httpd::const_req req,
+  std::string_view operation_name,
+  const request_auth_result& auth_result,
+  bool is_authorized,
+  security::acl_operation operation,
+  std::optional<std::string_view> reason,
+  chunked_vector<resource_detail>&& resources) {
+    return {
+      op_to_crud(operation),
+      actor_from_request_auth_result(
+        auth_result, is_authorized, ss::sstring{svc_name}, reason),
+      api{
+        .operation = ss::sstring{operation_name},
+        .service = {.name = ss::sstring{svc_name}}},
+      from_ss_endpoint(req.get_server_address(), svc_name),
+      from_ss_http_request(req),
+      std::vector<resource_detail>(
+        std::make_move_iterator(resources.begin()),
+        std::make_move_iterator(resources.end())),
+      severity_id::informational,
+      from_ss_endpoint(req.get_client_address()),
+      is_authorized ? api_activity::status_id::success
+                    : api_activity::status_id::failure,
+      create_timestamp_t(),
+      api_activity_unmapped{}};
 }
 
 api_activity api_activity::construct(

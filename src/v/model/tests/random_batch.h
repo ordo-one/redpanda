@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "container/chunked_circular_buffer.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timestamp.h"
@@ -25,6 +26,7 @@ struct record_batch_spec {
     int count{0};
     std::optional<int> records{std::nullopt};
     std::optional<int> max_key_cardinality{std::nullopt};
+    int headers_per_record = 2;
 
     model::record_batch_type bt{model::record_batch_type::raft_data};
     bool enable_idempotence{false};
@@ -32,6 +34,7 @@ struct record_batch_spec {
     int16_t producer_epoch{-1};
     int32_t base_sequence{-1};
     bool is_transactional{false};
+    bool is_control{false};
     std::optional<std::vector<size_t>> record_sizes;
     std::optional<model::timestamp> timestamp;
     bool all_records_have_same_timestamp{false};
@@ -60,17 +63,19 @@ model::record_batch make_random_batch(record_batch_spec);
 model::record_batch make_random_batch(
   model::offset o,
   bool allow_compression = true,
-  std::optional<model::timestamp> ts = std::nullopt);
+  std::optional<model::timestamp> ts = std::nullopt,
+  int records_per_batch = 0);
 
-ss::future<ss::circular_buffer<model::record_batch>> make_random_batches(
+ss::future<chunked_circular_buffer<model::record_batch>> make_random_batches(
   model::offset o,
   int count,
   bool allow_compression = true,
-  std::optional<model::timestamp> ts = std::nullopt);
+  std::optional<model::timestamp> ts = std::nullopt,
+  int records_per_batch = 0);
 
-ss::future<ss::circular_buffer<model::record_batch>>
+ss::future<chunked_circular_buffer<model::record_batch>>
 make_random_batches(model::offset o = model::offset(0));
 
-ss::future<ss::circular_buffer<model::record_batch>>
+ss::future<chunked_circular_buffer<model::record_batch>>
 make_random_batches(record_batch_spec spec);
 } // namespace model::test

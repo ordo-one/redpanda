@@ -7,20 +7,23 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
+#include "base/type_traits.h"
 #include "bytes/hash.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
+#include "container/chunked_circular_buffer.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
 #include "reflection/async_adl.h"
+#include "reflection/chunked_circular_buffer.h"
 #include "reflection/seastar/circular_buffer.h"
 
 #include <seastar/testing/thread_test_case.hh>
 
-#include <absl/container/btree_map.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
 
@@ -79,7 +82,9 @@ template<typename T>
 T make_random_collection_vec() {
     const auto size = rand_gen::get_int(0, 5);
     T collection;
-    collection.reserve(size);
+    if constexpr (CanReserve<T>) {
+        collection.reserve(size);
+    }
     for (auto i = 0; i < size; ++i) {
         collection.emplace_back(random_type<typename T::value_type>{}.gen());
     }
@@ -136,6 +141,10 @@ SEASTAR_THREAD_TEST_CASE(test_async_adl_collection_vec) {
       true,
       ser_deser_verify_hash(
         make_random_collection_vec<ss::circular_buffer<model::ntp>>()));
+    BOOST_REQUIRE_EQUAL(
+      true,
+      ser_deser_verify_hash(
+        make_random_collection_vec<chunked_circular_buffer<model::ntp>>()));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_async_adl_collection_map) {

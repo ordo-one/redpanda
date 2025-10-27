@@ -9,21 +9,20 @@
 
 #include "raft/configuration_manager.h"
 
+#include "absl/container/btree_map.h"
 #include "base/vlog.h"
 #include "bytes/iobuf_parser.h"
-#include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "raft/consensus_utils.h"
-#include "raft/types.h"
 #include "reflection/adl.h"
 #include "serde/rw/rw.h"
+#include "ssx/future-util.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/util/defer.hh>
 
-#include <absl/container/btree_map.h>
 #include <boost/range/irange.hpp>
 #include <fmt/ostream.h>
 
@@ -53,10 +52,12 @@ configuration_manager::configuration_manager(
 ss::future<> configuration_manager::truncate(model::offset offset) {
     vlog(_ctxlog.trace, "Truncating configurations at {}", offset);
     if (unlikely(offset <= _configurations.begin()->first)) {
-        return ss::make_exception_future<>(std::invalid_argument(fmt::format(
-          "can not truncate with offsets, lower or equal than the first one {} "
-          "included in the manager ",
-          _configurations.begin()->first)));
+        return ss::make_exception_future<>(std::invalid_argument(
+          fmt::format(
+            "can not truncate with offsets, lower or equal than the first one "
+            "{} "
+            "included in the manager ",
+            _configurations.begin()->first)));
     }
 
     return _lock.with([this, offset] {
@@ -162,10 +163,11 @@ void configuration_manager::add_configuration(
     auto [_, success] = _configurations.try_emplace(
       offset, indexed_configuration(std::move(cfg), idx));
     if (!success) {
-        throw std::invalid_argument(fmt::format(
-          "Unable to add configuration at offset {} as it "
-          "already exists",
-          offset));
+        throw std::invalid_argument(
+          fmt::format(
+            "Unable to add configuration at offset {} as it "
+            "already exists",
+            offset));
     }
 }
 

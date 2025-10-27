@@ -132,15 +132,25 @@ void requests::reset(request_result_t::error_type error) {
     _finished_requests.clear();
 }
 
+namespace {
+/**
+ * Increment sequence number with overflow handling. Wraps around to 0
+ */
+seq_t next_sequence(seq_t sequence) {
+    if (sequence == std::numeric_limits<seq_t>::max()) {
+        return 0;
+    }
+    return sequence + 1;
+}
+} // namespace
+
 bool requests::is_valid_sequence(seq_t incoming) const {
     auto last_req = last_request();
-    return
-      // this is the first request with seq=0
-      (!last_req && incoming == 0)
-      // incoming request forms a sequence with last_request
-      || (last_req && last_req.value()->_last_sequence + 1 == incoming)
-      // sequence numbers got rolled over because they hit int32 max limit.
-      || (last_req && last_req.value()->_last_sequence == std::numeric_limits<seq_t>::max() && incoming == 0);
+    if (!last_req) {
+        // no previous request, expect incoming sequence to be 0
+        return incoming == 0;
+    }
+    return incoming == next_sequence(last_req.value()->_last_sequence);
 }
 
 result<request_ptr> requests::try_emplace(
@@ -216,8 +226,9 @@ void requests::stm_apply(
     gc_requests_from_older_terms(term);
     result_promise_t ready{};
     ready.set_value(kafka_result{.last_offset = offset});
-    _finished_requests.emplace_back(ss::make_lw_shared<request>(
-      bid.first_seq, bid.last_seq, model::term_id{-1}, std::move(ready)));
+    _finished_requests.emplace_back(
+      ss::make_lw_shared<request>(
+        bid.first_seq, bid.last_seq, term, std::move(ready)));
 
     while (_finished_requests.size() > requests_cached_max) {
         _finished_requests.pop_front();
@@ -255,11 +266,9 @@ producer_state::producer_state(
     for (auto& req : snapshot.finished_requests) {
         result_promise_t ready{};
         ready.set_value(kafka_result{req.last_offset});
-        _requests._finished_requests.push_back(ss::make_lw_shared<request>(
-          req.first_sequence,
-          req.last_sequence,
-          model::term_id{-1},
-          std::move(ready)));
+        _requests._finished_requests.push_back(
+          ss::make_lw_shared<request>(
+            req.first_sequence, req.last_sequence, req.term, std::move(ready)));
     }
 }
 
@@ -352,10 +361,23 @@ void producer_state::reset_with_new_epoch(model::producer_epoch new_epoch) {
 
 result<request_ptr> producer_state::try_emplace_request(
   const model::batch_identity& bid, model::term_id current_term, bool reset) {
-    if (bid.first_seq > bid.last_seq) {
-        // malformed batch
-        return cluster::errc::invalid_request;
+    /**
+     * Sequence numbers are always non negative, negative sequence numbers
+     * indicate a non idempotent producer.
+     */
+    if (bid.first_seq < 0 || bid.last_seq < 0) {
+        vlog(
+          _logger.warn,
+          "[{}] request with non idempotent batch {}, term: {}, reset: {}, "
+          "request_state: {}",
+          *this,
+          bid,
+          current_term,
+          reset,
+          _requests);
+        return cluster::errc::sequence_out_of_order;
     }
+
     vlog(
       _logger.trace,
       "[{}] new request, batch meta: {}, term: {}, "
@@ -392,7 +414,7 @@ void producer_state::apply_data(
     }
     _requests.stm_apply(bid, header.ctx.term, offset);
     if (bid.is_transactional) {
-        if (!_transaction_state) {
+        if (!_transaction_state || !_transaction_state->is_in_progress()) {
             // possible if begin batch got truncated.
             _transaction_state
               = std::make_unique<producer_partition_transaction_state>(
@@ -527,7 +549,10 @@ producer_state::snapshot(kafka::offset log_start_offset) const {
         // offsets older than log start are no longer interesting.
         if (kafka_offset >= log_start_offset) {
             snapshot.finished_requests.emplace_back(
-              req->_first_sequence, req->_last_sequence, kafka_offset);
+              req->_first_sequence,
+              req->_last_sequence,
+              kafka_offset,
+              req->term());
         }
     }
     if (_transaction_state) {

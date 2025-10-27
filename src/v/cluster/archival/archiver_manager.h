@@ -15,7 +15,7 @@
 #include "cluster/archival/types.h"
 #include "cluster/fwd.h"
 #include "cluster/partition_leaders_table.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 
 #include <seastar/core/shared_ptr.hh>
 
@@ -35,7 +35,7 @@ public:
       ss::sharded<cluster::partition_manager>& pm,
       ss::sharded<raft::group_manager>& gm,
       ss::sharded<cloud_storage::remote>& api,
-      ss::sharded<cloud_storage::cache>& cache,
+      ss::sharded<cloud_io::cache>& cache,
       ss::sharded<archival::upload_housekeeping_service>& upload_housekeeping,
       ss::lw_shared_ptr<const configuration> config);
     ~archiver_manager();
@@ -43,10 +43,10 @@ public:
     ss::future<> stop();
 
     /// Snapshot of managed partitions
-    fragmented_vector<model::ntp> managed_partitions() const;
+    chunked_vector<model::ntp> managed_partitions() const;
 
     /// Snapshot of managed partitions which are leaders
-    fragmented_vector<model::ntp> leader_partitions() const;
+    chunked_vector<model::ntp> leader_partitions() const;
 
 private:
     std::unique_ptr<impl> _impl;

@@ -17,7 +17,7 @@
 #include "cluster/tests/utils.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "http/tests/http_imposter.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -25,7 +25,7 @@
 #include "model/timeout_clock.h"
 #include "random/generators.h"
 #include "test_utils/async.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 
 #include <seastar/core/loop.hh>

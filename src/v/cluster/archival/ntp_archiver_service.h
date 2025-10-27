@@ -9,7 +9,7 @@
  */
 
 #pragma once
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/remote.h"
@@ -19,17 +19,20 @@
 #include "cluster/archival/archival_policy.h"
 #include "cluster/archival/probe.h"
 #include "cluster/archival/scrubber.h"
+#include "cluster/archival/segment_reupload.h"
 #include "cluster/archival/types.h"
 #include "cluster/fwd.h"
 #include "config/property.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record.h"
+#include "ssx/checkpoint_mutex.h"
+#include "ssx/event.h"
 #include "storage/fwd.h"
+#include "utils/execution_monitor.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/noncopyable_function.hh>
@@ -153,7 +156,7 @@ public:
       const storage::ntp_config& ntp,
       ss::lw_shared_ptr<const configuration> conf,
       cloud_storage::remote& remote,
-      cloud_storage::cache& c,
+      cloud_io::cache& c,
       cluster::partition& parent,
       ss::shared_ptr<cloud_storage::async_manifest_view> amv);
 
@@ -332,10 +335,27 @@ public:
         model::offset local_start_offset,
         const cloud_storage::partition_manifest& manifest)>;
 
+    // TODO(oren): maybe stick metadata in here...
+    // need it to get a segment name for the call site (logging). not sure how
+    // important that actually is
     struct find_reupload_candidate_result {
-        std::optional<ssx::semaphore_units> units;
-        std::optional<upload_candidate_with_locks> locks;
-        archival_stm_fence read_write_fence;
+        std::optional<ssx::checkpoint_mutex_units> units;
+        std::optional<segment_collector_stream> upload_stream{};
+        archival_stm_fence read_write_fence{};
+        /// Set when find_reupload_candidate (non-compacted reupload) finds a
+        /// candidate that matches the offset bounds of some
+        /// adjacent_segment_run but does NOT match the expected size. If set,
+        /// adjacent_segment_merger moves its internal state to the end of the
+        /// run and begins its next scan from there.
+        ///
+        /// This can occur in situations where compaction is disabled before
+        /// some segment(s) in the manifest have been reuploaded. As a result,
+        /// the remote_segment sizes in the manifest won't match the size of the
+        /// (compacted) segments on disk. This situation is not recoverable from
+        /// the perspective of the housekeeping job, so we skip these offsets,
+        /// allowing adjacent segment merging to make forward progress on the
+        /// (presumably uncompacted) remainder of the log.
+        std::optional<model::offset> skip_to{};
     };
 
     /// Find upload candidate
@@ -346,9 +366,11 @@ public:
     /// candidate.remote_segments).
     ///
     /// \param scanner is a user provided function used to find upload candidate
-    /// \return {nullopt, nullopt} or the archiver lock and upload candidate
+    /// \return {nullopt, nullopt} OR the archiver lock and upload candidate OR
+    /// {.skip_to = <offset>} if the candidate contained compacted segments (see
+    /// find_reupload_candidate_result, above).
     ss::future<find_reupload_candidate_result>
-    find_reupload_candidate(manifest_scanner_t scanner);
+    find_reupload_candidate(manifest_scanner_t scanner, ss::abort_source& as);
 
     /**
      * Upload segment provided from the outside of the ntp_archiver.
@@ -371,6 +393,8 @@ public:
 
     /// Return reference to partition manifest from archival STM
     const cloud_storage::partition_manifest& manifest() const;
+
+    void log_collected_traces() noexcept;
 
     /// Get segment size for the partition
     size_t get_local_segment_size() const;
@@ -415,9 +439,16 @@ public:
       model::timestamp scrub_timestamp,
       std::optional<model::offset> last_scrubbed_offset,
       cloud_storage::scrub_status status,
-      cloud_storage::anomalies detected);
+      cloud_storage::anomalies detected,
+      ss::abort_source& caller_as);
 
     ss::future<std::error_code> reset_scrubbing_metadata();
+
+    cloud_storage::segment_name segment_name_for_stream(
+      const segment_collector_stream& strm,
+      std::optional<model::term_id> archiver_term = std::nullopt);
+
+    void initialize_probe();
 
 private:
     // Labels for contexts in which manifest uploads occur. Used for logging.
@@ -437,6 +468,9 @@ private:
     static constexpr const char* segment_merger_ctx_label
       = "adjacent_segment_merger";
 
+    /// Create a fence value for the next STM operation
+    archival_stm_fence emit_rw_fence();
+
     /// Delete objects, return true on success and false otherwise
     ss::future<bool>
     batch_delete(std::vector<cloud_storage_clients::object_key> paths);
@@ -445,7 +479,7 @@ private:
 
     ss::future<bool> do_upload_local(
       archival_stm_fence fence,
-      upload_candidate_with_locks candidate,
+      segment_collector_stream strm,
       std::optional<std::reference_wrapper<retry_chain_node>> source_rtc);
     ss::future<bool> do_upload_remote(
       upload_candidate_with_locks candidate,
@@ -457,7 +491,7 @@ private:
         /// NOTE: scheduled future may hold segment read locks.
         std::optional<ss::future<ntp_archiver_upload_result>> result;
         /// Last offset of the uploaded segment or part
-        model::offset inclusive_last_offset;
+        model::offset inclusive_last_offset{};
         /// Segment metadata
         std::optional<cloud_storage::partition_manifest::segment_meta> meta;
         /// Name of the uploaded segment
@@ -492,8 +526,8 @@ private:
         model::term_id archiver_term;
     };
 
-    ss::future<scheduled_upload> do_schedule_single_upload(
-      upload_candidate_with_locks, model::term_id, segment_upload_kind);
+    ss::future<scheduled_upload> do_schedule_single_upload_streaming(
+      segment_collector_stream, model::term_id, segment_upload_kind);
 
     /// Start upload without waiting for it to complete
     ss::future<scheduled_upload>
@@ -549,50 +583,33 @@ private:
       archival_stm_fence fence,
       std::vector<wait_uploads_complete_result> finished_uploads);
 
-    /// Upload individual segment to S3.
-    ///
-    /// \param archiver_term is a current term of the archiver
-    /// \param candidate is an upload candidate
-    /// \param segment_read_locks protects the underlying segment(s) from being
-    ///        deleted while the upload is in flight.
-    /// \param stream is a stream to the segment used for the initial upload. If
-    /// the upload is retried, the segment will be read again.
-    /// \param source_rtc
-    /// is a retry_chain_node of the caller, if it's set
-    ///        to nullopt own retry chain of the ntp_archiver is used
-    /// \return error code
-    ss::future<ntp_archiver_upload_result> upload_segment(
-      model::term_id archiver_term,
-      upload_candidate candidate,
-      std::vector<ss::rwlock::holder> segment_read_locks,
-      std::optional<std::reference_wrapper<retry_chain_node>> source_rtc
-      = std::nullopt);
+    ss::future<> upload_index(ss::sstring path, cloud_storage::offset_index);
 
-    /// Isolates segment upload and accepts a stream reference, so that if the
-    /// upload fails the exception can be handled in the caller and the stream
-    /// can be closed.
-    ss::future<cloud_storage::upload_result> do_upload_segment(
-      const remote_segment_path& path,
-      upload_candidate candidate,
-      ss::input_stream<char> stream,
-      std::optional<std::reference_wrapper<retry_chain_node>> source_rtc
-      = std::nullopt);
+    ss::future<ntp_archiver_upload_result> upload_segment(
+      segment_collector_stream strm,
+      const cloud_storage::segment_meta& meta,
+      std::optional<chunked_vector<model::tx_range>> tx_ranges = std::nullopt);
+
+    /// Upload tx-manifest
+    /// Return error-code if the manifest was uploaded or upload was attempted
+    /// and failed. Return nullopt if there are no aborted transactions in the
+    /// provided offset range.
+    ss::future<std::optional<cloud_storage::upload_result>>
+    maybe_upload_aborted_tx(
+      cloud_storage::remote_segment_path path,
+      std::optional<chunked_vector<model::tx_range>> tx,
+      retry_chain_node& parent_rtc);
 
     /// Get aborted transactions for upload
     ///
     /// \return list of aborted transactions
-    ss::future<fragmented_vector<model::tx_range>>
-    get_aborted_transactions(upload_candidate candidate);
+    ss::future<chunked_vector<model::tx_range>> get_aborted_transactions(
+      model::offset start_offset, model::offset end_offset);
 
-    /// Upload segment's transactions metadata to S3.
-    ///
-    /// \return error code
-    ss::future<ntp_archiver_upload_result> upload_tx(
-      model::term_id archiver_term,
-      upload_candidate candidate,
-      fragmented_vector<model::tx_range> tx,
-      std::optional<std::reference_wrapper<retry_chain_node>> source_rtc
-      = std::nullopt);
+    ss::future<
+      std::pair<std::optional<chunked_vector<model::tx_range>>, size_t>>
+    get_aborted_transactions(
+      const segment_collector_stream& meta, const cloud_storage::segment_name&);
 
     struct make_segment_index_result {
         cloud_storage::offset_index index;
@@ -687,10 +704,6 @@ private:
     /// part.
     bool stm_retention_needed() const;
 
-    /// Helper to generate a segment path from candidate
-    remote_segment_path segment_path_for_candidate(
-      model::term_id archiver_term, const upload_candidate& candidate);
-
     /// Method to use with lazy_abort_source
     std::optional<ss::sstring> upload_should_abort() const;
 
@@ -701,13 +714,14 @@ private:
     model::ntp _ntp;
     model::initial_revision_id _rev;
     cloud_storage::remote& _remote;
-    cloud_storage::cache& _cache;
+    cloud_io::cache& _cache;
     cluster::partition& _parent;
     model::term_id _start_term;
     archival_policy _policy;
     std::optional<cloud_storage_clients::bucket_name> _bucket_override;
     ss::gate _gate;
     ss::abort_source _as;
+    retry_chain_context _rtctx;
     retry_chain_node _rtcnode;
     retry_chain_logger _rtclog;
 
@@ -717,7 +731,7 @@ private:
     // NOTE: must be taken before doing anything that acquires segment read
     // locks (e.g. selecting segments for upload, replicating and waiting on
     // the underlying Raft STM).
-    ssx::semaphore _mutex{1, "archive/ntp"};
+    ssx::checkpoint_mutex _mutex{"archive/ntp"};
 
     ss::lw_shared_ptr<const configuration> _conf;
     config::binding<std::chrono::milliseconds> _sync_manifest_timeout;
@@ -749,7 +763,7 @@ private:
     // Held while the inner segment upload/manifest sync loop is running,
     // to enable code that uses _paused to wait until ongoing activity
     // has stopped.
-    ssx::named_semaphore<ss::lowres_clock> _uploads_active{1, "uploads_active"};
+    ssx::checkpoint_mutex _uploads_active{"uploads_active"};
 
     config::binding<std::chrono::milliseconds> _housekeeping_interval;
     simple_time_jitter<ss::lowres_clock> _housekeeping_jitter;
@@ -766,6 +780,10 @@ private:
     // Used by clients wait()'ing on flush. Will be signalled by a complete
     // flush(), or by a change in leadership.
     ss::condition_variable _flush_cond;
+
+    // Used to wakeup the upload loop if it has to run immediately (e.g. after a
+    // flush)
+    ssx::event _wakeup_event{"ntp_archiver"};
 
     // Indicates that a request to flush all local data up to and including
     // offset() (inclusive) has been made when has_value() is true.
@@ -798,6 +816,8 @@ private:
 
     config::binding<std::chrono::milliseconds> _initial_backoff;
     config::binding<std::chrono::milliseconds> _max_backoff;
+
+    ssx::execution_monitor _execution_monitor;
 
     friend class archiver_fixture;
 };

@@ -9,12 +9,17 @@
  */
 #pragma once
 
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/client/transport.h"
+#include "kafka/protocol/fetch.h"
 #include "kafka/protocol/schemata/produce_request.h"
 #include "model/compression.h"
+#include "model/fundamental.h"
+#include "model/namespace.h"
+#include "model/timestamp.h"
 
 #include <optional>
+#include <stdexcept>
 
 namespace tests {
 
@@ -42,14 +47,15 @@ struct kv_t {
       size_t num_records,
       std::optional<size_t> val_start = std::nullopt,
       size_t key_cardinality = 0,
-      bool produce_tombstones = false) {
+      bool produce_tombstones = false,
+      size_t base = 0) {
         size_t vstart = val_start.value_or(start);
         std::vector<kv_t> records;
         records.reserve(num_records);
         for (size_t i = 0; i < num_records; i++) {
             auto key = start + i;
             if (key_cardinality > 0) {
-                key = key % key_cardinality;
+                key = (key % key_cardinality) + base;
             }
             auto key_str = ssx::sformat("key{}", key);
             if (produce_tombstones) {
@@ -78,12 +84,13 @@ public:
       : _transport(std::move(t)) {}
 
     ss::future<> start() { return _transport.connect(); }
+    ss::future<> stop() { return _transport.stop(); }
 
     // Produces the given records per partition to the given topic.
     ss::future<pid_to_offset_map_t> produce(
       model::topic topic_name,
       pid_to_kvs_map_t records_per_partition,
-      std::optional<model::timestamp> ts = std::nullopt,
+      std::optional<model::timestamp> ts = model::timestamp::now(),
       model::compression compression_type = model::compression::none);
 
     // Produces the given records to the given topic partition.
@@ -91,8 +98,14 @@ public:
       model::topic topic_name,
       model::partition_id pid,
       std::vector<kv_t> records,
-      std::optional<model::timestamp> ts = std::nullopt,
+      std::optional<model::timestamp> ts = model::timestamp::now(),
       model::compression compression_type = model::compression::none);
+
+    ss::future<kafka::offset> produce_to_partition(
+      model::topic topic_name, model::partition_id pid, model::record_batch);
+
+    ss::future<kafka::offset>
+    produce_to_partition(const model::ntp& ntp, model::record_batch batch);
 
 private:
     // Convert the given records-per-partition mapping to a set of per-partition
@@ -114,6 +127,7 @@ public:
       : _transport(std::move(t)) {}
 
     ss::future<> start() { return _transport.connect(); }
+    ss::future<> stop() { return _transport.stop(); }
 
     ss::future<pid_to_kvs_map_t> consume(
       model::topic topic_name,
@@ -125,7 +139,16 @@ public:
       model::partition_id pid,
       model::offset kafka_offset_inclusive);
 
+    ss::future<chunked_vector<model::record>> raw_consume_from_partition(
+      model::topic topic_name,
+      model::partition_id pid,
+      model::offset kafka_offset_inclusive);
+
 private:
+    ss::future<kafka::fetch_response> raw_consume(
+      model::topic topic_name,
+      std::vector<model::partition_id> pids,
+      std::vector<model::offset> kafka_offsets_inclusive);
     kafka::client::transport _transport;
 };
 

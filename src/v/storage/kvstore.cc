@@ -48,8 +48,7 @@ kvstore::kvstore(
   , _ntpc(model::kvstore_ntp(shard), _conf.base_dir)
   , _snap(
       std::filesystem::path(_ntpc.work_directory()),
-      simple_snapshot_manager::default_snapshot_filename,
-      ss::default_priority_class())
+      simple_snapshot_manager::default_snapshot_filename)
   , _timer([this] { _sem.signal(); }) {
     if (_conf.sanitizer_config) {
         _ntp_sanitizer_config = _conf.sanitizer_config->get_config_for_ntp(
@@ -299,7 +298,6 @@ ss::future<> kvstore::roll() {
                  _ntpc,
                  model::offset(_next_offset),
                  model::term_id(0),
-                 ss::default_priority_class(),
                  record_version_type::v1,
                  config::shard_local_cfg().storage_read_buffer_size(),
                  config::shard_local_cfg().storage_read_readahead_count(),
@@ -343,7 +341,6 @@ ss::future<> kvstore::roll() {
                        _ntpc,
                        model::offset(_next_offset),
                        model::term_id(0),
-                       ss::default_priority_class(),
                        record_version_type::v1,
                        config::shard_local_cfg().storage_read_buffer_size(),
                        config::shard_local_cfg().storage_read_readahead_count(),
@@ -424,7 +421,7 @@ ss::future<> kvstore::recover() {
 
     auto segments = co_await recover_segments(
       partition_path(_ntpc),
-      _ntpc.is_compacted(),
+      _ntpc.is_locally_compacted(),
       [] { return std::nullopt; },
       _as,
       config::shard_local_cfg().storage_read_buffer_size(),
@@ -477,19 +474,21 @@ ss::future<> kvstore::load_snapshot_from_reader(snapshot_reader& reader) {
     // read and restore db from snapshot
     auto buf = co_await read_iobuf_exactly(reader.input(), sizeof(int32_t));
     if (buf.size_bytes() != sizeof(int32_t)) {
-        throw std::runtime_error(fmt::format(
-          "Failed to read snapshot size. Wanted {} bytes != {}",
-          sizeof(int32_t),
-          buf.size_bytes()));
+        throw std::runtime_error(
+          fmt::format(
+            "Failed to read snapshot size. Wanted {} bytes != {}",
+            sizeof(int32_t),
+            buf.size_bytes()));
     }
     auto size = reflection::from_iobuf<int32_t>(std::move(buf));
 
     buf = co_await read_iobuf_exactly(reader.input(), size);
     if ((int32_t)buf.size_bytes() != size) {
-        throw std::runtime_error(fmt::format(
-          "Failed to read snapshot data. Wanted {} bytes != {}",
-          size,
-          buf.size_bytes()));
+        throw std::runtime_error(
+          fmt::format(
+            "Failed to read snapshot data. Wanted {} bytes != {}",
+            size,
+            buf.size_bytes()));
     }
 
     auto batch = co_await reflection::from_iobuf_async<model::record_batch>(
@@ -497,16 +496,20 @@ ss::future<> kvstore::load_snapshot_from_reader(snapshot_reader& reader) {
 
     auto batch_crc = model::crc_record_batch(batch);
     if (batch.header().crc != batch_crc) {
-        throw std::runtime_error(fmt::format(
-          "Snapshot batch failed crc {} != {}", batch_crc, batch.header().crc));
+        throw std::runtime_error(
+          fmt::format(
+            "Snapshot batch failed crc {} != {}",
+            batch_crc,
+            batch.header().crc));
     }
 
     auto header_crc = model::internal_header_only_crc(batch.header());
     if (batch.header().header_crc != header_crc) {
-        throw std::runtime_error(fmt::format(
-          "Snapshot batch header failed crc {} != {}",
-          header_crc,
-          batch.header().header_crc));
+        throw std::runtime_error(
+          fmt::format(
+            "Snapshot batch header failed crc {} != {}",
+            header_crc,
+            batch.header().header_crc));
     }
 
     auto lock = co_await _db_mut.get_units();
@@ -569,8 +572,7 @@ ss::future<> kvstore::replay_segments(segment_set segs) {
           seg->offsets().get_base_offset(),
           _next_offset);
 
-        auto reader_handle = co_await seg->reader().data_stream(
-          0, ss::default_priority_class());
+        auto reader_handle = co_await seg->reader().data_stream(0);
         auto parser = std::make_unique<continuous_batch_parser>(
           std::make_unique<replay_consumer>(this), std::move(reader_handle));
         auto p = parser.get();
@@ -626,7 +628,7 @@ batch_consumer::consume_result kvstore::replay_consumer::accept_batch_start(
 
 void kvstore::replay_consumer::skip_batch_start(
   model::record_batch_header h, size_t, size_t) {
-    vassert(false, "kvstore should never skip batches, header: {}", h);
+    vunreachable("kvstore should never skip batches, header: {}", h);
 }
 
 void kvstore::replay_consumer::consume_batch_start(

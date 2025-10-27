@@ -11,10 +11,10 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
 #include "config/configuration.h"
 #include "config/property.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <boost/range/iterator_range.hpp>
 
 #include <iosfwd>
@@ -33,6 +33,8 @@ enum class license_required_feature {
     fips,
     datalake_iceberg,
     leadership_pinning,
+    shadow_linking,
+    cloud_topics,
 };
 
 std::ostream& operator<<(std::ostream&, license_required_feature);
@@ -66,6 +68,8 @@ public:
     // | Cluster     | `enable_schema_id_validation`   | `redpanda`    |
     // | Cluster     | `enable_schema_id_validation`   | `compat`      |
     // | Cluster     | `iceberg_enabled`               | `true`        |
+    // | Cluster     | `enable_shadow_linking`         | `true`        |
+    // | Cluster     | `cloud_topics_enabled`          | `true`        |
     // | Node        | `fips_mode`                     | `enabled`     |
     // | Node        | `fips_mode`                     | `permissive`  |
     // +-------------+---------------------------------+---------------+
@@ -95,7 +99,7 @@ public:
     std::pair<T, bool> operator()(bool should_sanction) const {
         const auto& val = _binding();
         if (should_sanction && _is_sanctioned) [[unlikely]] {
-            return std::make_pair(_prop.default_value(), true);
+            return std::make_pair(_prop.sanctioned_value(), true);
         } else {
             return std::make_pair(val, false);
         }

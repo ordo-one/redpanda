@@ -15,31 +15,37 @@ struct_type schemaless_struct_type() {
     using namespace iceberg;
     struct_type system_fields;
     system_fields.fields.emplace_back(
-      nested_field::create(2, "partition", field_required::yes, int_type{}));
+      nested_field::create(2, "partition", field_required::no, int_type{}));
     system_fields.fields.emplace_back(
-      nested_field::create(3, "offset", field_required::yes, long_type{}));
-    system_fields.fields.emplace_back(nested_field::create(
-      4, "timestamp", field_required::yes, timestamp_type{}));
+      nested_field::create(3, "offset", field_required::no, long_type{}));
+    system_fields.fields.emplace_back(
+      nested_field::create(
+        4, "timestamp", field_required::no, timestamptz_type{}));
 
     struct_type headers_kv;
     headers_kv.fields.emplace_back(
-      nested_field::create(7, "key", field_required::no, binary_type{}));
+      nested_field::create(7, "key", field_required::no, string_type{}));
     headers_kv.fields.emplace_back(
       nested_field::create(8, "value", field_required::no, binary_type{}));
-    system_fields.fields.emplace_back(nested_field::create(
-      5,
-      "headers",
-      field_required::no,
-      list_type::create(6, field_required::yes, std::move(headers_kv))));
+    system_fields.fields.emplace_back(
+      nested_field::create(
+        5,
+        "headers",
+        field_required::no,
+        list_type::create(6, field_required::no, std::move(headers_kv))));
 
     system_fields.fields.emplace_back(
       nested_field::create(9, "key", field_required::no, binary_type{}));
+    system_fields.fields.emplace_back(
+      nested_field::create(
+        10, "timestamp_type", field_required::no, int_type{}));
     struct_type res;
-    res.fields.emplace_back(nested_field::create(
-      1,
-      ss::sstring{rp_struct_name},
-      field_required::yes,
-      std::move(system_fields)));
+    res.fields.emplace_back(
+      nested_field::create(
+        1,
+        ss::sstring{rp_struct_name},
+        field_required::no,
+        std::move(system_fields)));
 
     return res;
 }

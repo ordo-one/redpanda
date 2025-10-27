@@ -13,28 +13,23 @@
 
 #include "base/seastarx.h"
 #include "base/units.h"
-#include "compression/compression.h"
 #include "config/configuration.h"
+#include "container/chunked_circular_buffer.h"
 #include "features/feature_table.h"
-#include "hashing/crc32c.h"
-#include "model/fundamental.h"
-#include "model/record.h"
-#include "model/record_utils.h"
-#include "model/tests/random_batch.h"
-#include "random/generators.h"
-#include "reflection/adl.h"
+#include "model/limits.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
+#include "storage/tests/batch_generators.h"
 #include "storage/types.h"
-#include "test_utils/fixture.h"
+#include "test_utils/test_env.h"
 #include "test_utils/test_macros.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/reactor.hh>
 
 #include <boost/range/irange.hpp>
-#include <boost/test/tools/old/interface.hpp>
 #include <fmt/core.h>
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <optional>
@@ -43,153 +38,7 @@ using namespace std::chrono_literals; // NOLINT
 
 inline ss::logger tlog{"test_log"};
 
-struct random_batches_generator {
-    ss::circular_buffer<model::record_batch>
-    operator()(std::optional<model::timestamp> base_ts = std::nullopt) {
-        return model::test::make_random_batches(
-                 model::offset(0),
-                 random_generators::get_int(1, 10),
-                 true,
-                 base_ts)
-          .get();
-    }
-};
-
-struct key_limited_random_batch_generator {
-    static constexpr int cardinality = 10;
-
-    ss::circular_buffer<model::record_batch>
-    operator()(std::optional<model::timestamp> ts = std::nullopt) {
-        return model::test::make_random_batches(
-                 model::test::record_batch_spec{
-                   .allow_compression = true,
-                   .count = random_generators::get_int(1, 10),
-                   .max_key_cardinality = cardinality,
-                   .bt = model::record_batch_type::raft_data,
-                   .timestamp = ts})
-          .get();
-    }
-};
-
-// Deterministic data generator that generates integer keys linearly with
-// duplicates in each batch. Each batch contains a new integer key. With small
-// enough batch sizes (not exceeding compaction budget), compaction should
-// dedupe all the keys within a batch and the resulting log file should contain
-// a single key per batch forming a sequence of integers. A handy validate()
-// method is provided that validates the the batch state after compaction.
-struct linear_int_kv_batch_generator {
-    int _idx = 0;
-
-    static constexpr int batches_per_call = 5;
-    static constexpr int records_per_batch = 5;
-
-    model::record_batch
-    make_batch(model::test::record_batch_spec spec, int idx) {
-        auto ts = spec.timestamp.value_or(
-          model::timestamp(model::timestamp::now()() - (spec.count - 1)));
-        auto max_ts = spec.timestamp.value_or(
-          model::timestamp(ts.value() + spec.count - 1));
-        auto header = model::record_batch_header{
-          .size_bytes = 0, // computed later
-          .base_offset = spec.offset,
-          .type = spec.bt,
-          .crc = 0, // we-reassign later
-          .attrs = model::record_batch_attributes(
-            random_generators::get_int<int16_t>(
-              0, spec.allow_compression ? 4 : 0)),
-          .last_offset_delta = spec.count - 1,
-          .first_timestamp = ts,
-          .max_timestamp = max_ts,
-          .producer_id = spec.producer_id,
-          .producer_epoch = spec.producer_epoch,
-          .base_sequence = 0,
-          .record_count = spec.count};
-
-        if (spec.is_transactional) {
-            header.attrs.set_transactional_type();
-        }
-
-        if (spec.enable_idempotence) {
-            header.base_sequence = spec.base_sequence;
-        }
-
-        auto size = model::packed_record_batch_header_size;
-        model::record_batch::records_type records;
-        auto rs = model::record_batch::uncompressed_records();
-        rs.reserve(spec.count);
-
-        for (int i = 0; i < spec.count; i++) {
-            rs.emplace_back(
-              model::test::make_random_record(i, reflection::to_iobuf(idx)));
-        }
-
-        if (header.attrs.compression() != model::compression::none) {
-            iobuf body;
-            for (auto& r : rs) {
-                model::append_record_to_buffer(body, r);
-            }
-            rs.clear();
-            records = ::compression::compressor::compress(
-              body, header.attrs.compression());
-            size += std::get<iobuf>(records).size_bytes();
-        } else {
-            for (auto& r : rs) {
-                size += r.size_bytes();
-                size += vint::vint_size(r.size_bytes());
-            }
-            records = std::move(rs);
-        }
-        // TODO: expose term setting
-        header.ctx = model::record_batch_header::context(
-          model::term_id(0), ss::this_shard_id());
-        header.size_bytes = size;
-        auto batch = model::record_batch(header, std::move(records));
-        batch.header().crc = model::crc_record_batch(batch);
-        batch.header().header_crc = model::internal_header_only_crc(
-          batch.header());
-        return batch;
-    }
-
-    ss::circular_buffer<model::record_batch>
-    operator()(std::optional<model::timestamp> ts = std::nullopt) {
-        ss::circular_buffer<model::record_batch> ret;
-        ret.reserve(batches_per_call);
-        auto batch_spec = model::test::record_batch_spec{
-          .allow_compression = false,
-          .count = records_per_batch,
-          .bt = model::record_batch_type::raft_data,
-          .timestamp = ts,
-        };
-        return operator()(batch_spec, batches_per_call);
-    }
-
-    ss::circular_buffer<model::record_batch>
-    operator()(model::test::record_batch_spec spec, int num_batches) {
-        ss::circular_buffer<model::record_batch> ret;
-        ret.reserve(num_batches);
-        for (int i = 0; i < num_batches; i++) {
-            ret.push_back(make_batch(spec, _idx++));
-        }
-        return ret;
-    }
-
-    // Batches generated by this generator should all have 1 record
-    // and the record should match the index of the batch if compaction
-    // ran correctly.
-    static void validate_post_compaction(
-      ss::circular_buffer<model::record_batch>&& batches) {
-        int idx = 0;
-        for (const auto& batch : batches) {
-            RPTEST_EXPECT_EQ(batch.record_count(), 1);
-            batch.for_each_record([&idx](model::record rec) {
-                RPTEST_EXPECT_EQ(
-                  reflection::from_iobuf<int>(rec.release_key()), idx++);
-            });
-        }
-    }
-};
-
-class storage_test_fixture {
+class storage_test_fixture : public ::testing::Test {
 public:
     ss::sstring test_dir;
     storage::kvstore kvstore;
@@ -199,7 +48,7 @@ public:
     std::optional<model::timestamp> ts_cursor;
 
     storage_test_fixture()
-      : test_dir("test.data." + random_generators::gen_alphanum_string(10))
+      : test_dir(test_env::random_dir_path("test.data.", 10))
       , kvstore(
           storage::kvstore_config(
             1_MiB,
@@ -267,7 +116,6 @@ public:
         auto cfg = storage::log_config(
           std::move(test_dir),
           200_MiB,
-          ss::default_priority_class(),
           cache,
           storage::make_sanitized_file_config());
         return cfg;
@@ -289,24 +137,23 @@ public:
               ss::stop_iteration::no);
         }
 
-        ss::circular_buffer<model::record_batch> end_of_stream() {
+        chunked_circular_buffer<model::record_batch> end_of_stream() {
             return std::move(batches);
         }
 
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_circular_buffer<model::record_batch> batches;
     };
 
-    ss::circular_buffer<model::record_batch>
+    chunked_circular_buffer<model::record_batch>
     read_and_validate_all_batches(ss::shared_ptr<storage::log> log) {
         return read_and_validate_all_batches(
           log, model::model_limits<model::offset>::max());
     }
 
-    ss::circular_buffer<model::record_batch> read_and_validate_all_batches(
+    chunked_circular_buffer<model::record_batch> read_and_validate_all_batches(
       ss::shared_ptr<storage::log> log, model::offset max_offset) {
         auto lstats = log->offsets();
-        storage::log_reader_config cfg(
-          lstats.start_offset, max_offset, ss::default_priority_class());
+        storage::local_log_reader_config cfg(lstats.start_offset, max_offset);
         auto reader = log->make_reader(std::move(cfg)).get();
         return reader.consume(batch_validating_consumer{}, model::no_timeout)
           .get();
@@ -315,20 +162,20 @@ public:
     // clang-format off
     template<typename T = random_batches_generator>
         requires requires(T generator, std::optional<model::timestamp> ts) {
-            { generator(ts) } -> std::same_as<ss::circular_buffer<model::record_batch>>;
+            { generator(ts) } -> std::same_as<chunked_circular_buffer<model::record_batch>>;
         }
     // clang-format on
     std::vector<model::record_batch_header> append_random_batches(
       ss::shared_ptr<storage::log> log,
       int appends,
       model::term_id term = model::term_id(0),
+      std::optional<model::timestamp> ts_override = std::nullopt,
       T batch_generator = T{},
       storage::log_append_config::fsync sync
       = storage::log_append_config::fsync::no,
       bool flush_after_append = true) {
         auto lstats = log->offsets();
-        storage::log_append_config append_cfg{
-          sync, ss::default_priority_class(), model::no_timeout};
+        storage::log_append_config append_cfg{sync, model::no_timeout};
 
         model::offset base_offset = lstats.dirty_offset < model::offset(0)
                                       ? model::offset(0)
@@ -339,16 +186,18 @@ public:
         // do multiple append calls
 
         for ([[maybe_unused]] auto append : boost::irange(0, appends)) {
-            auto batches = batch_generator(ts_cursor);
+            auto ts = ts_override.has_value() ? ts_override : ts_cursor;
+            auto batches = batch_generator(ts);
             // Collect batches offsets
             for (auto& b : batches) {
                 headers.push_back(b.header());
                 b.set_term(term);
                 total_records += b.record_count();
             }
-
-            ts_cursor = model::timestamp{
-              batches.back().header().max_timestamp() + 1};
+            if (!ts_override.has_value()) {
+                ts_cursor = model::timestamp{
+                  batches.back().header().max_timestamp() + 1};
+            }
 
             // make expected offset inclusive
             auto reader = model::make_memory_record_batch_reader(
@@ -377,9 +226,7 @@ public:
           batch.header().last_offset_delta);
         buffer.push_back(std::move(batch));
         storage::log_append_config append_cfg{
-          storage::log_append_config::fsync::no,
-          ss::default_priority_class(),
-          model::no_timeout};
+          storage::log_append_config::fsync::no, model::no_timeout};
 
         model::offset old_dirty_offset = log->offsets().dirty_offset;
         model::offset base_offset = old_dirty_offset < model::offset(0)
@@ -401,16 +248,14 @@ public:
     // model::offset start_offset;
     // size_t max_bytes;
     // size_t min_bytes;
-    // io_priority_class prio;
     // std::vector<model::record_batch_type> type_filter;
     // model::offset max_offset = model::model_limits<model::offset>::max(); //
     // inclusive
-    ss::circular_buffer<model::record_batch> read_range_to_vector(
+    chunked_circular_buffer<model::record_batch> read_range_to_vector(
       ss::shared_ptr<storage::log> log,
       model::offset start,
       model::offset end) {
-        storage::log_reader_config cfg(
-          start, end, ss::default_priority_class());
+        storage::local_log_reader_config cfg(start, end);
         tlog.info("read_range_to_vector: {}", cfg);
         auto reader = log->make_reader(std::move(cfg)).get();
         return std::move(reader)

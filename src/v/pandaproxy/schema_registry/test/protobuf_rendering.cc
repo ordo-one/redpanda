@@ -7,15 +7,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/flat_hash_set.h"
 #include "bytes/iobuf_parser.h"
 #include "pandaproxy/schema_registry/protobuf.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/test/compatibility_common.h"
+#include "pandaproxy/schema_registry/test/protobuf_utils.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "test_utils/runfiles.h"
 #include "utils/file_io.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <fmt/core.h>
 #include <gtest/gtest.h>
 
@@ -23,120 +24,74 @@
 
 namespace pp = pandaproxy;
 namespace pps = pp::schema_registry;
+namespace ppstu = pp::schema_registry::test_utils;
 
 namespace {
 
-struct simple_sharded_store {
-    explicit simple_sharded_store()
-      : store{} {
-        store.start(pps::is_mutable::yes, ss::default_smp_service_group())
-          .get();
-    }
-    ~simple_sharded_store() { store.stop().get(); }
-    simple_sharded_store(const simple_sharded_store&) = delete;
-    simple_sharded_store(simple_sharded_store&&) = delete;
-    simple_sharded_store& operator=(const simple_sharded_store&) = delete;
-    simple_sharded_store& operator=(simple_sharded_store&&) = delete;
-
-    pps::schema_id
-    insert(const pps::unparsed_schema& schema, pps::schema_version version) {
-        const auto id = next_id++;
-        store
-          .upsert(
-            pps::seq_marker{
-              std::nullopt,
-              std::nullopt,
-              version,
-              pps::seq_marker_key_type::schema},
-            schema.share(),
-            id,
-            version,
-            pps::is_deleted::no)
-          .get();
-        return id;
-    }
-
-    pps::schema_id next_id{1};
-    pps::sharded_store store;
-};
-
-} // namespace
-
-std::string
-sanitize(std::string_view raw_proto, pps::normalize norm = pps::normalize::no) {
-    simple_sharded_store s;
-    iobuf buf = pps::make_canonical_protobuf_schema(
-                  s.store,
-                  pps::unparsed_schema{
-                    pps::subject{"foo"},
-                    pps::unparsed_schema_definition{
-                      raw_proto, pps::schema_type::protobuf, {}}},
-                  norm)
-                  .get()
-                  .def()
-                  .raw()();
-    iobuf_parser parser{std::move(buf)};
-    return parser.read_string(parser.bytes_left());
-}
-
-auto normalize(std::string_view raw_proto) {
-    return sanitize(raw_proto, pps::normalize::yes);
+std::filesystem::path test_dir() {
+    return test_utils::get_runfile_path(
+      "src/v/pandaproxy/schema_registry/test/testdata/protobuf");
 }
 
 enum class SchemaType { input, sanitized, normalized };
 
-std::ostream& operator<<(std::ostream& os, const SchemaType st) {
+std::string_view to_string_view(const SchemaType st) {
     switch (st) {
     case SchemaType::input:
-        os << "input";
-        break;
+        return "input";
     case SchemaType::sanitized:
-        os << "sanitized";
-        break;
+        return "sanitized";
     case SchemaType::normalized:
-        os << "normalized";
-        break;
+        return "normalized";
     }
-    return os;
 }
+
+ss::sstring read_schema(const std::string_view test_case, const SchemaType pt) {
+    const auto proto_file = fmt::format(
+      "{}_{}.proto", test_case, to_string_view(pt));
+    const auto proto_path = test_dir() / proto_file;
+    return read_fully_to_string(proto_path).get();
+};
+
+} // namespace
 
 class ProtoRendering : public testing::TestWithParam<std::string> {};
 
 TEST_P(ProtoRendering, test_protobuf_rendering) {
-    auto test_path = test_utils::get_runfile_path(
-      "src/v/pandaproxy/schema_registry/test/testdata/protobuf");
-    const std::filesystem::path test_dir{test_path.value_or(".")};
-
-    const auto read_schema = [&test_dir](
-                               const std::string_view test_case,
-                               const SchemaType pt) -> std::string {
-        const auto proto_file = fmt::format("{}_{}.proto", test_case, pt);
-        const auto proto_path = test_dir / proto_file;
-        return read_fully_to_string(proto_path).get();
-    };
-
     const auto& test_case = GetParam();
     const auto input = read_schema(test_case, SchemaType::input);
 
     const auto sanitized_expected = read_schema(
       test_case, SchemaType::sanitized);
-    const auto sanitized_processed = sanitize(input);
+    const auto sanitized_processed = ppstu::sanitize(input);
     EXPECT_EQ(sanitized_expected, sanitized_processed);
 
     const auto normalized_expected = read_schema(
       test_case, SchemaType::normalized);
-    const auto normalized_processed = normalize(input);
+    const auto normalized_processed = ppstu::normalize(input);
     EXPECT_EQ(normalized_expected, normalized_processed);
 
     // These are to verify that the processed schemas are valid schemas.
     // We don't want to run these if the above fail because
     // they produce lot's of visual noise.
     if (sanitized_expected == sanitized_processed) {
-        EXPECT_EQ(sanitized_processed, sanitize(sanitized_processed));
+        EXPECT_EQ(sanitized_processed, ppstu::sanitize(sanitized_processed));
     }
     if (normalized_expected == normalized_processed) {
-        EXPECT_EQ(normalized_processed, normalize(normalized_processed));
+        EXPECT_EQ(normalized_processed, ppstu::normalize(normalized_processed));
     }
+}
+
+TEST_P(ProtoRendering, test_protobuf_serialized_mode) {
+    const auto& test_case = GetParam();
+    const auto input = read_schema(test_case, SchemaType::sanitized);
+
+    // Validate that a round trip to serialized and
+    // back results in the starting schema
+    auto schema_b64 = ppstu::sanitize(
+      input, pps::normalize::no, pps::output_format::serialized);
+    const auto schema_text = ppstu::sanitize(schema_b64, pps::normalize::no);
+    EXPECT_EQ(input, schema_text);
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -7,11 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.services.openmessaging_benchmark_configs import OMBSampleConfigurations
-from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.cluster import cluster
 from rptest.services.openmessaging_benchmark import OpenMessagingBenchmark
+from rptest.services.openmessaging_benchmark_configs import OMBSampleConfigurations
 from rptest.services.redpanda import SISettings
+from rptest.tests.redpanda_test import RedpandaTest
 
 
 class TSWriteOpenmessagingTest(RedpandaTest):
@@ -28,11 +28,12 @@ class TSWriteOpenmessagingTest(RedpandaTest):
             cloud_storage_spillover_manifest_max_segments=10,
         )
         self._ctx = ctx
-        super(TSWriteOpenmessagingTest,
-              self).__init__(test_context=ctx,
-                             num_brokers=3,
-                             si_settings=si_settings,
-                             extra_rp_conf=extra_rp_conf)
+        super(TSWriteOpenmessagingTest, self).__init__(
+            test_context=ctx,
+            num_brokers=3,
+            si_settings=si_settings,
+            extra_rp_conf=extra_rp_conf,
+        )
 
     @cluster(num_nodes=6)
     def test_perf(self):
@@ -69,21 +70,26 @@ class TSWriteOpenmessagingTest(RedpandaTest):
             "consumer_config": {
                 "auto.offset.reset": "earliest",
                 "enable.auto.commit": "false",
-                "max.partition.fetch.bytes": 131072
+                "max.partition.fetch.bytes": 131072,
             },
         }
 
         validator = {
-            OMBSampleConfigurations.AVG_THROUGHPUT_MBPS:
-            [OMBSampleConfigurations.gte(40)]
+            OMBSampleConfigurations.AVG_THROUGHPUT_MBPS: [
+                OMBSampleConfigurations.gte(40)
+            ]
         }
 
-        benchmark = OpenMessagingBenchmark(ctx=self._ctx,
-                                           redpanda=self.redpanda,
-                                           driver=driver,
-                                           workload=(workload, validator))
+        benchmark = OpenMessagingBenchmark(
+            ctx=self._ctx,
+            redpanda=self.redpanda,
+            driver=driver,
+            workload=(workload, validator),
+        )
         benchmark.start()
-        benchmark_time_min = benchmark.benchmark_time_mins(
-        ) + TSWriteOpenmessagingTest.BENCHMARK_WAIT_TIME_MIN
+        benchmark_time_min = (
+            benchmark.benchmark_time_mins()
+            + TSWriteOpenmessagingTest.BENCHMARK_WAIT_TIME_MIN
+        )
         benchmark.wait(timeout_sec=benchmark_time_min * 60)
         benchmark.check_succeed()

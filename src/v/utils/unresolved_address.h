@@ -39,6 +39,11 @@ public:
       , _port(port)
       , _family(family) {}
 
+    explicit unresolved_address(const ss::socket_address& sa)
+      : _host{fmt::format("{}", sa.addr())}
+      , _port{sa.port()}
+      , _family{sa.addr().in_family()} {}
+
     const ss::sstring& host() const { return _host; }
     uint16_t port() const { return _port; }
     inet_family family() const { return _family; }
@@ -47,6 +52,11 @@ public:
     std::strong_ordering operator<=>(const unresolved_address&) const = default;
 
     auto serde_fields() { return std::tie(_host, _port, _family); }
+
+    /// \brief Parses a string in the format of "host:port"
+    /// \throws std::invalid_argument if the string is not in the expected
+    /// format
+    static unresolved_address from_string(std::string_view maybe_address);
 
 private:
     friend std::ostream&

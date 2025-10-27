@@ -7,7 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "container/fragmented_vector.h"
+#include "absl/container/btree_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
+#include "absl/container/node_hash_set.h"
+#include "container/chunked_vector.h"
 #include "hashing/crc32c.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -37,10 +41,6 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/testing/thread_test_case.hh>
 
-#include <absl/container/btree_set.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-#include <absl/container/node_hash_set.h>
 #include <boost/functional/hash.hpp>
 #include <boost/test/unit_test.hpp>
 
@@ -145,8 +145,9 @@ SEASTAR_THREAD_TEST_CASE(incompatible_version_throws) {
 
 SEASTAR_THREAD_TEST_CASE(manual_and_envelope_equal) {
     const auto roundtrip = serde::from_iobuf<test_msg1_new_manual>(
-      serde::to_iobuf(test_msg1_new{
-        ._a = 77, ._m = test_msg0{._i = 2, ._j = 3}, ._b = 88, ._c = 99}));
+      serde::to_iobuf(
+        test_msg1_new{
+          ._a = 77, ._m = test_msg0{._i = 2, ._j = 3}, ._b = 88, ._c = 99}));
     const auto check = test_msg1_new_manual{
       ._a = 77, ._m = test_msg0{._i = 2, ._j = 3}, ._b = 88, ._c = 99};
     BOOST_CHECK(roundtrip == check);
@@ -482,11 +483,12 @@ ss::future<> test_snapshot_header::serde_async_read(
     crc.extend(ss::cpu_to_le(metadata_size));
 
     if (std::cmp_not_equal(header_crc, crc.value())) {
-        throw std::runtime_error(fmt::format(
-          "Corrupt snapshot. Failed to verify header crc: {} != "
-          "{}: path?",
-          crc.value(),
-          header_crc));
+        throw std::runtime_error(
+          fmt::format(
+            "Corrupt snapshot. Failed to verify header crc: {} != "
+            "{}: path?",
+            crc.value(),
+            header_crc));
     }
 }
 
@@ -582,9 +584,10 @@ SEASTAR_THREAD_TEST_CASE(compat_test_removed_field) {
 }
 
 SEASTAR_THREAD_TEST_CASE(compat_test_removed_field_vector) {
-    auto b = serde::to_iobuf(std::vector<big>{
-      {.a = 1, .b = 2, .c = 3, .d = 0x77},
-      {.a = 123, .b = 456, .c = 789, .d = 0x77}});
+    auto b = serde::to_iobuf(
+      std::vector<big>{
+        {.a = 1, .b = 2, .c = 3, .d = 0x77},
+        {.a = 123, .b = 456, .c = 789, .d = 0x77}});
     const auto deserialized = serde::from_iobuf<std::vector<small>>(
       std::move(b));
     BOOST_CHECK(deserialized.at(0).a == 1);
@@ -795,7 +798,7 @@ SEASTAR_THREAD_TEST_CASE(serde_fields_test_struct_test) {
       == serde_fields_test_struct{123});
 }
 
-SEASTAR_THREAD_TEST_CASE(fragmented_vector_test) {
+SEASTAR_THREAD_TEST_CASE(chunked_vector_test) {
     std::vector<int> sizes(100);
     std::iota(sizes.begin(), sizes.end(), 0);
     sizes.push_back(4095);
@@ -804,8 +807,8 @@ SEASTAR_THREAD_TEST_CASE(fragmented_vector_test) {
 
     for (auto i : sizes) {
         // build input
-        fragmented_vector<int> v_in;
-        fragmented_vector<int> v_in_copy;
+        chunked_vector<int> v_in;
+        chunked_vector<int> v_in_copy;
         for (int j = 0; j < i; ++j) {
             v_in.push_back(j);
             v_in_copy.push_back(j);
@@ -817,7 +820,7 @@ SEASTAR_THREAD_TEST_CASE(fragmented_vector_test) {
         iobuf b;
         serde::write(b, std::move(v_in));
         iobuf_parser parser{std::move(b)};
-        const auto v_out = serde::read<fragmented_vector<int>>(parser);
+        const auto v_out = serde::read<chunked_vector<int>>(parser);
 
         BOOST_REQUIRE_EQUAL(v_out.size(), v_in_copy.size());
         BOOST_REQUIRE_EQUAL_COLLECTIONS(
@@ -1109,7 +1112,7 @@ SEASTAR_THREAD_TEST_CASE(collections_interop) {
     auto vector = tests::random_vector(
       []() { return random_generators::gen_alphanum_string(32); }, 1024);
     ss::chunked_fifo<ss::sstring> fifo;
-    fragmented_vector<ss::sstring> f_vector;
+    chunked_vector<ss::sstring> f_vector;
     std::copy(vector.begin(), vector.end(), std::back_inserter(fifo));
     std::copy(vector.begin(), vector.end(), std::back_inserter(f_vector));
 

@@ -12,31 +12,30 @@
 #pragma once
 
 #include "base/seastarx.h"
-#include "container/fragmented_vector.h"
-#include "kafka/client/partitioners.h"
-#include "kafka/client/types.h"
+#include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/metadata.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 
 #include <seastar/core/future.hh>
-
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
 
 namespace kafka::client {
 
 class topic_cache {
     struct partition_data {
         model::node_id leader;
+        kafka::leader_epoch leader_epoch{invalid_leader_epoch};
     };
 
     struct topic_data {
-        partitioner partitioner_func;
-        absl::flat_hash_map<model::partition_id, partition_data> partitions;
+        chunked_hash_map<model::partition_id, partition_data> partitions;
+        kafka::topic_authorized_operations authorized_operations
+          = kafka::topic_authorized_operations_not_set;
+        int16_t replication_factor;
+        std::optional<model::topic_id> topic_id;
     };
 
-    using topics_t = absl::node_hash_map<model::topic, topic_data>;
+    using topics_t = chunked_hash_map<model::topic, topic_data>;
 
 public:
     topic_cache() = default;
@@ -47,15 +46,26 @@ public:
     ~topic_cache() noexcept = default;
 
     /// \brief Apply the given metadata response.
-    ss::future<>
-    apply(small_fragment_vector<metadata_response::topic>&& topics);
+    void apply(const chunked_vector<metadata_response::topic>& topics);
 
     /// \brief Obtain the leader for the given topic-partition
-    ss::future<model::node_id> leader(model::topic_partition tp) const;
+    std::optional<model::node_id> leader(model::topic_partition_view) const;
+    std::optional<kafka::leader_epoch>
+      leader_epoch(model::topic_partition_view) const;
 
-    /// \brief Obtain the partition_id for the given record
-    ss::future<model::partition_id>
-    partition_for(model::topic_view tv, const record_essence& rec);
+    /// \brief A view of all known topics
+    auto topics() const { return std::views::keys(_topics); }
+
+    std::optional<model::topic_id> topic_id_for_name(model::topic_view) const;
+
+    std::optional<kafka::topic_authorized_operations>
+    authorized_operations_for_topic(model::topic_view tp) const;
+
+    std::optional<int32_t> partition_count(model::topic_view tp) const;
+
+    std::optional<int16_t> replication_factor(model::topic_view tp) const;
+
+    const topics_t& cache() const noexcept;
 
 private:
     /// \brief Cache of topic information.

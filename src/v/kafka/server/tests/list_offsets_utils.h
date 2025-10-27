@@ -32,6 +32,7 @@ public:
       : _transport(std::move(t)) {}
 
     ss::future<> start() { return _transport.connect(); }
+    ss::future<> stop() { return _transport.stop(); }
 
     ss::future<model::offset> start_offset_for_partition(
       model::topic topic_name, model::partition_id pid);
@@ -50,6 +51,9 @@ public:
           std::move(topic_name), std::move(m));
         co_return out_map[pid];
     }
+
+    ss::future<kafka::offset>
+    timequery(model::topic_partition tp, model::timestamp time);
 
 private:
     kafka::client::transport _transport;

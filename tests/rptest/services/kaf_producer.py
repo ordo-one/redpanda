@@ -8,9 +8,10 @@
 # by the Apache License, Version 2.0
 
 import sys
-from ducktape.services.background_thread import BackgroundThreadService
-from ducktape.cluster.remoteaccount import RemoteCommandError
 from threading import Event
+
+from ducktape.cluster.remoteaccount import RemoteCommandError
+from ducktape.services.background_thread import BackgroundThreadService
 
 
 class KafProducer(BackgroundThreadService):
@@ -33,8 +34,7 @@ class KafProducer(BackgroundThreadService):
                 if self._pid is None:
                     # Take first line as pid
                     self._pid = line.strip()
-                    self._redpanda.logger.debug(
-                        f"Spawned remote shell {self._pid}")
+                    self._redpanda.logger.debug(f"Spawned remote shell {self._pid}")
                     continue
                 else:
                     self._output_line_count += 1

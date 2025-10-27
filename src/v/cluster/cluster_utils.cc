@@ -12,17 +12,12 @@
 #include "base/vlog.h"
 #include "cluster/errc.h"
 #include "cluster/logger.h"
-#include "cluster/metadata_cache.h"
 #include "cluster/partition.h"
-#include "cluster/simple_batch_builder.h"
+#include "cluster/snapshot.h"
 #include "cluster/types.h"
-#include "config/configuration.h"
 #include "model/fips_config.h"
-#include "partition_properties_stm.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
-#include "rpc/backoff_policy.h"
-#include "rpc/types.h"
 #include "storage/disk_log_impl.h"
 
 #include <seastar/core/future.hh>
@@ -150,6 +145,7 @@ cluster::errc map_update_interruption_error_code(std::error_code ec) {
         case raft::errc::group_not_exists:
         case raft::errc::replicate_first_stage_exception:
         case raft::errc::invalid_input_records:
+        case raft::errc::not_learner:
             return errc::replication_error;
         }
         __builtin_unreachable();
@@ -381,7 +377,8 @@ std::vector<partition_stm_state> get_partition_stm_state(consensus_ptr ptr) {
         partition_stm_state state;
         state.name = stm->name();
         state.last_applied_offset = stm->last_applied();
-        state.max_collectible_offset = stm->max_collectible_offset();
+        state.max_removable_local_log_offset
+          = stm->max_removable_local_log_offset();
         result.push_back(std::move(state));
     }
     return result;
@@ -471,6 +468,7 @@ const std::vector<ss::sstring>& stm_snapshot_names() {
       cluster::id_allocator_snapshot,
       cluster::rm_stm_snapshot,
       cluster::partition_properties_stm_snapshot,
+      cluster::write_at_offset_stm_snapshot,
     };
 
     return names;
